@@ -674,7 +674,7 @@ await check("a 5xx refresh is not retried, a 4xx one is", async () => {
 
   reset();
   const { ctx: c } = makeCtx(expired());
-  refreshAnswer = () => new Response(JSON.stringify({ error: "bad_request" }), { status: 400, headers: { "content-type": "application/json" } });
+  refreshAnswer = () => new Response(JSON.stringify({ error: "invalid_schema" }), { status: 400, headers: { "content-type": "application/json" } });
   await refusal(invoke("whoami", {}, c));
   refreshAnswer = rotatesTo(33);
   seen = [];
@@ -739,15 +739,17 @@ await check("without an agent-level record a credential is not sealed and nothin
 });
 
 // `refresh_expired` will never rotate again: terminal, like `refresh_reused`.
-await check("an expired refresh token is reported once and not presented again", async () => {
-  reset();
-  const { ctx } = makeCtx(expired());
-  refreshAnswer = () => new Response(JSON.stringify({ error: "refresh_expired" }), { status: 409, headers: { "content-type": "application/json" } });
-  const said: string[] = [];
-  for (let i = 0; i < 3; i++) said.push(await refusal(invoke("whoami", {}, ctx)));
-  must(refreshes === 1, `three calls made ${refreshes} refresh requests`);
-  must(said.every((x) => /sign in again/.test(x)), `said: ${JSON.stringify(said)}`);
-});
+for (const [code, status] of [["refresh_expired", 409], ["refresh_invalid", 400]] as const) {
+  await check(`${code} is reported once and not presented again`, async () => {
+    reset();
+    const { ctx } = makeCtx(expired());
+    refreshAnswer = () => new Response(JSON.stringify({ error: code }), { status, headers: { "content-type": "application/json" } });
+    const said: string[] = [];
+    for (let i = 0; i < 3; i++) said.push(await refusal(invoke("whoami", {}, ctx)));
+    must(refreshes === 1, `three calls made ${refreshes} refresh requests`);
+    must(said.every((x) => /sign in again/.test(x)), `said: ${JSON.stringify(said)}`);
+  });
+}
 
 // `loadSession`'s second read, in the queue: B read "no row" before A sealed and
 // rotated; B must then use A's session, not seal the original over it.

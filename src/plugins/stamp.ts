@@ -341,10 +341,14 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
     if (!res.ok) {
       const code = String(body.error ?? body.code ?? body.errorCode ?? "");
       // Not retried, and said in the only terms that help: somebody has to act.
-      // The mark stays: the gateway has said this token is spent, or will never rotate again.
-      if (code === "refresh_reused" || code === "refresh_revoked" || code === "refresh_expired") {
-        throw new Error(code === "refresh_expired"
-          ? "stamp: this session's refresh token has expired (refresh_expired), so it can never be refreshed again. " +
+      // The mark stays: the gateway has said this token is spent, or will never
+      // rotate again (botiverse/stamp `agentRefresh`: 409 for the first three,
+      // 400 `refresh_invalid` for a token it does not know). `refresh_reused`
+      // also ends every live session the agent holds for the service, so the
+      // agent's other stamp mounts answer `refresh_revoked` next.
+      if (code === "refresh_reused" || code === "refresh_revoked" || code === "refresh_expired" || code === "refresh_invalid") {
+        throw new Error(code === "refresh_expired" || code === "refresh_invalid"
+          ? `stamp: the gateway will never refresh this session's refresh token (${code}). ` +
             "A person needs to sign in again for this mount alone and give it that session; do not retry."
           : `stamp: this session's refresh token was already used elsewhere or has been revoked (${code}), and the gateway ` +
             "revokes every token that agent holds for the service when that happens — including other machines. " +
@@ -353,10 +357,12 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
       }
       const said = `stamp: could not refresh the session (${res.status}${code ? ` ${code}` : ""}) — ` +
         `${String(body.message ?? body.text ?? "").slice(0, 300)}`.trim();
-      // A 5xx may come from a proxy after the gateway committed the rotation, so
-      // the mark stays. A 4xx is the gateway refusing before it rotates, so the
-      // token is as it was and the mark comes off; if that write fails the mark
-      // stays, which only costs a sign-in.
+      // A 5xx may come after the gateway committed the rotation — its own 503
+      // when the commit fails or a concurrent refresh won, a proxy's 502/504 —
+      // so the mark stays. Any other 4xx (`invalid_schema`: this plugin's
+      // request is wrong) is refused before anything rotates, so the token is
+      // as it was and the mark comes off; if that write fails the mark stays,
+      // which only costs a sign-in.
       if (res.status >= 500) {
         throw new Error(`${said}. The gateway may have rotated the session before failing, so this mount will not ` +
           "present that refresh token again: a person needs to sign in again for this mount alone and give it that session.");
