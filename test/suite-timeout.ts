@@ -300,13 +300,13 @@ check("interrupting the gate (INT, TERM, HUP) ends the suite and its watchdog, w
 
 /**
  * A gate's typecheck lines, cut out from `limit=$(suite_limit typecheck)` to
- * the `case "$tc"` line, run with a fake `npm` first on PATH. The same
+ * the `typecheck_clean "$tc"` line, run with a fake `npm` first on PATH. The same
  * sentinels as gateRunSuite, for the same reason.
  */
 function gateTypecheck(script: string, prelude: string, npm: string, env: Record<string, string> = {}) {
   const lines = readFileSync(script, "utf8").split("\n");
   const start = lines.findIndex((l) => l.startsWith("limit=$(suite_limit typecheck)"));
-  const end = lines.findIndex((l, i) => i > start && l.startsWith('case "$tc"'));
+  const end = lines.findIndex((l, i) => i > start && l.startsWith('typecheck_clean "$tc"'));
   if (start < 0 || end < 0) throw new Error(`${script}: no typecheck block to test`);
   const bin = join(dir, `bin-${++n}`);
   execFileSync("mkdir", ["-p", bin]);

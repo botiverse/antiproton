@@ -53,6 +53,33 @@ check("the last count wins, so an earlier summary cannot mask the verdict", () =
   if (count("  3 passed, 0 failed\n...\n  0 passed, 0 failed\n") !== "0") throw new Error("an earlier count was used");
 });
 
+check("the typecheck is clean only on a total that says 0 new", () => {
+  // One rule for both gates and CI (typecheck_clean). The broken-boundary line
+  // carries no ", 0 new" on purpose, and an empty verdict is not clean either.
+  const clean = (line: string) => sh('typecheck_clean "$1" && echo yes || echo no', "", line);
+  const cases: Array<[string, string]> = [
+    ["typecheck: 8 error signature(s) in 2 programs, 8 in baseline, 0 new, 0 cleared", "yes"],
+    ["typecheck: 9 error signature(s) in 2 programs, 8 in baseline, 1 new, 0 cleared", "no"],
+    ["typecheck: program boundary broken; counts not comparable", "no"],
+    ["", "no"],
+  ];
+  for (const [line, want] of cases) {
+    const got = clean(line);
+    if (got !== want) throw new Error(`${JSON.stringify(line)} read as clean=${got}, not ${want}`);
+  }
+});
+
+check("the suites needing a live service are named once, and only they are skipped", () => {
+  const skipped = (name: string) => sh('suite_needs_service "$1" && echo skip || echo run', "", name);
+  for (const name of ["appworld", "live-e2e", "live-github"]) {
+    if (skipped(name) !== "skip") throw new Error(`${name} is not skipped`);
+  }
+  // Substrings of a listed name, and suites beside them, still run.
+  for (const name of ["live", "e2e", "app", "suite-verdict", ""]) {
+    if (skipped(name) !== "run") throw new Error(`${JSON.stringify(name)} would be skipped`);
+  }
+});
+
 check("a suite production is guarded by and that has gone is refused, by name", () => {
   const dir = mkdtempSync(join(tmpdir(), "suites-"));
   const previous = join(dir, "previous.txt");

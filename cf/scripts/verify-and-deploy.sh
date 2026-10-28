@@ -77,7 +77,6 @@ case " $* " in
     if [ -n "$problems" ]; then echo "$problems"; exit 1; fi
     ;;
 esac
-NEEDS_SERVICE=" appworld live-e2e live-github "  # a live AppWorld server; real GitHub
 run_suite() {  # name, command...
   local name="$1"; shift
   suite_name "$name"
@@ -99,7 +98,8 @@ run_suite() {  # name, command...
 }
 for f in test/*.ts; do
   t=$(basename "$f" .ts)
-  case "$NEEDS_SERVICE" in *" $t "*) suite_name "$t"; echo "skipped (needs a live service)"; continue;; esac
+  # The suites that need a live service: suite_needs_service (cf/scripts/suite-verdict.sh), one list for both gates.
+  if suite_needs_service "$t"; then suite_name "$t"; echo "skipped (needs a live service)"; continue; fi
   run_suite "$t" node "$f"
 done
 # The storage conformance suite on real Durable Object SQLite (local workerd, no network).
@@ -138,7 +138,7 @@ tc=$(typecheck_result "$file"); rm -f "$file"
 if [ -n "$SUITE_TIMED_OUT" ]; then echo "typecheck: TIMEOUT (still running after ${limit}s; killed)"; exit 1; fi
 if [ -n "$SUITE_ERROR" ]; then echo "typecheck: FAIL ($SUITE_ERROR)"; exit 1; fi
 echo "$tc"
-case "$tc" in *", 0 new"*) ;; *) echo "typecheck: new errors"; exit 1;; esac
+typecheck_clean "$tc" || { echo "typecheck: new errors"; exit 1; }
 # Which tree is about to become production, in the log that records the deploy.
 # The same reason as the branch gate's (cf/scripts/suite-verdict.sh): the green
 # above is a fact about one tree, and a deploy log that does not name it cannot
