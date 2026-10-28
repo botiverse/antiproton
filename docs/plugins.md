@@ -350,7 +350,9 @@ when Raft made it (`provisionedBy`), `"api"` when the Agents API did (the
 `openai` config its adopt writes), else `"console"`. The seven original rows
 are `for: ["console", "raft"]`, `since: 1`; `reminder` is `for: ["console"]`,
 `since: 2`, because Raft wakes its agents through its own channel and the
-plugin's `create` refuses there. No row is for `"api"`: an API agent opened
+plugin's `create` refuses there. `stamp` is `for: ["raft"]`, `since: 3`,
+because it signs in through Raft Agent Login (`stamp_login`), which only an
+agent Raft hosts can do. No row is for `"api"`: an API agent opened
 in the console is provisioned like any other, and gets nothing from the
 catalogue. Its container comes from the Agents API's own pick of the rows
 (`apiAgentSeeds`), passed as an explicit list, where `for` is not asked.
@@ -358,6 +360,31 @@ The record is the fact
 because it exists before any mount does: Raft provisioning writes it, then
 seeds, then adds the `raft` mount (`cf/src/provision/steps.ts`), and the
 Agents API adopts before it seeds.
+
+**A row can also depend on the one agent.** `unavailable()` answers for the
+whole deployment; `unavailableFor(agent)` answers for one agent, and is what
+keeps `stamp` off a Raft agent whose server does not have the Stamp app
+installed, since a mount's tools are in every request's schema and most agents
+never ship code. The reconcile asks it only for a row that is for the agent's
+kind and whose outcome on the agent is not final (`added` or `present`), so
+nothing is asked once the mount is there. Its reason is part of the pass's
+key, so a changed verdict runs the pass again, and an unchanged one writes
+nothing; keep each reason a fixed string. It must not make a turn wait:
+`serverHasIntegration` answers from the runtime's per-agent memory of Raft's
+read-only app list (`ToolGateway.integrationInstalled`, never the login or
+grant route) and, when that is missing or stale, starts a read in the
+background, so the mount arrives on a later turn. A "no" is kept for an hour,
+a failed read for a minute with the verdict before it; "unknown" (no usable
+`raft` mount, or no Raft credential) asks nothing of Raft and is not kept.
+`stamp` withholds on "no" and "unknown" alike.
+
+**A seeded `stamp` mount needs an operator to remove it.** `removeMount`
+from the console refuses a mount whose plugin has no `consoleMount` or that
+the console did not add, and the seeded mount is neither. That is on purpose
+for now: `sdk:stamp` (in `run_js`) and the `stamp.write` policy key name the
+alias, so a mount removed or renamed by its owner would leave both pointing at
+nothing. An operator removes it through `/admin/mounts`; the catalogue never
+adds it again (`added` is final).
 
 A catalogue row's alias is reserved on every agent, whether or not the row
 applies to it: `addMount` refuses another plugin under it, so no mount from

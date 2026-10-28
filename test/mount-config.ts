@@ -9,7 +9,7 @@ import { readFile } from "node:fs/promises";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
 import { pluginEnabled, renameSafety, type PluginChoice, isExclusive } from "../src/plugins/types.ts";
-import { AgentRuntime, SEEDED_PLUGINS } from "../cf/src/runtime.ts";
+import { AgentRuntime, SEEDED_PLUGINS, seedJudge } from "../cf/src/runtime.ts";
 import { capabilityTags } from "../scripts/plugin-capabilities.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
@@ -333,7 +333,8 @@ await check("every catalogue seed validates against its own plugin, so a stray k
   for (const seed of AgentRuntime.DEFAULT_MOUNTS) {
     const plugin = byId.get(seed.plugin);
     if (!plugin) { missing.push(`${seed.alias}: no plugin "${seed.plugin}"`); continue; }
-    const problems = validateMount(plugin, (seed.config ?? { account: seed.account }) as Record<string, any>, seed.secretRef ?? null);
+    // Judged as `reconcileSeeds` judges it (`seedJudge`: a plugin that logs itself in gets its account later).
+    const problems = validateMount(seedJudge(plugin, seed.secretRef ?? null), (seed.config ?? { account: seed.account }) as Record<string, any>, seed.secretRef ?? null);
     if (problems.length) missing.push(`${seed.alias} (${seed.plugin}): ${problems.map((p) => p.message).join("; ")}`);
   }
   if (missing.length) {
@@ -725,7 +726,7 @@ await check("每个默认挂载的设置都通过校验", () => {
     // A seed naming a plugin nobody installed is a mount whose every call the
     // gateway refuses, and it looks fine in the list until something calls it.
     if (!plugin) throw new Error(`${m.alias} seeds plugin "${m.plugin}", which is not installed`);
-    const problems = validateMount(plugin, (m.config ?? {}) as any, m.secretRef ?? null);
+    const problems = validateMount(seedJudge(plugin, m.secretRef ?? null), (m.config ?? {}) as any, m.secretRef ?? null);
     if (problems.length) {
       throw new Error(`${m.alias}: ${problems.map((x) => x.message).join("; ")}`);
     }
@@ -1380,8 +1381,8 @@ await check("every plugin the catalogue seeds is installed", async () => {
   }
   // Without this the rule passes on an empty catalogue, which is the one state
   // that would make every agent start with nothing and say nothing about it.
-  if (SEEDED_PLUGINS.size !== 8) {
-    throw new Error(`expected eight seeded plugins, found ${SEEDED_PLUGINS.size}: ${[...SEEDED_PLUGINS].join(", ")}`);
+  if (SEEDED_PLUGINS.size !== 9) {
+    throw new Error(`expected nine seeded plugins, found ${SEEDED_PLUGINS.size}: ${[...SEEDED_PLUGINS].join(", ")}`);
   }
   // The sandbox in particular, and for a reason that is not about mounts.
   //
@@ -2822,11 +2823,24 @@ await check("format is declared only on the type it describes: origin on a strin
   if (problems.length) throw new Error(`a number setting was judged as an origin: ${JSON.stringify(problems)}`);
 });
 
+// #1105: the seed may take its account later only for a plugin that logs itself in (Agent Login), and only while
+// the seed names no credential. Each guard of `seedJudge` is pinned on its own, since no catalogue row reaches the
+// other two branches today (the plugins that require a credential without Agent Login are seeded with one).
+await check("seedJudge relaxes a required account only for an Agent Login plugin with no credential on the seed", () => {
+  const base = { id: "p", version: "1.0.0", tools: [], credential: { kind: "token", required: true } } as any;
+  const login = { ...base, agentLogin: { services: ["stamp"] } };
+  if (seedJudge(base, null).credential?.required !== true) throw new Error("a plugin without Agent Login was relaxed");
+  if (seedJudge(login, null).credential?.required !== false) throw new Error("an Agent Login plugin with no credential was not relaxed");
+  if (seedJudge(login, "ref").credential?.required !== true) throw new Error("a seed that names a credential was relaxed");
+  if (seedJudge({ ...login, agentLogin: { services: [] } }, null).credential?.required !== true) throw new Error("an empty Agent Login was relaxed");
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }
 const pass = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${pass} passed, ${results.length - pass} failed\n`);
+
 // A suite that runs no cases must not report success. `pass === results.length` is the whole of
 // this file's verdict, and an empty run satisfies it — which is how a suite
 // dies without saying so: the gate runs every file (#245), but a file that

@@ -2016,6 +2016,19 @@ export interface SandboxEgress {
   placeholder(placeholder: string): string;
 }
 
+/**
+ * What `Plugin.unavailableFor` is told about one agent. `kind` is the agent's kind as the catalogue reads it
+ * (cf/src/runtime.ts `agentKind`). `serverHasIntegration` is whether the agent's Raft server has an app installed,
+ * as last read (`ToolGateway.integrationInstalled`): it resolves at once from what the runtime holds, and when that is
+ * missing or stale it starts a refresh in the background and answers with the last verdict, so it never makes a turn
+ * wait on Raft. "unknown": nothing has been read yet, the agent has no usable raft mount or no Raft credential, or
+ * every read so far failed.
+ */
+export interface AgentAvailability {
+  kind: "console" | "raft" | "api";
+  serverHasIntegration(service: string): Promise<"yes" | "no" | "unknown">;
+}
+
 export interface Plugin {
   id: string;
   version: string;
@@ -2134,6 +2147,17 @@ export interface Plugin {
    */
   unavailable?(): string | null;
   /**
+   * Why one agent should not be given the catalogue's mount of this plugin, or null when it should: a per-agent
+   * question `unavailable` cannot answer, such as whether the agent's Raft server has the plugin's app installed.
+   * Asked by the catalogue reconcile (`AgentRuntime.reconcileSeeds`) only for an entry whose outcome on this agent
+   * is not final and whose `for` includes the agent's kind; its answer is part of the pass's key, so a changed answer
+   * runs the pass again, and like `unavailable` it governs only the adding, never a mount already there. Asked on
+   * every such pass, so it must be cheap: `serverHasIntegration` answers from what the runtime already knows and
+   * never waits on Raft (see {@link AgentAvailability}). The reason is recorded on the outcome row: keep it a fixed
+   * string, so a pass with the same verdict writes nothing. Absent means available to every agent.
+   */
+  unavailableFor?(agent: AgentAvailability): Promise<string | null>;
+  /**
    * The plugin's own verdict on a mount's settings, for a rule `config` cannot
    * declare. A string is the reason the mount is refused, shown to whoever
    * asked; `undefined` accepts it.
@@ -2176,6 +2200,13 @@ export interface Plugin {
    * nothing a caller chose.
    */
   grantAgentLogin?(ctx: PluginContext, service: string, codeChallenge: string, target?: string): Promise<AgentLoginAnswer>;
+  /**
+   * Whether the Raft server this plugin's mount acts on has `service` installed as an app, read from this plugin's
+   * own credential (the raft plugin, over Raft's read-only integrations list). Called by the gateway only
+   * (`ToolGateway.integrationInstalled`), on the raft mount's own context. It must never sign in, ask for a grant or
+   * post anything: it is a read, asked in the background for `Plugin.unavailableFor`. Throws when Raft did not answer.
+   */
+  integrationInstalled?(ctx: PluginContext, service: string): Promise<boolean>;
   /** The database each mount of this plugin keeps; see {@link DbSpec}. */
   database?: DbSpec;
   /** What credential it needs, if any. Absent means it never uses one. */

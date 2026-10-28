@@ -2108,6 +2108,22 @@ export class ToolGateway {
   }
 
   /**
+   * Whether this agent's Raft server has `service` installed as an app, asked of the agent's raft mount
+   * (`Plugin.integrationInstalled`, the read-only integrations list) on the context a credential check gets. The mount
+   * is found as `#agentLogin` finds it. "unknown" when there is no usable raft mount, its plugin cannot say, or it holds
+   * no Raft credential: nothing was asked of Raft. Throws when Raft did not answer, so the caller can tell a failed read
+   * from a verdict (`AgentRuntime` keeps the last verdict then).
+   */
+  async integrationInstalled(tenantId: string, agentId: string, service: string): Promise<"yes" | "no" | "unknown"> {
+    const ctx = { tenantId, agentId };
+    const usable = await this.#sibling(ctx, RAFT_LOGIN_ALIAS, (m) => this.#db(ctx, m));
+    const mount = usable ? await this.#store.getMountByAlias(tenantId, agentId, RAFT_LOGIN_ALIAS) : null;
+    const raft = mount ? this.#plugins.get(mount.plugin) : undefined;
+    if (!mount || !raft?.integrationInstalled || !usable?.credential) return "unknown";
+    return await raft.integrationInstalled(await this.#credentialContext(tenantId, agentId, mount, usable.credential), service) ? "yes" : "no";
+  }
+
+  /**
    * Another of this agent's mounts, as `PluginContext.sibling` hands it: the one lookup, for a call's context and a
    * credential check's alike, so a check sees exactly what a call would and nothing more.
    */

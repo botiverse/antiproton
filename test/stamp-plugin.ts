@@ -10,7 +10,7 @@
  * replaced by the spent credential; and approving, merging and `api` wait for a
  * person on a mount that sets no policy (#1051).
  */
-import { stampPlugin, SESSION_STORE, parseSession, loadSession, queuedMounts, gatewayFetch } from "../src/plugins/stamp.ts";
+import { stampPlugin, STAMP_WITHHELD, SESSION_STORE, parseSession, loadSession, queuedMounts, gatewayFetch } from "../src/plugins/stamp.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { keepRaftIdentity } from "../src/plugins/raft-identity.ts";
@@ -2240,6 +2240,18 @@ await check("every stamp_login attempt writes one trace row, and it carries no s
   must(traces.length === 1 && traces[0].status === "refused_credential" && traces[0].verdict === "blocked", JSON.stringify(traces));
 });
 
+
+await check("unavailableFor: only a raft agent whose server answers yes for the stamp app, each other verdict a fixed reason", async () => {
+  const asked: string[] = [];
+  const agent = (kind: "console" | "raft" | "api", answer: "yes" | "no" | "unknown") =>
+    ({ kind, serverHasIntegration: async (s: string) => { asked.push(s); return answer; } });
+  must(await stampPlugin.unavailableFor!(agent("raft", "yes")) === null, "yes withheld");
+  must(await stampPlugin.unavailableFor!(agent("raft", "no")) === STAMP_WITHHELD.no, "no not withheld as no");
+  must(await stampPlugin.unavailableFor!(agent("raft", "unknown")) === STAMP_WITHHELD.unknown, "unknown not withheld as unknown");
+  must(asked.length === 3 && asked.every((s) => s === "stamp"), `asked: ${JSON.stringify(asked)}`);
+  for (const kind of ["console", "api"] as const) must(await stampPlugin.unavailableFor!(agent(kind, "yes")) === STAMP_WITHHELD.notRaft, `${kind} given stamp`);
+  must(asked.length === 3, "a non-raft agent asked Raft");
+});
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;

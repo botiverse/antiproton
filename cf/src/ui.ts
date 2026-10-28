@@ -2510,7 +2510,7 @@ export function catalogue(d: any): string {
   const switchChip = (p: any) =>
     (p.choice ?? "inherit") === "inherit"
       ? `<span class="tag ${p.enabled ? "ok" : ""}">${p.enabled ? "on" : "off"} by inheritance — the plugin is ${
-          p.defaultForAllAgents ? "default for all agents" : "opt-in"}</span>`
+          p.defaultForAllAgents ? (p.defaultWhereAvailable ? "default where it is available" : "default for all agents") : "opt-in"}</span>`
       : p.enabled
         ? `<span class="tag ok">on — this agent answered "enable"</span>`
         : `<span class="tag bad">off — this agent answered "disable"</span>`;

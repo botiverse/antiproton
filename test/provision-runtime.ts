@@ -46,7 +46,7 @@ function raft() {
   return calls;
 }
 
-async function runtime(opts: { reminderApp?: { origin?: string; credential?: string } } = {}) {
+async function runtime(opts: { reminderApp?: { origin?: string; credential?: string }; extraPlugins?: unknown[] } = {}) {
   const host = sqliteHost();
   const rows = new Map<string, HookRow>();
   const directory = {
@@ -65,6 +65,7 @@ async function runtime(opts: { reminderApp?: { origin?: string; credential?: str
       GW_TOKEN: "gt" } as any),
     hooks: { origin: "https://hooks.test", directory },
     ...(opts.reminderApp ? { reminderApp: opts.reminderApp } : {}),
+    ...(opts.extraPlugins ? { extraPlugins: opts.extraPlugins } : {}),
   } as any);
   await rt.ready();
   return { rt, host, rows };
@@ -411,6 +412,43 @@ await check("ready: an import that lands before push is on says nothing; push en
   must((await rt.attachCredential("t", "raft_r4", PROVISION_MOUNT_ALIAS, { token: CRED })).ok, "credential");
   must((await provisionTool(rt, "t", "raft_r4", "enable_push")).ok, "enable_push");
   must(readyRows(host).length === 1 && readyRows(host)[0]!.attrs.reason === "push enabled", JSON.stringify(readyRows(host)));
+  host.dispose();
+});
+
+// ---- a seed with no credential: refused unless its plugin logs the mount in itself (cf/src/runtime.ts `seedJudge`)
+
+/** Two fixture plugins whose account is required: one declares Agent Login (as stamp does), the other does not. */
+const keyed = (id: string, agentLogin: boolean) => ({
+  id, version: "1.0.0",
+  tools: [{ name: "ping", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
+  credential: { required: true, summary: `a ${id} key`, shape: "token" },
+  ...(agentLogin ? { agentLogin: { services: [id] } } : {}),
+  async invoke() { return { ok: true }; },
+});
+
+await check("a seed with no credential is refused for a plugin whose account is required, unless that plugin declares Agent Login", async () => {
+  const { rt, host } = await runtime({ extraPlugins: [keyed("needskey", false), keyed("logsin", true)] });
+  const rows = [
+    { alias: "k", plugin: "needskey", config: {}, secretRef: null, policy: null, for: ["console"], since: 1 },
+    { alias: "l", plugin: "logsin", config: {}, secretRef: null, policy: null, for: ["console"], since: 1 },
+  ] as any;
+  // Through the catalogue reconcile, on a console agent with both plugins switched on.
+  await rt.store.createAgent("t", "c1", {});
+  for (const id of ["needskey", "logsin"]) await rt.store.setPluginChoice("t", "c1", id, "enable");
+  const out = await rt.reconcileSeeds("t", "c1", rows) as any;
+  must(out.ran, `the pass: ${JSON.stringify(out)}`);
+  const by = Object.fromEntries((await rt.store.seedRecord("t", "c1")).outcomes.map((o: any) => [o.alias, o]));
+  must(by.k?.outcome === "refused" && /needskey needs an account and this mount has no secret_ref/.test(String(by.k.reason)), `needskey: ${JSON.stringify(by.k)}`);
+  must(by.l?.outcome === "added", `logsin: ${JSON.stringify(by.l)}`);
+  const aliases = (await rt.store.listMounts("t", "c1")).map((m: any) => m.alias).sort().join();
+  must(aliases === "l", `mounts: ${aliases}`);
+  // Through an explicit list (`provision` with `chosen`, an evaluation's or a bench arm's): the same rule.
+  await rt.store.createAgent("t", "c2", {});
+  let refused = "";
+  try { await rt.provision("t", "c2", [rows[0]], { chosen: true }); } catch (e) { refused = String((e as Error).message); }
+  must(/needskey needs an account/.test(refused), `explicit needskey: ${refused || "no refusal"}`);
+  await rt.provision("t", "c3", [rows[1]], { chosen: true });
+  must((await rt.store.listMounts("t", "c3")).map((m: any) => m.alias).join() === "l", "explicit logsin was not mounted");
   host.dispose();
 });
 

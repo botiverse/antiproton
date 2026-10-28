@@ -17,8 +17,8 @@ function check(name: string, fn: () => void) {
 }
 const must = (cond: unknown, msg: string) => { if (!cond) throw new Error(msg); };
 
-const plugin = (id: string, def: boolean, choice: string, enabled: boolean) => ({
-  id, version: "1.0.0", defaultForAllAgents: def, choice, enabled,
+const plugin = (id: string, def: boolean, choice: string, enabled: boolean, whereAvailable = false) => ({
+  id, version: "1.0.0", defaultForAllAgents: def, defaultWhereAvailable: whereAvailable, choice, enabled,
   credential: null, config: [], tools: [],
 });
 
@@ -29,6 +29,20 @@ check("inherit says what it resolves to, and why", () => {
   const off = catalogue({ installed: [plugin("appworld", false, "inherit", false)] });
   must(off.includes("off by inheritance"), "resolved-off inherit did not say so");
   must(off.includes("opt-in"), "the reason was not named");
+});
+
+check("a seeded plugin that can be withheld says where it is available, and one that cannot says all agents", () => {
+  // stamp and reminder can be withheld (installedRows' `defaultWhereAvailable`); gh's github and web's http cannot.
+  for (const id of ["stamp", "reminder"]) {
+    const html = catalogue({ installed: [plugin(id, true, "inherit", true, true)] });
+    must(html.includes("the plugin is default where it is available"), `${id} did not say where it is available`);
+    must(!html.includes("default for all agents"), `${id} said all agents`);
+  }
+  for (const id of ["github", "http"]) {
+    const html = catalogue({ installed: [plugin(id, true, "inherit", true, false)] });
+    must(html.includes("the plugin is default for all agents"), `${id} did not say all agents`);
+    must(!html.includes("where it is available"), `${id} said where it is available`);
+  }
 });
 
 check("an explicit answer is named, not left as a plain select", () => {

@@ -741,6 +741,8 @@ const HARNESS_OWN = ["run_js", "resume", "jobs"];
 const mountAliases = async (w: World) => (await w.rt.store.listMounts(T, A)).map((m) => m.alias).sort();
 const toolConfigOfRecord = (a: { config: unknown } | null) => (a?.config as { toolConfig?: unknown } | undefined)?.toolConfig;
 const raftCatalogue = () => AgentRuntime.DEFAULT_MOUNTS.filter((m) => m.for.includes("raft"));
+/** The rows every Raft agent gets: `stamp` only arrives where the agent's server has the Stamp app, which this fake Raft's never does. */
+const everyRaftAgents = () => raftCatalogue().filter((m) => m.alias !== "stamp");
 
 await check("toolConfig: a POST without mounts or harness makes today's agent â€” every catalogue mount, run_js, resume and jobs, reconciled as ever", async () => {
   const w = await world("1", { post: {} });
@@ -751,8 +753,10 @@ await check("toolConfig: a POST without mounts or harness makes today's agent â€
   must(ex.toolConfig === null, `export toolConfig: ${show(ex.toolConfig)}`);
   const names = ex.tools.map((t: any) => t.name);
   must(HARNESS_OWN.every((n) => names.includes(n)), `harness tools: ${show(names.filter((n: string) => !n.includes("__")))}`);
-  const want = [...raftCatalogue().map((m) => m.alias), "raft"].sort();
+  const want = [...everyRaftAgents().map((m) => m.alias), "raft"].sort();
   must(show(await mountAliases(w)) === show(want), `mounts ${show(await mountAliases(w))}, want ${show(want)}`);
+  const stamp = (await w.rt.store.seedRecord(T, A)).outcomes.find((o: any) => o.alias === "stamp");
+  must(stamp?.outcome === "unavailable", `stamp: ${show(stamp)}`);
   const manifest = (await call(w, "GET", `${A}/seed/manifest`)).body;
   must(manifest.toolConfig === null && manifest.manifestSha256 === sha256Hex(canonJson([])), `manifest: ${show(manifest)}`);
   await w.rt.postMessage(T, A, "a real turn", "prompt");
@@ -829,7 +833,7 @@ await check("toolConfig: mounts [] is raft alone; harness minimal alone keeps th
   // harness is the default here: raft's questions still need resume, so it is offered; run_js and jobs as ever.
   must(bareNames.every((n: string) => n.startsWith("raft__") || HARNESS_OWN.includes(n)) && bareNames.includes("resume"), `mounts []: ${show(bareNames)}`);
   const h = await minimalWorld({ harness: "minimal" });
-  must(show(await mountAliases(h)) === show([...raftCatalogue().map((m) => m.alias), "raft"].sort()), `harness only: ${show(await mountAliases(h))}`);
+  must(show(await mountAliases(h)) === show([...everyRaftAgents().map((m) => m.alias), "raft"].sort()), `harness only: ${show(await mountAliases(h))}`);
   const names = (await call(h, "GET", `${A}/tools`)).body.tools.map((t: any) => t.name);
   must(!names.some((n: string) => HARNESS_OWN.includes(n)) && names.some((n: string) => n.startsWith("web__")), `harness only: ${show(names)}`);
   must((await h.rt.store.seedRecord(T, A)).chosen === false, "harness alone marked the agent chosen");

@@ -1270,8 +1270,13 @@ a real turn's request, and measured its request identical to the base commit's, 
 
 - **`mounts: string[]`** — the default mounts to give the agent, named by the alias the catalogue
   gives them for an agent Raft hosts (`tools`, `artifacts`, `web`, `search`, `gh`, `sandbox`,
-  `state`; `AgentRuntime.DEFAULT_MOUNTS`, `cf/src/runtime.ts`). `raft` is always added and must not
-  be named. The agent gets exactly those plus `raft`, and is marked as having chosen its mounts
+  `state`, `stamp`; `AgentRuntime.DEFAULT_MOUNTS`, `cf/src/runtime.ts`). `raft` is always added and must not
+  be named. Named here, `stamp` is mounted as asked: whether the agent's server has the Stamp app
+  (`unavailableFor`, which keeps `stamp` off an unnamed agent on a server without it) cannot be read
+  yet when the list is added, since the `raft` mount comes after it; a server without the app answers
+  `stamp_login` with Raft's install card. Like every seeded mount, a seeded `stamp` mount is not
+  removable from the console (its plugin has no `consoleMount`); an operator removes it through
+  `/admin/mounts`, because `sdk:stamp` and the `stamp.write` policy key name its alias. The agent gets exactly those plus `raft`, and is marked as having chosen its mounts
   (`chosen`, `src/store/seed-record.ts`), so no catalogue reconcile — at a turn's start, a console
   open or a later provision — ever adds one. `[]` is `raft` alone. An unknown name, a name given
   twice, `raft`, a non-string entry or a non-array is `400` naming the entry; so is a mount whose

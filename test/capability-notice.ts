@@ -147,7 +147,26 @@ const transcriptHas = async (d: Deployment, t: string, a: string, needle: string
   JSON.stringify(await d.obj(t, a).runtime().branchEntries(t, a, "main")).includes(needle);
 
 const originalFetch = globalThis.fetch;
-globalThis.fetch = (async () => new Response("{}", { status: 404 })) as any;
+/** A fake Raft at RAFT whose app list has Stamp or not (`raftHasStamp`); every other request anywhere is a 404. */
+const RAFT = "https://raft.example";
+let raftHasStamp = false;
+let listCount = 0;
+/** A function, not the variable, so an assertion on one count does not narrow the next comparison's type. */
+const reads = () => listCount;
+const STAMP_APP = {
+  id: "svc_stamp", clientId: "stamp", name: "Stamp", description: null, homepageUrl: "https://stamp.build",
+  returnUrl: "https://stamp.build/auth/raft/callback", agentManifestUrl: "https://stamp.build/.well-known/raft-app-manifest.json",
+  createdAt: "2026-10-01T00:00:00.000Z", updatedAt: "2026-10-01T00:00:00.000Z",
+};
+globalThis.fetch = (async (input: any, init: any = {}) => {
+  const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+  const method = String(init.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+  if (url.origin === RAFT && url.pathname === "/internal/agent-api/integrations" && method === "GET") {
+    listCount++;
+    return new Response(JSON.stringify({ services: raftHasStamp ? [STAMP_APP] : [], activeLogins: [] }), { status: 200, headers: { "content-type": "application/json" } });
+  }
+  return new Response("{}", { status: 404 });
+}) as any;
 
 
 /**
@@ -295,6 +314,59 @@ await check("a new agent that gains an entry later is told: the first-tools rule
   const from = said.length;
   await d.say("t", "fresh", "second");
   must(reminderNotices(from).length === 1, `told: ${show(said.slice(from))}`);
+});
+
+// ---------------------------------------------------------------- stamp: a server that installs it later
+
+await check("a Raft agent whose server installs Stamp later gets it once the hour's answer expires, and is told once", async () => {
+  raftHasStamp = false;
+  listCount = 0;
+  const d = deployment({});
+  const o = d.obj("t", "cody");
+  const adopted = await o.provisionAdopt("t", "cody", JSON.stringify({ name: "Cody", instructions: "be brief", raftOrigin: RAFT }));
+  must(adopted.ok, `adopt: ${show(adopted)}`);
+  must((await o.uiAttachCredential("t", "cody", "raft", { token: "sk_agent_cody_0123456789abcdef" })).ok, "control: no credential");
+  const settle = () => new Promise((r) => setTimeout(r, 30));
+  const hasStamp = async () => (await d.mountsOf("t", "cody")).some((m) => m.plugin === "stamp");
+  const STAMP_NOTICE = /You can now ship code through Stamp/;
+  const stampNotices = (from: number) => said.slice(from).filter((s) => noticeLines(s.text).some((l) => STAMP_NOTICE.test(l)));
+  const from = said.length;
+  await pushWake(d, "t", "cody", "one");
+  await settle();
+  await endTurn(d, "t", "cody");
+  await pushWake(d, "t", "cody", "two");
+  await endTurn(d, "t", "cody");
+  must(reads() === 1 && !(await hasStamp()), `control: before the install: ${reads()} reads, stamp ${await hasStamp()}`);
+  // Installed now; within the hour the agent still holds "no", and nothing is read or added.
+  raftHasStamp = true;
+  const realNow = Date.now;
+  try {
+    Date.now = () => realNow() + 30 * 60_000;
+    await pushWake(d, "t", "cody", "three");
+    await settle();
+    await endTurn(d, "t", "cody");
+    must(reads() === 1 && !(await hasStamp()), `within the hour: ${reads()} reads, stamp ${await hasStamp()}`);
+    // Past it: one turn reads, the next adds and carries the notice, and the one after says nothing.
+    Date.now = () => realNow() + 61 * 60_000;
+    await pushWake(d, "t", "cody", "four");
+    await settle();
+    await endTurn(d, "t", "cody");
+    must(reads() === 2, `reads past the hour: ${reads()}`);
+    const before = said.length;
+    await pushWake(d, "t", "cody", "five");
+    await endTurn(d, "t", "cody");
+    must(await hasStamp(), "stamp not added after the install");
+    const told = stampNotices(before);
+    must(told.length === 1 && told[0]!.text.endsWith("five"), `told at five: ${show(said.slice(before).map((s) => s.text))}`);
+    const line = noticeLines(told[0]!.text).find((l) => STAMP_NOTICE.test(l))!;
+    must(/`stamp__stamp_login`/.test(line) && !/https?:|stamp\.build|credential/i.test(line), `the line: ${line}`);
+    await pushWake(d, "t", "cody", "six");
+    await endTurn(d, "t", "cody");
+  } finally { Date.now = realNow; }
+  must(stampNotices(from).length === 1, `told ${stampNotices(from).length} times: ${show(stampNotices(from).map((s) => s.text))}`);
+  const rec = await d.record("t", "cody");
+  const n = rec.notices.filter((x: any) => x.alias === "stamp");
+  must(n.length === 1 && n[0].deliveredAt !== null, `notice rows: ${show(n)}`);
 });
 
 // ---------------------------------------------------------------- races
