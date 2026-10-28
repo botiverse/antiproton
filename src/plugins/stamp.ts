@@ -1420,7 +1420,7 @@ export const stampPlugin: Plugin = {
    * `api` is decided by the bridge's rows (`API_ROUTES`): a listed write under its row's key, the tool of the same
    * effect, so a mount's entry for `pr_comment` or `pr_create` covers `api` too; an unlisted one under `stamp.write`.
    * The gateway takes the stricter of `api`'s own entry and the key's. Never throws: a call the table refuses, or whose
-   * path or method is not one `api` takes, has no key and is refused by the handler (`apiRoute`).
+   * path or method is not one `api` takes, has no key: `refuse` answers it first (`apiRoute`).
    */
   policyKey(tool: string, args: Json): string | undefined {
     if (tool !== "api" || !args || typeof args !== "object" || Array.isArray(args)) return undefined;
@@ -1431,6 +1431,23 @@ export const stampPlugin: Plugin = {
     } catch {
       return undefined;
     }
+  },
+  /**
+   * `api` refuses what the table refuses (`apiRoute`) before anything is decided, so a person is never asked to
+   * approve a call that would only fail (botiverse/antiproton#1092): the row's own sentence, or, for a path or method
+   * `api` does not take, the error its handler throws. Every other tool, and every call the table does not refuse,
+   * is left to the policy. The handler refuses the same calls again, as a second line.
+   */
+  refuse(tool: string, args: Json): string | undefined {
+    if (tool !== "api") return undefined;
+    const a = (args && typeof args === "object" && !Array.isArray(args) ? args : {}) as Record<string, unknown>;
+    let route: RouteClass;
+    try {
+      ({ route } = apiRoute(a.method, a.path, a.body));
+    } catch (e) {
+      return String((e as Error)?.message ?? e);
+    }
+    return route.kind === "refused" ? route.message : undefined;
   },
   // The one service this plugin may log in to through the agent's raft mount (`ctx.agentLogin`).
   agentLogin: { services: [STAMP_SERVICE] },
@@ -1723,8 +1740,8 @@ export const stampPlugin: Plugin = {
         return (await call("GET", gatewayPath(a.path, API_PREFIXES), ctx)) as Json;
 
       case "api": {
-        // Decided at the gateway by `policyKey` on the same table; refused here, so neither an approved replay nor a
-        // mount that sets `stamp.write: allow` runs what the table refuses.
+        // Decided at the gateway by `policyKey` on the same table, and refused there by `refuse`, approved replay
+        // included. Refused here again, so an `invoke` that did not come through the gateway does not run it either.
         const { method, path, route } = apiRoute(a.method, a.path, a.body);
         if (route.kind === "refused") throw new Error(`stamp: ${route.message}`);
         return (await call(method, path, ctx, a.body)) as Json;
