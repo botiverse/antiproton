@@ -1138,6 +1138,18 @@ await check("api: what the table refuses is refused where stamp.write and every 
   must(seen.length === 0, `the replay reached the gateway: ${JSON.stringify(seen.map((x) => x.path))}`);
 });
 
+await check("api: refusal comes before deny — a mount with api: deny sending an approve hears route_refused, not policy_denied", async () => {
+  reset();
+  const denied = await gatewayMount({ tools: { api: "deny" } });
+  const r = await denied("api", { method: "POST", path: "/v1/repositories/o/r/pulls/7/approve", body: {} });
+  must(r.status === "rejected" && r.error?.code === "route_refused" && /^api may not approve: call pr_approve/.test(r.error.message),
+    `api: deny + approve: ${JSON.stringify(r)}`);
+  // The control: a write the table does not refuse is denied by the mount, as before.
+  const c = await denied("api", COMMENT);
+  must(c.status === "rejected" && c.error?.code === "policy_denied", `api: deny + comment: ${JSON.stringify(c)}`);
+  must(seen.length === 0 && (await denied.store.listApprovals("t")).length === 0, "it reached the gateway, or a card was made");
+});
+
 await check("api's refuse answers what the handler refuses, in the handler's words, and nothing else", async () => {
   const refuse = (args: unknown, tool = "api") => stampPlugin.refuse!(tool, args as any);
   const ctx = { credential: session(), alias: "stamp" } as any;

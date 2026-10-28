@@ -2285,8 +2285,9 @@ export interface Plugin {
    * It only refuses, never permits: `undefined` leaves the call to the policy, `policyKey` and `confirm` exactly as
    * without the hook. A throw, or an answer that is not a non-empty string, refuses the call with a fixed message:
    * a plugin that could not say whether a call is one it refuses has not said that it is not. Synchronous and local,
-   * like `classify`. The tool's own handler should still refuse the same calls, as a second line, since an
-   * `invoke` reached some other way does not pass through here.
+   * like `classify`. A reason past {@link REFUSE_REASON_MAX} UTF-16 code units is cut there, the bound the bridge
+   * puts on a `normalize` error, since the agent reads it whole. The tool's own handler should still refuse the same
+   * calls, as a second line, since an `invoke` reached some other way does not pass through here.
    */
   refuse?(tool: string, args: Json): string | undefined;
   /**
@@ -2614,10 +2615,12 @@ export function policyKeyOf(p: Pick<Plugin, "policyKey">, tool: string, args: Js
 
 /** What a call is told when its plugin's `refuse` threw or answered something that is not a reason. */
 export const REFUSE_FAILED = "this call is refused: the plugin could not say whether it may run";
+/** The longest reason `Plugin.refuse` hands the agent, in UTF-16 code units (`String.length`); a longer one is cut. */
+export const REFUSE_REASON_MAX = 300;
 
 /**
  * Why `Plugin.refuse` refuses this call: `null` when there is no hook or it answered `undefined`, the hook's reason when
- * it gave one, and {@link REFUSE_FAILED} when it threw or answered anything else. Fails closed: only `undefined` lets
+ * it gave one (cut to {@link REFUSE_REASON_MAX}), and {@link REFUSE_FAILED} when it threw or answered anything else. Fails closed: only `undefined` lets
  * the call through to the policy.
  */
 export function refusalOf(p: Pick<Plugin, "refuse">, tool: string, args: Json): string | null {
@@ -2625,7 +2628,7 @@ export function refusalOf(p: Pick<Plugin, "refuse">, tool: string, args: Json): 
   let why: unknown;
   try { why = p.refuse.call(p, tool, args); } catch { return REFUSE_FAILED; }
   if (why === undefined) return null;
-  return typeof why === "string" && why !== "" ? why : REFUSE_FAILED;
+  return typeof why === "string" && why !== "" ? why.slice(0, REFUSE_REASON_MAX) : REFUSE_FAILED;
 }
 
 /** The tool a bridge's requests are calls of, on every mount whose plugin declares one: `<alias>.request`. */

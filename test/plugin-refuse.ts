@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
-import { REFUSE_FAILED, refusalOf } from "../src/plugins/types.ts";
+import { REFUSE_FAILED, REFUSE_REASON_MAX, refusalOf } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import type { MountPolicy } from "../src/core/types.ts";
 
@@ -83,6 +83,31 @@ await check("on a default mount a refused call is rejected as route_refused: no 
   // The call the hook does not refuse is held as before: the hook answers only what it refuses.
   const held: any = await gw.invoke(caller, "svc.api", { path: "comment" });
   must(held.status === "pending" && f.ran.length === 0 && (await store.listApprovals("t", "pending")).length === 1, `not held: ${JSON.stringify(held)}`);
+});
+
+await check("a reason past 300 UTF-16 code units is cut there, through the gateway too; one at the bound is kept whole", async () => {
+  must(REFUSE_REASON_MAX === 300, `the bound is ${REFUSE_REASON_MAX}`);
+  const exact = "x".repeat(300);
+  must(refusalOf({ refuse: () => exact }, "api", {}) === exact, "a reason at the bound was cut");
+  // Counted in UTF-16 code units, as `String.length` counts: 200 CJK characters are 200, 200 astral ones 400.
+  const astral = "\u{1F600}".repeat(200);
+  must(refusalOf({ refuse: () => astral }, "api", {})!.length === 300, "an astral reason was not cut at 300 code units");
+  const long = "y".repeat(1000);
+  const f = fixture(() => long);
+  const { gw } = await gatewayWith(null, f.plugin);
+  const r: any = await gw.invoke(caller, "svc.api", { path: "merge" });
+  must(r.status === "rejected" && r.error?.code === "route_refused" && r.error.message === long.slice(0, 300), `not cut: ${String(r.error?.message).length}`);
+});
+
+await check("refusal comes before deny: a mount that denies the tool still hears route_refused, with the plugin's reason", async () => {
+  const f = fixture();
+  const { gw, store } = await gatewayWith({ tools: { api: "deny" } }, f.plugin);
+  const r: any = await gw.invoke(caller, "svc.api", { path: "merge" });
+  must(r.status === "rejected" && r.error?.code === "route_refused" && r.error.message === NO_MERGE, `deny answered first: ${JSON.stringify(r)}`);
+  // The control: a call the hook does not refuse is denied as before.
+  const d: any = await gw.invoke(caller, "svc.api", { path: "comment" });
+  must(d.status === "rejected" && d.error?.code === "policy_denied", `not denied: ${JSON.stringify(d)}`);
+  must(f.ran.length === 0 && (await allApprovals(store)).length === 0, "it ran, or a card was made");
 });
 
 await check("refused where the mount allows everything, and where the agent asks to confirm", async () => {
