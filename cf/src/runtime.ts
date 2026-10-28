@@ -324,6 +324,17 @@ export function capabilityNotice(
   return said ? HARNESS_NOTICE + said.replace(/\s*\n\s*/g, " ") : null;
 }
 
+/**
+ * The plugin a seed's settings are judged against. A seed with no credential of a plugin whose account is required is
+ * refused (`validateMount`: it would look like a working mount until its first call), unless the plugin's mount
+ * gets its account itself: a plugin that declares Agent Login (`Plugin.agentLogin`, stamp's `stamp_login`) is judged as
+ * the operator's add judges every mount, account later (`addMount`), since the login is how its account arrives.
+ */
+export function seedJudge(plugin: Plugin, secretRef: string | null): Plugin {
+  if (secretRef || !plugin.credential?.required || !plugin.agentLogin?.services.length) return plugin;
+  return { ...plugin, credential: { ...plugin.credential, required: false } };
+}
+
 /** The tenant every benchmark agent lives under (the bench paths in cf/src/index.ts); never reconciled (`reconcileSeeds`). */
 export const BENCH_TENANT = "bench";
 
@@ -346,11 +357,14 @@ export function seedApplies(seed: SeedMount, kind: AgentKind | null, plugin: Plu
  * `since`, and the entries themselves), the agent's kind, its answers about the catalogue's plugins, and which of
  * those plugins the deployment cannot run. A pass whose key equals the one stored on the agent does nothing
  * (src/store/seed-record.ts). Each part is here because a change in it can change an outcome: an owner switching a
- * plugin back on, a deployment gaining the configuration a plugin lacked, an agent Raft adopts. So `declined` and
+ * plugin back on, a deployment gaining the configuration a plugin lacked, an agent Raft adopts, a plugin's verdict on
+ * this one agent (`Plugin.unavailableFor`: its server installing an app). So `declined` and
  * `unavailable` are not final; `added` is, and that is the record's rule, not the key's.
  */
 export function seedKey(
   catalogue: readonly SeedMount[], kind: AgentKind, choices: Record<string, PluginChoice>, unavailable: readonly string[],
+  /** Each plugin its `unavailableFor` withholds from this agent, with the reason: a per-agent verdict, so it is here. */
+  unavailableFor: Readonly<Record<string, string>> = {},
 ): { key: string; revision: number } {
   const revision = Math.max(0, ...catalogue.map((m) => m.since ?? 1));
   const ids = [...new Set(catalogue.map((m) => m.plugin))].sort();
@@ -361,6 +375,7 @@ export function seedKey(
       entries: catalogue.map((m) => `${m.alias}@${m.since ?? 1}:${m.plugin}`),
       choices: ids.filter((p) => choices[p] !== undefined).map((p) => `${p}:${choices[p]}`),
       unavailable: [...unavailable].sort(),
+      unavailableFor: Object.keys(unavailableFor).sort().map((p) => `${p}:${unavailableFor[p]}`),
     }),
   };
 }
@@ -1132,6 +1147,18 @@ export async function boundedWait(p: Promise<unknown>, ms: number): Promise<"set
  */
 export const RETAKE_BACKOFF_MS = 10 * 60_000;
 /**
+ * How long one agent's answer about its Raft server's apps (`ToolGateway.integrationInstalled`, for
+ * `Plugin.unavailableFor`) is kept before a reconcile refreshes it in the background. "no" for an hour: a server
+ * installing an app is rare, an hour before its agents see it costs nothing, and every expiry is a Raft call per agent.
+ * "yes" as long: it is asked only while the entry is not yet added, which a "yes" ends at the next pass. "unknown"
+ * (no usable raft mount, or no Raft credential) is not kept, because finding it asks nothing of Raft, and an agent
+ * Raft has just adopted gets its credential moments later. A failed read is kept briefly, with the verdict before it.
+ */
+export const INTEGRATION_TTL_MS = { yes: 60 * 60_000, no: 60 * 60_000, unknown: 0 } as const;
+export const INTEGRATION_ERROR_TTL_MS = 60_000;
+/** The longest one background read of an agent's Raft apps may take; past it the read counts as failed. */
+export const INTEGRATION_PROBE_TIMEOUT_MS = 3_000;
+/**
  * How long a removal waits on the plugin's `unmount` (`Plugin.unmount`, `AgentRuntime.removeMount`). A person is
  * waiting on the console's answer, and the call is a few requests to the plugin's service to cancel what it
  * registered — a webhook delete is one. Ten seconds is room for a slow service and a couple of those, and the
@@ -1252,6 +1279,12 @@ export class AgentRuntime {
   #retakeFailed = new Map<string, { basis: string; at: number }>();
   /** The re-take pass running for an agent (`tenant/agent`), which a second turn start joins rather than repeats. */
   #retaking = new Map<string, Promise<void>>();
+  /**
+   * Each agent's last answer about its Raft server's apps (`tenant/agent/service`), for `Plugin.unavailableFor`: the
+   * verdict, until when it holds (`INTEGRATION_TTL_MS`), and the background read refreshing it, if one is running.
+   * In the isolate's memory: an evicted object reads again on its next pass, which is one more Raft call at most.
+   */
+  #integrations = new Map<string, { verdict: "yes" | "no" | "unknown"; until: number; refreshing: Promise<void> | null }>();
   #secrets!: import("../../src/runtime/gateway.ts").SecretResolver;
   #kek: Promise<CryptoKey | null> = Promise.resolve(null);
   #unchecked = new Map<string, string>();
@@ -2591,6 +2624,23 @@ export class AgentRuntime {
           `now, with a note you write for yourself; when it is due, a message carrying the note wakes you in this ` +
           `conversation, even if nothing else would have.` + (rest ? ` ${rest}.` : "");
       } },
+    // Stamp, for shipping code: pull requests and issues under the agent's own Stamp identity. Seeded with no
+    // credential and the plugin's own policy, so it grants nothing by itself: every call needs the session
+    // `stamp_login` gets through Raft Agent Login, which a person approves, and approving and merging wait for a
+    // person too. Only for an agent Raft hosts, since only one can do Raft Agent Login, and only where its server has
+    // the Stamp app installed (`unavailableFor` in src/plugins/stamp.ts): its tools are in every request's schema,
+    // and most agents never ship code. The alias is the one `sdk:stamp` and `stamp.write` name. A console owner
+    // cannot remove it (the plugin has no `consoleMount`); an operator can, through `/admin/mounts`.
+    { alias: "stamp", plugin: "stamp", config: {},
+      secretRef: null, policy: null, for: ["raft"], since: 3,
+      // The tool name is the plugin's own (src/plugins/stamp.ts `LOGIN_TOOL`); `tool` answers what it was offered as.
+      notice: (tool) => {
+        const login = tool("stamp_login");
+        if (!login) return null;
+        return `You can now ship code through Stamp: open, review, comment on and merge pull requests, and open and ` +
+          `comment on issues, as your own Stamp identity. Run \`${login}\` first; a person approves it, and until it ` +
+          `has succeeded the other Stamp tools refuse.`;
+      } },
 
   ];
 
@@ -2699,7 +2749,7 @@ export class AgentRuntime {
       if (declared && !pluginEnabled(SEEDED_PLUGINS.has(m.plugin), choices[m.plugin])) continue;
       // A misspelt setting is refused here, at the first agent it would have
       // reached, rather than becoming the plugin's silent default everywhere.
-      if (declared) assertMountConfig(declared, (m.config ?? { account: m.account }) as Record<string, Json>, m.secretRef ?? null);
+      if (declared) assertMountConfig(seedJudge(declared, m.secretRef ?? null), (m.config ?? { account: m.account }) as Record<string, Json>, m.secretRef ?? null);
       await this.store.addMount({
         tenantId, agentId, alias: m.alias, plugin: m.plugin,
         installationId: seedInstallation(m.alias), connectionId: null,
@@ -2756,11 +2806,12 @@ export class AgentRuntime {
       const why = byId.get(m.plugin)?.unavailable?.();
       if (why) unavailable.set(m.plugin, why);
     }
-    const { key, revision } = seedKey(catalogue, kind, choices, [...unavailable.keys()]);
+    const withheldFor = await this.#unavailableFor(tenantId, agentId, kind, catalogue, unavailable);
+    const { key, revision } = seedKey(catalogue, kind, choices, [...unavailable.keys()], withheldFor);
     const plan: SeedPlan[] = catalogue.map((m) => {
       const entry = { alias: m.alias, plugin: m.plugin, since: m.since ?? 1 };
       if (m.for && !m.for.includes(kind)) return { ...entry, withheld: "not-for", reason: `for ${m.for.join(", ")} agents; this one is ${kind}` };
-      const missing = unavailable.get(m.plugin);
+      const missing = unavailable.get(m.plugin) ?? withheldFor[m.plugin];
       if (missing) return { ...entry, withheld: "unavailable", reason: missing };
       const plugin = byId.get(m.plugin);
       if (plugin && !pluginEnabled(SEEDED_PLUGINS.has(m.plugin), choices[m.plugin])) {
@@ -2769,7 +2820,7 @@ export class AgentRuntime {
       const config = (m.config ?? { account: m.account }) as Record<string, Json>;
       // The seed is hand-written and reaches every agent: a misspelt setting is refused at the first agent it
       // would have reached, and said in the record, rather than becoming the plugin's silent default everywhere.
-      const problems = plugin ? validateMount(plugin, config, m.secretRef ?? null) : [];
+      const problems = plugin ? validateMount(seedJudge(plugin, m.secretRef ?? null), config, m.secretRef ?? null) : [];
       if (problems.length) return { ...entry, withheld: "refused", reason: problems.map((x) => x.message).join("; ") };
       // Under `minimal` there is no resume, so a plugin's question would be dropped (cf/src/provision/steps.ts
       // `toolConfigProblem` refuses one when the agent is made; this is the same rule for an entry added later).
@@ -2791,6 +2842,75 @@ export class AgentRuntime {
       for (const r of out.changed) if (r.outcome === "refused") console.warn(`seed ${r.alias}@${r.since} refused for ${agentId}: ${r.reason}`);
     }
     return out;
+  }
+
+  /**
+   * The catalogue's plugins whose `unavailableFor` withholds them from this agent, each with its reason. Asked only of
+   * an entry whose `for` includes the agent's kind, that the deployment can run, and whose outcome on this agent is not
+   * final (`added` or `present`, src/store/seed-record.ts): once Stamp is added, nothing about it is asked again, of
+   * the plugin or of Raft. The record is read only when there is such an entry, so an agent with none (every console
+   * agent today) pays nothing for this. A hook that throws withholds, with a fixed reason: fail closed.
+   */
+  async #unavailableFor(
+    tenantId: string, agentId: string, kind: AgentKind, catalogue: readonly SeedMount[], unavailable: ReadonlyMap<string, string>,
+  ): Promise<Record<string, string>> {
+    const byId = new Map(this.#plugins.map((p) => [p.id, p]));
+    const asked = catalogue.filter((m) => (!m.for || m.for.includes(kind)) && !unavailable.has(m.plugin) && byId.get(m.plugin)?.unavailableFor);
+    if (!asked.length) return {};
+    const final = new Set((await this.store.seedRecord(tenantId, agentId)).outcomes
+      .filter((o) => o.outcome === "added" || o.outcome === "present").map((o) => `${o.alias}@${o.since}`));
+    const agent = {
+      kind,
+      serverHasIntegration: async (service: string) => this.#integrationVerdict(tenantId, agentId, service),
+    };
+    const out: Record<string, string> = {};
+    for (const m of asked) {
+      if (final.has(`${m.alias}@${m.since ?? 1}`) || m.plugin in out) continue;
+      const why = await byId.get(m.plugin)!.unavailableFor!(agent)
+        .catch(() => `${m.plugin} could not say whether this agent can use it`);
+      if (why) out[m.plugin] = why;
+    }
+    return out;
+  }
+
+  /**
+   * Whether this agent's Raft server has `service` installed, as last read, without waiting: a missing or expired
+   * answer starts one background read (`#refreshIntegration`) and is answered with the verdict it had, or "unknown".
+   * So a turn start never waits on Raft, and the read's answer is used by the next pass, the next turn.
+   */
+  #integrationVerdict(tenantId: string, agentId: string, service: string): "yes" | "no" | "unknown" {
+    const k = `${tenantId}/${agentId}/${service}`;
+    const held = this.#integrations.get(k);
+    if (held && Date.now() < held.until) return held.verdict;
+    if (!held?.refreshing) {
+      const entry = held ?? { verdict: "unknown" as const, until: 0, refreshing: null };
+      this.#integrations.set(k, entry);
+      entry.refreshing = this.#refreshIntegration(tenantId, agentId, service, k);
+      this.#deps.ctx.waitUntil?.(entry.refreshing);
+    }
+    return held?.verdict ?? "unknown";
+  }
+
+  /**
+   * One read of the agent's Raft apps (`ToolGateway.integrationInstalled`), bounded by INTEGRATION_PROBE_TIMEOUT_MS.
+   * A verdict is kept for its TTL; a failure or a timeout keeps the verdict before it, for INTEGRATION_ERROR_TTL_MS.
+   */
+  async #refreshIntegration(tenantId: string, agentId: string, service: string, k: string): Promise<void> {
+    const entry = this.#integrations.get(k)!;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const read = this.#gateway.integrationInstalled(tenantId, agentId, service);
+      const timedOut = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timed out")), INTEGRATION_PROBE_TIMEOUT_MS); });
+      const verdict = await Promise.race([read, timedOut]);
+      entry.verdict = verdict;
+      entry.until = Date.now() + INTEGRATION_TTL_MS[verdict];
+    } catch (e) {
+      entry.until = Date.now() + INTEGRATION_ERROR_TTL_MS;
+      console.warn(`reading whether ${tenantId}/${agentId}'s Raft server has ${service} failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+    } finally {
+      clearTimeout(timer);
+      entry.refreshing = null;
+    }
   }
 
   /**

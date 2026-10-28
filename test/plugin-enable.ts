@@ -21,7 +21,8 @@
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
-import { AgentRuntime, catalogueKey, enabledMounts, parsePluginChoice, reuseHarness, unofferedMounts } from "../cf/src/runtime.ts";
+import { AgentRuntime, catalogueKey, enabledMounts, parsePluginChoice, reuseHarness, seedJudge, unofferedMounts } from "../cf/src/runtime.ts";
+import { stampPlugin } from "../src/plugins/stamp.ts";
 import { pluginEnabled, credentialForm } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
@@ -199,12 +200,14 @@ await check("种子只包含【用户什么都不用给就能用】的插件", a
   const registry: Plugin[] = [];
   registry.push(githubPlugin, demoPlugin, httpPlugin, exaPlugin, sandboxPlugin(artifacts, "b"),
     statePlugin(store, artifacts, "b"), artifactsPlugin(artifacts, "b"),
-    builtinToolsPlugin(store, () => registry), reminderPlugin);
+    builtinToolsPlugin(store, () => registry), reminderPlugin, stampPlugin);
 
   for (const seed of AgentRuntime.DEFAULT_MOUNTS as any[]) {
     const plugin = registry.find((p) => p.id === seed.plugin);
     if (!plugin) throw new Error(`seed ${seed.alias} names a plugin nobody installed`);
-    const form = credentialForm((plugin as any).credential);
+    // Judged as the reconcile judges it (`seedJudge`): a plugin that logs its mount in itself (stamp, `stamp_login`)
+    // gets its account from that login, not from the user.
+    const form = credentialForm((seedJudge(plugin, seed.secretRef ?? null) as any).credential);
     const personal = form.kind !== "none" && form.accountRequired && !seed.secretRef;
     if (personal) {
       throw new Error(`seed ${seed.alias} needs a credential the user has not given yet, so a new agent gets a mount that fails on its first call`);

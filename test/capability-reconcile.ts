@@ -153,7 +153,33 @@ const transcriptHas = async (d: Deployment, t: string, a: string, needle: string
   JSON.stringify(await d.obj(t, a).runtime().branchEntries(t, a, "main")).includes(needle);
 
 const originalFetch = globalThis.fetch;
-globalThis.fetch = (async () => new Response("{}", { status: 404 })) as any;
+/**
+ * A fake Raft at RAFT: its app list (`GET /internal/agent-api/integrations`, what `integrationInstalled` reads) answers
+ * as `raftList` says; every other request to anywhere is a 404, as before. Each request to Raft is recorded in
+ * `raftSeen`, so a test can count the list reads and see that nothing else (the login route) was asked.
+ */
+const RAFT = "https://raft.example";
+const RAFT_CREDENTIAL = "sk_agent_cody_0123456789abcdef";
+let raftList: "stamp" | "none" | "error" | "hang" = "none";
+const raftSeen: Array<{ method: string; path: string }> = [];
+const STAMP_APP = {
+  id: "svc_stamp", clientId: "stamp", name: "Stamp", description: null, homepageUrl: "https://stamp.build",
+  returnUrl: "https://stamp.build/auth/raft/callback", agentManifestUrl: "https://stamp.build/.well-known/raft-app-manifest.json",
+  createdAt: "2026-10-01T00:00:00.000Z", updatedAt: "2026-10-01T00:00:00.000Z",
+};
+globalThis.fetch = (async (input: any, init: any = {}) => {
+  const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+  if (url.origin === RAFT) {
+    const method = String(init.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+    raftSeen.push({ method, path: url.pathname });
+    if (url.pathname === "/internal/agent-api/integrations" && method === "GET") {
+      if (raftList === "hang") return new Promise(() => {});
+      if (raftList === "error") return new Response(JSON.stringify({ error: "integration registry unavailable" }), { status: 503, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ services: raftList === "stamp" ? [STAMP_APP] : [], activeLogins: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+  }
+  return new Response("{}", { status: 404 });
+}) as any;
 
 // ---------------------------------------------------------------- backfill at each turn start
 
@@ -174,9 +200,10 @@ for (const [entry, run] of [
     const reminders = (await d.mountsOf("t", "old")).filter((m) => m.plugin === "reminder");
     must(reminders.length === 1 && reminders[0]!.alias === "reminder" && reminders[0]!.installationId === "inst-reminder", `reminder mounts: ${show(reminders)}`);
     const rec = await d.record("t", "old");
-    must(rec.revision === 2 && rec.key !== null, `record: ${show({ revision: rec.revision, key: rec.key })}`);
+    must(rec.revision === 3 && rec.key !== null, `record: ${show({ revision: rec.revision, key: rec.key })}`);
     const by = Object.fromEntries(rec.outcomes.map((o: any) => [`${o.alias}@${o.since}`, o.outcome]));
     must(by["reminder@2"] === "added", `reminder outcome: ${show(by)}`);
+    must(by["stamp@3"] === "not-for", `stamp outcome on a console agent: ${show(by)}`);
     for (const alias of ["tools", "artifacts", "web", "search", "gh", "sandbox", "state"]) must(by[`${alias}@1`] === "present", `${alias}: ${show(by)}`);
   });
 }
@@ -489,6 +516,165 @@ await check("an agent Raft hosts never gets reminder: not at adopt, a push, a ba
   must((await old.outcome("t", "raft_old", "reminder"))?.outcome === "not-for", "control: the push did not reconcile");
 });
 
+// ---------------------------------------------------------------- stamp: only where the agent's Raft server has it
+
+const { STAMP_WITHHELD } = await import("../src/plugins/stamp.ts");
+const listReads = () => raftSeen.filter((r) => r.method === "GET" && r.path === "/internal/agent-api/integrations").length;
+/** Let a background read of the app list finish: a few awaits on answers the fake gives at once. */
+const settle = () => new Promise((r) => setTimeout(r, 30));
+const hasStamp = async (d: Deployment, t: string, a: string) => (await d.mountsOf(t, a)).some((m) => m.plugin === "stamp");
+/** Raft's own order (cf/src/provision/steps.ts, then the provision credential route): adopt, then the raft credential. */
+async function raftAgent(d: Deployment, t: string, a: string) {
+  const o = d.obj(t, a);
+  const adopted = await o.provisionAdopt(t, a, JSON.stringify({ name: "Cody", instructions: "be brief", raftOrigin: RAFT }));
+  must(adopted.ok, `adopt: ${show(adopted)}`);
+  const cred = await o.uiAttachCredential(t, a, "raft", { token: RAFT_CREDENTIAL });
+  must(cred.ok, `credential: ${show(cred)}`);
+  return o.runtime();
+}
+function fresh(list: typeof raftList) { raftList = list; raftSeen.length = 0; }
+const realNow = Date.now;
+/** Run `fn` with the clock moved `ms` ahead, as an hour passing would. */
+async function later<R>(ms: number, fn: () => Promise<R>): Promise<R> {
+  Date.now = () => realNow() + ms;
+  try { return await fn(); } finally { Date.now = realNow; }
+}
+
+await check("stamp: a raft agent on a server with Stamp gets it through the real adopt order, on the turn after the background read", async () => {
+  fresh("stamp");
+  const d = deployment({});
+  await raftAgent(d, "t", "cody");
+  // The adopt's pass ran before the raft mount existed: nothing could be asked of Raft.
+  const atAdopt = await d.outcome("t", "cody", "stamp");
+  must(atAdopt?.outcome === "unavailable" && atAdopt.reason === STAMP_WITHHELD.unknown, `at adopt: ${show(atAdopt)}`);
+  must(listReads() === 0, `reads at adopt: ${listReads()}`);
+  await pushWake(d, "t", "cody", "first push");
+  must(await transcriptHas(d, "t", "cody", "first push"), "control: the push did not land");
+  must(!(await hasStamp(d, "t", "cody")), "stamp was mounted on the turn that started the read");
+  await settle();
+  must(listReads() === 1, `reads after the first turn: ${listReads()}`);
+  await pushWake(d, "t", "cody", "second push");
+  must(await hasStamp(d, "t", "cody"), `mounts after the second turn: ${(await d.mountsOf("t", "cody")).map((m) => m.alias)}`);
+  const m = (await d.mountsOf("t", "cody")).find((x) => x.plugin === "stamp")!;
+  must(m.alias === "stamp" && m.installationId === "inst-stamp", `the mount: ${show(m)}`);
+  must((await d.outcome("t", "cody", "stamp"))?.outcome === "added", `outcome: ${show(await d.outcome("t", "cody", "stamp"))}`);
+  // Only the read-only list was asked of Raft's integrations: never the login route, which can post a card.
+  const asked = raftSeen.filter((r) => r.path.startsWith("/internal/agent-api/integrations"));
+  must(asked.every((r) => r.method === "GET" && r.path === "/internal/agent-api/integrations"), `asked of Raft: ${show(asked)}`);
+});
+
+await check("stamp: a server without Stamp gives unavailable, with its fixed reason; a console agent gives not-for and asks Raft nothing", async () => {
+  fresh("none");
+  const d = deployment({});
+  await raftAgent(d, "t", "cody");
+  await pushWake(d, "t", "cody", "one");
+  await settle();
+  await pushWake(d, "t", "cody", "two");
+  must(listReads() === 1, `reads: ${listReads()}`);
+  must(!(await hasStamp(d, "t", "cody")), "stamp mounted on a server without it");
+  const no = await d.outcome("t", "cody", "stamp");
+  must(no?.outcome === "unavailable" && no.reason === STAMP_WITHHELD.no, `raft agent: ${show(no)}`);
+  fresh("stamp");
+  await existing(d, "t", "console");
+  await d.say("t", "console", "hello");
+  await settle();
+  await d.say("t", "console", "again");
+  const c = await d.outcome("t", "console", "stamp");
+  must(c?.outcome === "not-for" && /raft/.test(String(c.reason)), `console agent: ${show(c)}`);
+  must(!(await hasStamp(d, "t", "console")) && listReads() === 0, `console agent: reads ${listReads()}`);
+});
+
+await check("stamp: a failed read seeds nothing; once added, nothing is ever removed and Raft is not asked again", async () => {
+  fresh("error");
+  const d = deployment({});
+  await raftAgent(d, "t", "cody");
+  await pushWake(d, "t", "cody", "one");
+  await settle();
+  await pushWake(d, "t", "cody", "two");
+  must(listReads() === 1, `reads: ${listReads()}`);
+  must(!(await hasStamp(d, "t", "cody")), "stamp mounted after a failed read");
+  const err = await d.outcome("t", "cody", "stamp");
+  must(err?.outcome === "unavailable" && err.reason === STAMP_WITHHELD.unknown, `after the failure: ${show(err)}`);
+  // Past the failure's short hold, Raft answers yes: the next turn's read sees it, the one after adds it.
+  raftList = "stamp";
+  await later(2 * 60_000, async () => { await pushWake(d, "t", "cody", "three"); await settle(); await pushWake(d, "t", "cody", "four"); });
+  must(await hasStamp(d, "t", "cody"), "stamp not added once Raft answered yes");
+  const reads = listReads();
+  // Raft now fails, then says no, hours later: the mount stays, the record stays, and nothing is read.
+  for (const [list, at] of [["error", 2 * 3600_000], ["none", 4 * 3600_000]] as const) {
+    raftList = list;
+    await later(at, async () => { await pushWake(d, "t", "cody", `at ${at}`); await settle(); await pushWake(d, "t", "cody", `after ${at}`); });
+    must(await hasStamp(d, "t", "cody"), `stamp removed when Raft answered ${list}`);
+    must((await d.outcome("t", "cody", "stamp"))?.outcome === "added", `outcome moved when Raft answered ${list}`);
+  }
+  must(listReads() === reads, `Raft was asked again after the add: ${listReads()} reads, ${reads} before`);
+});
+
+await check("stamp: an unchanged verdict writes nothing and reads Raft once within the hour", async () => {
+  fresh("none");
+  const d = deployment({});
+  const rt = await raftAgent(d, "t", "cody");
+  await pushWake(d, "t", "cody", "one");
+  await settle();
+  await pushWake(d, "t", "cody", "two");
+  must((await d.outcome("t", "cody", "stamp"))?.reason === STAMP_WITHHELD.no, "control: the verdict is not no");
+  must(listReads() === 1, `reads: ${listReads()}`);
+  const seen: string[] = [];
+  const sql = d.sql("t", "cody");
+  const exec = sql.exec.bind(sql);
+  (sql as any).exec = (q: string, ...b: unknown[]) => { seen.push(q.replace(/\s+/g, " ").trim()); return exec(q, ...b); };
+  let out: any;
+  try { out = await later(59 * 60_000, () => rt.reconcileSeeds("t", "cody")); } finally { (sql as any).exec = exec; }
+  must(out.ran === false && out.why === "unchanged", `the pass: ${show(out)}`);
+  const writes = seen.filter((q) => /^(INSERT|UPDATE|DELETE|REPLACE)/i.test(q));
+  must(writes.length === 0, `writes: ${show(writes)}`);
+  const fp = d.footprint("t", "cody");
+  await later(59 * 60_000, async () => { await pushWake(d, "t", "cody", "three"); await settle(); });
+  must(d.footprint("t", "cody") === fp, "a turn with the same verdict changed the record");
+  must(listReads() === 1, `Raft read again within the hour: ${listReads()}`);
+  // Control: past the hour it is read again.
+  await later(61 * 60_000, async () => { await pushWake(d, "t", "cody", "four"); await settle(); });
+  must(listReads() === 2, `not read again past the hour: ${listReads()}`);
+  // A failed read past the next hour keeps the verdict it had: the record does not move to "unknown" and back.
+  raftList = "error";
+  const kept = d.footprint("t", "cody");
+  await later(122 * 60_000, async () => { await pushWake(d, "t", "cody", "five"); await settle(); await pushWake(d, "t", "cody", "six"); });
+  must(listReads() === 3, `the failed read: ${listReads()} reads`);
+  must((await d.outcome("t", "cody", "stamp"))?.reason === STAMP_WITHHELD.no && d.footprint("t", "cody") === kept,
+    `after a failed read: ${show(await d.outcome("t", "cody", "stamp"))}`);
+});
+
+await check("stamp: a turn never waits on the read, even one that never answers", async () => {
+  fresh("hang");
+  const d = deployment({});
+  await raftAgent(d, "t", "cody");
+  for (const n of ["one", "two"]) {
+    const t0 = realNow();
+    const r = await Promise.race([pushWake(d, "t", "cody", n).then(() => "done"), new Promise((res) => setTimeout(() => res("waited"), 1_500))]);
+    must(r === "done", `turn ${n} waited on the read (${realNow() - t0} ms)`);
+    must(await transcriptHas(d, "t", "cody", n), `control: turn ${n} did not land`);
+    await d.obj("t", "cody").runtime().cancelSession("t", "cody", "main");
+  }
+  // One read in flight, joined by the second turn rather than repeated.
+  must(listReads() === 1, `reads: ${listReads()}`);
+  must(!(await hasStamp(d, "t", "cody")), "stamp mounted with no answer");
+});
+
+await check("stamp: an existing mount of another plugin under the alias `stamp` is refused, and left as it is", async () => {
+  fresh("stamp");
+  const d = deployment({});
+  const rt = await raftAgent(d, "t", "cody");
+  await rt.store.addMount({ tenantId: "t", agentId: "cody", alias: "stamp", plugin: "http", installationId: "inst-mine", connectionId: null,
+    toolVersion: rt.pluginVersion("http") ?? "1.0.0", publicConfig: { account: "mine" }, secretRef: null, policy: null });
+  await pushWake(d, "t", "cody", "one");
+  await settle();
+  await pushWake(d, "t", "cody", "two");
+  const r = await d.outcome("t", "cody", "stamp");
+  must(r?.outcome === "refused" && /http mount/.test(String(r.reason)), `outcome: ${show(r)}`);
+  const mine = (await d.mountsOf("t", "cody")).filter((m) => m.alias === "stamp");
+  must(mine.length === 1 && mine[0]!.plugin === "http" && mine[0]!.installationId === "inst-mine", `the alias: ${show(mine)}`);
+});
+
 // ---------------------------------------------------------------- reads change nothing
 
 await check("reading an agent changes nothing: status, transcript, version, diagnose, API session status, agent()", async () => {
@@ -520,7 +706,8 @@ await check("each changed outcome is a mount.seeded trace row, and the added one
   must(reminder.length === 1, `reminder rows: ${show(reminder)}`);
   must(show(reminder[0]) === show({ status: "added", verdict: "ok", spanId: "reminder@2",
     attrs: { alias: "reminder", plugin: "reminder", since: 2, outcome: "added", reason: null, notice: "pending" } }), `the row: ${show(reminder[0])}`);
-  must(rows.length === 8 && rows.filter((r) => r.status === "present").length === 7, `rows: ${show(rows.map((r) => r.spanId + ":" + r.status))}`);
+  must(rows.length === 9 && rows.filter((r) => r.status === "present").length === 7 && rows.filter((r) => r.status === "not-for").length === 1,
+    `rows: ${show(rows.map((r) => r.spanId + ":" + r.status))}`);
   // A trace row that cannot be written takes the mount and the record with it.
   const e = deployment(REMINDER_APP);
   await existing(e, "t", "old");

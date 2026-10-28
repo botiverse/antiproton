@@ -600,7 +600,8 @@ await check("the deployment registers reminder and seeds it for console agents, 
   must(seeds.length === 1 && seeds[0]!.alias === "reminder" && !seeds[0]!.secretRef, `the reminder seed: ${JSON.stringify(seeds)}`);
   must(seeds[0]!.for.join() === "console" && seeds[0]!.since === 2, `the seed is not for console agents only, added in revision 2: ${JSON.stringify(seeds[0])}`);
   // The rows before it: every kind of agent provisioning judges, revision 1.
-  const before = AgentRuntime.DEFAULT_MOUNTS.filter((d) => d.plugin !== "reminder");
+  // Revision 3 (`stamp`, test/capability-reconcile.ts) came after it, so only the rows up to revision 2.
+  const before = AgentRuntime.DEFAULT_MOUNTS.filter((d) => d.plugin !== "reminder" && d.since <= 2);
   must(before.length === 7 && before.every((d) => d.for.join() === "console,raft" && d.since === 1), `the first seven rows: ${JSON.stringify(before.map((d) => [d.alias, d.for, d.since]))}`);
   // Unavailable exactly where every call refuses, with the same reason.
   must(createReminderPlugin().unavailable?.() === NO_CREDENTIAL, "no config: not unavailable");

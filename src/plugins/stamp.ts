@@ -1365,9 +1365,30 @@ const HEAD_ARG = {
   base: { type: "string", description: "the exact base SHA" },
 };
 
+/**
+ * Why `unavailableFor` withholds the catalogue's stamp mount, one fixed string per verdict so an unchanged verdict
+ * writes nothing (`Plugin.unavailableFor`). "unknown" withholds too: a mount whose every call refuses costs every
+ * request its tool schema and teaches the agent a capability it does not have.
+ */
+export const STAMP_WITHHELD = {
+  notRaft: "stamp signs in through Raft Agent Login, which only an agent Raft hosts can do",
+  no: "this agent's Raft server does not have the Stamp app installed",
+  unknown: "whether this agent's Raft server has the Stamp app installed is not known yet",
+} as const;
+
 export const stampPlugin: Plugin = {
   id: "stamp",
   version: "1.0.0",
+  /**
+   * Only where `stamp_login` can work: an agent Raft hosts, on a server with the Stamp app installed (the catalogue's
+   * entry, cf/src/runtime.ts `DEFAULT_MOUNTS`). Most Raft agents never ship code, and a mount's tools are in every
+   * request's schema, so an agent on a server without Stamp is not given them.
+   */
+  async unavailableFor(agent) {
+    if (agent.kind !== "raft") return STAMP_WITHHELD.notRaft;
+    const installed = await agent.serverHasIntegration(STAMP_SERVICE);
+    return installed === "yes" ? null : installed === "no" ? STAMP_WITHHELD.no : STAMP_WITHHELD.unknown;
+  },
   /**
    * The rotating session. Not `listed`: it exists, and that it exists is
    * listable, never what is in it.

@@ -21,7 +21,7 @@ import {
 import { PARK_BYTES } from "./artifacts.ts";
 import {
   ACTIONS_TOOL, AGENT_LOGIN_TOOLS, INVOKE_TOOL, LIST_TOOL, LOGIN_TOOL, SESSION_STORE, integrationsActions, integrationsInvoke, integrationsList, integrationsLogin,
-  notInstalled, type AgentLoginDeps, type ManifestCache,
+  notInstalled, serviceInstalled, type AgentLoginDeps, type ManifestCache,
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
 import {
@@ -3187,6 +3187,8 @@ export function createRaftPlugin(deps: {
      * first time and not every time. The request is closed — this action, these three fields, nothing a caller chose
      * — so the hook cannot be turned into a way to run any action of any app.
      */
+    /** Whether this mount's Raft server has `service` installed: the read-only list (`serviceInstalled`), nothing else. */
+    integrationInstalled: (ctx: PluginContext, service: string) => serviceInstalled(agentLogin(ctx), service),
     async grantAgentLogin(ctx: PluginContext, service: string, codeChallenge: string, target?: string): Promise<AgentLoginAnswer> {
       let out: Record<string, any>;
       try {

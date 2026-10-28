@@ -870,6 +870,43 @@ await check("a not-installed miss whose sign-in answers anything else rethrows t
   must(w.logins.length === 1 && w.logins[0].service === SERVICE.id, JSON.stringify(w.logins));
 });
 
+// -------------------------------------------------------------------------------------------------------------
+// integrationInstalled: the read the catalogue's stamp seed is judged by (Plugin.unavailableFor).
+
+await check("integrationInstalled reads the app list and nothing else: matched as a login would match, never the login route", async () => {
+  const w = world();
+  w.install();
+  const m = mount();
+  for (const q of [SERVICE.id, "reminder-app", "Reminder"]) must(await m.plugin.integrationInstalled!(m.ctx, q) === true, `${q} not found`);
+  must(await m.plugin.integrationInstalled!(m.ctx, "stamp") === false, "an app that is not installed was found");
+  must(w.logins.length === 0, `logged in: ${JSON.stringify(w.logins)}`);
+  const paths = w.seen.map((r) => `${r.method} ${new URL(r.url).pathname}`);
+  must(paths.length === 4 && paths.every((p) => p === "GET /internal/agent-api/integrations"), JSON.stringify(paths));
+});
+
+await check("integrationInstalled throws when Raft does not answer, so a failed read is never a no", async () => {
+  const w = world({ list: { status: 503 } });
+  w.install();
+  const m = mount();
+  const e = await failure(() => m.plugin.integrationInstalled!(m.ctx, SERVICE.id));
+  must(/did not list this agent's apps/.test(e.message), e.message);
+});
+
+await check("through the gateway: yes and no from the raft mount's own credential; unknown with no raft mount or no credential, asking Raft nothing", async () => {
+  const w = world();
+  w.install();
+  const { store, gateway } = await behindGateway();
+  must(await gateway.integrationInstalled("tenant", "agent", "reminder-app") === "yes", "installed app not yes");
+  must(await gateway.integrationInstalled("tenant", "agent", "stamp") === "no", "missing app not no");
+  must(w.seen.every((r) => r.headers.authorization === `Bearer ${CREDENTIAL}`), "a read without the mount's credential");
+  const reads = w.seen.length;
+  await store.setMountSecretRef("tenant", "agent", "raft", null);
+  must(await gateway.integrationInstalled("tenant", "agent", "reminder-app") === "unknown", "no credential not unknown");
+  await store.removeMount("tenant", "agent", "raft", null);
+  must(await gateway.integrationInstalled("tenant", "agent", "reminder-app") === "unknown", "no mount not unknown");
+  must(w.seen.length === reads, `Raft was asked without a usable mount: ${w.seen.length - reads} requests`);
+});
+
 globalThis.fetch = originalFetch;
 console.log(`\n  raft agent login\n  ${"─".repeat(56)}`);
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

@@ -838,11 +838,25 @@ async function listed(deps: AgentLoginDeps): Promise<Obj> {
   return { services: Array.isArray(data.services) ? data.services : [], activeLogins: Array.isArray(data.activeLogins) ? data.activeLogins : [] };
 }
 
-async function findService(deps: AgentLoginDeps, query: string): Promise<ServiceRecord> {
+/** The installed app `query` names in Raft's list, by the rule every Agent Login tool uses, or undefined. */
+async function matchService(deps: AgentLoginDeps, query: string): Promise<ServiceRecord | undefined> {
   const services = (obj(await listed(deps)).services as unknown[]).map(serviceOf).filter((s): s is ServiceRecord => s !== null);
   const q = query.trim().toLowerCase();
   // An exact service id first: another app named like it must not stand in for it.
-  const found = services.find((s) => s.id === query) ?? services.find((s) => s.clientId.toLowerCase() === q || s.name.toLowerCase() === q);
+  return services.find((s) => s.id === query) ?? services.find((s) => s.clientId.toLowerCase() === q || s.name.toLowerCase() === q);
+}
+
+/**
+ * Whether the agent's Raft server has `query` installed (`Plugin.integrationInstalled`): the list route alone, matched
+ * as `findService` matches, so "installed" means exactly what a login or an action would find. Never the login route,
+ * which can post a card to Raft. Throws as `listed` throws when Raft did not answer.
+ */
+export async function serviceInstalled(deps: AgentLoginDeps, query: string): Promise<boolean> {
+  return (await matchService(deps, query)) !== undefined;
+}
+
+async function findService(deps: AgentLoginDeps, query: string): Promise<ServiceRecord> {
+  const found = await matchService(deps, query);
   if (!found) {
     throw Object.assign(fail(`No app installed on this Server matched ${JSON.stringify(query)}. ${LIST_TOOL} shows the installed apps; ${LOGIN_TOOL} says whether one needs installing.`), { notInstalled: true });
   }
