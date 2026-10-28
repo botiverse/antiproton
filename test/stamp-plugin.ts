@@ -1138,6 +1138,26 @@ await check("api: what the table refuses is refused where stamp.write and every 
   must(seen.length === 0, `the replay reached the gateway: ${JSON.stringify(seen.map((x) => x.path))}`);
 });
 
+await check("api: refusal comes before deny — a mount with api: deny sending an approve hears route_refused, not policy_denied", async () => {
+  reset();
+  const denied = await gatewayMount({ tools: { api: "deny" } });
+  const r = await denied("api", { method: "POST", path: "/v1/repositories/o/r/pulls/7/approve", body: {} });
+  must(r.status === "rejected" && r.error?.code === "route_refused" && /^api may not approve: call pr_approve/.test(r.error.message),
+    `api: deny + approve: ${JSON.stringify(r)}`);
+  must(seen.length === 0 && (await denied.store.listApprovals("t")).length === 0, "it reached the gateway, or a card was made");
+});
+
+await check("api: deny still answers what the table does not refuse — a PR comment and an unlisted write are policy_denied, not route_refused", async () => {
+  reset();
+  const denied = await gatewayMount({ tools: { api: "deny" } });
+  for (const [what, args] of [["a PR comment", COMMENT], ["an unlisted write", LABELS]] as const) {
+    must(stampPlugin.refuse!("api", args as any) === undefined, `${what} is one the table refuses`);
+    const r = await denied("api", args);
+    must(r.status === "rejected" && r.error?.code === "policy_denied", `api: deny + ${what}: ${JSON.stringify(r)}`);
+  }
+  must(seen.length === 0 && (await denied.store.listApprovals("t")).length === 0, "it reached the gateway, or a card was made");
+});
+
 await check("api's refuse answers what the handler refuses, in the handler's words, and nothing else", async () => {
   const refuse = (args: unknown, tool = "api") => stampPlugin.refuse!(tool, args as any);
   const ctx = { credential: session(), alias: "stamp" } as any;

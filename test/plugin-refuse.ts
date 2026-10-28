@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
-import { REFUSE_FAILED, refusalOf } from "../src/plugins/types.ts";
+import { REFUSE_FAILED, REFUSE_REASON_BYTES, REFUSE_TOO_LONG, refusalOf } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import type { MountPolicy } from "../src/core/types.ts";
 
@@ -83,6 +83,42 @@ await check("on a default mount a refused call is rejected as route_refused: no 
   // The call the hook does not refuse is held as before: the hook answers only what it refuses.
   const held: any = await gw.invoke(caller, "svc.api", { path: "comment" });
   must(held.status === "pending" && f.ran.length === 0 && (await store.listApprovals("t", "pending")).length === 1, `not held: ${JSON.stringify(held)}`);
+});
+
+await check("a reason of exactly 300 bytes (String.length) passes unchanged", async () => {
+  must(REFUSE_REASON_BYTES === 300, `the bound is ${REFUSE_REASON_BYTES}`);
+  const exact = "a".repeat(300);
+  must(refusalOf({ refuse: () => exact }, "api", {}) === exact, "a reason of exactly 300 bytes was not passed unchanged");
+});
+
+await check("a reason of 301 bytes is replaced by the fixed message and still refused, through the gateway too", async () => {
+  const over = "a".repeat(301);
+  must(refusalOf({ refuse: () => over }, "api", {}) === REFUSE_TOO_LONG, "a reason of 301 bytes was not replaced");
+  const f = fixture(() => over);
+  const { gw, store } = await gatewayWith(null, f.plugin);
+  const r: any = await gw.invoke(caller, "svc.api", { path: "comment" });
+  must(r.status === "rejected" && r.error?.code === "route_refused" && r.error.message === REFUSE_TOO_LONG, `an over-long reason: ${JSON.stringify(r).slice(0, 200)}`);
+  must(f.ran.length === 0 && (await allApprovals(store)).length === 0, "it ran, or a card was made");
+});
+
+await check("an over-long reason ending in a non-BMP character (301 bytes) gives the fixed message, with no lone surrogate", async () => {
+  const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  const over = "a".repeat(299) + "\u{1F600}";
+  must(over.length === 301, `the fixture is ${over.length} bytes, not 301`);
+  const got = refusalOf({ refuse: () => over }, "api", {})!;
+  must(got === REFUSE_TOO_LONG, `not the fixed message: ${JSON.stringify(got.slice(-4))}`);
+  must(!lone.test(got), `a lone surrogate: ${JSON.stringify(got.slice(-4))}`);
+});
+
+await check("refusal comes before deny: a mount that denies the tool still hears route_refused, with the plugin's reason", async () => {
+  const f = fixture();
+  const { gw, store } = await gatewayWith({ tools: { api: "deny" } }, f.plugin);
+  const r: any = await gw.invoke(caller, "svc.api", { path: "merge" });
+  must(r.status === "rejected" && r.error?.code === "route_refused" && r.error.message === NO_MERGE, `deny answered first: ${JSON.stringify(r)}`);
+  // The control: a call the hook does not refuse is denied as before.
+  const d: any = await gw.invoke(caller, "svc.api", { path: "comment" });
+  must(d.status === "rejected" && d.error?.code === "policy_denied", `not denied: ${JSON.stringify(d)}`);
+  must(f.ran.length === 0 && (await allApprovals(store)).length === 0, "it ran, or a card was made");
 });
 
 await check("refused where the mount allows everything, and where the agent asks to confirm", async () => {
