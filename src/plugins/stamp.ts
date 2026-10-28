@@ -1259,7 +1259,8 @@ const API_METHODS = ["POST", "PATCH", "PUT", "DELETE"] as const;
  *
  * Refused before the table, as the bridge refuses them (`bridgePath` in the gateway): a `;` (a matrix parameter, so
  * `merge;x`) and anything outside ASCII (a full-width `ｍerge`), as sent or once decoded — spellings a server may route
- * as a listed path while a pattern does not see it. The body is judged as `call` sends it: JSON, or none when falsy.
+ * as a listed path while a pattern does not see it. So is a path whose escapes do not decode as UTF-8 (`%FF`), in any
+ * round: what this reads would not be what Stamp routes. The body is judged as `call` sends it: JSON, or none when falsy.
  */
 export function apiRoute(method: unknown, rawPath: unknown, body: unknown): { method: string; path: string; route: RouteClass } {
   const m = String(method ?? "");
@@ -1270,7 +1271,11 @@ export function apiRoute(method: unknown, rawPath: unknown, body: unknown): { me
   let hasQuery = path.includes("?") || String(rawPath ?? "").split("#", 1)[0]!.includes("?");
   let p = path.split("?", 1)[0]!;
   for (let i = 0; i < 4 && p.includes("%"); i++) {
-    try { p = decodeURIComponent(p); } catch { break; /* gatewayPath already refused what would matter */ }
+    // Refused, not left half-decoded: one escape that is not UTF-8 (`%FF`) would keep every other escape encoded
+    // here, while Stamp decodes byte by byte and routes `o%FF/r/pulls/7%2Fmerge` as a merge.
+    try { p = decodeURIComponent(p); } catch {
+      return { method: m, path, route: { kind: "refused", message: `${NOT_ON_API} name a path whose escapes do not decode as UTF-8, which may route as another path: escape each character as UTF-8, or spell it in plain ASCII` } };
+    }
   }
   const cut = p.search(/[?#]/);
   if (cut >= 0) { p = p.slice(0, cut); hasQuery = true; }

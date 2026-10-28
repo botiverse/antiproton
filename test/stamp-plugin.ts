@@ -1088,6 +1088,11 @@ await check("api: what the table refuses is refused where stamp.write and every 
     ["PUT", "/api/v3/repos/o/r/pulls/7/merge%3Bx", {}, /; or a character outside ASCII/],
     ["PUT", "/api/v3/repos/o/r/pulls/7/ｍerge", {}, /; or a character outside ASCII/],
     ["PUT", "/api/v3/repos/o/r/pulls/7/%EF%BD%8Derge", {}, /; or a character outside ASCII/],
+    // An escape that is not UTF-8 stops no decoding of the others: the path is refused whole.
+    ["PUT", "/api/v3/repos/o%FF/r/pulls/7%2Fmerge", {}, /do not decode as UTF-8/],
+    ["PUT", "/api/v3/repos/o/r/pulls/7%FF%2Fmerge", {}, /do not decode as UTF-8/],
+    ["POST", "/api/v3/repos/o/r%FF/pulls/7%2Fapprove", {}, /do not decode as UTF-8/],
+    ["POST", "/api/v3/repos/o/r/labels/x%25FF", { name: "x" }, /do not decode as UTF-8/],
   ] as const) {
     reset();
     const r = await open("api", { method, path, body });
@@ -1103,6 +1108,22 @@ await check("api: what the table refuses is refused where stamp.write and every 
   const done: any = await held.gw.applyApproval("t", a.operationId, "approved", "owner");
   must(done.result?.status !== "succeeded" && /api may not merge/.test(JSON.stringify(done)), `the replay: ${JSON.stringify(done)}`);
   must(seen.length === 0, `the replay reached the gateway: ${JSON.stringify(seen.map((x) => x.path))}`);
+});
+
+await check("api: a key resolves through the mount's blanket write setting: write approval holds and write deny refuses what api: allow ran", async () => {
+  reset();
+  for (const [key, args] of [["pr_comment", COMMENT], ["pr_create", { method: "POST", path: "/v1/pull-requests", body: { title: "t" } }],
+    ["stamp.write", LABELS]] as const) {
+    const held = await gatewayMount({ write: "approval", tools: { api: "allow" } });
+    const r = await held("api", args);
+    must(r.status === "pending" && await pendingKey(held) === key, `write: approval, ${key}: ${JSON.stringify(r)}`);
+  }
+  const denied = await gatewayMount({ write: "deny", tools: { api: "allow" } });
+  for (const args of [COMMENT, { method: "POST", path: "/v1/pull-requests", body: { title: "t" } }, LABELS]) {
+    const r = await denied("api", args);
+    must(r.status === "rejected" && r.error?.code === "policy_denied", `write: deny, ${args.path}: ${JSON.stringify(r)}`);
+  }
+  must(seen.length === 0, `reached the gateway: ${JSON.stringify(seen.map((x) => x.path))}`);
 });
 
 await check("api is not modelOnly: a program's api call is held as a card, not refused as not_from_a_program", async () => {

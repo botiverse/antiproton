@@ -654,6 +654,10 @@ const PARITY: Array<[string, string, string | null, string]> = [
   ["POST", "/api/v3/repos/o/r/labels;x", '{"name":"x"}', "refused"],
   ["PUT", "/api/v3/repos/o/r/pulls/7/ｍerge", "{}", "refused"],
   ["POST", "/api/v3/repos/o/r/issues/3/commentsé", "{}", "refused"],
+  // An escape that is not UTF-8, beside one that would spell a merge or an approval once decoded.
+  ["PUT", "/api/v3/repos/o%FF/r/pulls/7%2Fmerge", "{}", "refused"],
+  ["PUT", "/api/v3/repos/o/r/pulls/7%FF%2Fmerge", "{}", "refused"],
+  ["POST", "/api/v3/repos/o/r%FF/pulls/7%2Fapprove", "{}", "refused"],
 ];
 
 await check("step 4 parity: the bridge and api decide every spelling alike — the same key, or both refuse (; and non-ASCII included)", async () => {
