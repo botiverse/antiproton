@@ -3,27 +3,28 @@
  *
  * Verifies:
  * 1. Build script runs cleanly and generates index.html and version.json.
- * 2. All 12 markdown documents are compiled into the site.
+ * 2. All markdown documents in docs/ are accounted for: every docs/*.md file
+ *    is either categorized in one of the three stratification tiers (public, internal, archive)
+ *    or explicitly excluded by name in EXCLUDED_FROM_SITE (e.g. docs/README.md).
  * 3. Stratification is preserved: public guides, internal references, and frozen archives are categorized.
  * 4. Provenance metadata (commit SHA, tree SHA, build timestamp) is present and well-formed.
  * 5. Frozen archives explicitly carry warning callouts distinguishing them from current specs.
  */
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(__dirname, "..");
+const DOCS_DIR = join(ROOT, "docs");
+const OUT_DIR = join(ROOT, "docs-site", "public");
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
   try { fn(); results.push({ name, ok: true }); }
   catch (e) { results.push({ name, ok: false, error: String((e as Error)?.message ?? e) }); }
 }
-
-import { fileURLToPath } from "node:url";
-import { dirname } from "node:path";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const ROOT = join(__dirname, "..");
-const OUT_DIR = join(ROOT, "docs-site", "public");
 
 check("build-docs script runs successfully", () => {
   const out = execSync("node scripts/build-docs.mjs", { cwd: ROOT, encoding: "utf8" });
@@ -45,6 +46,33 @@ check("version.json carries required provenance fields", () => {
   if (!v.tree || v.tree.length < 7) throw new Error(`bad tree: ${v.tree}`);
   if (!v.builtAt) throw new Error("missing builtAt");
   if (!Array.isArray(v.sections) || v.sections.length < 3) throw new Error("sections array missing or incomplete");
+});
+
+check("every markdown file in docs/ is either categorized in the site or in explicit exclusion list", () => {
+  // Explicit exclusions from published docs site:
+  // - README.md: Internal index for git repository browsing, redundant on the rendered docs site.
+  const EXCLUDED_FROM_SITE = new Set(["README.md"]);
+
+  const diskDocs = readdirSync(DOCS_DIR).filter((f) => f.endsWith(".md"));
+  const v = JSON.parse(readFileSync(join(OUT_DIR, "version.json"), "utf8"));
+  const siteDocs = new Set<string>();
+  for (const s of v.sections) {
+    for (const d of s.docs) {
+      siteDocs.add(d.file);
+    }
+  }
+
+  const unaccounted = diskDocs.filter((f) => !siteDocs.has(f) && !EXCLUDED_FROM_SITE.has(f));
+  if (unaccounted.length > 0) {
+    throw new Error(`Unaccounted files in docs/: ${unaccounted.join(", ")}. Every file must be categorized into a section or explicitly added to EXCLUDED_FROM_SITE.`);
+  }
+
+  // Also assert that siteDocs from docs/ actually exist on disk (except repository root README.md)
+  for (const f of siteDocs) {
+    if (f !== "README.md" && !diskDocs.includes(f)) {
+      throw new Error(`Ghost doc in site sections: ${f} does not exist in docs/`);
+    }
+  }
 });
 
 check("stratification: public, internal, and archive sections exist", () => {
