@@ -1,0 +1,15 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "antiproton-docs",
+  "compatibility_date": "2026-09-05",
+  "assets": {
+    "directory": "./public"
+  },
+  "routes": [
+    {
+      "pattern": "docs.antiproton.ai",
+      "custom_domain": true
+    }
+  ],
+  "workers_dev": true
+}

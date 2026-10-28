@@ -1,0 +1,90 @@
+{
+  "service": "docs.antiproton.ai",
+  "repository": "botiverse/antiproton",
+  "commit": "d0a0e0c86a9c6ebe26e514bd1fe5b2af457e731d",
+  "tree": "81eae7c00c5581adfd6c50718cd4621e04724798",
+  "commitDate": "2026-10-27T15:25:22Z",
+  "builtAt": "2026-10-28T01:41:22.986Z",
+  "sections": [
+    {
+      "id": "public",
+      "category": "Public Documentation & Guides",
+      "docs": [
+        {
+          "slug": "overview",
+          "file": "README.md",
+          "title": "Overview & Architecture"
+        },
+        {
+          "slug": "philosophy",
+          "file": "philosophy.md",
+          "title": "Philosophy & Principles"
+        },
+        {
+          "slug": "plugins",
+          "file": "plugins.md",
+          "title": "Plugin Authoring Guide"
+        },
+        {
+          "slug": "agents-api",
+          "file": "agents-api.md",
+          "title": "OpenAI Agents API Guide"
+        },
+        {
+          "slug": "agent-surface",
+          "file": "agent-surface.md",
+          "title": "Agent Surface & Workspaces"
+        },
+        {
+          "slug": "metering",
+          "file": "metering.md",
+          "title": "Metering & Ledger Retention"
+        },
+        {
+          "slug": "ax-design",
+          "file": "ax-design.md",
+          "title": "Agent Experience (AX) Design"
+        },
+        {
+          "slug": "assistant-instructions",
+          "file": "assistant-default-instructions.md",
+          "title": "Assistant Default Instructions"
+        }
+      ]
+    },
+    {
+      "id": "internal",
+      "category": "Internal Engineering Reference",
+      "badge": "Internal",
+      "docs": [
+        {
+          "slug": "pi-upstream",
+          "file": "pi-upstream.md",
+          "title": "Upstream Pi Synchronization"
+        },
+        {
+          "slug": "runbook",
+          "file": "runbook.md",
+          "title": "Operator Runbook"
+        }
+      ]
+    },
+    {
+      "id": "archive",
+      "category": "Historical Archives",
+      "badge": "Frozen Archive",
+      "docs": [
+        {
+          "slug": "self-hosted-plan-archive",
+          "file": "self-hosted-plan-archive.md",
+          "title": "Local Self-Hosted Plan (Archive)"
+        },
+        {
+          "slug": "server-plan-archive",
+          "file": "server-plan-archive.md",
+          "title": "Server-Side Plan (Archive)"
+        }
+      ]
+    }
+  ]
+}

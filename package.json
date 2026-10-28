@@ -37,7 +37,9 @@
     "auth": "node test/auth.ts",
     "typecheck": "node scripts/typecheck.mjs",
     "suite-table": "node scripts/suite-table.mjs",
-    "typecheck-baseline": "node test/typecheck-baseline.ts"
+    "typecheck-baseline": "node test/typecheck-baseline.ts",
+    "docs:build": "node scripts/build-docs.mjs",
+    "docs:test": "node test/docs-site.ts"
   },
   "dependencies": {
     "@botiverse/raft-sdk": "0.32.0",
