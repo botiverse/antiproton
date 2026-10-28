@@ -179,7 +179,7 @@ leaving the queue are decided under `stamp.write`, held for a person unless the
 mount allows it. So `api: "allow"` alone runs only listed writes whose tools the
 mount allows. What the table refuses (approving, merging, GraphQL, the
 `/repositories/<id>` alias, a review write with a query, a review body with no
-single string `event`, and a path with `;`, a character outside ASCII, or
+single string `event`, and a path with `;`, a space or control character, a character outside ASCII, or
 escapes that do not decode as UTF-8) `api`
 refuses too, even after a person approves the call and even with
 `stamp.write: "allow"`.

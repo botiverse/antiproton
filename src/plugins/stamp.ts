@@ -1279,8 +1279,8 @@ export function apiRoute(method: unknown, rawPath: unknown, body: unknown): { me
   }
   const cut = p.search(/[?#]/);
   if (cut >= 0) { p = p.slice(0, cut); hasQuery = true; }
-  if (/[;]|[^\x00-\x7e]/.test(p)) {
-    return { method: m, path, route: { kind: "refused", message: `${NOT_ON_API} name a path with ; or a character outside ASCII, which may route as another path: spell it in plain ASCII` } };
+  if (/[;\x00-\x20\x7f]|[^\x00-\x7e]/.test(p)) {
+    return { method: m, path, route: { kind: "refused", message: `${NOT_ON_API} name a path with ;, a space, a control character or a character outside ASCII, which may route as another path: spell it in plain ASCII` } };
   }
   p = p.replace(/\/{2,}/g, "/");
   if (p.length > 1) p = p.replace(/\/+$/, "");

@@ -654,6 +654,10 @@ const PARITY: Array<[string, string, string | null, string]> = [
   ["POST", "/api/v3/repos/o/r/labels;x", '{"name":"x"}', "refused"],
   ["PUT", "/api/v3/repos/o/r/pulls/7/ｍerge", "{}", "refused"],
   ["POST", "/api/v3/repos/o/r/issues/3/commentsé", "{}", "refused"],
+  // A space or a control character once decoded: the bridge refuses any escape, api refuses these after decoding.
+  ["PUT", "/api/v3/repos/o/r/pulls/7/merge%09", "{}", "refused"],
+  ["PUT", "/api/v3/repos/o/r/pulls/7/merge%00", "{}", "refused"],
+  ["PUT", "/api/v3/repos/o/r/pulls/7/merge%20", "{}", "refused"],
   // An escape that is not UTF-8, beside one that would spell a merge or an approval once decoded.
   ["PUT", "/api/v3/repos/o%FF/r/pulls/7%2Fmerge", "{}", "refused"],
   ["PUT", "/api/v3/repos/o/r/pulls/7%FF%2Fmerge", "{}", "refused"],
