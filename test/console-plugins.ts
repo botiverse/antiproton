@@ -385,16 +385,27 @@ check("the real catalogue reaches the page: nine rows say default, four say opt-
   // strings, do not delete the case. It is what keeps `SEEDED_PLUGINS` from
   // silently stopping at the page.
   const why = (id: string) => `${id} is seeded in AgentRuntime.DEFAULT_MOUNTS`;
+  // A seeded plugin that can be withheld (`unavailable`, `unavailableFor`) says where it is available instead:
+  // reminder (a deployment without reminder-app) and stamp (a Raft server without the Stamp app) today.
+  const whereAvailable = rows.filter((r) => r.defaultWhereAvailable).map((r) => r.id).sort();
+  must(whereAvailable.join() === "reminder,stamp", `the seeded rows that can be withheld are ${whereAvailable.join()}`);
   for (const id of seeded) {
-    must(blocks.get(id)?.includes("default for all agents"),
-      `${why(id)}, but its row does not say "default for all agents". If the wording changed, update this `
+    const label = whereAvailable.includes(id) ? "default where it is available" : "default for all agents";
+    const other = whereAvailable.includes(id) ? "default for all agents" : "default where it is available";
+    must(blocks.get(id)?.includes(label),
+      `${why(id)}, but its row does not say "${label}". If the wording changed, update this `
       + `assertion; if it now says opt-in, the producer has stopped reading the catalogue.`);
+    must(!blocks.get(id)?.includes(other), `${id}'s row says "${other}" as well`);
+  }
+  // By name, so the two labels are pinned to plugins and not only to the rule: gh and web are on every agent.
+  for (const [id, label] of [["stamp", "where it is available"], ["reminder", "where it is available"], ["github", "for all agents"], ["http", "for all agents"]]) {
+    must(blocks.get(id)?.includes(`the plugin is default ${label}`), `${id} does not say "default ${label}"`);
   }
   for (const id of optIn) {
     must(blocks.get(id)?.includes("opt-in"),
       `${id} is NOT in AgentRuntime.DEFAULT_MOUNTS, so its row must say "opt-in". If the wording changed, `
       + `update this assertion.`);
-    must(!blocks.get(id)?.includes("default for all agents"),
+    must(!blocks.get(id)?.includes("default for all agents") && !blocks.get(id)?.includes("default where it is available"),
       `${id} is not in the catalogue yet renders as a default — the catalogue has widened, or the producer is `
       + `no longer reading it.`);
   }

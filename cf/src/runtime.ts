@@ -6582,6 +6582,10 @@ export function installedRows(
     version: p.version,
     // The operator's catalogue, not a flag on the plugin: one source.
     defaultForAllAgents: seeded.has(p.id),
+    // A seeded plugin that can be withheld — from the whole deployment (`unavailable`) or from one agent
+    // (`unavailableFor`) — is not on every agent, so the page must not say it is. Read from the plugin, so a plugin
+    // that gains either hook is labelled by that alone.
+    defaultWhereAvailable: seeded.has(p.id) && (typeof p.unavailable === "function" || typeof p.unavailableFor === "function"),
     choice: choices[p.id] ?? "inherit",
     // Resolved here rather than in the page, so the rule stays in the one
     // function that states it. A page that recomputes it is a second copy that
