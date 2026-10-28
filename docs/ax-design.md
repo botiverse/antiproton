@@ -101,7 +101,9 @@ Recorded so the design is not read as a description of today:
     character, or whose path part carries `;`, a percent-escape or anything outside printable
     ASCII, or has an empty, `.` or `..` segment; a path past 2048 characters; a body past 1 MiB
     of UTF-8 (CJK text is three bytes a character, so about a third as many characters); and a
-    header value with CR or LF. It drops a GET's or HEAD's body.
+    header value with CR or LF; and a method other than GET, HEAD, POST, PUT, PATCH or DELETE. It
+    drops a GET's or HEAD's body, and a held request is kept, shown and replayed with only the
+    headers that may leave the box.
   - The plugin's route table then classifies the request, on the path its `normalize` answers
     (without the query or a trailing slash, case-insensitively) and the body as sent. A row with a
     body check that cannot judge the body — not sent as JSON (`application/json`, `…+json`), or
@@ -116,6 +118,37 @@ Recorded so the design is not read as a description of today:
     the model sends a new program after the approval; there is no resume, which waits on #596.
     Only the dynamic worker executor loads these modules; QuickJS refuses the import
     (`bridge_unavailable`).
+  - A refusal reaches the SDK as a 403 whose JSON body carries the gateway's `error` (`code`,
+    `message`) and the same `message` as a top-level string; a failed call reaches it as a
+    rejected fetch. Every SDK file is loaded as `{ js }`, whatever its name.
+  - A `refuse` row with a body check refuses a body it cannot judge, with its `unsure` message
+    (or the core's UNJUDGED_BODY), since its own message would name a remedy for a request that
+    may not be the one it refuses. So an SDK whose writes the table judges by body has to send
+    them as a JSON object with `content-type: application/json`; anything else on such a route
+    is refused, comments included.
+- stamp is the first bridged plugin: `const { stamp } = await import("sdk:stamp")` gives the
+  published `@botiverse/stamp-sdk` client (`lib/client.mjs` and what it imports, vendored verbatim
+  at the pinned version by `scripts/vendor-stamp-sdk.mjs`), called as `stamp(method, path, body)`,
+  with `ApiError` and `NetworkError`. Its auth holds no token and is not the agent mode, so the box
+  never refreshes; the gateway sends with the mount's session, rotates on a 401 and resends once.
+  Its table (`STAMP_ROUTES`, src/plugins/stamp.ts) refuses `/api/auth/*`, anything outside `/v1/`
+  and `/api/v3/`, approving (v1 `approve`, a review whose `event` is APPROVE in any casing, a
+  review body it cannot judge) and merging (v1 merge, auto-merge and queue; v3 `pulls/<n>/merge`
+  and `merges`), and `/api/v3/graphql`. A write is decided under the tool of the same effect
+  (`pr_comment` for comments, COMMENT reviews and review edits; `pr_unapprove`, `pr_create`,
+  `issue_create`, `issue_comment`), and where no tool has it — requesting changes, cancelling
+  auto-merge, leaving the queue, anything unlisted — under `stamp.write`, held for a person
+  unless the mount allows it. Unlisted includes writes Stamp's own proxy refuses for an agent
+  (updating a branch, branch protection, `git/refs`, `contents`): a mount that sets
+  `stamp.write: allow` relies on that proxy for them. The table judges a review's body, never
+  the content of a query: a review write that carries any query (`?event=APPROVE`) is refused
+  (a row may ask only whether a query is present, `RouteEntry.withQuery`), and a body that names
+  `event` twice, in any case, cannot be judged and is refused. GitHub's repository-id alias
+  (`/api/v3/repositories/<id>/…`) is refused for every method, since the table is written for
+  `/api/v3/repos/<owner>/<repo>`. The core's refusal of any `%` in a path stands, so a name that
+  needs an encoded separator (`contents/docs%2Freadme.md`, `commits/feature%2Fx`) goes through a
+  query form where upstream has one (`commits?sha=feature/x`), or through the `api_get` / `api`
+  tools.
 - A program can stop itself and ask: `const answer = await pause(question, data, expected?)`.
   That pause is resumable — the result is `yielded`, with a token, and the model answers with the
   one static `resume` tool (or cancels); the program continues from that line. `expected`

@@ -63,6 +63,19 @@ function hookModuleMaps(): void {
   });
 }
 
+/**
+ * What workerd refuses at load: a module given as a bare string whose name does not end in `.js` (it reads a bare
+ * string as an ES module only by that suffix). Refused here too, at the same moment, so that a module map the platform
+ * would not load — an SDK's `client.mjs` handed over as a string — fails in node instead of passing.
+ */
+function rejectBareNonJs(modules: Record<string, unknown>): void {
+  for (const [name, src] of Object.entries(modules ?? {})) {
+    if (typeof src === "string" && !name.endsWith(".js")) {
+      throw new TypeError(`module "${name}" is a bare string, which the loader takes only for a name ending in .js; give it as { js: source }`);
+    }
+  }
+}
+
 export function standInLoader(opts: {
   callHopMs?: number;
   /** Calls that are lost on the way: never delivered, never answered. */
@@ -81,29 +94,32 @@ export function standInLoader(opts: {
   return {
     dropped,
     loader: {
-      load: (code: any) => ({
-        getEntrypoint: () => ({
-          fetch: async (req: Request) => {
-            const execId = String(code.env?.TOOLS?.execId ?? "");
-            live.set(execId, true);
-            try {
-              const src = code.modules[code.mainModule] as string;
-              let mod;
-              if (Object.keys(code.modules).length > 1) {
-                hookModuleMaps();
-                const id = crypto.randomUUID();
-                loads.set(id, code.modules);
-                mod = await import(`standin://${id}/${encodeURIComponent(code.mainModule)}`);
-              } else {
-                mod = await import(`data:text/javascript;base64,${Buffer.from(src).toString("base64")}`);
+      load: (code: any) => {
+        rejectBareNonJs(code.modules);
+        return {
+          getEntrypoint: () => ({
+            fetch: async (req: Request) => {
+              const execId = String(code.env?.TOOLS?.execId ?? "");
+              live.set(execId, true);
+              try {
+                const src = code.modules[code.mainModule] as string;
+                let mod;
+                if (Object.keys(code.modules).length > 1) {
+                  hookModuleMaps();
+                  const id = crypto.randomUUID();
+                  loads.set(id, code.modules);
+                  mod = await import(`standin://${id}/${encodeURIComponent(code.mainModule)}`);
+                } else {
+                  mod = await import(`data:text/javascript;base64,${Buffer.from(src).toString("base64")}`);
+                }
+                return await mod.default.fetch(req, code.env);
+              } finally {
+                live.set(execId, false);
               }
-              return await mod.default.fetch(req, code.env);
-            } finally {
-              live.set(execId, false);
-            }
-          },
-        }),
-      }),
+            },
+          }),
+        };
+      },
     },
     makeToolBinding: (execId: string) => ({
       execId,

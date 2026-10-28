@@ -38,7 +38,8 @@ import { ApiError, NetworkError, makeClient } from "@botiverse/stamp-sdk/client"
 import type { Json, MountPolicy } from "../core/types.ts";
 import { openText, sealText } from "./raft-agent-login.ts";
 import { RAFT_MOUNT_ALIAS, raftIdentityOf } from "./raft-identity.ts";
-import type { CredentialCheck, Plugin, PluginContext, ToolSchema } from "./types.ts";
+import { FILES as SDK_FILES } from "./stamp-sdk-box.ts";
+import type { BridgeDecl, BridgeIo, BridgeRequest, BridgeResponse, CredentialCheck, Plugin, PluginContext, RouteEntry, ToolSchema } from "./types.ts";
 import { credentialState, identityNote, markIdentity, policyFor } from "./types.ts";
 
 /** The one host this plugin talks to. Not a setting: nothing here has been tried against a self-hosted Stamp. */
@@ -923,7 +924,10 @@ const DEFAULT_POLICY: MountPolicy = {
   // stamp_login (cody, botiverse/antiproton#1084): Raft's Agent Login is granted with no one asked, so the moment a
   // mount first gains a Stamp identity that can write to GitHub is where a person is put. A mount's own policy may
   // allow it; nothing after the login (rotation, use) asks again.
-  tools: { pr_approve: "approval", pr_merge: "approval", api: "approval", [LOGIN_TOOL]: "approval" },
+  // `stamp.write` (`UNLISTED_WRITE_KEY`): a program's write that `STAMP_ROUTES` does not name. The core holds it at
+  // `approval` whatever this says, and only a mount's own entry lifts it. `request` has no entry, on purpose: an
+  // unlisted read is decided under it, and an entry here would put every off-table GET in front of a person.
+  tools: { pr_approve: "approval", pr_merge: "approval", api: "approval", [LOGIN_TOOL]: "approval", "stamp.write": "approval" },
 };
 
 /**
@@ -1068,6 +1072,227 @@ async function call(method: string, path: string, ctx: PluginContext, body?: unk
   }
 }
 
+// ---- the SDK bridge (botiverse/antiproton#1092) ------------------------------------------------------------------
+
+/** The policy key of a write no row of `STAMP_ROUTES` names: held for a person unless the mount itself allows it. */
+export const UNLISTED_WRITE_KEY = "stamp.write";
+
+/**
+ * The box's entry: the published client over the gateway-backed `fetch`, with an auth that holds nothing. `mode` is
+ * not `"agent"`, so a 401 never makes the box ask for another token: refreshing is `bridgeSend`'s, at the gateway.
+ * The token is a placeholder the gateway drops (only `content-type` and `accept` leave the box). Reads are not retried
+ * (`retryReads: false`), so one SDK call is one bridged request against the run's host-call budget.
+ *
+ * The one thing it adds to the client: a refusal's 403 carries the gateway's `error` as an object, and the client
+ * builds `ApiError.message` from `body.error`, which would read `403: [object Object]`; there the message is the
+ * sentence the gateway gave (`body.message`). The error is the client's own `ApiError`, status and body unchanged.
+ */
+const BOX_ENTRY = `import { makeClient, ApiError, NetworkError } from "./lib/client.mjs";
+export default function make(fetch) {
+  const client = makeClient({
+    mode: "bridge",
+    apiBase: ${JSON.stringify(ORIGIN)},
+    token: async () => "bridge",
+    retryToken: async () => null,
+  }, fetch, { retryReads: false });
+  async function stamp(method, path, body) {
+    try {
+      return await client(method, path, body);
+    } catch (e) {
+      if (e instanceof ApiError && e.body && typeof e.body.error === "object" && e.body.error !== null && typeof e.body.message === "string") {
+        e.message = e.status + ": " + e.body.message;
+      }
+      throw e;
+    }
+  }
+  return { stamp, ApiError, NetworkError };
+}
+`;
+
+const SEG = "[^/]+";
+const V1_REPO = `^/v1/repositories/${SEG}/${SEG}`;
+const V3_REPO = `^/api/v3/repos/${SEG}/${SEG}`;
+const re = (s: string) => new RegExp(s);
+/** Every method a row that refuses a whole path means: the six the core lets a bridged request use (`bridgeArgs`). */
+const ANY = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] as const;
+const WRITES = ["POST", "PUT", "PATCH", "DELETE"] as const;
+
+/**
+ * The keys of a JSON object's top level as the text spells them, repeats kept, which `JSON.parse` drops (the last one
+ * wins). Asked only of text `JSON.parse` has already read as an object, so it only has to find where each key and
+ * value ends, not check them.
+ */
+export function topLevelKeys(text: string): string[] {
+  const keys: string[] = [];
+  let i = 0;
+  const skipSpace = () => { while (i < text.length && " \t\n\r".includes(text[i]!)) i++; };
+  const readString = (): string => {
+    const start = i++;
+    while (i < text.length && text[i] !== '"') i += text[i] === "\\" ? 2 : 1;
+    i++;
+    return JSON.parse(text.slice(start, i)) as string;
+  };
+  skipSpace();
+  if (text[i] !== "{") throw new Error("not a JSON object");
+  i++;
+  skipSpace();
+  if (text[i] === "}") return keys;
+  for (;;) {
+    skipSpace();
+    keys.push(readString());
+    skipSpace();
+    i++; // the colon
+    // The value: to the comma or brace that closes it at this depth, strings skipped whole.
+    let depth = 0;
+    while (i < text.length) {
+      const c = text[i]!;
+      if (c === '"') { readString(); continue; }
+      if (c === "{" || c === "[") depth++;
+      else if (c === "}" || c === "]") { if (depth === 0) break; depth--; }
+      else if (c === "," && depth === 0) break;
+      i++;
+    }
+    if (i >= text.length || text[i] === "}") return keys;
+    i++; // the comma
+  }
+}
+
+/**
+ * A review's `event`, as GitHub reads it: the key in any case, the value in any case and around whitespace. A value
+ * that is not a string throws, so the APPROVE row refuses rather than reading it as "not an approval" — what upstream
+ * makes of `["APPROVE"]` or `{"APPROVE":1}` is not something this table can know. So does `event` given twice, in any
+ * case, which parsers settle differently (`JSON.parse` keeps the last): Stamp's own proxy refuses it as unreadable too.
+ */
+function reviewEvent(body: { [k: string]: Json } | null, raw: string | null): string[] {
+  if (raw !== null && topLevelKeys(raw).filter((k) => k.toLowerCase() === "event").length > 1) {
+    throw new Error("a review event given more than once");
+  }
+  const out: string[] = [];
+  for (const [k, v] of Object.entries(body ?? {})) {
+    if (k.toLowerCase() !== "event") continue;
+    if (typeof v !== "string") throw new Error("a review event that is not a string");
+    out.push(v.trim().toUpperCase());
+  }
+  return out;
+}
+
+const NOT_ON_BRIDGE = "a program's request through sdk:stamp may not";
+/**
+ * Which tool's policy decides each request a program makes through `sdk:stamp`, or that it never runs there. The first
+ * row that matches decides (`classifyRoute`), on the path as sent (the core refuses `%`, `//`, `.` and `..` before
+ * this), without its query or a trailing slash, in any case. A row's key is the tool with the same effect, so a mount
+ * that holds or refuses that tool holds or refuses the request too; where no tool has the effect, `stamp.write`.
+ *
+ * It lists the routes known to approve or merge, and a few by name for their key: it is not a list of every spelling
+ * upstream accepts. A write it does not name is held under `stamp.write` (`unlistedWriteKey`); a read passes. That
+ * includes writes Stamp's own proxy refuses for an agent — updating a branch, branch protection, `git/refs`,
+ * `contents` — so on a mount that sets `stamp.write: allow` those rest on Stamp's proxy alone. A query's content is
+ * never judged; a review write that carries one at all is refused, so `?event=APPROVE` cannot ride beside a body that
+ * says nothing. GitHub's `/repositories/<id>` alias is refused whole, since every row here is written for owner/repo.
+ */
+export const STAMP_ROUTES: readonly RouteEntry[] = [
+  // The session endpoints are this plugin's own (`rotate`, `selfLogin`): a program never signs in or refreshes.
+  { methods: ANY, path: /^\/api\/auth(\/|$)/, refuse: `${NOT_ON_BRIDGE} reach /api/auth: the mount keeps and refreshes its own session` },
+  // The same prefixes `api` keeps to (`API_PREFIXES`); `send` checks them again.
+  { methods: ANY, path: /^(?!\/v1\/|\/api\/v3\/)/, refuse: `${NOT_ON_BRIDGE} leave /v1/ and /api/v3/` },
+  { methods: ANY, path: re(`${V1_REPO}/pulls/${SEG}/approve$`),
+    refuse: `${NOT_ON_BRIDGE} approve: call pr_approve, which names the exact head a person signs for` },
+  { methods: ["POST", "PUT", "PATCH"], path: re(`${V1_REPO}/pulls/${SEG}/(merge|auto-merge|queue(/${SEG})?)$`),
+    refuse: `${NOT_ON_BRIDGE} merge, enable auto-merge or join the queue: call pr_merge, which names the exact head a person signs for` },
+  // Cancelling auto-merge or leaving the queue is not merging, but it is a write someone should see until it is known
+  // to be harmless.
+  { methods: ["DELETE"], path: re(`${V1_REPO}/pulls/${SEG}/(auto-merge|queue(/${SEG})?)$`), key: UNLISTED_WRITE_KEY },
+  { methods: WRITES, path: re(`${V3_REPO}/(pulls/${SEG}/merge|merges)$`),
+    refuse: `${NOT_ON_BRIDGE} merge through GitHub's API: call pr_merge, which names the exact head a person signs for` },
+  // A GraphQL mutation can approve or merge, and its body is not something a row can judge.
+  { methods: ANY, path: /^\/api\/v3\/graphql$/, refuse: `${NOT_ON_BRIDGE} use GitHub's GraphQL API, which can approve or merge: use the REST paths, or the stamp tools` },
+  // GitHub's repository-id alias reaches every route below under another spelling; the table is written for owner/repo.
+  { methods: ANY, path: /^\/api\/v3\/repositories(\/|$)/,
+    refuse: `${NOT_ON_BRIDGE} use GitHub's /repositories/<id> paths: name the repository as /api/v3/repos/<owner>/<repo>, or use the pr_* tools` },
+  // A review write with a query: the table matches the path without it, so whatever upstream reads there (an `event`)
+  // is something no row can judge.
+  { methods: WRITES, path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}(/events)?)?$`), withQuery: true,
+    refuse: `${NOT_ON_BRIDGE} write a review with a query string, which this table cannot judge: put every field in the JSON body` },
+  // Every write to a review, not only POST: which methods upstream reads an `event` on is not this table's to guess.
+  { methods: WRITES, path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}(/events)?)?$`),
+    body: (b, raw) => reviewEvent(b, raw).includes("APPROVE"),
+    refuse: `${NOT_ON_BRIDGE} approve through a review: call pr_approve, which names the exact head a person signs for`,
+    unsure: "this review's body could not be read as a JSON object with a string `event` (sent with content-type: " +
+      "application/json), so it may be an approval and is refused. Send it as JSON, or use the tools: pr_comment to " +
+      "comment, pr_approve to approve" },
+  // Requesting changes blocks a merge and no tool does it, so it is held under the write key, not run as a comment.
+  { methods: WRITES, path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}(/events)?)?$`),
+    body: (b, raw) => reviewEvent(b, raw).includes("REQUEST_CHANGES"), key: UNLISTED_WRITE_KEY },
+  // Any other review (COMMENT, a pending one), and editing one: a comment.
+  { methods: ["POST", "PUT", "PATCH"], path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}(/events)?)?$`), key: "pr_comment" },
+  { methods: ["POST"], path: re(`${V3_REPO}/pulls/(${SEG}/comments(/${SEG}/replies)?)$`), key: "pr_comment" },
+  { methods: ["POST"], path: re(`${V1_REPO}/pulls/${SEG}/comments$`), key: "pr_comment" },
+  { methods: ["POST"], path: re(`${V1_REPO}/pulls/${SEG}/unapprove$`), key: "pr_unapprove" },
+  { methods: ["POST"], path: /^\/v1\/pull-requests$/, key: "pr_create" },
+  { methods: ["POST"], path: re(`${V3_REPO}/pulls$`), key: "pr_create" },
+  { methods: ["POST"], path: re(`(${V1_REPO}|${V3_REPO})/issues$`), key: "issue_create" },
+  { methods: ["POST"], path: re(`(${V1_REPO}|${V3_REPO})/issues/${SEG}/comments$`), key: "issue_comment" },
+];
+
+/** What the approval card names for a bridged request: the repository, and the pull request or issue number. */
+function describeRoute(path: string): { repo?: string; pr?: number } {
+  const p = path.split(/[?#]/, 1)[0]!;
+  const m = /^\/(?:v1\/repositories|api\/v3\/repos)\/([^/]+)\/([^/]+)(?:\/(?:pulls|issues)\/(\d+)(?:\/|$))?/i.exec(p);
+  if (!m) return {};
+  return { repo: `${m[1]}/${m[2]}`, ...(m[3] ? { pr: Number(m[3]) } : {}) };
+}
+
+/** One attempt of a bridged request with one access token, through `gatewayFetch`; a transport failure said as one. */
+async function bridgeAttempt(req: BridgeRequest, token: string): Promise<Response> {
+  try {
+    return await gatewayFetch(ORIGIN + req.path, {
+      method: req.method,
+      headers: { ...req.headers, authorization: `Bearer ${token}` },
+      body: req.body ?? undefined,
+    });
+  } catch (e) {
+    const err = e as Error & { cause?: { code?: unknown }; code?: unknown };
+    const code = err?.cause?.code ?? err?.code;
+    // The path and origin refusals `gatewayFetch` makes are not transport failures, and keep their own words.
+    if (!(e instanceof TypeError) && code === undefined) throw e;
+    // What the SDK in the box reads as a network error (`networkFailureOf` matches "fetch failed").
+    throw new Error(`fetch failed (${typeof code === "string" && code ? code : (err?.name ?? "Error")})`);
+  }
+}
+
+/**
+ * Make one bridged request with this mount's session: the token the stamp tools send (`accessToken`, rotating first
+ * when it is due), registered with the core (`io.used`) before it is sent, with the session's refresh token, so that an
+ * upstream that echoes either has it replaced, in an answer or in the message of a throw. A 401 rotates and resends
+ * once, as the SDK's agent auth does, and only when the rotation gave another token; the box never refreshes.
+ */
+async function bridgeSend(ctx: PluginContext, req: BridgeRequest, io: BridgeIo): Promise<BridgeResponse> {
+  const first = await accessToken(ctx, false);
+  io.used(first.token);
+  io.used(first.session.refresh_token);
+  let res = await bridgeAttempt(req, first.token);
+  if (res.status === 401) {
+    const next = await accessToken(ctx, true);
+    io.used(next.token);
+    io.used(next.session.refresh_token);
+    if (next.token !== first.token) res = await bridgeAttempt(req, next.token);
+  }
+  const headers: Record<string, string> = {};
+  res.headers.forEach((v, k) => { headers[k] = v; });
+  return { status: res.status, headers, text: await res.text() };
+}
+
+/** `sdk:stamp` in a run_js program: the published client, every request decided by `STAMP_ROUTES` at the gateway. */
+const STAMP_BRIDGE: BridgeDecl = {
+  box: { files: { ...SDK_FILES, "entry.mjs": BOX_ENTRY }, entry: "entry.mjs", exports: ["stamp", "ApiError", "NetworkError"] },
+  routes: STAMP_ROUTES,
+  unlistedWriteKey: UNLISTED_WRITE_KEY,
+  send: bridgeSend,
+  describe: describeRoute,
+  // The CLI's version notices; harmless to the box, and what the client's `onVersions` reads.
+  responseHeaders: ["stamp-cli-latest", "stamp-cli-minimum"],
+};
+
 const t = (
   name: string, summary: string, properties: Record<string, unknown>,
   required: string[], sideEffects: "read" | "write",
@@ -1132,6 +1357,8 @@ export const stampPlugin: Plugin = {
    * unattended on every mount that did not think to say.
    */
   defaultPolicy: DEFAULT_POLICY,
+  // `await import("sdk:stamp")` in run_js: the SDK's client, each request a call of `stamp.request` (`STAMP_ROUTES`).
+  bridge: STAMP_BRIDGE,
   // The one service this plugin may log in to through the agent's raft mount (`ctx.agentLogin`).
   agentLogin: { services: [STAMP_SERVICE] },
   tools: [

@@ -2641,6 +2641,12 @@ export type RouteEntry = {
   methods: readonly string[];
   path: RegExp;
   /**
+   * The row applies only to a request whose path carries a query (a `?`, even with nothing after it). `path` is matched
+   * without the query, so this is the one way a row can see it: for a route where upstream may read a query parameter
+   * the table cannot judge, and a refuse row is the safe answer. The query's content is never read.
+   */
+  withQuery?: true;
+  /**
    * Whether the row applies, asked of the body as a JSON object, or null when the request has none. The row cannot
    * judge a request whose content-type is not JSON (`application/json`, `…+json`; none counts as not), which upstream
    * reads its own way; nor a body that is not a JSON object (form-encoded, a byte-order mark before the JSON, an
@@ -2648,8 +2654,10 @@ export type RouteEntry = {
    * refuses whenever it cannot rule the body out — and a `key` row does not apply but holds the request as an
    * unlisted write; neither passes it to a later, looser row. False on a JSON object sent as JSON moves on, so the predicate has to be as robust as
    * upstream is about spelling — key and value case, aliases — or a spelling it missed reaches a later row.
+   * `raw` is the body as sent, for what parsing loses: a key given twice, which `JSON.parse` keeps the last of and
+   * another parser may not.
    */
-  body?: (body: { [k: string]: Json } | null) => boolean;
+  body?: (body: { [k: string]: Json } | null, raw: string | null) => boolean;
 } & (
   /** Decided under this key and the bridge tool's own entry, the stricter of the two (`Plugin.policyKey`). */
   | { key: string; refuse?: undefined }
@@ -2718,11 +2726,13 @@ export type RouteClass =
 
 /**
  * Classify one request against a bridge's table. `path` is already normalized, without its query or a trailing slash
- * (the gateway's `routePath`), and matched case-insensitively; `body` is as sent, and `contentType` is how it was sent:
+ * (the gateway's `routePath`; `hasQuery` says whether there was one), and matched case-insensitively; `body` is as sent, and `contentType` is how it was sent:
  * a row with a body check that does not match a body not sent as JSON holds it (`RouteEntry.body`).
  */
 export function classifyRoute(
   decl: Pick<BridgeDecl, "routes" | "unlistedWriteKey">, method: string, path: string, body: string | null, contentType: string | null = null,
+  /** Whether the request's path carried a query, which `path` here does not (`RouteEntry.withQuery`). */
+  hasQuery = false,
 ): RouteClass {
   const m = method.toUpperCase();
   const held: RouteClass = { kind: "unlisted-write", key: decl.unlistedWriteKey };
@@ -2738,6 +2748,7 @@ export function classifyRoute(
   for (const row of decl.routes) {
     // Case-insensitive, as upstream routes are (`…/MERGE` is a merge), and never on a `g` or `y` regex's last index.
     if (!row.methods.some((x) => x.toUpperCase() === m) || !new RegExp(row.path.source, row.path.flags.replace(/[gyi]/g, "") + "i").test(path)) continue;
+    if (row.withQuery && !hasQuery) continue;
     if (row.body) {
       // What a row does with a body it cannot judge: a refusal stays a refusal (holding it would let a mount that
       // allows unlisted writes run what the row exists to stop), and a key row holds it for a person.
@@ -2748,7 +2759,7 @@ export function classifyRoute(
       if (parsed === undefined) return unsure;
       let hit = false;
       // A predicate that throws on a body it did not expect has not said the row does not apply.
-      try { hit = row.body(parsed); } catch { return unsure; }
+      try { hit = row.body(parsed, body); } catch { return unsure; }
       if (!hit) continue;
     }
     return row.refuse !== undefined ? { kind: "refused", message: row.refuse } : { kind: "listed", key: row.key! };
