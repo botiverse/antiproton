@@ -1,0 +1,65 @@
+# The branch gate (cf/scripts/gate.sh) on every pull request and every push to
+# master: every suite, the removal guard and the typecheck, with no deploy.
+# The suite selection, the live-service skips and the typecheck verdict are
+# the deploy gate's own (cf/scripts/suite-verdict.sh: suite_needs_service,
+# typecheck_clean, suite_passed_count), so a green here is the same verdict
+# cf/scripts/verify-and-deploy.sh would reach before shipping, minus the
+# question only production can answer (which commit it runs).
+#
+# Test only. No secrets are read, the token can only read the repository,
+# checkout keeps no credentials, and nothing here deploys.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to the same PR cancels the run it supersedes; master runs
+  # are each kept (a group per commit), so every merged commit gets a verdict.
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    # Measured locally at ~6 min for the whole gate; each suite is also bounded
+    # by the gate's own limit (GATE_SUITE_LIMIT, 600 s).
+    timeout-minutes: 30
+    env:
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the removal guard compares test/*.ts with a base commit.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          # package.json engines: node >=24; the deploy host runs 24.x.
+          node-version: 24
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+
+      - name: Branch gate (cf/scripts/gate.sh)
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # The base the removal guard compares against. A pull request is
+          # checked out as its merge commit, whose first parent is the base it
+          # would merge into. A push compares with what master was before it,
+          # so a suite deleted anywhere in a multi-commit push is still seen.
+          if [ "$EVENT" = push ] && [ -n "$BEFORE" ] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            export GATE_BASE="$BEFORE"
+          else
+            export GATE_BASE="HEAD^1"
+          fi
+          echo "GATE_BASE=$GATE_BASE ($(git rev-parse "$GATE_BASE"))"
+          bash cf/scripts/gate.sh

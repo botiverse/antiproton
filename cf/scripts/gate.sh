@@ -38,10 +38,6 @@ set -u
 cd "$(dirname "$0")/../.."
 . cf/scripts/suite-verdict.sh
 
-# Suites that need something this script will not start (a local server, a
-# live account). Named, so that "did not run" is visible rather than absent.
-NEEDS_SERVICE=" appworld live-e2e live-github "
-
 fails=0
 
 # Said before the suites and again beside the verdict: the header scrolls past
@@ -90,7 +86,8 @@ run_suite() {
 
 for f in test/*.ts; do
   t=$(basename "$f" .ts)
-  case "$NEEDS_SERVICE" in *" $t "*) suite_name "$t"; echo "skipped (needs a live service)"; continue;; esac
+  # The suites that need a live service: suite_needs_service, one list for both gates.
+  if suite_needs_service "$t"; then suite_name "$t"; echo "skipped (needs a live service)"; continue; fi
   run_suite "$t" node "$f"
 done
 run_suite pi-storage-do bash test/pi-storage-do.sh
@@ -115,7 +112,7 @@ tc=$(typecheck_result "$file"); rm -f "$file"
 if [ -n "$SUITE_TIMED_OUT" ]; then tc="TIMEOUT (still running after ${limit}s; killed)"; timeouts=$((timeouts+1));
 elif [ -n "$SUITE_ERROR" ]; then tc="FAIL ($SUITE_ERROR)"; fi
 echo "typecheck: $tc"
-case "$tc" in *", 0 new"*) ;; *) echo "typecheck: NOT CLEAN"; fails=$((fails+1));; esac
+typecheck_clean "$tc" || { echo "typecheck: NOT CLEAN"; fails=$((fails+1)); }
 
 gate_provenance
 echo "TIMEOUTS=$timeouts"

@@ -35,6 +35,30 @@ typecheck_result() {
   grep '^typecheck: ' "$1" | tail -1 || true
 }
 
+# typecheck_clean LINE: succeeds when LINE, typecheck_result's verdict, says
+# ", 0 new". The test is the line, not the exit status: the typecheck exits
+# non-zero exactly when it has something to say, and a broken program boundary
+# prints deliberately WITHOUT ", 0 new" because the counts above it then mean
+# nothing. One definition, read by both gates and so by CI (which runs
+# cf/scripts/gate.sh), so the three cannot disagree about what "clean" means.
+typecheck_clean() {
+  case "$1" in *", 0 new"*) return 0;; esac
+  return 1
+}
+
+# The suites no gate runs, each because it needs something a gate will not
+# start: a live AppWorld server (appworld), the real deployment and GitHub
+# (live-e2e, live-github). Named, so "did not run" is printed rather than
+# absent, and named ONCE: the deploy gate, the branch gate and CI (which runs
+# the branch gate) all skip exactly these.
+GATE_NEEDS_SERVICE=" appworld live-e2e live-github "
+
+# suite_needs_service NAME: succeeds when NAME is one of GATE_NEEDS_SERVICE.
+suite_needs_service() {
+  case "$GATE_NEEDS_SERVICE" in *" $1 "*) return 0;; esac
+  return 1
+}
+
 # suite_removals PREVIOUS_NAMES_FILE ACKNOWLEDGED_FILE WHERE CURRENT_NAMES...
 # prints one line per suite in PREVIOUS that is not in CURRENT and not
 # acknowledged, nothing otherwise. Blank lines and "#" comments are ignored.
