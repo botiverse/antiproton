@@ -11,7 +11,7 @@ import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
 import { keyedOperationId } from "./operation-id.ts";
 import type { PluginErrorFields, ToolSnapshot } from "../plugins/types.ts";
-import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf, BRIDGE_TOOL, classifyRoute, isJsonContentType, policyKeyOf, stricter } from "../plugins/types.ts";
+import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf, BRIDGE_TOOL, classifyRoute, isJsonContentType, policyKeyOf, refusalOf, stricter } from "../plugins/types.ts";
 import type { BridgeDecl, ToolSchema } from "../plugins/types.ts";
 import { admitTools } from "./mount-tools.ts";
 import { isReleased, leaseRow, releasedFacts, toolRefusedRow } from "../trace/seams.ts";
@@ -1200,6 +1200,12 @@ export class ToolGateway {
     });
 
     const facts = () => (opts.callId === undefined ? {} : { callId: opts.callId });
+    // A call refused before any verdict, a bridged request on its route or a call its plugin refuses
+    // (`Plugin.refuse`): ended as a refusal ends, nothing ran, and answered in one shape whichever it was.
+    const refusedHere = async (error: ToolError): Promise<ToolResult> => {
+      await this.#store.completeOperation(ctx.tenantId, operationId, "rejected", null, undefined, facts());
+      return { status: "rejected", error };
+    };
     // A bridged request is classified on its route before any verdict: a refused route ends here, approved or not,
     // since what a person approved was a request the table now refuses — or one it never should have held.
     let route: { method: string; path: string; body: string | null; headers: Record<string, string> } | null = null;
@@ -1223,13 +1229,14 @@ export class ToolGateway {
       const c = route ? classifyRoute(bridge, route.method, routePath(route.path), route.body, route.headers["content-type"] ?? null,
         route.path.includes("?")) : null;
       if (c?.kind === "refused") refusal = { code: "route_refused", message: c.message };
-      if (refusal || !c || c.kind === "refused") {
-        await this.#store.completeOperation(ctx.tenantId, operationId, "rejected", null, undefined, facts());
-        return { status: "rejected", error: refusal! };
-      }
+      if (refusal || !c || c.kind === "refused") return refusedHere(refusal!);
       key = c.kind === "unlisted-read" ? null : c.key;
       side = route!.method === "GET" || route!.method === "HEAD" ? "read" : "write";
     } else {
+      // A call the plugin will never run is refused before the policy is asked (`Plugin.refuse`), approved or not, so
+      // no card is made for it — and none held earlier is run — and it is answered as a refused route is.
+      const why = refusalOf(plugin, r.tool, args);
+      if (why !== null) return refusedHere({ code: "route_refused", message: why });
       key = policyKeyOf(plugin, r.tool, args);
       // A declared write may be a read for the policy, per call, when the plugin says so (`Plugin.classify`).
       side = callSideEffects(plugin, r.tool, args, schema.sideEffects);

@@ -157,10 +157,11 @@ Recorded so the design is not read as a description of today:
   does, and a path whose escapes do not decode as UTF-8 (`%FF`), which would otherwise leave the
   other escapes encoded while Stamp decodes byte by byte, and judges the body as the JSON `call` sends. `policyKey` names the row's key, or
   `stamp.write` for an unlisted write, and the gateway takes the stricter of that and `api`'s
-  own entry. A refused route has no key and the handler throws, so it never runs, not on an
-  approved replay and not with `stamp.write: allow`. A refused `api` call is still held for
-  approval first under `api`'s default, because only the handler refuses it. `api_get` is not
-  judged by the table.
+  own entry. A refused route, or a path or method `api` does not take, has no key and is
+  answered by the plugin's `refuse` before the policy is asked: `rejected` with `route_refused`,
+  as the bridge answers, and no approval card, so it never runs — not on an approved replay and
+  not with `stamp.write: allow` — and no person is asked to approve it first. The handler
+  throws on the same routes as a second line. `api_get` is not judged by the table.
 - A program can stop itself and ask: `const answer = await pause(question, data, expected?)`.
   That pause is resumable — the result is `yielded`, with a token, and the model answers with the
   one static `resume` tool (or cancels); the program continues from that line. `expected`

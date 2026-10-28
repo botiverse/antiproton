@@ -144,6 +144,20 @@ declared read raised to a write would be rerun after a crash under a new
 operation id and land twice. It fails closed: `undefined`, a throw, or any
 other value leaves the call a write.
 
+**A call the plugin will never run is refused, not held.** A tool that refuses
+some of its calls whatever the mount allows (stamp's `api` on a merge, say)
+answers them from `refuse(tool, args)` on the plugin with the sentence the
+agent should read. The gateway asks it before the policy (`refusalOf` in
+`src/plugins/types.ts`), so the call ends `rejected` with code `route_refused`,
+as a route a bridge's table refuses does, and no approval card is made: a card
+a person approves only to see the call fail spends a human click on nothing. It
+is asked on an approved replay as well, so a card held before the plugin
+learned to refuse that call does not run it. It only refuses — `undefined`
+leaves the call to the policy as before — and fails closed: a throw, or an
+answer that is not a non-empty string, refuses the call with a fixed message.
+Keep the same refusal in the tool's handler too, for an `invoke` that does not
+come through the gateway. `test/plugin-refuse.ts` holds the core's half.
+
 **Errors are for the model.** Throw an `Error` whose message says what went
 wrong and what to do instead; the gateway returns it as a `tool_error`. When a
 request may have reached the service before failing (a timeout, a 5xx), set

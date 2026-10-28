@@ -2273,6 +2273,23 @@ export interface Plugin {
    */
   policyKey?(tool: string, args: Json): string | undefined;
   /**
+   * A call this plugin will never run, said before anything is decided about it: the reason, as the sentence the
+   * agent reads, or `undefined` to let the policy decide as before (botiverse/antiproton#1092). Read through
+   * {@link refusalOf}, never directly.
+   *
+   * The gateway asks it before the policy verdict, so a refused call is answered `rejected` with code
+   * `route_refused` — the shape a bridged request the route table refuses gets — and no approval card is made for
+   * it, nor any held call: a card a person approves only to see the call fail spends a human click on nothing. It is
+   * asked on an approved replay as well, so a card held before the plugin learned to refuse that call does not run it.
+   *
+   * It only refuses, never permits: `undefined` leaves the call to the policy, `policyKey` and `confirm` exactly as
+   * without the hook. A throw, or an answer that is not a non-empty string, refuses the call with a fixed message:
+   * a plugin that could not say whether a call is one it refuses has not said that it is not. Synchronous and local,
+   * like `classify`. The tool's own handler should still refuse the same calls, as a second line, since an
+   * `invoke` reached some other way does not pass through here.
+   */
+  refuse?(tool: string, args: Json): string | undefined;
+  /**
    * The plugin's SDK, importable in a run_js program as `sdk:<alias>` (and `sdk:<plugin id>` where that names one
    * mount alone), with every request it makes forwarded through the gateway as a call of `<alias>.request`. See
    * {@link BridgeDecl}. A plugin that declares it may not have a tool of its own named `request`.
@@ -2593,6 +2610,22 @@ export function policyKeyOf(p: Pick<Plugin, "policyKey">, tool: string, args: Js
   try { key = p.policyKey.call(p, tool, args); } catch { return false; }
   if (key === undefined || key === tool) return null;
   return typeof key === "string" && key !== "" ? key : false;
+}
+
+/** What a call is told when its plugin's `refuse` threw or answered something that is not a reason. */
+export const REFUSE_FAILED = "this call is refused: the plugin could not say whether it may run";
+
+/**
+ * Why `Plugin.refuse` refuses this call: `null` when there is no hook or it answered `undefined`, the hook's reason when
+ * it gave one, and {@link REFUSE_FAILED} when it threw or answered anything else. Fails closed: only `undefined` lets
+ * the call through to the policy.
+ */
+export function refusalOf(p: Pick<Plugin, "refuse">, tool: string, args: Json): string | null {
+  if (!p.refuse) return null;
+  let why: unknown;
+  try { why = p.refuse.call(p, tool, args); } catch { return REFUSE_FAILED; }
+  if (why === undefined) return null;
+  return typeof why === "string" && why !== "" ? why : REFUSE_FAILED;
 }
 
 /** The tool a bridge's requests are calls of, on every mount whose plugin declares one: `<alias>.request`. */

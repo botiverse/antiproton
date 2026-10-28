@@ -673,16 +673,27 @@ async function gatewayMount(policy: unknown) {
   return Object.assign(call, { store, gw });
 }
 type Json = any;
+// An unlisted write, held under `api`'s default: the `api` call a default mount asks a person about.
+const LABELS_EARLY = { method: "POST", path: "/api/v3/repos/o/r/labels", body: { name: "x" } };
 const MERGE = { repo: "o/r", number: 7, head: HEAD, base: BASE };
 
 await check("with no mount policy, approve, merge and api wait for a person; reads and comments do not", async () => {
   const call = await gatewayMount(null);
-  for (const [tool, args] of [["pr_approve", MERGE], ["pr_merge", MERGE], ["api", { path: "/v1/repositories/o/r/pulls/7/approve", method: "POST", body: {} }]] as const) {
+  for (const [tool, args] of [["pr_approve", MERGE], ["pr_merge", MERGE], ["api", LABELS_EARLY]] as const) {
     reset();
     const r = await call(tool, args);
     must(r.status === "pending" && r.error?.code === "awaiting_approval", `${tool}: ${JSON.stringify(r)}`);
     must(seen.length === 0, `${tool} reached the gateway: ${seen.map((x) => x.path)}`);
   }
+  // An approval through `api` is one the table refuses (`refuse`), so no person is asked to approve it first: it is
+  // rejected as the bridge rejects the route, with no card, and nothing is sent.
+  reset();
+  const cards = (await call.store.listApprovals("t")).length;
+  const refused = await call("api", { path: "/v1/repositories/o/r/pulls/7/approve", method: "POST", body: {} });
+  must(refused.status === "rejected" && refused.error?.code === "route_refused" && /^api may not approve/.test(refused.error.message),
+    `api approve: ${JSON.stringify(refused)}`);
+  must((await call.store.listApprovals("t")).length === cards, "a card was made for a call the table refuses");
+  must(seen.length === 0, `api approve reached the gateway: ${seen.map((x) => x.path)}`);
   reset();
   const read = await call("pr_view", { repo: "o/r", number: 7 });
   must(read.status === "succeeded", `pr_view: ${JSON.stringify(read)}`);
@@ -1006,7 +1017,8 @@ await check("a mount that allows api still cannot approve or merge through it", 
   ] as const) {
     reset();
     const r = await call("api", { method, path, body });
-    must(r.status !== "succeeded" && /^stamp: api may not .*call pr_(approve|merge)/.test(String(r.error?.message)), `${method} ${path}: ${JSON.stringify(r)}`);
+    must(r.status === "rejected" && r.error?.code === "route_refused" && /^api may not .*call pr_(approve|merge)/.test(String(r.error?.message)),
+      `${method} ${path}: ${JSON.stringify(r)}`);
     must(seen.length === 0, `${path} reached the gateway`);
   }
   // The allow is real: a write the table does not hold goes straight through.
@@ -1100,18 +1112,56 @@ await check("api: what the table refuses is refused where stamp.write and every 
   ] as const) {
     reset();
     const r = await open("api", { method, path, body });
-    must(r.status === "failed" && /^stamp: (api may not |this review's body)/.test(r.error?.message) && said.test(r.error.message), `${method} ${path}: ${JSON.stringify(r)}`);
+    must(r.status === "rejected" && r.error?.code === "route_refused" && /^(api may not |this review's body)/.test(r.error?.message) &&
+      said.test(r.error.message), `${method} ${path}: ${JSON.stringify(r)}`);
     must(seen.length === 0, `${path} reached the gateway`);
   }
-  // Held by default (api: approval) and approved by a person: the replay is refused, not run.
+  must((await open.store.listApprovals("t")).length === 0, "a card was made for a refused call");
+  // A default mount (api: approval) asks nobody: the call is refused before a card exists.
   reset();
   const held = await gatewayMount(null);
-  const r = await held("api", { method: "PUT", path: "/v1/repositories/o/r/pulls/7/merge", body: {} });
-  must(r.status === "pending", `held: ${JSON.stringify(r)}`);
-  const a = (await held.store.listApprovals("t", "pending"))[0]!;
-  const done: any = await held.gw.applyApproval("t", a.operationId, "approved", "owner");
-  must(done.result?.status !== "succeeded" && /api may not merge/.test(JSON.stringify(done)), `the replay: ${JSON.stringify(done)}`);
+  const MERGE_ARGS = { method: "PUT", path: "/v1/repositories/o/r/pulls/7/merge", body: {} };
+  const r = await held("api", MERGE_ARGS);
+  must(r.status === "rejected" && r.error?.code === "route_refused" && /^api may not merge/.test(r.error.message), `default mount: ${JSON.stringify(r)}`);
+  must((await held.store.listApprovals("t")).length === 0, "a default mount made a card for a refused call");
+  // A card held before `refuse` answered (made the way the gateway makes one), approved by a person: the replay is
+  // refused, not run.
+  const operationId = "op_held_before_refuse";
+  await held.store.recordOperation({ operationId, tenantId: "t", agentId: "a", taskId: "k", mountAlias: "stamp", tool: "stamp.api",
+    modelName: "stamp__api", toolVersion: stampPlugin.version });
+  await held.store.requireApproval({ tenantId: "t", operationId, agentId: "a", taskId: "k", mountAlias: "stamp", tool: "api",
+    request: { tool: "stamp.api", args: MERGE_ARGS, heldBy: "policy" } });
+  const done: any = await held.gw.applyApproval("t", operationId, "approved", "owner");
+  must(done.result?.status === "rejected" && done.result.error?.code === "route_refused" && /^api may not merge/.test(done.result.error.message),
+    `the replay: ${JSON.stringify(done)}`);
+  must((await held.store.getOperation("t", operationId))?.status === "rejected", "the replayed operation does not read rejected");
   must(seen.length === 0, `the replay reached the gateway: ${JSON.stringify(seen.map((x) => x.path))}`);
+});
+
+await check("api's refuse answers what the handler refuses, in the handler's words, and nothing else", async () => {
+  const refuse = (args: unknown, tool = "api") => stampPlugin.refuse!(tool, args as any);
+  const ctx = { credential: session(), alias: "stamp" } as any;
+  const threw = async (args: any) => { try { await stampPlugin.invoke("api", args, ctx); return null; } catch (e) { return (e as Error).message; } };
+  reset();
+  // A route the table refuses: the row's sentence, which the handler throws with the plugin's prefix.
+  for (const args of [{ method: "PUT", path: "/v1/repositories/o/r/pulls/7/merge" }, { method: "POST", path: "/api/v3/graphql", body: { query: "x" } }]) {
+    const why = refuse(args);
+    must(typeof why === "string" && /^api may not /.test(why) && await threw(args) === `stamp: ${why}`, `${args.path}: ${why}`);
+  }
+  // A path or method api does not take: exactly the error the handler throws.
+  for (const args of [null, 5, [], {}, { method: "GET", path: "/v1/x" }, { method: "POST" }, { method: "POST", path: "//evil.example/v1/x" },
+    { method: "POST", path: "/v1/repositories/o/r/pulls/7%2Fmerge" }]) {
+    const why = refuse(args);
+    const handler = await threw(args);
+    must(typeof why === "string" && why !== "" && why === handler, `${JSON.stringify(args)}: refuse ${why} handler ${handler}`);
+  }
+  must(seen.length === 0, `reached the gateway: ${JSON.stringify(seen.map((x) => x.path))}`);
+  // What the table holds or lets through, and every other tool, is left to the policy.
+  for (const args of [LABELS, COMMENT, { method: "DELETE", path: "/v1/repositories/o/r/pulls/7/auto-merge" }]) {
+    must(refuse(args) === undefined, `${args.path} was refused`);
+  }
+  must(refuse({ method: "PUT", path: "/v1/repositories/o/r/pulls/7/merge" }, "api_get") === undefined && refuse(MERGE, "pr_merge") === undefined,
+    "refused for another tool");
 });
 
 await check("api: a key resolves through the mount's blanket write setting: write approval holds and write deny refuses what api: allow ran", async () => {
