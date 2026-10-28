@@ -12,7 +12,7 @@
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stampPlugin, STAMP_ROUTES, API_ROUTES, UNLISTED_WRITE_KEY, apiRoute } from "../src/plugins/stamp.ts";
@@ -84,9 +84,15 @@ const RAFT_STUB = { id: "raft", version: "1.0.0", tools: [], async invoke() { re
   database: { version: 8, stores: { context: {} } } } as any;
 const caller = { tenantId: "t", agentId: "a", taskId: "k" };
 
+// One directory for the whole run, removed when the process exits, whichever way it exits (the suite ends with
+// process.exit). A directory per case that nothing removed filled a shared host's tmpfs /tmp with 14,774 of them (#1108).
+const RUN_DIR = mkdtempSync(join(tmpdir(), "stamp-bridge-"));
+process.on("exit", () => rmSync(RUN_DIR, { recursive: true, force: true }));
+let mounts = 0;
+
 async function mount(policy: unknown, plugin: Plugin = stampPlugin) {
   reset();
-  const path = join(mkdtempSync(join(tmpdir(), "stamp-bridge-")), "s.sqlite");
+  const path = join(RUN_DIR, `s${++mounts}.sqlite`);
   const store = new SqliteStore(path);
   await store.init();
   await store.createAgent("t", "a");
