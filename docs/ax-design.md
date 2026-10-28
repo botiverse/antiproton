@@ -149,6 +149,17 @@ Recorded so the design is not read as a description of today:
   needs an encoded separator (`contents/docs%2Freadme.md`, `commits/feature%2Fx`) goes through a
   query form where upstream has one (`commits?sha=feature/x`), or through the `api_get` / `api`
   tools.
+- stamp's `api` tool goes by the same rows (`API_ROUTES`, built with `STAMP_ROUTES` by
+  `stampRoutes`, so patterns, methods, body checks and keys are one copy; only the wording
+  differs, "api may not …"). `apiRoute` reads the path as `call` will send it (`gatewayPath`),
+  decoded up to four times, empty segments collapsed, trailing slash dropped, an escaped `?` or
+  `#` counted as a query. It refuses a `;` and anything outside ASCII as the bridge's core check
+  does, and judges the body as the JSON `call` sends. `policyKey` names the row's key, or
+  `stamp.write` for an unlisted write, and the gateway takes the stricter of that and `api`'s
+  own entry. A refused route has no key and the handler throws, so it never runs, not on an
+  approved replay and not with `stamp.write: allow`. A refused `api` call is still held for
+  approval first under `api`'s default, because only the handler refuses it. `api_get` is not
+  judged by the table.
 - A program can stop itself and ask: `const answer = await pause(question, data, expected?)`.
   That pause is resumable — the result is `yielded`, with a token, and the model answers with the
   one static `resume` tool (or cancels); the program continues from that line. `expected`

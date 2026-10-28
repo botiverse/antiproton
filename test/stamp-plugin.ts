@@ -669,7 +669,8 @@ async function gatewayMount(policy: unknown) {
   });
   const credential = session();
   const gw = gatewayOver(store, credential);
-  return (tool: string, args: Json) => gw.invoke({ tenantId: "t", agentId: "a", taskId: "k" }, `stamp.${tool}`, args) as Promise<any>;
+  const call = (tool: string, args: Json) => gw.invoke({ tenantId: "t", agentId: "a", taskId: "k" }, `stamp.${tool}`, args) as Promise<any>;
+  return Object.assign(call, { store, gw });
 }
 type Json = any;
 const MERGE = { repo: "o/r", number: 7, head: HEAD, base: BASE };
@@ -948,7 +949,7 @@ await check("api refuses the approve and merge routes, however they are spelled"
   ];
   for (const [method, path, body] of held) {
     const threw = await refusal(invoke("api", { method, path, body }, ctx));
-    must(/goes through pr_(approve|merge), not api/.test(threw), `${method} ${path}: ${threw}`);
+    must(/^stamp: api may not .*call pr_(approve|merge)/.test(threw), `${method} ${path}: ${threw}`);
   }
   must(seen.length === 0, `reached the gateway: ${JSON.stringify(seen.map((x) => x.path))}`);
   // Leaving the merge queue is not a merge.
@@ -956,7 +957,7 @@ await check("api refuses the approve and merge routes, however they are spelled"
   must(left === "" && seen.at(-1)?.method === "DELETE", `leaving the queue: ${left}`);
   // Not every write under a pull request is held: a comment review is not an approval.
   const ok = await refusal(invoke("api", { method: "POST", path: "/api/v3/repos/o/r/pulls/7/reviews", body: { event: "COMMENT" } }, ctx));
-  must(!/not api/.test(ok), `a comment review was refused: ${ok}`);
+  must(!/api may not/.test(ok), `a comment review was refused: ${ok}`);
 });
 
 // botiverse/antiproton#1092: the bridge will route through this same table, so each
@@ -981,7 +982,7 @@ await check("api: escaped slashes, a mixed-case event, a trailing slash and DELE
   ];
   for (const [method, path, body] of held) {
     const threw = await refusal(invoke("api", { method, path, body }, ctx));
-    must(/goes through pr_(approve|merge), not api/.test(threw), `${method} ${path}: ${threw}`);
+    must(/^stamp: api may not .*call pr_(approve|merge)/.test(threw), `${method} ${path}: ${threw}`);
   }
   // /v1/ takes no escapes at all, so an escaped slash there never reaches the table.
   for (const path of ["/v1/repositories/o/r/pulls/7%2Fmerge", "/v1/repositories/o/r/pulls/7%2Fapprove"]) {
@@ -991,7 +992,7 @@ await check("api: escaped slashes, a mixed-case event, a trailing slash and DELE
   must(seen.length === 0, `reached the gateway: ${JSON.stringify(seen.map((x) => x.path))}`);
   // Cancelling auto-merge is not a merge.
   const cancelled = await refusal(invoke("api", { method: "DELETE", path: "/v1/repositories/o/r/pulls/7/auto-merge" }, ctx));
-  must(!/not api/.test(cancelled) && seen.at(-1)?.method === "DELETE" && seen.at(-1)?.path === "/v1/repositories/o/r/pulls/7/auto-merge",
+  must(!/api may not/.test(cancelled) && seen.at(-1)?.method === "DELETE" && seen.at(-1)?.path === "/v1/repositories/o/r/pulls/7/auto-merge",
     `cancelling auto-merge: ${cancelled}`);
 });
 
@@ -1005,13 +1006,132 @@ await check("a mount that allows api still cannot approve or merge through it", 
   ] as const) {
     reset();
     const r = await call("api", { method, path, body });
-    must(r.status !== "succeeded" && /goes through pr_(approve|merge), not api/.test(JSON.stringify(r)), `${method} ${path}: ${JSON.stringify(r)}`);
+    must(r.status !== "succeeded" && /^stamp: api may not .*call pr_(approve|merge)/.test(String(r.error?.message)), `${method} ${path}: ${JSON.stringify(r)}`);
     must(seen.length === 0, `${path} reached the gateway`);
   }
   // The allow is real: a write the table does not hold goes straight through.
   reset();
   const ok = await call("api", { method: "POST", path: "/v1/repositories/o/r/pulls/7/comments", body: { body: "hi" } });
   must(ok.status === "succeeded" && seen.at(-1)?.path === "/v1/repositories/o/r/pulls/7/comments", `comment: ${JSON.stringify(ok)}`);
+});
+
+// botiverse/antiproton#1092 step 4: `api` is decided by the bridge's rows (`API_ROUTES`), each call under its row's
+// key besides `api`'s own entry (`policyKey`), and a route the table refuses is refused by the handler.
+replies["POST /api/v3/repos/o/r/labels"] = { name: "x" };
+replies["POST /api/v3/repos/o/r/pulls/7/reviews"] = { id: 55 };
+const LABELS = { method: "POST", path: "/api/v3/repos/o/r/labels", body: { name: "x" } };
+const COMMENT = { method: "POST", path: "/v1/repositories/o/r/pulls/7/comments", body: { body: "hi" } };
+const pendingKey = async (call: Awaited<ReturnType<typeof gatewayMount>>) =>
+  ((await call.store.listApprovals("t", "pending")).at(-1)?.request as any)?.policyKey;
+
+await check("api: an unlisted write, REQUEST_CHANGES and cancelling auto-merge wait under stamp.write even where api is allowed", async () => {
+  for (const [what, args] of [
+    ["a label", LABELS],
+    ["REQUEST_CHANGES", { method: "POST", path: "/api/v3/repos/o/r/pulls/7/reviews", body: { event: "REQUEST_CHANGES" } }],
+    ["cancelling auto-merge", { method: "DELETE", path: "/v1/repositories/o/r/pulls/7/auto-merge" }],
+    ["a branch delete", { method: "DELETE", path: "/api/v3/repos/o/r/git/refs/heads/x" }],
+  ] as const) {
+    for (const policy of [null, { tools: { api: "allow" } }, { write: "allow", tools: { api: "allow" } }]) {
+      reset();
+      const call = await gatewayMount(policy);
+      const r = await call("api", args);
+      must(r.status === "pending" && await pendingKey(call) === "stamp.write", `${what} under ${JSON.stringify(policy)}: ${JSON.stringify(r)}`);
+      must(seen.length === 0, `${what} reached the gateway`);
+    }
+  }
+  // Only the mount's own entry for stamp.write lifts it.
+  reset();
+  const lifted = await gatewayMount({ tools: { api: "allow", "stamp.write": "allow" } });
+  const ran = await lifted("api", LABELS);
+  must(ran.status === "succeeded" && seen.at(-1)?.path === "/api/v3/repos/o/r/labels", `stamp.write: allow: ${JSON.stringify(ran)}`);
+});
+
+await check("api: a listed write is decided under its tool's key too — the card names it, its deny refuses, api's deny wins", async () => {
+  reset();
+  const held = await gatewayMount({ tools: { api: "allow", pr_comment: "approval" } });
+  const r1 = await held("api", COMMENT);
+  must(r1.status === "pending" && await pendingKey(held) === "pr_comment" && seen.length === 0, `pr_comment held: ${JSON.stringify(r1)}`);
+  const denied = await gatewayMount({ tools: { api: "allow", pr_comment: "deny" } });
+  const r2 = await denied("api", COMMENT);
+  must(r2.status === "rejected" && r2.error?.code === "policy_denied" && seen.length === 0, `pr_comment deny: ${JSON.stringify(r2)}`);
+  const apiDenied = await gatewayMount({ tools: { api: "deny", pr_comment: "allow" } });
+  const r3 = await apiDenied("api", COMMENT);
+  must(r3.status === "rejected" && r3.error?.code === "policy_denied" && seen.length === 0, `api deny + pr_comment allow: ${JSON.stringify(r3)}`);
+  for (const [key, args] of [
+    ["pr_create", { method: "POST", path: "/v1/pull-requests", body: { title: "t" } }],
+    ["issue_create", { method: "POST", path: "/api/v3/repos/o/r/issues", body: { title: "t" } }],
+    ["issue_comment", { method: "POST", path: "/api/v3/repos/o/r/issues/3/comments", body: { body: "x" } }],
+    ["pr_unapprove", { method: "POST", path: "/v1/repositories/o/r/pulls/7/unapprove" }],
+  ] as const) {
+    const d = await (await gatewayMount({ tools: { api: "allow", [key]: "deny" } }))("api", args);
+    must(d.status === "rejected" && d.error?.code === "policy_denied", `${key}: deny did not refuse api ${args.path}: ${JSON.stringify(d)}`);
+  }
+  must(seen.length === 0, `reached the gateway: ${JSON.stringify(seen.map((x) => x.path))}`);
+  // Allowed both ways, a COMMENT review runs: its body is judged as JSON, as `call` sends it.
+  const open = await gatewayMount({ tools: { api: "allow" } });
+  const r4 = await open("api", { method: "POST", path: "/api/v3/repos/o/r/pulls/7/reviews", body: { event: "COMMENT", body: "hi" } });
+  must(r4.status === "succeeded" && seen.at(-1)?.path === "/api/v3/repos/o/r/pulls/7/reviews", `a COMMENT review: ${JSON.stringify(r4)}`);
+});
+
+await check("api: what the table refuses is refused where stamp.write and every tool are allowed, and on an approved replay", async () => {
+  const open = await gatewayMount({ write: "allow", tools: { api: "allow", "stamp.write": "allow", pr_approve: "allow", pr_merge: "allow", pr_comment: "allow" } });
+  for (const [method, path, body, said] of [
+    ["POST", "/api/v3/graphql", { query: "mutation{x}" }, /GraphQL/],
+    ["PUT", "/api/v3/repositories/123/pulls/7/merge", {}, /repositories\/<id>/],
+    ["POST", "/api/v3/repos/o/r/pulls/7/reviews?x=1", { event: "COMMENT" }, /query string/],
+    ["POST", "/api/v3/repos/o/r/pulls/7/reviews%3Fevent=APPROVE", { event: "COMMENT" }, /query string/],
+    ["POST", "/api/v3/repos/o/r/pulls/7/reviews", { Event: "APPROVE" }, /may not approve through a review/],
+    ["POST", "/api/v3/repos/o/r/pulls/7/reviews", { event: "COMMENT", Event: "APPROVE" }, /Name `event` once/],
+    ["POST", "/api/v3/repos/o/r/pulls/7/reviews", { event: ["APPROVE"] }, /Name `event` once/],
+    ["POST", "/api/v3/repos/o/r/pulls/7/reviews", { event: 1 }, /Name `event` once/],
+    ["PUT", "/v1/repositories/o/r/pulls/7/merge;x", {}, /; or a character outside ASCII/],
+    ["PUT", "/api/v3/repos/o/r/pulls/7/merge%3Bx", {}, /; or a character outside ASCII/],
+    ["PUT", "/api/v3/repos/o/r/pulls/7/ｍerge", {}, /; or a character outside ASCII/],
+    ["PUT", "/api/v3/repos/o/r/pulls/7/%EF%BD%8Derge", {}, /; or a character outside ASCII/],
+  ] as const) {
+    reset();
+    const r = await open("api", { method, path, body });
+    must(r.status === "failed" && /^stamp: (api may not |this review's body)/.test(r.error?.message) && said.test(r.error.message), `${method} ${path}: ${JSON.stringify(r)}`);
+    must(seen.length === 0, `${path} reached the gateway`);
+  }
+  // Held by default (api: approval) and approved by a person: the replay is refused, not run.
+  reset();
+  const held = await gatewayMount(null);
+  const r = await held("api", { method: "PUT", path: "/v1/repositories/o/r/pulls/7/merge", body: {} });
+  must(r.status === "pending", `held: ${JSON.stringify(r)}`);
+  const a = (await held.store.listApprovals("t", "pending"))[0]!;
+  const done: any = await held.gw.applyApproval("t", a.operationId, "approved", "owner");
+  must(done.result?.status !== "succeeded" && /api may not merge/.test(JSON.stringify(done)), `the replay: ${JSON.stringify(done)}`);
+  must(seen.length === 0, `the replay reached the gateway: ${JSON.stringify(seen.map((x) => x.path))}`);
+});
+
+await check("api is not modelOnly: a program's api call is held as a card, not refused as not_from_a_program", async () => {
+  must(stampPlugin.tools.find((t) => t.name === "api")?.modelOnly !== true, "api is modelOnly");
+  reset();
+  const call = await gatewayMount(null);
+  const r = await call.gw.invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "stamp.api", LABELS, { fromProgram: true }) as any;
+  must(r.status === "pending" && await pendingKey(call) === "stamp.write", `from a program: ${JSON.stringify(r)}`);
+});
+
+await check("api's policyKey never throws: a key for a listed or unlisted write, undefined for a refusal, a bad path or bad args", () => {
+  const key = (args: unknown, tool = "api") => stampPlugin.policyKey!(tool, args as any);
+  const circular: any = { a: 1 }; circular.self = circular;
+  for (const args of [null, undefined, 5, "x", [], {}, { path: 5 }, { method: "GET", path: "/v1/x" }, { method: "POST" },
+    { method: "POST", path: "//evil.example/v1/x" }, { method: "POST", path: "/v1/../api/auth/agent/refresh" },
+    { method: "POST", path: "/v1/repositories/o/r/pulls/7%2Fmerge" }, { method: "POST", path: "/api/v3/x", body: circular },
+    { method: "POST", path: "/api/v3/x", body: { n: 1n } }, { method: "PUT", path: "/v1/repositories/o/r/pulls/7/merge" },
+    { method: "POST", path: "/api/v3/graphql" }]) {
+    let got: unknown;
+    try { got = key(args); } catch (e) { throw new Error(`threw on ${String(args)}: ${(e as Error).message}`); }
+    must(got === undefined, `${JSON.stringify(args, (_k, v) => typeof v === "bigint" ? `${v}n` : v === circular ? "[circular]" : v)}: ${got}`);
+  }
+  must(key(LABELS) === "stamp.write" && key(COMMENT) === "pr_comment", `keys: ${key(LABELS)} ${key(COMMENT)}`);
+  // The body is judged as `call` sends it: a falsy one is no body at all, so a review without one is a comment.
+  for (const body of [null, "", 0, false]) {
+    const k = key({ method: "POST", path: "/api/v3/repos/o/r/pulls/7/reviews", body });
+    must(k === "pr_comment", `a review with body ${JSON.stringify(body)}: ${k}`);
+  }
+  must(key(LABELS, "api_get") === undefined && key(MERGE, "pr_merge") === undefined, "a key for another tool");
 });
 
 // Through the real gateway and store: the agent-level record is handed to a
