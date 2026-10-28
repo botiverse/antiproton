@@ -373,7 +373,12 @@ nothing; keep each reason a fixed string. It must not make a turn wait:
 `serverHasIntegration` answers from the runtime's per-agent memory of Raft's
 read-only app list (`ToolGateway.integrationInstalled`, never the login or
 grant route) and, when that is missing or stale, starts a read in the
-background, so the mount arrives on a later turn. A "no" is kept for an hour,
+background, so the mount arrives on a later turn: the first turn that
+starts after the read has answered "yes". A turn already running keeps the
+tools it started with (`reuseHarness`), so an agent checking right after a
+deploy sees no `stamp` at first and sees it from its next message on. An
+agent inside a long turn cannot make it appear by checking again: the new
+tools arrive with the turn that the next message starts. A "no" is kept for an hour,
 a failed read for a minute with the verdict before it; "unknown" (no usable
 `raft` mount, or no Raft credential) asks nothing of Raft and is not kept.
 `stamp` withholds on "no" and "unknown" alike.
