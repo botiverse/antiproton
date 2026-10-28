@@ -39,8 +39,8 @@ import type { Json, MountPolicy } from "../core/types.ts";
 import { openText, sealText } from "./raft-agent-login.ts";
 import { RAFT_MOUNT_ALIAS, raftIdentityOf } from "./raft-identity.ts";
 import { FILES as SDK_FILES } from "./stamp-sdk-box.ts";
-import type { BridgeDecl, BridgeIo, BridgeRequest, BridgeResponse, CredentialCheck, Plugin, PluginContext, RouteEntry, ToolSchema } from "./types.ts";
-import { credentialState, identityNote, markIdentity, policyFor } from "./types.ts";
+import type { BridgeDecl, BridgeIo, BridgeRequest, BridgeResponse, CredentialCheck, Plugin, PluginContext, RouteClass, RouteEntry, ToolSchema } from "./types.ts";
+import { classifyRoute, credentialState, identityNote, markIdentity, policyFor } from "./types.ts";
 
 /** The one host this plugin talks to. Not a setting: nothing here has been tried against a self-hosted Stamp. */
 const ORIGIN = "https://stamp.build";
@@ -886,47 +886,17 @@ function gatewayPath(raw: unknown, allowed: readonly string[]): string {
   return url.pathname + url.search;
 }
 
-/**
- * What `api` must not do, because a dedicated tool does it and that tool is held
- * for a person by default (`defaultPolicy`): a mount that lifted `api` for some
- * other write would otherwise approve or merge through it. Matched on the path
- * as Stamp will route it — decoded, empty segments and a trailing slash
- * dropped, any case — so a
- * spelling that reaches the same route is the same route. Null: not held.
- * The list is of routes known to approve or merge, not of every spelling: one that
- * stays encoded past Stamp's routing (`merge%3Fx`, `merge%2520`) is a different
- * route there and is not held. `..` in any spelling never gets here: gatewayPath
- * refuses a path that climbs out.
- */
-function heldRoute(method: string, path: string, body: unknown): "an approval" | "a merge" | null {
-  let p = path.split("?", 1)[0];
-  // Decoded at least as many times as anything upstream would, so `%252F` cannot slip past
-  // as a slash decoded twice. gatewayPath decodes four times for its own dot-segment
-  // check; the counts match, but neither one depends on the other.
-  for (let i = 0; i < 4 && p.includes("%"); i++) {
-    try { p = decodeURIComponent(p); } catch { break; /* gatewayPath already refused what would matter */ }
-  }
-  // Empty segments collapsed: `pulls/7//merge` must meet the hold, not a redirect further on.
-  p = p.replace(/\/{2,}/g, "/").replace(/\/+$/, "").toLowerCase();
-  if (/^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/approve$/.test(p)) return "an approval";
-  // DELETE on these is leaving the queue or cancelling auto-merge: undoing a merge request, not making one.
-  if (method !== "DELETE" && /^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/(merge|auto-merge|queue(\/[^/]+)?)$/.test(p)) return "a merge";
-  if (/^\/api\/v3\/repos\/[^/]+\/[^/]+\/(pulls\/[^/]+\/merge|merges)$/.test(p)) return "a merge";
-  if (/^\/api\/v3\/repos\/[^/]+\/[^/]+\/pulls\/[^/]+\/reviews(\/[^/]+\/events)?$/.test(p)) {
-    const event = body && typeof body === "object" ? String((body as Record<string, unknown>).event ?? "") : "";
-    if (event.toUpperCase() === "APPROVE") return "an approval";
-  }
-  return null;
-}
-
 /** What a person signs for unless the mount names the tool: see `defaultPolicy` below. */
 const DEFAULT_POLICY: MountPolicy = {
   // stamp_login (cody, botiverse/antiproton#1084): Raft's Agent Login is granted with no one asked, so the moment a
   // mount first gains a Stamp identity that can write to GitHub is where a person is put. A mount's own policy may
   // allow it; nothing after the login (rotation, use) asks again.
-  // `stamp.write` (`UNLISTED_WRITE_KEY`): a program's write that `STAMP_ROUTES` does not name. The core holds it at
-  // `approval` whatever this says, and only a mount's own entry lifts it. `request` has no entry, on purpose: an
-  // unlisted read is decided under it, and an entry here would put every off-table GET in front of a person.
+  // `stamp.write` (`UNLISTED_WRITE_KEY`): a write the route table does not name, a program's (`STAMP_ROUTES`) or
+  // `api`'s (`API_ROUTES`, through `policyKey`), and the writes no tool makes (requesting changes, cancelling
+  // auto-merge, leaving the queue). For a program the core holds it at `approval` whatever this says; for `api` this
+  // entry does. Either way only a mount's own entry lifts it, so `api: allow` alone runs only the listed writes whose
+  // tools the mount allows. `request` has no entry, on purpose: an unlisted read is decided under it, and an entry
+  // here would put every off-table GET in front of a person.
   tools: { pr_approve: "approval", pr_merge: "approval", api: "approval", [LOGIN_TOOL]: "approval", "stamp.write": "approval" },
 };
 
@@ -1177,6 +1147,79 @@ function reviewEvent(body: { [k: string]: Json } | null, raw: string | null): st
 }
 
 const NOT_ON_BRIDGE = "a program's request through sdk:stamp may not";
+/** How `api`'s refusals begin: the same rows as the bridge's, said of the tool (`API_ROUTES`). */
+const NOT_ON_API = "api may not";
+
+// The patterns, methods and body checks both tables share (`stampRoutes`): one copy, so the two cannot drift apart.
+const AUTH_PATH = /^\/api\/auth(\/|$)/;
+const OFF_PREFIX = /^(?!\/v1\/|\/api\/v3\/)/;
+const V1_APPROVE = re(`${V1_REPO}/pulls/${SEG}/approve$`);
+const V1_MERGE = re(`${V1_REPO}/pulls/${SEG}/(merge|auto-merge|queue(/${SEG})?)$`);
+const V1_UNMERGE = re(`${V1_REPO}/pulls/${SEG}/(auto-merge|queue(/${SEG})?)$`);
+const V3_MERGE = re(`${V3_REPO}/(pulls/${SEG}/merge|merges)$`);
+const GRAPHQL = /^\/api\/v3\/graphql$/;
+const REPOSITORY_ID = /^\/api\/v3\/repositories(\/|$)/;
+const REVIEW = re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}(/events)?)?$`);
+const V3_PR_COMMENT = re(`${V3_REPO}/pulls/(${SEG}/comments(/${SEG}/replies)?)$`);
+const V1_PR_COMMENT = re(`${V1_REPO}/pulls/${SEG}/comments$`);
+const V1_UNAPPROVE = re(`${V1_REPO}/pulls/${SEG}/unapprove$`);
+const V1_PR_CREATE = /^\/v1\/pull-requests$/;
+const V3_PR_CREATE = re(`${V3_REPO}/pulls$`);
+const ISSUE_CREATE = re(`(${V1_REPO}|${V3_REPO})/issues$`);
+const ISSUE_COMMENT = re(`(${V1_REPO}|${V3_REPO})/issues/${SEG}/comments$`);
+const MERGE_METHODS = ["POST", "PUT", "PATCH"] as const;
+const COMMENT_METHODS = ["POST", "PUT", "PATCH"] as const;
+const POST = ["POST"] as const;
+const approves = (b: { [k: string]: Json } | null, raw: string | null) => reviewEvent(b, raw).includes("APPROVE");
+const requestsChanges = (b: { [k: string]: Json } | null, raw: string | null) => reviewEvent(b, raw).includes("REQUEST_CHANGES");
+
+/**
+ * The route table, said of `subject` ("… may not"): the bridge's (`STAMP_ROUTES`) and `api`'s (`API_ROUTES`) are these
+ * rows, so a spelling one of them refuses or decides under a key, the other does too. `unsure` is the APPROVE row's
+ * answer to a review body it cannot judge, which names a remedy each caller can follow.
+ */
+function stampRoutes(subject: string, unsure: string): readonly RouteEntry[] {
+  return [
+    // The session endpoints are this plugin's own (`rotate`, `selfLogin`): a program never signs in or refreshes.
+    { methods: ANY, path: AUTH_PATH, refuse: `${subject} reach /api/auth: the mount keeps and refreshes its own session` },
+    // The same prefixes `api` keeps to (`API_PREFIXES`); `send` checks them again.
+    { methods: ANY, path: OFF_PREFIX, refuse: `${subject} leave /v1/ and /api/v3/` },
+    { methods: ANY, path: V1_APPROVE,
+      refuse: `${subject} approve: call pr_approve, which names the exact head a person signs for` },
+    { methods: MERGE_METHODS, path: V1_MERGE,
+      refuse: `${subject} merge, enable auto-merge or join the queue: call pr_merge, which names the exact head a person signs for` },
+    // Cancelling auto-merge or leaving the queue is not merging, but it is a write someone should see until it is known
+    // to be harmless.
+    { methods: ["DELETE"], path: V1_UNMERGE, key: UNLISTED_WRITE_KEY },
+    { methods: WRITES, path: V3_MERGE,
+      refuse: `${subject} merge through GitHub's API: call pr_merge, which names the exact head a person signs for` },
+    // A GraphQL mutation can approve or merge, and its body is not something a row can judge.
+    { methods: ANY, path: GRAPHQL, refuse: `${subject} use GitHub's GraphQL API, which can approve or merge: use the REST paths, or the stamp tools` },
+    // GitHub's repository-id alias reaches every route below under another spelling; the table is written for owner/repo.
+    { methods: ANY, path: REPOSITORY_ID,
+      refuse: `${subject} use GitHub's /repositories/<id> paths: name the repository as /api/v3/repos/<owner>/<repo>, or use the pr_* tools` },
+    // A review write with a query: the table matches the path without it, so whatever upstream reads there (an `event`)
+    // is something no row can judge.
+    { methods: WRITES, path: REVIEW, withQuery: true,
+      refuse: `${subject} write a review with a query string, which this table cannot judge: put every field in the JSON body` },
+    // Every write to a review, not only POST: which methods upstream reads an `event` on is not this table's to guess.
+    { methods: WRITES, path: REVIEW, body: approves,
+      refuse: `${subject} approve through a review: call pr_approve, which names the exact head a person signs for`,
+      unsure },
+    // Requesting changes blocks a merge and no tool does it, so it is held under the write key, not run as a comment.
+    { methods: WRITES, path: REVIEW, body: requestsChanges, key: UNLISTED_WRITE_KEY },
+    // Any other review (COMMENT, a pending one), and editing one: a comment.
+    { methods: COMMENT_METHODS, path: REVIEW, key: "pr_comment" },
+    { methods: POST, path: V3_PR_COMMENT, key: "pr_comment" },
+    { methods: POST, path: V1_PR_COMMENT, key: "pr_comment" },
+    { methods: POST, path: V1_UNAPPROVE, key: "pr_unapprove" },
+    { methods: POST, path: V1_PR_CREATE, key: "pr_create" },
+    { methods: POST, path: V3_PR_CREATE, key: "pr_create" },
+    { methods: POST, path: ISSUE_CREATE, key: "issue_create" },
+    { methods: POST, path: ISSUE_COMMENT, key: "issue_comment" },
+  ];
+}
+
 /**
  * Which tool's policy decides each request a program makes through `sdk:stamp`, or that it never runs there. The first
  * row that matches decides (`classifyRoute`), on the path as sent (the core refuses `%`, `//`, `.` and `..` before
@@ -1190,49 +1233,61 @@ const NOT_ON_BRIDGE = "a program's request through sdk:stamp may not";
  * never judged; a review write that carries one at all is refused, so `?event=APPROVE` cannot ride beside a body that
  * says nothing. GitHub's `/repositories/<id>` alias is refused whole, since every row here is written for owner/repo.
  */
-export const STAMP_ROUTES: readonly RouteEntry[] = [
-  // The session endpoints are this plugin's own (`rotate`, `selfLogin`): a program never signs in or refreshes.
-  { methods: ANY, path: /^\/api\/auth(\/|$)/, refuse: `${NOT_ON_BRIDGE} reach /api/auth: the mount keeps and refreshes its own session` },
-  // The same prefixes `api` keeps to (`API_PREFIXES`); `send` checks them again.
-  { methods: ANY, path: /^(?!\/v1\/|\/api\/v3\/)/, refuse: `${NOT_ON_BRIDGE} leave /v1/ and /api/v3/` },
-  { methods: ANY, path: re(`${V1_REPO}/pulls/${SEG}/approve$`),
-    refuse: `${NOT_ON_BRIDGE} approve: call pr_approve, which names the exact head a person signs for` },
-  { methods: ["POST", "PUT", "PATCH"], path: re(`${V1_REPO}/pulls/${SEG}/(merge|auto-merge|queue(/${SEG})?)$`),
-    refuse: `${NOT_ON_BRIDGE} merge, enable auto-merge or join the queue: call pr_merge, which names the exact head a person signs for` },
-  // Cancelling auto-merge or leaving the queue is not merging, but it is a write someone should see until it is known
-  // to be harmless.
-  { methods: ["DELETE"], path: re(`${V1_REPO}/pulls/${SEG}/(auto-merge|queue(/${SEG})?)$`), key: UNLISTED_WRITE_KEY },
-  { methods: WRITES, path: re(`${V3_REPO}/(pulls/${SEG}/merge|merges)$`),
-    refuse: `${NOT_ON_BRIDGE} merge through GitHub's API: call pr_merge, which names the exact head a person signs for` },
-  // A GraphQL mutation can approve or merge, and its body is not something a row can judge.
-  { methods: ANY, path: /^\/api\/v3\/graphql$/, refuse: `${NOT_ON_BRIDGE} use GitHub's GraphQL API, which can approve or merge: use the REST paths, or the stamp tools` },
-  // GitHub's repository-id alias reaches every route below under another spelling; the table is written for owner/repo.
-  { methods: ANY, path: /^\/api\/v3\/repositories(\/|$)/,
-    refuse: `${NOT_ON_BRIDGE} use GitHub's /repositories/<id> paths: name the repository as /api/v3/repos/<owner>/<repo>, or use the pr_* tools` },
-  // A review write with a query: the table matches the path without it, so whatever upstream reads there (an `event`)
-  // is something no row can judge.
-  { methods: WRITES, path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}(/events)?)?$`), withQuery: true,
-    refuse: `${NOT_ON_BRIDGE} write a review with a query string, which this table cannot judge: put every field in the JSON body` },
-  // Every write to a review, not only POST: which methods upstream reads an `event` on is not this table's to guess.
-  { methods: WRITES, path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}(/events)?)?$`),
-    body: (b, raw) => reviewEvent(b, raw).includes("APPROVE"),
-    refuse: `${NOT_ON_BRIDGE} approve through a review: call pr_approve, which names the exact head a person signs for`,
-    unsure: "this review's body could not be read as a JSON object with a string `event` (sent with content-type: " +
-      "application/json), so it may be an approval and is refused. Send it as JSON, or use the tools: pr_comment to " +
-      "comment, pr_approve to approve" },
-  // Requesting changes blocks a merge and no tool does it, so it is held under the write key, not run as a comment.
-  { methods: WRITES, path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}(/events)?)?$`),
-    body: (b, raw) => reviewEvent(b, raw).includes("REQUEST_CHANGES"), key: UNLISTED_WRITE_KEY },
-  // Any other review (COMMENT, a pending one), and editing one: a comment.
-  { methods: ["POST", "PUT", "PATCH"], path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}(/events)?)?$`), key: "pr_comment" },
-  { methods: ["POST"], path: re(`${V3_REPO}/pulls/(${SEG}/comments(/${SEG}/replies)?)$`), key: "pr_comment" },
-  { methods: ["POST"], path: re(`${V1_REPO}/pulls/${SEG}/comments$`), key: "pr_comment" },
-  { methods: ["POST"], path: re(`${V1_REPO}/pulls/${SEG}/unapprove$`), key: "pr_unapprove" },
-  { methods: ["POST"], path: /^\/v1\/pull-requests$/, key: "pr_create" },
-  { methods: ["POST"], path: re(`${V3_REPO}/pulls$`), key: "pr_create" },
-  { methods: ["POST"], path: re(`(${V1_REPO}|${V3_REPO})/issues$`), key: "issue_create" },
-  { methods: ["POST"], path: re(`(${V1_REPO}|${V3_REPO})/issues/${SEG}/comments$`), key: "issue_comment" },
-];
+export const STAMP_ROUTES: readonly RouteEntry[] = stampRoutes(NOT_ON_BRIDGE,
+  "this review's body could not be read as a JSON object with a string `event` (sent with content-type: " +
+  "application/json), so it may be an approval and is refused. Send it as JSON, or use the tools: pr_comment to " +
+  "comment, pr_approve to approve");
+
+/**
+ * The same rows for the `api` tool (botiverse/antiproton#1092 step 4), its refusals said of `api`. Its body is always
+ * sent as JSON, so the APPROVE row's `unsure` is about the body's shape alone: an `event` that is not a string, or one
+ * named twice in any case.
+ */
+export const API_ROUTES: readonly RouteEntry[] = stampRoutes(NOT_ON_API,
+  "this review's body does not name one string `event`, so it may be an approval and is refused. Name `event` once, " +
+  "as a string, or use the tools: pr_comment to comment, pr_approve to approve");
+
+/** The methods `api` writes with; a read is `api_get`'s. */
+const API_METHODS = ["POST", "PATCH", "PUT", "DELETE"] as const;
+
+/**
+ * How `api` decides one call: by `API_ROUTES`, on the path `call` will send (`gatewayPath`, which throws on one that
+ * climbs out or leaves the prefixes), spelled as Stamp will route it. That is decoded as many times as anything upstream
+ * would (four, as `gatewayPath`'s own dot-segment check, so `%252F` cannot slip past as a slash decoded twice), with
+ * empty segments collapsed (`pulls/7//merge` meets the merge row, not a redirect further on) and a trailing slash
+ * dropped; matched in any case (`classifyRoute`). An escaped `?` or `#` ends the path there and counts as a query.
+ *
+ * Refused before the table, as the bridge refuses them (`bridgePath` in the gateway): a `;` (a matrix parameter, so
+ * `merge;x`) and anything outside ASCII (a full-width `ｍerge`), as sent or once decoded — spellings a server may route
+ * as a listed path while a pattern does not see it. So is a path whose escapes do not decode as UTF-8 (`%FF`), in any
+ * round: what this reads would not be what Stamp routes. The body is judged as `call` sends it: JSON, or none when falsy.
+ */
+export function apiRoute(method: unknown, rawPath: unknown, body: unknown): { method: string; path: string; route: RouteClass } {
+  const m = String(method ?? "");
+  if (!(API_METHODS as readonly string[]).includes(m)) {
+    throw new Error(`method must be one of ${API_METHODS.join(", ")}, got ${JSON.stringify(m).slice(0, 20)}`);
+  }
+  const path = gatewayPath(rawPath, API_PREFIXES);
+  let hasQuery = path.includes("?") || String(rawPath ?? "").split("#", 1)[0]!.includes("?");
+  let p = path.split("?", 1)[0]!;
+  for (let i = 0; i < 4 && p.includes("%"); i++) {
+    // Refused, not left half-decoded: one escape that is not UTF-8 (`%FF`) would keep every other escape encoded
+    // here, while Stamp decodes byte by byte and routes `o%FF/r/pulls/7%2Fmerge` as a merge.
+    try { p = decodeURIComponent(p); } catch {
+      return { method: m, path, route: { kind: "refused", message: `${NOT_ON_API} name a path whose escapes do not decode as UTF-8, which may route as another path: escape each character as UTF-8, or spell it in plain ASCII` } };
+    }
+  }
+  const cut = p.search(/[?#]/);
+  if (cut >= 0) { p = p.slice(0, cut); hasQuery = true; }
+  if (/[;\x00-\x20\x7f]|[^\x00-\x7e]/.test(p)) {
+    return { method: m, path, route: { kind: "refused", message: `${NOT_ON_API} name a path with ;, a space, a control character or a character outside ASCII, which may route as another path: spell it in plain ASCII` } };
+  }
+  p = p.replace(/\/{2,}/g, "/");
+  if (p.length > 1) p = p.replace(/\/+$/, "");
+  const text = body ? JSON.stringify(body) : null;
+  return { method: m, path, route: classifyRoute(API_TABLE, m, p, text, "application/json", hasQuery) };
+}
+const API_TABLE = { routes: API_ROUTES, unlistedWriteKey: UNLISTED_WRITE_KEY };
 
 /** What the approval card names for a bridged request: the repository, and the pull request or issue number. */
 function describeRoute(path: string): { repo?: string; pr?: number } {
@@ -1352,13 +1407,31 @@ export const stampPlugin: Plugin = {
   /**
    * The tools a person signs unless the mount names them otherwise. Approving
    * and merging cannot be undone by trying again, and `api` writes to anything
-   * under /v1/ or GitHub's API — including approving and merging. An absent mount
-   * policy allows everything (`policyFor`), so without this they would run
-   * unattended on every mount that did not think to say.
+   * under /v1/ or GitHub's API. `api` never approves or merges (`API_ROUTES`
+   * refuses those), but it is held as a whole too, and each call is also decided
+   * under its row's key (`policyKey`). An absent mount policy allows everything
+   * (`policyFor`), so without this they would run unattended on every mount that
+   * did not think to say.
    */
   defaultPolicy: DEFAULT_POLICY,
   // `await import("sdk:stamp")` in run_js: the SDK's client, each request a call of `stamp.request` (`STAMP_ROUTES`).
   bridge: STAMP_BRIDGE,
+  /**
+   * `api` is decided by the bridge's rows (`API_ROUTES`): a listed write under its row's key, the tool of the same
+   * effect, so a mount's entry for `pr_comment` or `pr_create` covers `api` too; an unlisted one under `stamp.write`.
+   * The gateway takes the stricter of `api`'s own entry and the key's. Never throws: a call the table refuses, or whose
+   * path or method is not one `api` takes, has no key and is refused by the handler (`apiRoute`).
+   */
+  policyKey(tool: string, args: Json): string | undefined {
+    if (tool !== "api" || !args || typeof args !== "object" || Array.isArray(args)) return undefined;
+    try {
+      const a = args as Record<string, unknown>;
+      const { route } = apiRoute(a.method, a.path, a.body);
+      return route.kind === "listed" || route.kind === "unlisted-write" ? route.key : undefined;
+    } catch {
+      return undefined;
+    }
+  },
   // The one service this plugin may log in to through the agent's raft mount (`ctx.agentLogin`).
   agentLogin: { services: [STAMP_SERVICE] },
   tools: [
@@ -1650,16 +1723,10 @@ export const stampPlugin: Plugin = {
         return (await call("GET", gatewayPath(a.path, API_PREFIXES), ctx)) as Json;
 
       case "api": {
-        const method = String(a.method ?? "");
-        if (!["POST", "PATCH", "PUT", "DELETE"].includes(method)) {
-          throw new Error(`method must be one of POST, PATCH, PUT, DELETE, got ${JSON.stringify(method).slice(0, 20)}`);
-        }
-        const path = gatewayPath(a.path, API_PREFIXES);
-        const held = heldRoute(method, path, a.body);
-        if (held) {
-          throw new Error(`stamp: ${held} goes through ${held === "a merge" ? "pr_merge" : "pr_approve"}, not api — ` +
-            "that is the tool a person signs for this mount, and api would be a way around it");
-        }
+        // Decided at the gateway by `policyKey` on the same table; refused here, so neither an approved replay nor a
+        // mount that sets `stamp.write: allow` runs what the table refuses.
+        const { method, path, route } = apiRoute(a.method, a.path, a.body);
+        if (route.kind === "refused") throw new Error(`stamp: ${route.message}`);
         return (await call(method, path, ctx, a.body)) as Json;
       }
 

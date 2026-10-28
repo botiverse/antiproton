@@ -170,6 +170,20 @@ policy does not name them, because approving or merging cannot be undone by
 trying again. Only the mount's own per-tool entry lifts one; a mount-wide
 `write: "allow"` does not.
 
+`stamp`'s `api` tool (any write under `/v1/` or `/api/v3/`) is decided by the
+same route table as a run_js program's `sdk:stamp` requests. A write the table
+names is also decided under the tool of the same effect, the stricter of the
+two: `api: "allow"` with `pr_comment: "deny"` refuses a comment through `api`.
+A write it does not name, requesting changes, and cancelling auto-merge or
+leaving the queue are decided under `stamp.write`, held for a person unless the
+mount allows it. So `api: "allow"` alone runs only listed writes whose tools the
+mount allows. What the table refuses (approving, merging, GraphQL, the
+`/repositories/<id>` alias, a review write with a query, a review body with no
+single string `event`, and a path with `;`, a space or control character, a character outside ASCII, or
+escapes that do not decode as UTF-8) `api`
+refuses too, even after a person approves the call and even with
+`stamp.write: "allow"`.
+
 The parking matters more than it sounds. Answering a held call with an error
 made the agent announce it could not proceed and stop; told instead that it is
 paused and a decision is coming, the same task went from a 75s failure to a

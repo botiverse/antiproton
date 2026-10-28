@@ -15,7 +15,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { stampPlugin, STAMP_ROUTES, UNLISTED_WRITE_KEY } from "../src/plugins/stamp.ts";
+import { stampPlugin, STAMP_ROUTES, API_ROUTES, UNLISTED_WRITE_KEY, apiRoute } from "../src/plugins/stamp.ts";
 import { FILES, STAMP_SDK_VERSION } from "../src/plugins/stamp-sdk-box.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
@@ -24,7 +24,7 @@ import { DynamicWorkerExecutor } from "../src/runtime/dynamic-worker-executor.ts
 import { bridgeModulesFor } from "../src/runtime/pi-tools.ts";
 import { DEFAULT_LIMITS } from "../src/core/execution.ts";
 import { UNJUDGED_BODY } from "../src/plugins/types.ts";
-import type { Plugin } from "../src/plugins/types.ts";
+import type { Plugin, RouteEntry } from "../src/plugins/types.ts";
 import { standInLoader } from "./spec/worker-stand-in.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -582,6 +582,104 @@ await check("describe names the repository and number on v1 and v3 pull and issu
   // In any case, as the table matches: the card must name what a person signs for however the program spelled it.
   must(JSON.stringify(d("/V1/Repositories/o/r/PULLS/7")) === '{"repo":"o/r","pr":7}', "v1 in another case");
   must(JSON.stringify(d("/API/V3/REPOS/o/r/ISSUES/3")) === '{"repo":"o/r","pr":3}', "v3 in another case");
+});
+
+// ---- step 4: `api` is decided by the same rows (botiverse/antiproton#1092) -------------------------------------------
+
+/** Every refusal and `unsure` the bridge says, as text: pinned so that sharing the rows with `api` changed none of them. */
+const BRIDGE_WORDS = [
+  "a program's request through sdk:stamp may not reach /api/auth: the mount keeps and refreshes its own session",
+  "a program's request through sdk:stamp may not leave /v1/ and /api/v3/",
+  "a program's request through sdk:stamp may not approve: call pr_approve, which names the exact head a person signs for",
+  "a program's request through sdk:stamp may not merge, enable auto-merge or join the queue: call pr_merge, which names the exact head a person signs for",
+  "a program's request through sdk:stamp may not merge through GitHub's API: call pr_merge, which names the exact head a person signs for",
+  "a program's request through sdk:stamp may not use GitHub's GraphQL API, which can approve or merge: use the REST paths, or the stamp tools",
+  "a program's request through sdk:stamp may not use GitHub's /repositories/<id> paths: name the repository as /api/v3/repos/<owner>/<repo>, or use the pr_* tools",
+  "a program's request through sdk:stamp may not write a review with a query string, which this table cannot judge: put every field in the JSON body",
+  "a program's request through sdk:stamp may not approve through a review: call pr_approve, which names the exact head a person signs for",
+  "this review's body could not be read as a JSON object with a string `event` (sent with content-type: application/json), so it may be an approval and is refused. Send it as JSON, or use the tools: pr_comment to comment, pr_approve to approve",
+];
+
+await check("step 4 pin: API_ROUTES is STAMP_ROUTES row by row — same methods, pattern, query rule, body check and key; only the wording differs", () => {
+  must(API_ROUTES.length === STAMP_ROUTES.length && API_ROUTES.length === 19, `rows: ${API_ROUTES.length} vs ${STAMP_ROUTES.length}`);
+  STAMP_ROUTES.forEach((b, i) => {
+    const a = API_ROUTES[i]!;
+    const at = `row ${i} (${b.path.source})`;
+    must(JSON.stringify(a.methods) === JSON.stringify(b.methods), `${at}: methods ${a.methods} vs ${b.methods}`);
+    must(a.path.source === b.path.source && a.path.flags === b.path.flags, `${at}: pattern ${a.path}`);
+    must(a.withQuery === b.withQuery, `${at}: withQuery`);
+    // The same function, not a copy of it: a predicate edited in one table is edited in both.
+    must(a.body === b.body, `${at}: body check`);
+    must(a.key === b.key, `${at}: key ${a.key} vs ${b.key}`);
+    const unsure = (r: RouteEntry) => (r.refuse !== undefined ? r.unsure : undefined);
+    must((a.refuse === undefined) === (b.refuse === undefined) && (unsure(a) === undefined) === (unsure(b) === undefined), `${at}: refuse/unsure`);
+    if (b.refuse !== undefined) {
+      const prefix = "a program's request through sdk:stamp may not ";
+      must(b.refuse.startsWith(prefix) && a.refuse === `api may not ${b.refuse.slice(prefix.length)}`, `${at}: ${JSON.stringify(a.refuse)}`);
+    }
+  });
+  const words = STAMP_ROUTES.flatMap((r) => (r.refuse !== undefined ? [r.refuse, r.unsure] : [])).filter((x): x is string => x !== undefined);
+  must(JSON.stringify(words) === JSON.stringify(BRIDGE_WORDS), `the bridge's wording moved: ${JSON.stringify(words)}`);
+});
+
+/** Each spelling, its body as the box would send it; `api` gets the same body parsed, as a model's arguments carry it. */
+const PARITY: Array<[string, string, string | null, string]> = [
+  ["POST", `${V1PR}/approve`, "{}", "refused"],
+  ["PUT", `${V1PR}/MERGE`, "{}", "refused"],
+  ["PUT", `${V1PR}/merge/`, "{}", "refused"],
+  ["PUT", `${V1PR}/queue/req_1`, "{}", "refused"],
+  ["DELETE", `${V1PR}/auto-merge`, null, UNLISTED_WRITE_KEY],
+  ["DELETE", `${V1PR}/queue/req_1`, null, UNLISTED_WRITE_KEY],
+  ["PUT", "/api/v3/repos/o/r/pulls/7/merge", "{}", "refused"],
+  ["POST", "/api/v3/repos/o/r/merges", "{}", "refused"],
+  ["POST", "/api/v3/graphql", '{"query":"mutation{x}"}', "refused"],
+  ["PUT", "/api/v3/repositories/123/pulls/7/merge", "{}", "refused"],
+  ["POST", REVIEW, '{"event":"APPROVE"}', "refused"],
+  ["POST", `${REVIEW}/55/events`, '{"Event":" approve "}', "refused"],
+  ["POST", REVIEW, '{"event":"COMMENT","Event":"APPROVE"}', "refused"],
+  ["POST", REVIEW, '{"event":["APPROVE"]}', "refused"],
+  ["POST", `${REVIEW}?x=1`, '{"event":"COMMENT"}', "refused"],
+  ["POST", REVIEW, '{"event":"REQUEST_CHANGES"}', UNLISTED_WRITE_KEY],
+  ["POST", REVIEW, '{"event":"COMMENT","body":"hi"}', "pr_comment"],
+  ["PUT", `${REVIEW}/55`, '{"body":"edited"}', "pr_comment"],
+  ["POST", "/api/v3/repos/o/r/pulls/7/comments", '{"body":"x"}', "pr_comment"],
+  ["POST", `${V1PR}/unapprove`, "{}", "pr_unapprove"],
+  ["POST", "/v1/pull-requests", "{}", "pr_create"],
+  ["POST", "/api/v3/repos/o/r/issues", "{}", "issue_create"],
+  ["POST", "/v1/repositories/o/r/issues/3/comments", "{}", "issue_comment"],
+  ["POST", "/api/v3/repos/o/r/labels", '{"name":"x"}', UNLISTED_WRITE_KEY],
+  ["DELETE", "/api/v3/repos/o/r/git/refs/heads/x", null, UNLISTED_WRITE_KEY],
+  // A matrix parameter and a character outside ASCII: refused by both, on a listed route and an unlisted one alike.
+  ["PUT", `${V1PR}/merge;x`, "{}", "refused"],
+  ["POST", "/api/v3/repos/o/r/labels;x", '{"name":"x"}', "refused"],
+  ["PUT", "/api/v3/repos/o/r/pulls/7/ｍerge", "{}", "refused"],
+  ["POST", "/api/v3/repos/o/r/issues/3/commentsé", "{}", "refused"],
+  // A space or a control character once decoded: the bridge refuses any escape, api refuses these after decoding.
+  ["PUT", "/api/v3/repos/o/r/pulls/7/merge%09", "{}", "refused"],
+  ["PUT", "/api/v3/repos/o/r/pulls/7/merge%00", "{}", "refused"],
+  ["PUT", "/api/v3/repos/o/r/pulls/7/merge%20", "{}", "refused"],
+  // An escape that is not UTF-8, beside one that would spell a merge or an approval once decoded.
+  ["PUT", "/api/v3/repos/o%FF/r/pulls/7%2Fmerge", "{}", "refused"],
+  ["PUT", "/api/v3/repos/o/r/pulls/7%FF%2Fmerge", "{}", "refused"],
+  ["POST", "/api/v3/repos/o/r%FF/pulls/7%2Fapprove", "{}", "refused"],
+];
+
+await check("step 4 parity: the bridge and api decide every spelling alike — the same key, or both refuse (; and non-ASCII included)", async () => {
+  const keyed = { request: "allow", pr_comment: "approval", pr_create: "approval", pr_unapprove: "approval", issue_create: "approval", issue_comment: "approval" };
+  for (const [method, path, body, want] of PARITY) {
+    const m = await mount({ tools: keyed });
+    const r = await m.request(method, path, body);
+    const card = (await m.store.listApprovals("t", "pending"))[0]?.request as any;
+    const bridge = r.status === "rejected" && (r.error?.code === "route_refused" || r.error?.code === "bad_request") ? "refused"
+      : r.status === "pending" ? card?.policyKey : `${r.status} ${r.error?.code}`;
+    const args = { method, path, ...(body === null ? {} : { body: JSON.parse(body) }) };
+    const { route } = apiRoute(method, path, args.body);
+    const api = route.kind === "refused" ? "refused" : route.kind === "unlisted-read" ? "read" : route.key;
+    const hook = stampPlugin.policyKey!("api", args as any);
+    must(bridge === want && api === want, `${method} ${path} ${body}: bridge ${bridge}, api ${api}, want ${want}`);
+    must(hook === (want === "refused" ? undefined : want), `${method} ${path}: policyKey ${hook}`);
+  }
+  must(seen.length === 0, `reached upstream: ${JSON.stringify(seen)}`);
 });
 
 for (const r of results) {
