@@ -1,5 +1,5 @@
 import type { Json, MountRecord } from "../core/types.ts";
-import type { CredentialRefKind, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm, ToolSchema } from "./types.ts";
+import type { CredentialRefKind, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm, ToolSchema, Withdrawal } from "./types.ts";
 import { backgrounded, identityNote, LEASE_KEY, markIdentity, markReleased, releaseRetryMs } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
@@ -1524,6 +1524,17 @@ const UNKNOWN_WIRING: Wired = { alias: "", plugin: "", placeholder: "", digest: 
  * secret is accepted again and then not substituted (measured on run9,
  * 2026-09-15: re-registered after a policy change, GitHub answered 401).
  */
+/**
+ * Whether `value` carries a placeholder made for this box (`placeholderFor`), as itself or in the base64 form a git
+ * registration wraps it in: the mark is the box id's tail, which every placeholder for the box carries.
+ */
+export function carriesBoxPlaceholder(value: string, boxId: string): boolean {
+  const mark = `_${boxId.slice(-8).replace(/[^A-Za-z0-9]/g, "_")}_`;
+  const forms = [value];
+  try { forms.push(atob(value)); } catch { /* not base64 */ }
+  return forms.some((v) => v.includes("__AP_") && v.includes(mark));
+}
+
 export function placeholderFor(
   alias: string, boxId: string,
   fresh = [...crypto.getRandomValues(new Uint8Array(3))].map((b) => b.toString(16).padStart(2, "0")).join(""),
@@ -1687,6 +1698,9 @@ async function reconcileAccounts(
   ctx: PluginContext, state: BoxState, provider: SandboxProvider,
   want: Awaited<ReturnType<typeof accountsWanted>>, machine: string,
 ): Promise<BoxState> {
+  // A deleted agent's container acts as nobody: what was wired is taken off, and nothing is wired again, whatever the
+  // mounts still hold (its delete withdraws first, and a command racing that must not put the accounts back).
+  if (ctx.agentDeleted) want = { wire: [], leftOut: [] };
   const had = state.wired ?? [];
   const same = (w: Wired, c: { alias: string; plugin: string; digest: string }) =>
     w.alias === c.alias && w.plugin === c.plugin && w.digest === c.digest && w.names !== null;
@@ -2356,6 +2370,81 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     async usage(ctx: PluginContext): Promise<MountUsage[]> {
       // The shared window: every machine's sessions, each naming its machine when not the default.
       return usageOf(asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY)));
+    },
+    /**
+     * Every egress registration on every box this mount holds, removed, and the record of what was wired cleared:
+     * for an agent's delete (`Holding.withdraw`). run9 holds the registered value and swaps it in on the box's way
+     * out with no call back here, so this is the only way to stop a box still running from using it.
+     *
+     * A box is `clean` only on positive evidence: its registrations listed again after the removal, under this
+     * mount's key, as a complete and readable list (run9's is a bare array with no pages; anything else throws),
+     * showing none; and no project-scope registration carrying one of its placeholders (run9 injects those into the
+     * boxes they label without listing them on the box). A project registration that only shares a name is `review`:
+     * a person should look, but it is not proof. That match is a heuristic: no match does not mean none exists.
+     * Anything else is not clean: no key to reach the box with, a listing that cannot be read, a box made under a
+     * key since replaced (stranded: neither listable nor deletable with this one, so every delete reports it again).
+     */
+    async withdraw(ctx: PluginContext): Promise<Withdrawal> {
+      const mount = await readMount(ctx);
+      const cfg = cfgOf(ctx);
+      const backend = backendFor(cfg);
+      const things: Withdrawal["things"] = [];
+      // What run9 answered is never repeated, only its status or shape: this text reaches Raft in a DELETE's answer.
+      const failure = (e: unknown) => e instanceof ProviderError ? `run9 refused (${e.status ? `HTTP ${e.status}` : e.code})` : String((e as Error)?.message ?? e).slice(0, 200);
+      const provider = ctx.credential && backend.caps.boxSecrets ? backend.open(cfg, ctx.credential) : null;
+      // Project scope, listed once per withdrawal and never written: one run9 project is shared with production, and
+      // a project-scope secret removed here could stop another deployment's boxes from working. What it shows is
+      // handed up whole (`project`): the caller keeps residue where it outlives this mount (D1, cf/src/egress-residue.ts)
+      // and resolves it only on a listing that is `complete`.
+      const project: Withdrawal["project"] = { state: "no_credential", ids: [], findings: [] };
+      let listed: Array<{ name: unknown; id: unknown; placeholder: unknown }> = [];
+      if (!backend.caps.boxSecrets) project.state = "none";
+      else if (provider?.listProjectSecrets) {
+        try { listed = await provider.listProjectSecrets(); project.state = "complete"; project.ids = listed.map((p) => String(p.id)); }
+        catch (e) { project.state = "failed"; project.error = `the project-scope listing failed: ${failure(e)}`; }
+      } else if (provider) project.state = "none";
+      for (const machine of boxedMachines(mount)) {
+        const state = await readView(ctx, machine);
+        if (!state.boxId) continue;
+        // A provider that cannot hold a credential for one box has none registered on it (accountsWanted).
+        if (!backend.caps.boxSecrets) { things.push({ id: state.boxId, clean: true, ownKey: false, why: `${backend.name} wires no account into a box` }); continue; }
+        // A deletion by this mount's release is believed only for a box recorded as made under this kind of key.
+        const ownKey = !!ctx.credential && state.credentialRef !== undefined && state.credentialRef === ctx.credentialRefKind;
+        if (!provider) { things.push({ id: state.boxId, clean: false, ownKey: false, code: "no_credential", why: "no credential to reach the box with" }); continue; }
+        try {
+          const before = await provider.listSecrets(state.boxId);
+          const placeholders = new Set([...before.map((x) => String(x.placeholder ?? "")), ...(state.wired ?? []).map((w) => w.placeholder)].filter(Boolean));
+          const names = new Set([...before.map((x) => String(x.name ?? "")), ...(state.wired ?? []).flatMap((w) => w.names ?? [])].filter(Boolean));
+          for (const sec of before) await provider.removeSecret(state.boxId, sec.id);
+          const left = await provider.listSecrets(state.boxId);
+          // One carrying this box's placeholder is residue run9 will inject: handed up as a finding, every time.
+          let named = 0;
+          for (const p of listed) {
+            const ph = String(p.placeholder ?? "");
+            if (ph && ([...placeholders].some((x) => ph === x || ph.includes(x)) || carriesBoxPlaceholder(ph, state.boxId))) {
+              project.findings.push({ boxId: state.boxId, secretId: String(p.id), name: String(p.name ?? "").slice(0, 120) });
+            } else if (names.has(String(p.name ?? ""))) named++;
+          }
+          const view = await readView(ctx, machine);
+          if (view.boxId === state.boxId && (view.wired || view.leftOut)) {
+            const next = { ...view };
+            delete next.wired; delete next.leftOut;
+            await writeView(ctx, machine, next);
+          }
+          // `clean` is the box's own registrations. A project listing that failed is not clean: residue was never checked.
+          const failed = project.state === "failed";
+          const code = left.length ? "not_withdrawn" as const : failed ? "project_listing_failed" as const : undefined;
+          const why = left.length ? `${left.length} registration(s) still on the box after removal` : failed ? project.error : undefined;
+          things.push({ id: state.boxId, clean: !left.length && !failed, ownKey, ...(code ? { code } : {}), ...(why ? { why } : {}),
+            ...(named ? { review: `${named} project-scope registration(s) share a name with this box's accounts; a person should look` } : {}) });
+        } catch (e) {
+          things.push({ id: state.boxId, clean: false, ownKey, code: "listing_failed", why: failure(e) });
+        }
+      }
+      for (const id of Object.keys(mount?.stranded ?? {})) {
+        things.push({ id, clean: false, ownKey: false, code: "stranded", why: "stranded: made under a key since replaced, so with this one its registrations can be neither listed nor removed, nor the box deleted" });
+      }
+      return { things, project };
     },
     /** Hands this mount's box back, so an idle one is not left running on the
      *  tenant's quota because nobody thought to stop it. Safe to call when there

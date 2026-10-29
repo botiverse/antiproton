@@ -32,6 +32,8 @@ import { MAX_BUDGET_CENTS, PLANS, type BudgetWrite, type Plan, type TenantPlanSt
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider, type ReconnectTarget } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
 import { logEvent } from "../../../src/core/log.ts";
+import { residueUnknownMessage, withResidue, type BoxEnd, type ResidueStore } from "../egress-residue.ts";
+import type { Withdrawal } from "../../../src/plugins/types.ts";
 import { logTurnStop, type StopTurnOutcome } from "../../../src/runtime/turn-stop.ts";
 import { WORKING_SET } from "../../../src/plugins/state.ts";
 import { SEED_MODES, seedPathProblem, seedText, sha256Hex as sha256Sync, type SeedFileMeta, type SeedMode, type SeedSeal, type SeedWriteResult } from "../../../src/store/seed-files.ts";
@@ -80,6 +82,15 @@ export interface ProvisionAgentOps {
    * `failed`, with why. Optional: a deployment without it answers the stop route 404 and deletes without a stop.
    */
   stopTurn?(tenantId: string, agentId: string, trigger: "provider_stop" | "delete"): Promise<StopTurnResult>;
+  /**
+   * For a delete, after the stop: the agent's far-end registrations taken back (a sandbox's egress credentials) and
+   * its held things let go (`AgentRuntime.releaseForDelete`).
+   */
+  releaseForDelete?(tenantId: string, agentId: string): Promise<{
+    things: BoxEnd[]; projects: Array<{ alias: string } & Withdrawal["project"]>;
+    released: string[];
+    failed: Array<{ alias: string; stage: "withdraw" | "release"; error: string }>;
+  }>;
 }
 
 /** What ending an agent's turn did (src/runtime/turn-stop.ts). */
@@ -228,6 +239,8 @@ export interface ProvisionDeps {
   readAudit?: ReadAudit;
   /** Held calls (docs/raft-approvals.md): each agent's, from its object, and the provider-wide copy. Absent: the routes answer 404. */
   approvals?: ProvisionApprovals;
+  /** Where egress residue outlives a mount and its agent (cf/src/egress-residue.ts). Absent: none is kept or reported. */
+  egressResidue?: ResidueStore;
 }
 
 /** What the approval routes act through (cf/src/index.ts): the agent's object for its own holds, D1 for every agent's. */
@@ -1019,7 +1032,23 @@ export async function handleProvision(
     // First, and on a repeated delete too: a delete that does not end the running turn leaves the agent calling its
     // model with nobody able to see it (Raft stops taking a deleted agent's activity), which is what happened on
     // preview before deletes did this. A stop that fails does not fail the delete; it is logged (`turn.stop`).
-    if (deps.agent.stopTurn) await stopTurnOf(deps.agent.stopTurn, tenantId, row.agentId, "delete");
+    const stop = deps.agent.stopTurn ? await stopTurnOf(deps.agent.stopTurn, tenantId, row.agentId, "delete") : null;
+    // Then what its mounts hold at the far end: first the credentials registered there taken back (a sandbox's egress
+    // holds the agent's GitHub token and swaps it in with no call back here, so only this stops a box still running
+    // from using it), then each held thing let go (a box deleted). Again on a repeated delete. A failure is not a
+    // failed delete: it is in the answer (`sandboxes`), with what to do next.
+    const releaseHeld = async () => {
+      if (!deps.agent.releaseForDelete) return null;
+      let r: Awaited<ReturnType<NonNullable<ProvisionAgentOps["releaseForDelete"]>>>;
+      try { r = await deps.agent.releaseForDelete(tenantId, row.agentId); }
+      catch (e) { r = { things: [], projects: [], released: [], failed: [{ alias: "*", stage: "release" as const, error: `the agent's object did not answer: ${String((e as Error)?.message ?? e).slice(0, 160)}` }] }; }
+      // Residue kept in D1 laid over the boxes: found now, or before and not yet seen gone, its box held or not.
+      if (!deps.egressResidue) return { ...r, residueUnknown: false };
+      const at = deps.now();
+      return { ...r, ...await withResidue(deps.egressResidue, tenantId, row.agentId, r.things, r.projects, at, `delete:${at}`) };
+    };
+    // Right after the stop, before anything slower: a box still running acts with the agent's accounts until then.
+    const held = await releaseHeld();
     // Its holds' copies are kept as the record of who decided what for it, no longer listed, without the arguments'
     // text, which is the agent's to keep (`markAgentDeleted`). Again on a repeated delete, and by the next prune, so one
     // whose marking failed is finished. A failure is logged, not a failed delete: the list leaves a deleted agent's rows
@@ -1089,8 +1118,41 @@ export async function handleProvision(
       }
       return ends;
     };
-    const answer = (agent: ReturnType<typeof view>, ends: ConnectionEnd[] | null) => ends === null ? ok(agent)
-      : ok({ ...agent, connections: ends, connectionsClean: ends.every((e) => e.mount === "cleared" && !e.error) });
+    // What the delete could not finish, each with what to do next. Still a 200: the agent is deleted either way.
+    //  - a background job whose cancel failed goes on with whatever it holds: `turn.stillRunning`, retry_delete;
+    //  - each held thing (a box) is clean only on positive evidence (`releaseForDelete`): `via: "withdrawn"` or
+    //    `"deleted"`. Anything else (no key to reach it, a listing that could not be read, a stranded box, a "not
+    //    found" that cannot be believed) is not clean, with why and retry_delete; it may still act with the agent's
+    //    accounts. A step that failed outright is in `sandboxes.failed`.
+    // `clean` is every part clean; `connectionsClean` is the connections' alone, as before.
+    const answer = (agent: ReturnType<typeof view>, ends: ConnectionEnd[] | null) => {
+      const stillRunning = stop && stop.result !== "failed" ? stop.stillRunning ?? [] : [];
+      const turn = stop?.result === "failed" ? { stopped: false, error: stop.error, action: "retry_delete" as const }
+        : stillRunning.length ? { stopped: true, stillRunning, action: "retry_delete" as const } : null;
+      const sandboxes = held === null ? null : {
+        released: held.released,
+        boxes: held.things,
+        ...(held.failed.length ? { failed: held.failed } : {}),
+      };
+      const connectionsClean = ends === null ? true : ends.every((e) => e.mount === "cleared" && !e.error);
+      // Residue records that could not be read leave the delete not clean and retryable even with no box held: what a
+      // box deleted earlier left is known only from them (`withResidue`).
+      const residueUnknown = held?.residueUnknown === true;
+      const clean = connectionsClean && turn === null && !residueUnknown && (held === null || (held.things.every((t) => t.clean) && held.failed.length === 0));
+      // `retry`: whether a repeated DELETE can finish anything left. Never true when all that is left is a person's
+      // (`needs_operator_cleanup`, or a connection's `revoke_on_github`).
+      // A release that failed is retried too, unless what it failed on is only what no retry fixes (a stranded box).
+      const releaseRetry = held !== null && held.failed.some((f) => {
+        if (f.stage === "withdraw") return true;
+        const mine = held.things.filter((t) => f.alias === "*" || t.alias === f.alias);
+        return mine.length === 0 || mine.some((t) => t.clean || t.action === "retry_delete");
+      });
+      const retry = turn !== null || residueUnknown || (ends ?? []).some((e) => e.action === "retry_delete")
+        || (held !== null && (releaseRetry || held.things.some((t) => t.action === "retry_delete")));
+      if (ends === null && held === null && turn === null) return ok(agent);
+      return ok({ ...agent, ...(ends === null ? {} : { connections: ends, connectionsClean }), ...(turn ? { turn } : {}), ...(sandboxes ? { sandboxes } : {}),
+        ...(residueUnknown ? { residueUnknown, residueMessage: residueUnknownMessage("delete") } : {}), clean, retry });
+    };
     if (row.status === "deleted") {
       const ends = await unbind(deps.now());
       await keepHolds(row.deletedAt ?? row.updatedAt);

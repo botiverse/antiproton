@@ -46,6 +46,8 @@ import {
 } from "../../src/runtime/pi-tools.ts";
 import { jsRunRow, modelAttemptRow, toolRefusedRow } from "../../src/trace/seams.ts";
 import { agentDeletedAt, logTurnStop, markAgentDeleted, turnStopRow, type StopTrigger, type StopTurnOutcome } from "../../src/runtime/turn-stop.ts";
+import { unclean, type BoxEnd, type UncleanCode } from "./egress-residue.ts";
+import type { Withdrawal } from "../../src/plugins/types.ts";
 import { explainUnavailableTool } from "../../src/runtime/unavailable-tool.ts";
 import {
   bindingKey, buildBriefing, programSendCounter, clearBackstop, conversationMessages, hasAnswer, judgeOverflow, mainCallOut, mainMessages, mainTip, needsReset, noteRebuilt,
@@ -758,6 +760,48 @@ export class BoundArtifacts {
 export const isOperatorModelRef = (ref: string) => providerOfRef(ref) !== null;
 export { OPERATOR_RUN9_REF, OPERATOR_INSTABOX_REF, OPERATOR_EXA_REF } from "./operator-ref.ts";
 
+/** What a failure's text says without what any provider answered: the HTTP statuses it names, or that it failed. */
+export function statusesOnly(text: string): string {
+  const statuses = [...text.matchAll(/(?:returned|->|HTTP)\s*(\d{3})\b/g)].map((m) => m[1]);
+  return statuses.length ? `failed (HTTP ${[...new Set(statuses)].join(", ")})` : "failed";
+}
+
+/**
+ * Each withdrawn thing as answered. Clean only on positive evidence: withdrawn (a complete listing showing none), or let
+ * go by a release that did not fail (`releaseFailed`; null when no release was asked) of a thing recorded as made under
+ * the mount's own kind of key, so its "deleted" can be believed. A "not found" for a thing made under another key, or
+ * under none recorded, is never taken as deleted, and a project-scope listing that failed means residue was never
+ * checked, so not clean whatever became of the box.
+ */
+function boxEnds(things: Array<{ alias: string } & Withdrawal["things"][number]>, releaseFailed: ReadonlySet<string> | null): BoxEnd[] {
+  return things.map((t) => {
+    const listingFailed = t.code === "project_listing_failed";
+    const deleted = releaseFailed !== null && t.ownKey && !releaseFailed.has(t.alias);
+    const via = listingFailed ? null : t.clean ? "withdrawn" as const : deleted ? "deleted" as const : null;
+    const common = { alias: t.alias, id: t.id, ...(t.review ? { review: t.review } : {}), ...(t.why ? { why: t.why } : {}) };
+    if (via) return { alias: t.alias, id: t.id, ...(t.review ? { review: t.review } : {}), clean: true, via };
+    const code: UncleanCode = listingFailed ? "project_listing_failed"
+      : t.code === "stranded" || t.code === "no_credential" ? t.code
+      : releaseFailed !== null && !releaseFailed.has(t.alias) ? "deletion_unconfirmed"
+      : t.code === "listing_failed" ? "listing_failed" : "not_withdrawn";
+    return unclean({ ...common, clean: false }, code);
+  });
+}
+
+/**
+ * What an agent's delete did to what its mounts hold (`AgentRuntime.releaseForDelete`): for each held thing, whether
+ * it is clean and how that was seen (`withdrawn`: nothing registered for it any more; `deleted`: let go by a release
+ * that can be believed), or why not; the mounts let go; and every step that failed.
+ */
+export interface ReleaseForDelete {
+  /** Each held thing: clean with how, or why not and what to do (residue kept in D1 is laid over them by the caller). */
+  things: BoxEnd[];
+  /** Each mount's project-scope listing, for the caller to keep residue by (`withResidue`, cf/src/egress-residue.ts). */
+  projects: Array<{ alias: string } & Withdrawal["project"]>;
+  released: string[];
+  failed: Array<{ alias: string; stage: "withdraw" | "release"; error: string }>;
+}
+
 export interface RuntimeDeps {
   ctx: any;
   bucketName: string;
@@ -1407,6 +1451,7 @@ export class AgentRuntime {
         heldPlace: async (ctx) => heldPlaceFor(agentKind((await this.store.loadAgent(ctx.tenantId, ctx.agentId))?.config),
           ctx.taskId, approvalsUrl(deps.consoleOrigin, ctx.agentId)),
         ...(deps.approvalTtlMs !== undefined ? { approvalTtlMs: deps.approvalTtlMs } : {}),
+        agentDeleted: () => agentDeletedAt(this.#deps.ctx.storage.sql) !== null,
       });
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
@@ -4817,6 +4862,42 @@ export class AgentRuntime {
   }
 
   /**
+   * For an agent's delete, after its turn is stopped: take back every credential its mounts registered at the far
+   * end (`Holding.withdraw`: a sandbox's egress registrations, so a box still running stops acting with the agent's
+   * GitHub account at once), then let every held thing go (`releaseTask`, as an operator's release: a box is deleted,
+   * not parked). The withdrawal comes first because the release can fail and leave the box running. Both are
+   * repeated by a repeated delete; what each could not do is named.
+   */
+  /**
+   * The withdrawal alone (`Holding.withdraw` on every mount), nothing let go: for an operator observing it against a
+   * real box (`POST /admin/withdraw-egress`). On a live agent the next command wires the accounts again, as it does
+   * after any change of credentials, so what it shows lasts until then.
+   */
+  async withdrawEgress(tenantId: string, agentId: string): Promise<{ things: BoxEnd[]; projects: ReleaseForDelete["projects"]; failed: Array<{ alias: string; error: string }> }> {
+    await this.ready();
+    const w = await this.#gateway.withdrawTask({ tenantId, agentId, taskId: LEGACY_TASK });
+    // Nothing is let go here, so a box is clean only when withdrawn. As the delete's answer does it: a failure's
+    // statuses, never its text (`statusesOnly`).
+    return { things: boxEnds(w.things, null), projects: w.projects, failed: w.failed.map((f) => ({ alias: f.alias, error: statusesOnly(f.error) })) };
+  }
+
+  async releaseForDelete(tenantId: string, agentId: string): Promise<ReleaseForDelete> {
+    await this.ready();
+    const ctx = { tenantId, agentId, taskId: LEGACY_TASK };
+    const w = await this.#gateway.withdrawTask(ctx);
+    const r = await this.#gateway.releaseTask(ctx);
+    return {
+      things: boxEnds(w.things, new Set(r.failed.map((f) => f.alias))),
+      projects: w.projects,
+      released: r.released,
+      // A failure's text is the plugin's, and may carry what run9 answered (a delete's or a stop's body): only the
+      // HTTP statuses in it go into the answer, which reaches Raft. The whole text stays in the logs and the lease.
+      failed: [...w.failed.map((f) => ({ alias: f.alias, stage: "withdraw" as const, error: statusesOnly(f.error) })),
+        ...r.failed.map((f) => ({ alias: f.alias, stage: "release" as const, error: statusesOnly(f.error) }))],
+    };
+  }
+
+  /**
    * End the agent's running turn from outside: the provider's stop route (`provider_stop`), the operator's
    * /admin/cancel-turn (`admin_cancel`), or a delete (`delete`), which also marks the agent so that no later pass takes
    * another step for it (`step`). Every session with a turn is cancelled as `cancelSession` cancels one. A turn that
@@ -4859,15 +4940,18 @@ export class AgentRuntime {
       let cancelled: string | null = null;
       // The main conversation's turn, read before the cancel closes it, for the row that says it was stopped.
       const stoppedTurn = pd ? null : turnIdOf(sql, MAIN_SESSION);
+      const stillRunning: string[] = [];
       for (const session of sessions) {
         const r = await this.cancelSession(tenantId, agentId, session);
         if (r.cancelledTurn && cancelled === null) cancelled = r.cancelledTurn;
+        stillRunning.push(...r.stillRunning);
         if (!pd) markSession(sql, session, false);
       }
-      if (cancelled === null) return done({ result: "not_running" });
+      const left = stillRunning.length ? { stillRunning } : {};
+      if (cancelled === null) return done({ result: "not_running", ...left });
       try { appendTrace(sql, [turnStopRow({ tenantId, agentId, operationId: cancelled, trigger, at: Date.now(), turn: stoppedTurn })]); }
       catch (e) { console.error(`the turn.stop row of ${tenantId}/${agentId} could not be written:`, e); }
-      return done({ result: "interrupted", cancelledTurn: cancelled });
+      return done({ result: "interrupted", cancelledTurn: cancelled, ...left });
     } catch (e) {
       return done({ result: "failed", error: String((e as Error)?.message ?? e).slice(0, 200) });
     }

@@ -111,6 +111,28 @@ function caller(settings: ProviderSettings, auth: string) {
   return { send, api };
 }
 
+/**
+ * What a value looks like, never what it says: its type, whether it is an array, and an object's key names. For
+ * errors about run9's answers, which flow back to Raft in a DELETE's answer: a malformed list may hold a token.
+ */
+export function shapeOf(v: unknown): string {
+  if (v === null) return "null";
+  if (Array.isArray(v)) return `array of ${v.length}`;
+  if (typeof v === "object") return `object with keys ${Object.keys(v as object).slice(0, 8).join(", ") || "(none)"}`;
+  return typeof v;
+}
+
+/** A secrets listing as run9 answers it: a bare array of views, each with its `secret_id`. Throws on anything else. */
+export function secretViews(listed: unknown, path: string): any[] {
+  if (!Array.isArray(listed)) throw new Error(`run9 GET ${path}: not a list of secrets (${shapeOf(listed)})`);
+  for (const s of listed) {
+    if (!s || typeof s !== "object" || typeof (s as any).secret_id !== "string") {
+      throw new Error(`run9 GET ${path}: an entry without its secret_id (${shapeOf(s)})`);
+    }
+  }
+  return listed;
+}
+
 function open(settings: ProviderSettings, credential: string): SandboxProvider {
   const cred = JSON.parse(credential) as Run9Credential;
   const { send, api } = caller(settings, authOf(cred));
@@ -274,9 +296,18 @@ function open(settings: ProviderSettings, credential: string): SandboxProvider {
       });
     },
 
+    // listBoxSecrets and listProjectSecrets (https://api.run.sys9.ai/swagger.yaml, read 2026-10-29, sha256
+    // fa95943a…b98c1): a bare array of api.ProjectSecretView, no pagination, no wrapper. Anything else (a wrapped
+    // or paged shape, a proxy's HTML) is refused rather than read as "none": a withdrawal is confirmed by an empty
+    // list, so a list that could not be read must never look like one.
     async listSecrets(id: string) {
-      const listed = await api("GET", `${box(id)}/secrets`);
-      return (Array.isArray(listed) ? listed : []).map((s: any) => ({ name: s?.name, id: s.secret_id }));
+      return secretViews(await api("GET", `${box(id)}/secrets`), `${box(id)}/secrets`)
+        .map((s) => ({ name: s.name, id: s.secret_id, placeholder: s.placeholder }));
+    },
+
+    async listProjectSecrets() {
+      return secretViews(await api("GET", `/projects/${settings.project}/secrets`), `/projects/${settings.project}/secrets`)
+        .map((s) => ({ name: s.name, id: s.secret_id, placeholder: s.placeholder, boxLabel: s.box_label ?? null, scope: s.scope ?? null }));
     },
 
     async removeSecret(id: string, secretId: unknown) {

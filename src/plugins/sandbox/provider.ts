@@ -218,7 +218,14 @@ export interface SandboxProvider {
   list?(labels: Record<string, string>): Promise<Array<{ id: string; name: string; state: BoxState; labels: Record<string, string> }>>;
   /** What the provider metered for this box, where it meters one. */
   usage?(id: string): Promise<{ runningSeconds: number; vcpuSeconds: number; memGiBSeconds: number; diskGiBSeconds: number }>;
+  /** Registered for this box alone (box scope), never for the project: see `listProjectSecrets`. */
   addSecret(id: string, secret: EgressSecret): Promise<void>;
-  listSecrets(id: string): Promise<Array<{ name: unknown; id: unknown }>>;
+  /** This box's registrations, as the provider lists them. Throws on any answer it cannot read as that list. */
+  listSecrets(id: string): Promise<Array<{ name: unknown; id: unknown; placeholder?: unknown }>>;
+  /**
+   * The project's own registrations, which a provider may inject into boxes it labels without listing them on the
+   * box (run9's project scope). Metadata only. Absent where the provider has none. Throws on an answer it cannot read.
+   */
+  listProjectSecrets?(): Promise<Array<{ name: unknown; id: unknown; placeholder: unknown; boxLabel: unknown; scope: unknown }>>;
   removeSecret(id: string, secretId: unknown): Promise<void>;
 }

@@ -110,6 +110,7 @@ import { d1ServiceTokens } from "./control-plane.ts";
 import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens, reservedTenantProblem } from "./admin-provider-tokens.ts";
+import { cleanupResidue, d1EgressResidue, residueUnknownMessage, withResidue } from "./egress-residue.ts";
 import { renewalAudience, d1ConnectorGrants, d1Connections, d1Connectors, type ConnectorRefresh, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
 import type { GithubGrant } from "./github-token.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps, type ReconnectTarget } from "./provision/connect.ts";
@@ -315,6 +316,12 @@ export interface Env {
   /** Lets automation reach the endpoints that spend money, since a script
    *  cannot sign in through a browser. */
   AUTOMATION_TOKEN?: string;
+  /**
+   * "1" turns on `POST /admin/withdraw-egress`, a verification hook for observing an agent's egress withdrawal
+   * against a real run9 box (#1130), to be removed after that observation (#1132). Set in cf/wrangler.preview.jsonc
+   * only, never for production: absent, the path is an unknown route like any other.
+   */
+  EGRESS_VERIFY_ROUTE?: string;
   LOADER: {
     load(code: WorkerCode): WorkerStub;
     get(id: string, cb: () => Promise<WorkerCode> | WorkerCode): WorkerStub;
@@ -1573,6 +1580,18 @@ export class AgentDO extends DurableObject<Env> {
       await this.broadcast();
       return out;
     });
+  }
+
+  /** The withdrawal alone, for an operator observing it against a real box (`/admin/withdraw-egress`). */
+  async withdrawEgress(tenantId: string, agentId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("withdrawEgress", () => this.runtime().withdrawEgress(tenantId, agentId));
+  }
+
+  /** An agent's delete, after its turn is stopped: its far-end registrations taken back, its held things let go. */
+  async releaseForDelete(tenantId: string, agentId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("releaseForDelete", () => this.runtime().releaseForDelete(tenantId, agentId));
   }
 
   /** Cancel a session's running turn and its background work (Agents API input.cancel). */
@@ -3801,6 +3820,7 @@ function provisionDeps(env: Env): ProvisionDeps {
         stub(tenantId, agentId).provisionDecide(tenantId, agentId, ids, operationId, decision, decidedBy) as Promise<ProvisionDecideResult | null>,
       index: d1ApprovalIndex(env.CONTROL_DB),
     },
+    egressResidue: d1EgressResidue(env.CONTROL_DB),
     ...(evalSeedRoutes(env) ? {
       seed: {
         write: (tenantId, agentId, f) => stub(tenantId, agentId).seedWrite(tenantId, agentId, f.path, f.mode, f.text),
@@ -3853,6 +3873,7 @@ function provisionDeps(env: Env): ProvisionDeps {
       tool: (tenantId, agentId, name) => stub(tenantId, agentId).provisionTool(tenantId, agentId, name),
       pushStatus: (tenantId, agentId) => stub(tenantId, agentId).provisionPushStatus(tenantId, agentId),
       stopTurn: (tenantId, agentId, trigger) => stub(tenantId, agentId).stopTurn(tenantId, agentId, trigger),
+      releaseForDelete: (tenantId, agentId) => stub(tenantId, agentId).releaseForDelete(tenantId, agentId),
     },
     // Only where this deployment can run the flow: an OAuth App, a session secret and its own origin.
     ...(connectDeps(env) ? {
@@ -4141,7 +4162,11 @@ export default {
     // trigger's own history, which is where a missed retention day is looked for. The friction step
     // cannot throw and is cut off at its limit, so it can neither hide nor cause that failure.
     await dailyCron(
-      async () => { await retainUsage(env.CONTROL_DB, controller.scheduledTime); },
+      async () => {
+        await retainUsage(env.CONTROL_DB, controller.scheduledTime);
+        // Its own failure, not the retention's: recorded in admin_audit as failed (`cleanupResidue`), never thrown.
+        await cleanupResidue(env.CONTROL_DB, controller.scheduledTime);
+      },
       () => frictionDaily(env, { bucket: env.ARTIFACTS as unknown as FrictionBucket, window: frictionWindowOf(env) }, controller.scheduledTime),
     );
   },
@@ -5188,6 +5213,72 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
           // another, as a stop waiting on a tool call does (cf/src/provision/handlers.ts `stopTurnOf`).
           logTurnStop({ tenantId: t, agentId: a, trigger: "admin_cancel", side: "worker" }, r);
           return Response.json({ tenantId: t, agentId: a, ...r }, { status: r.result === "failed" ? 503 : 200 });
+        }
+        case "/admin/withdraw-egress": {
+          // A verification hook, preview only (EGRESS_VERIFY_ROUTE, set in cf/wrangler.preview.jsonc), to be removed
+          // after the real-box observation (#1132). Without the flag this path is an unknown route like any other.
+          if (env.EGRESS_VERIFY_ROUTE !== "1") return unrouted();
+          // The withdrawal an agent's delete starts with, alone: every egress registration on every box the agent's
+          // mounts hold is removed, nothing is let go or deleted, and the answer is what each box showed
+          // (`Holding.withdraw`). The agent's next command wires its accounts again.
+          //
+          // Every attempt is a row in D1's admin_audit (migration 0033), refusals included, written before the agent's
+          // object is called and updated after: never the token, nor anything run9 answered. `x-claimed-caller` is
+          // who the caller says it is, free text, not authentication: the token is the operator's, shared with
+          // /admin and the bench scripts.
+          const claimedCaller = (request.headers.get("x-claimed-caller") ?? "").trim().slice(0, 64) || null;
+          // Ids past 128 characters are no agent's (`RAFT_ID`-length and below): refused, and never written. Until the
+          // token is checked, no id is written either: a stranger's attempts must not fill the table with names.
+          let t = url.searchParams.get("tenantId") ?? "";
+          let a = url.searchParams.get("agentId") ?? "";
+          const tooLong = t.length > 128 || a.length > 128;
+          const authorized = isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"));
+          if (tooLong || !authorized) { t = ""; a = ""; }
+          const audit = async (outcome: string, counts?: Record<string, number>, id?: number): Promise<number | null> => {
+            const at = Date.now();
+            logEvent("admin.withdraw_egress", { tenantId: t || null, agentId: a || null, claimedCaller, outcome, at: new Date(at).toISOString(), ...(counts ?? {}) });
+            if (id !== undefined) {
+              await env.CONTROL_DB.prepare("UPDATE admin_audit SET outcome = ?, counts = ?, finished_at = ? WHERE id = ?")
+                .bind(outcome, counts ? JSON.stringify(counts) : null, at, id).run();
+              return id;
+            }
+            const row = await env.CONTROL_DB.prepare(
+              "INSERT INTO admin_audit (at, route, tenant_id, agent_id, claimed_caller, outcome, counts) VALUES (?, '/admin/withdraw-egress', ?, ?, ?, ?, ?) RETURNING id",
+            ).bind(at, t || null, a || null, claimedCaller, outcome, counts ? JSON.stringify(counts) : null).first<{ id: number }>();
+            return row ? Number(row.id) : null;
+          };
+          if (!authorized) {
+            await audit("unauthorized");
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (tooLong) { await audit("ids_too_long"); return Response.json({ error: "tenantId and agentId are at most 128 characters" }, { status: 400 }); }
+          if (request.method !== "POST") { await audit("wrong_method"); return Response.json({ error: "POST" }, { status: 405 }); }
+          if (!claimedCaller) {
+            await audit("no_claimed_caller");
+            return Response.json({ error: "x-claimed-caller is required: who is calling, as free text" }, { status: 400 });
+          }
+          if (!t || !a) { await audit("no_agent_named"); return Response.json({ error: "tenantId and agentId are required" }, { status: 400 }); }
+          // Only an agent this deployment provisioned, read from its own D1 before its object is touched: an id that
+          // was never an agent is a 404, and no object is opened (opening one records it as the agent's).
+          if (!(await d1ProvisionedAgents(env.CONTROL_DB).getByAgentId(t, a))) {
+            await audit("no_such_agent");
+            return Response.json({ error: "not_found" }, { status: 404 });
+          }
+          // Written before the call: a call the Worker does not live to finish stays 'started', unconfirmed.
+          const id = await audit("started");
+          if (id === null) return Response.json({ error: "the audit row could not be written, so nothing was done" }, { status: 503 });
+          let w: Awaited<ReturnType<AgentDO["withdrawEgress"]>>;
+          try { w = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).withdrawEgress(t, a); }
+          catch {
+            await audit("object_threw", undefined, id);
+            return Response.json({ error: "the agent's object did not answer" }, { status: 503 });
+          }
+          // Residue kept in D1 laid over the boxes, as the delete does it; resolved only by this call's complete listing.
+          const { things, residueUnknown } = await withResidue(d1EgressResidue(env.CONTROL_DB), t, a, w.things, w.projects, Date.now(), `admin_audit:${id}`, "withdrawal");
+          await audit("withdrawn", { things: things.length, clean: things.filter((x) => x.clean).length,
+            residue: things.reduce((n, x) => n + (x.projectResidue?.length ?? 0), 0), failed: w.failed.length, residueUnknown: residueUnknown ? 1 : 0 }, id);
+          return Response.json({ tenantId: t, agentId: a, at: new Date().toISOString(), things, failed: w.failed,
+            ...(residueUnknown ? { residueUnknown, residueMessage: residueUnknownMessage("withdrawal") } : {}) });
         }
         case "/admin/migrate-engine":
           return await adminMigrateEngine(request, env.AUTOMATION_TOKEN,

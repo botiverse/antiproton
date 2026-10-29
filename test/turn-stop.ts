@@ -141,6 +141,20 @@ await check("DELETE ends the running turn first, and again on a repeated delete;
   must(d.status === 200 && d.body.status === "deleted" && broken.rows.get("LIVE")!.status === "deleted", `${d.status} ${show(d.body)}`);
 });
 
+await check("DELETE: a background job whose cancel failed, or a stop that failed, is not a clean delete; the answer says retry_delete", async () => {
+  const left = fakeDeps(async () => ({ result: "interrupted", cancelledTurn: "op_1", stillRunning: ["job_7"] }));
+  const r = await call(left.deps, "DELETE", "/agents/by-raft-agent/LIVE");
+  must(r.status === 200 && r.body.status === "deleted" && r.body.clean === false && r.body.turn?.action === "retry_delete"
+    && show(r.body.turn.stillRunning) === show(["job_7"]), `${r.status} ${show(r.body)}`);
+  const broken = fakeDeps(async () => { throw new Error("unreachable"); });
+  const d = await call(broken.deps, "DELETE", "/agents/by-raft-agent/LIVE");
+  must(d.status === 200 && d.body.clean === false && d.body.turn?.stopped === false && d.body.turn.action === "retry_delete", `${d.status} ${show(d.body)}`);
+  // Control: a stop that ended everything leaves nothing to say.
+  const clean = fakeDeps(async () => ({ result: "interrupted", cancelledTurn: "op_1" }));
+  const c = await call(clean.deps, "DELETE", "/agents/by-raft-agent/LIVE");
+  must(c.status === 200 && c.body.turn === undefined && c.body.clean !== false, `${c.status} ${show(c.body)}`);
+});
+
 // ---- the stop, on the real runtime ----------------------------------------------------------------------
 
 type World = { host: ReturnType<typeof sqliteHost>; rt: AgentRuntime; sent: string[]; answered: Set<string> };
@@ -234,6 +248,17 @@ await check("a delete stops the looping turn and the agent takes no step after i
   must(fatal[0] === "stopped: agent deleted", `BridgeFatal: ${show(fatal)}`);
   // A repeated delete: nothing running, still deleted.
   must(show(await w.rt.stopTurn("t", "a", "delete")) === show({ result: "not_running" }), "repeat");
+});
+
+await check("a delete reports a background job it could not cancel as still running", async () => {
+  const w = await world();
+  await w.rt.postMessage("t", "a", "keep going", "prompt", "main");
+  await loopFor(w, 1);
+  // A job on a mount that cannot stop it (no such mount): its cancel throws, and it goes on.
+  const { recordBackgroundJob } = await import("../src/runtime/background-jobs.ts");
+  recordBackgroundJob(w.host.sql as any, { tenantId: "t", agentId: "a" }, { id: "job_stuck", session: "main", mount: "nowhere", tool: "shell", handle: { execId: "e1" } });
+  const r = await w.rt.stopTurn("t", "a", "delete");
+  must(r.result !== "failed" && show((r as { stillRunning?: string[] }).stillRunning) === show(["job_stuck"]), show(r));
 });
 
 await check("an agent that never ran is not_running, and the operator's cancel says so too", async () => {

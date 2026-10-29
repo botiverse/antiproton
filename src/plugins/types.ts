@@ -540,6 +540,11 @@ export interface PluginContext {
     policy: MountPolicy | null;
   } | null>;
   /**
+   * True when the agent has been deleted (its delete stopped it): a plugin registers none of its accounts anywhere
+   * any more, whatever `sandboxForms` says. Absent: not deleted, or a caller that cannot tell.
+   */
+  agentDeleted?: boolean;
+  /**
    * This agent's mounts whose plugin declares a {@link SandboxForm}, with each
    * one's credential, for the plugin that runs the agent's container.
    *
@@ -1826,6 +1831,20 @@ export interface PromptPart {
   by: "agent" | "setup" | "plugin";
 }
 
+/**
+ * What a `Holding.withdraw` saw. `things`: one answer per held thing; `clean` only on positive evidence that nothing
+ * is registered on it any more; `ownKey` when it records being made under the mount's current kind of key, so its
+ * deletion by this mount's release can be believed; `code` why not clean. `project`: the registrations made outside the
+ * things (run9's project scope), as listed once: `complete` with every id seen, `failed`, `no_credential` (no key to
+ * list with), or `none` (nothing of that kind here); `findings` carry a thing's placeholder. The caller keeps findings
+ * where they outlive the mount, and resolves one only on a `complete` listing without it.
+ */
+export interface Withdrawal {
+  things: Array<{ id: string; clean: boolean; ownKey: boolean; why?: string; review?: string;
+    code?: "no_credential" | "stranded" | "listing_failed" | "not_withdrawn" | "project_listing_failed" }>;
+  project: { state: "complete" | "failed" | "no_credential" | "none"; ids: string[]; findings: Array<{ boxId: string; secretId: string; name: string }>; error?: string };
+}
+
 export interface Holding {
   /**
    * Which of this plugin's tools lets go of the thing, and which postpones.
@@ -1878,6 +1897,15 @@ export interface Holding {
    * complete is written where it happens.
    */
   usage?(ctx: PluginContext): Promise<MountUsage[]>;
+  /**
+   * Take back every credential this mount registered at the far end for the things it holds, without letting the
+   * things go: for an agent's delete, before the release, so a thing the release cannot end (a refusal, an outage)
+   * stops acting with the agent's accounts at once. Never a throw: an answer for each held thing, `clean` only on
+   * positive evidence that nothing is registered on it any more (a complete listing, read with a key that sees it,
+   * showing none; registrations made outside it are `projectResidue`), and `ownKey` when the thing records being made under the mount's current kind of key, so a
+   * deletion of it by this mount's release can be believed.
+   */
+  withdraw?(ctx: PluginContext): Promise<Withdrawal>;
   /**
    * Let go of it. Scoped to the AGENT rather than to one task, safe to call
    * again, and it must throw rather than return if something billed could not
