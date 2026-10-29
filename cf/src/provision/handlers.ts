@@ -186,7 +186,8 @@ export interface ProvisionDeps {
     reconnect(tenantId: string, agentId: string, provider: ConnectionProvider, connectorId: string, was: { ciphertext: string; iv: string },
       sealed: { ciphertext: string; iv: string }, refresh: ConnectorRefresh | null): Promise<{ ok: true; updated: boolean } | { ok: false; error: string }>;
     /** Remove it only while the mount still holds this connector's credential, not a key put there since. */
-    detachIfFrom(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string }, connectorId?: string | null): Promise<boolean>;
+    detachIfFrom(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string }, connectorId?: string | null):
+      Promise<{ ok: true; removed: boolean; other?: true } | { ok: false; error: string; gone?: true }>;
     /** Remove the provider's credential from the agent's mount. */
     detach(tenantId: string, agentId: string, provider: ConnectionProvider): Promise<boolean>;
     /** The same, for an agent's delete, telling nothing to clear from a refusal (`AgentRuntime.clearConnection`). */
@@ -1040,8 +1041,7 @@ export async function handleProvision(
     //    the binding goes, and `action: "revoke_on_github"` (botiverse/antiproton#1128).
     type ConnectionEnd = { provider: ConnectionProvider; connectorId: string | null; binding: "removed" | "kept" | "none";
       mount: "cleared" | "not_cleared"; action?: "retry_delete" | "revoke_on_github"; message?: string; error?: string };
-    const REVOKE = "this agent's object holds nothing to clear, so a copy it was handed cannot be removed here; revoke the connection on GitHub " +
-      "to end it, which also makes every other agent on this connector re-authorise, since they share the token (botiverse/antiproton#1128)";
+    const REVOKE = REVOKE_ON_GITHUB;
     const unbind = async (at: number): Promise<ConnectionEnd[] | null> => {
       const c = deps.connections;
       if (!c) return null;
@@ -1368,6 +1368,17 @@ function importView(rec: ImportRecord, row: ProvisionedAgent) {
  * here in the clear: the flow in connect.ts seals it, and the handlers carry it only sealed.
  */
 /**
+ * What a caller is told when a copy of a connection's credential was handed to an agent whose object holds nothing
+ * now (its storage wiped), so nothing here can remove it. The operator's cleanup comes first; revoking on GitHub is
+ * the last resort, and its reach is said in full: it is the GitHub account's authorization of this App that goes.
+ */
+export const REVOKE_ON_GITHUB = "a copy of this connection's credential was handed to an agent whose object holds nothing to clear, so it cannot be " +
+  "removed here. First choice, once it exists: the operator cleanup of such copies (botiverse/antiproton#1128, planned). Until then, " +
+  "the last resort: revoking this App's " +
+  "authorization on GitHub invalidates ALL of this GitHub account's tokens for this App, possibly including other connectors and agents, " +
+  "which will all need to re-authorise.";
+
+/**
  * A connection route read the agent live, then the agent was deleted before its binding was written (the guarded
  * `put` wrote nothing): the credential just put on its mount is taken off again, and the route answers as for an agent
  * that is not there. A clear that fails is logged; the agent's delete clears its mounts again when repeated.
@@ -1527,12 +1538,43 @@ async function connection(
   }
   if (method === "DELETE") {
     const got = await c.registry.get(tenantId, row.raftAgentId, p);
-    await c.detach(tenantId, row.agentId, p);
-    await c.registry.remove(tenantId, row.raftAgentId, p);
-    // Who asked is optional here: removing a connection from an agent gives nobody an identity.
+    // The mount cleared first, then the binding, as an agent's delete does it (`clearConnection`): cleared, nothing
+    // there, refused (something the key made is still held), the object not answering, or the object holding no such
+    // agent. Refused or not answering: the binding is kept, so the next DELETE finds it, and the answer is 409 with
+    // `action: "retry_delete"`, not a 204 that says the connection is gone while the mount still holds its credential.
+    // Gone: nothing here can reach the copy; the binding goes, and the answer says to revoke on GitHub.
+    let error: string | null = null, gone = false, took = false;
+    try {
+      const r = await c.clear(tenantId, row.agentId, p);
+      if (r.ok) took = r.cleared; else { error = r.error; gone = r.gone === true; }
+    } catch (e) { error = `the agent's object did not answer: ${String((e as Error)?.message ?? e).slice(0, 160)}`; }
+    // With no binding, an object that holds no such agent has nothing on the mount either: a plain clean result.
+    if (gone && !got) { error = null; gone = false; }
+    const outcome = error === null ? (took ? "cleared" : "none") : "not_cleared";
+    const keep = error !== null && !gone;
+    if (!keep) await c.registry.remove(tenantId, row.raftAgentId, p);
+    // Who asked is optional here: removing a connection from an agent gives nobody an identity. The event is recorded
+    // all the same (with the deployment as the actor when none was named), with what became of the mount, and for a
+    // connection with no connector too (0032), named by its provider.
     const acting = body === undefined || body === null ? null : actingField(body, []);
-    if (got?.connectorId && acting && !isFail(acting)) {
-      await c.connectors.record({ tenantId, connectorId: got.connectorId, raftAgentId: row.raftAgentId, action: "unbind", ...acting, at: deps.now() });
+    const named = acting && !isFail(acting) ? acting : null;
+    await c.connectors.record({ tenantId, connectorId: got?.connectorId ?? null, raftAgentId: row.raftAgentId, provider: p, action: "unbind",
+      ...(named ?? { actingRaftUserId: SYSTEM_ACTOR, actingRole: "system" as const }), at: deps.now(),
+      reason: JSON.stringify({ outcome, bindingKept: keep, bound: got !== null, actorNamed: named !== null, ...(error ? { error } : {}) }) });
+    logEvent("connect.disconnect_agent", { tenantId, agentId: row.agentId, provider: p, outcome, bindingKept: keep });
+    if (keep) {
+      return Response.json({
+        error: { code: "mount_not_cleared", message: got
+          ? `the agent's mount still holds the connection's credential (${error}); the connection was kept, DELETE it again`
+          : `the agent's mount still holds a credential (${error}), with no connection left to keep; DELETE it again` },
+        // The one shape a removal that did not take answers with, here and for a connector's disconnect: 409 (a 502 is
+        // retried by many clients on their own), outcome, retry, and the agents it is about.
+        outcome: "not_cleared", retry: true, agents: [row.raftAgentId],
+        binding: got ? "kept" : "none", mount: "not_cleared", action: "retry_delete" }, { status: 409, headers: { "cache-control": "no-store" } });
+    }
+    if (gone) {
+      return ok({ binding: "removed", mount: "not_cleared", action: "revoke_on_github",
+        message: REVOKE_ON_GITHUB });
     }
     return new Response(null, { status: 204 });
   }
@@ -1684,59 +1726,88 @@ async function disconnect(tenantId: string, connectorId: string, body: unknown, 
   //
   // Every agent bound to it gives the credential up, another origin's too: one bound before connectors had an origin
   // (0030) holds this origin's credential, which is this origin's to take back. First by the connector's own
-  // credential, by value or by what renews it (`detachIfFrom`). When that matches nothing:
-  //  - another origin's agent is cleared by the agent: it may hold an older copy, a non-expiring token from before a
-  //    reconnect in place, which skips another origin's agents;
+  // credential, by value or by what renews it (`detachIfFrom`). When the mount holds nothing of the connector's:
+  //  - another origin's agent is cleared by the agent (`clear`): it may hold an older copy, a non-expiring token from
+  //    before a reconnect in place, which skips another origin's agents;
   //  - this origin's agent keeps what it holds, which is not the connector's: a key put on the mount since, in the
   //    console, clears what renewed it, and is the person's, not the connector's to take.
-  // Each agent ends one of four ways, and only the first is clean:
-  //  - detached: this origin's agent, the connector's credential removed;
-  //  - kept: this origin's agent, holding another credential (above), left as it is and said so;
-  //  - cleared elsewhere: another origin's agent, its copy removed, but that origin has held a working token for this
-  //    connector, which only re-authorising or revoking it on GitHub ends (a person's decision, not made here);
-  //  - failed: nothing could be removed; the connector stays, and the same call tries again.
-  // Another origin's agents are counted in the answer and named only in the log: their ids are that origin's.
+  // Each agent ends one of these ways, as a single connection's removal does (`DELETE …/connections/{provider}`):
+  //  - detached: this origin's agent, the connector's credential removed, or none there;
+  //  - kept: this origin's agent holding another credential, left as it is and said so;
+  //  - cleared elsewhere: another origin's agent, its copy removed, but that origin has held a working token;
+  //  - failed: refused (something the key made is still held) or not answered (usually passing): its binding is kept,
+  //    and so is the connector, the only handles a retry has; the answer is 502 with `action: "retry_delete"`;
+  //  - revoke: the object holds no such agent (wiped), so nothing here can reach what it was handed: the binding goes,
+  //    and the answer says what to do (`REVOKE_ON_GITHUB`).
+  // Each is recorded as an `unbind` event with its outcome. Another origin's agents are counted in the answer and
+  // named only in the log: their ids are that origin's.
   const detached: string[] = [];
   const kept: string[] = [];
-  const failed: Array<{ raftAgentId: string; error: string }> = [];
+  const failed: Array<{ raftAgentId: string; error: string; action: "retry_delete" }> = [];
+  const revoke: string[] = [];
   const elsewhere: string[] = [];
   const elsewhereFailed: Array<{ raftAgentId: string; error: string }> = [];
+  const elsewhereRevoke: string[] = [];
+  const asText = (e: unknown) => String((e as { message?: unknown })?.message ?? e).slice(0, 200);
   for (const raftAgentId of await c.registry.boundTo(tenantId, k.id)) {
     const row = await deps.registry.get(tenantId, raftAgentId).catch(() => undefined);
     const ours = !row || row.raftOrigin === who.raftOrigin;
-    try {
-      if (row === undefined) throw new Error("the agent could not be read");
-      let held = false;
-      if (row) {
-        const matched = await c.detachIfFrom(tenantId, row.agentId, provider, k.sealed, k.id);
-        // False from the detach by the agent: the mount holds nothing of the agent's own, so nothing is left there.
-        if (!matched && !ours) await c.detach(tenantId, row.agentId, provider);
-        held = !matched && ours;
-      }
-      await c.registry.remove(tenantId, raftAgentId, provider);
-      (held ? kept : ours ? detached : elsewhere).push(raftAgentId);
-    } catch (e) {
-      (ours ? failed : elsewhereFailed).push({ raftAgentId, error: String((e as { message?: unknown })?.message ?? e).slice(0, 200) });
+    // What became of this agent's copy: cleared, none of the connector's there, held another, not cleared, or gone.
+    let end: { outcome: "cleared" | "none" | "other" | "not_cleared" | "gone"; error?: string };
+    if (row === undefined) end = { outcome: "not_cleared", error: "the agent could not be read" };
+    else if (row === null) end = { outcome: "none" };
+    else {
+      try {
+        const r = await c.detachIfFrom(tenantId, row.agentId, provider, k.sealed, k.id);
+        if (!r.ok) end = r.gone ? { outcome: "gone", error: r.error } : { outcome: "not_cleared", error: r.error };
+        else if (r.removed) end = { outcome: "cleared" };
+        else if (ours) end = { outcome: r.other ? "other" : "none" };
+        else {
+          const by = await c.clear(tenantId, row.agentId, provider);
+          end = by.ok ? { outcome: by.cleared ? "cleared" : "none" } : by.gone ? { outcome: "gone", error: by.error } : { outcome: "not_cleared", error: by.error };
+        }
+      } catch (e) { end = { outcome: "not_cleared", error: `the agent's object did not answer: ${asText(e)}` }; }
     }
+    const keepBinding = end.outcome === "not_cleared";
+    try {
+      if (!keepBinding) await c.registry.remove(tenantId, raftAgentId, provider);
+    } catch (e) { end = { outcome: "not_cleared", error: asText(e) }; }
+    const bindingKept = end.outcome === "not_cleared";
+    await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId, provider, action: "unbind", ...acting, at: deps.now(),
+      reason: JSON.stringify({ via: "disconnect", outcome: end.outcome === "other" ? "none" : end.outcome === "gone" ? "not_cleared" : end.outcome,
+        bindingKept, ...(end.outcome === "other" ? { heldAnother: true } : {}), ...(end.error ? { error: end.error } : {}) }) });
+    if (bindingKept) {
+      if (ours) failed.push({ raftAgentId, error: end.error ?? "not cleared", action: "retry_delete" });
+      else elsewhereFailed.push({ raftAgentId, error: end.error ?? "not cleared" });
+    } else if (end.outcome === "gone") (ours ? revoke : elsewhereRevoke).push(raftAgentId);
+    else if (end.outcome === "other") kept.push(raftAgentId);
+    else (ours ? detached : elsewhere).push(raftAgentId);
   }
-  const otherOrigins = elsewhere.length || elsewhereFailed.length ? {
+  const otherOrigins = elsewhere.length || elsewhereFailed.length || elsewhereRevoke.length ? {
     otherOrigins: {
-      cleared: elsewhere.length, failed: elsewhereFailed.length,
-      message: "agents of another Raft origin held this connector's credential: their copies are removed here, but that origin has had a working token; re-authorise or revoke it on GitHub to end it",
+      cleared: elsewhere.length, failed: elsewhereFailed.length, ...(elsewhereRevoke.length ? { revoke: elsewhereRevoke.length } : {}),
+      // The revoke hint only when something needs a person: another origin's object was wiped, so its copy could not be
+      // reached. A copy removed here (the common case) needs nobody.
+      message: "agents of another Raft origin held this connector's credential: their copies are removed here, but that origin has had a working token" +
+        (elsewhereRevoke.length ? `. ${REVOKE_ON_GITHUB}` : ""),
     },
   } : {};
+  const revokeOnGithub = revoke.length ? { revokeOnGithub: { agents: revoke, action: "revoke_on_github" as const, message: REVOKE_ON_GITHUB } } : {};
   logEvent("connect.disconnect", { tenantId, connectorId: k.id, detached: detached.join(" "), kept: kept.join(" "), failed: failed.map((f) => f.raftAgentId).join(" "),
-    clearedElsewhere: elsewhere.join(" "), failedElsewhere: elsewhereFailed.map((f) => f.raftAgentId).join(" "),
-    errors: [...failed, ...elsewhereFailed].map((f) => f.error).join(" | ").slice(0, 500) });
+    revoke: revoke.join(" "), clearedElsewhere: elsewhere.join(" "), failedElsewhere: elsewhereFailed.map((f) => f.raftAgentId).join(" "),
+    revokeElsewhere: elsewhereRevoke.join(" "), errors: [...failed, ...elsewhereFailed].map((f) => f.error).join(" | ").slice(0, 500) });
   if (failed.length || elsewhereFailed.length) {
     return Response.json({
-      error: { code: "partially_disconnected", message: "some agents still hold this connector's credential; the same call finishes the job" },
-      detached, ...(kept.length ? { kept } : {}), failed, ...otherOrigins,
-    }, { status: 502, headers: { "cache-control": "no-store" } });
+      error: { code: "partially_disconnected", message: "some agents still hold this connector's credential; their bindings and the connector were kept, and the same call finishes the job" },
+      // As a single connection's removal answers it (409, outcome, retry, agents): this origin's agents by id, another
+      // origin's counted under `otherOrigins`.
+      outcome: "not_cleared", retry: true, agents: failed.map((f) => f.raftAgentId),
+      detached, ...(kept.length ? { kept } : {}), failed, ...revokeOnGithub, ...otherOrigins,
+    }, { status: 409, headers: { "cache-control": "no-store" } });
   }
   await c.connectors.remove(tenantId, k.id);
   await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: null, action: "disconnect", ...acting, at: deps.now() });
-  return ok({ disconnected: true, connectorId: k.id, detached, ...(kept.length ? { kept } : {}), ...otherOrigins });
+  return ok({ disconnected: true, connectorId: k.id, detached, ...(kept.length ? { kept } : {}), ...revokeOnGithub, ...otherOrigins });
 }
 
 /**

@@ -445,7 +445,7 @@ function connectionsFake() {
     async clear(_t, agentId, provider) { detached.push(`${agentId}/${provider}/cleared`); return { ok: true, cleared: true }; },
     async detachIfFrom(_t, agentId, provider, sealed) {
       if (failDetach.has(agentId)) throw new Error("the agent's object did not answer");
-      detached.push(`${agentId}/${provider}/${sealed.ciphertext}`); return true;
+      detached.push(`${agentId}/${provider}/${sealed.ciphertext}`); return { ok: true, removed: true };
     },
     async confirm(_t, _a, _p, pending, raftUserId) {
       return pending === "pend_ok_12345" && raftUserId === "u_owner"
@@ -524,7 +524,7 @@ await check("connections: a link for the agent's Raft only, bound to who asked, 
   const got = await call(f.deps, "GET", path);
   if (got.body.connected !== true || got.body.account !== "octocat" || got.body.connectedBy !== "u_owner" || /token|secret|ghp_/.test(got.text)) throw new Error(JSON.stringify(got.body));
   const gone = await call(f.deps, "DELETE", path);
-  if (gone.status !== 204 || detached[0] !== `${[...f.rows.values()][0]!.agentId}/github` || (await call(f.deps, "GET", path)).body.connected !== false) throw new Error(`delete: ${gone.status} ${JSON.stringify(detached)}`);
+  if (gone.status !== 204 || detached[0] !== `${[...f.rows.values()][0]!.agentId}/github/cleared` || (await call(f.deps, "GET", path)).body.connected !== false) throw new Error(`delete: ${gone.status} ${JSON.stringify(detached)}`);
 
   const agent = await call(f.deps, "GET", "/agents/by-raft-agent/01JAGENT");
   if (JSON.stringify(agent.body.connections) !== '["github"]') throw new Error(`the agent does not say what it can connect: ${JSON.stringify(agent.body)}`);
@@ -567,7 +567,7 @@ await check("connectors: a confirmed connection is the tenant's; another agent i
   if ((await call(f.deps, "DELETE", `/connectors/${id}`, { actingRaftUserId: "u_stranger", actingRole: "creator" })).status !== 403 || !connectors.has(id)) throw new Error("a stranger disconnected it");
   failDetach.add(other);
   const half = await call(f.deps, "DELETE", `/connectors/${id}`, { actingRaftUserId: "u_owner", actingRole: "creator" });
-  if (half.status !== 502 || !connectors.has(id) || half.body.failed?.[0]?.raftAgentId !== "01JOTHER") throw new Error(`partial: ${half.status} ${half.text}`);
+  if (half.status !== 409 || half.body.outcome !== "not_cleared" || half.body.retry !== true || !connectors.has(id) || half.body.failed?.[0]?.raftAgentId !== "01JOTHER") throw new Error(`partial: ${half.status} ${half.text}`);
   failDetach.clear();
   const done = await call(f.deps, "DELETE", `/connectors/${id}`, { actingRaftUserId: "u_owner", actingRole: "creator" });
   if (done.status !== 200 || connectors.has(id) || [...conns.values()].some((c) => c.connectorId === id) || !detached.includes(`${other}/github/sealed-token`)) {
