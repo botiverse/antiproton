@@ -1947,6 +1947,17 @@ await check("the credential inventory's read of a mount: the key's presence and 
   w.dispose();
 });
 
+await check("the console's view of a connected mount reads the key's own record: attached, verified, its account and when it was set", async () => {
+  const w = await world();
+  const a = await w.agent("YS");
+  await w.connect(a);
+  const mount = (await a.rt.store.findMountsByPlugin(TENANT, a.agentId, "github"))[0]!;
+  const meta = await a.rt.credentialMeta(TENANT, a.agentId, mount);
+  must(meta.attached === true && meta.operator === false && meta.verified === true && typeof meta.account === "string" && meta.account.length > 0
+    && typeof meta.setAt === "number", `the console's view: ${JSON.stringify(meta)}`);
+  w.dispose();
+});
+
 // Guards agreement between two read paths until #1135 unifies them; at that point keep the outcome assertions and drop
 // the agreement check.
 await check("the inventory's read of a mount agrees with the runtime's (key present, none, dangling; the renewal record's connector), and lists the right state for each", async () => {
