@@ -42,7 +42,6 @@ export const RECENT_MS = 60_000;
 export type OAuthStatus = "connected" | "disconnected" | "error";
 export const RECONNECT_REASON = "OAuth authorization expired; reconnect required";
 
-/** What renews one mount's access token. Sealed as JSON under `oauth:<name>`. */
 /**
  * What renews a mount's key (`MountGrant`), stored under OAUTH_PREFIX + the key's name (`mountKeyName`,
  * src/runtime/secrets.ts); null when there is none or it cannot be opened here. The one reading of it, for the renewal
@@ -60,6 +59,7 @@ export async function readMountGrant(
   try { return JSON.parse(await open(kek, row)) as MountGrant; } catch { return null; }
 }
 
+/** What renews one mount's access token. Sealed as JSON under `oauth:<name>`. */
 export interface MountGrant {
   v: 1;
   refreshToken: string | null;
