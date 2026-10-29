@@ -836,6 +836,8 @@ await check("migration 0029: an existing copy gains the mark, an already-deleted
     `the prunes do not use their indexes: ${ended} | ${audit}`);
   // The mark reads the registry's deleted agents and reaches their rows by key: never a scan of the copy.
   must(!/SCAN provider_approvals\b/.test(mark!) && /provider_approvals USING (?:PRIMARY KEY|INDEX)/.test(mark!), `the mark scans the copy: ${mark}`);
+  // And the registry's deleted agents by their own index, never a scan of every agent.
+  must(mark!.includes("provisioned_agents_deleted") && !/SCAN provisioned_agents(?! USING)/.test(mark!), `the mark scans the registry: ${mark}`);
 });
 
 await check("notice: the agent writing the notice's own head first does not stop it being told", async () => {

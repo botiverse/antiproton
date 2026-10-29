@@ -20,3 +20,5 @@ UPDATE provider_approvals
 CREATE INDEX provider_approvals_ended ON provider_approvals(updated_at)
   WHERE agent_deleted_at IS NULL AND status IN ('denied', 'expired', 'executed', 'failed');
 CREATE INDEX provider_approvals_audit ON provider_approvals(agent_deleted_at) WHERE agent_deleted_at IS NOT NULL;
+-- The prune's mark (`d1ApprovalIndex.prune`) reads the deleted agents on every list: a few rows of many, so only those.
+CREATE INDEX provisioned_agents_deleted ON provisioned_agents(tenant_id, agent_id) WHERE status = 'deleted';
