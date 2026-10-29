@@ -2375,6 +2375,43 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
      *  task.
      *
      *  What happens to each machine is `releaseMachine`'s. */
+    /**
+     * Every egress registration on every box this mount holds, removed, and the record of what was wired cleared:
+     * for an agent's delete (`Holding.withdraw`). run9 holds the registered value and swaps it in on the box's way
+     * out with no call back here, so this is the only way to stop a box still running from using it. A command
+     * after this would wire the accounts again (`reconcileAccounts`); a deleted agent takes none.
+     */
+    async withdraw(ctx: PluginContext): Promise<{ withdrawn: string[]; failed: string[] }> {
+      const mount = await readMount(ctx);
+      const withdrawn: string[] = [];
+      const failed: string[] = [];
+      const cfg = cfgOf(ctx);
+      for (const machine of boxedMachines(mount)) {
+        const state = await readView(ctx, machine);
+        if (!state.boxId) continue;
+        if (!backendFor(cfg).caps.boxSecrets) continue;
+        if (!ctx.credential) { failed.push(`${state.boxId}: no credential to reach it with`); continue; }
+        try {
+          const provider = backendFor(cfg).open(cfg, ctx.credential);
+          for (const sec of await provider.listSecrets(state.boxId)) await provider.removeSecret(state.boxId, sec.id);
+          // Checked, not assumed: a removal the far end took but did not apply is not a withdrawal.
+          const left = await provider.listSecrets(state.boxId);
+          if (left.length) { failed.push(`${state.boxId}: ${left.length} registration(s) still there after removal`); continue; }
+          const now = await readView(ctx, machine);
+          if (now.boxId === state.boxId && (now.wired || now.leftOut)) {
+            const next = { ...now };
+            delete next.wired; delete next.leftOut;
+            await writeView(ctx, machine, next);
+          }
+          withdrawn.push(state.boxId);
+        } catch (e) {
+          failed.push(`${state.boxId}: ${String((e as Error)?.message ?? e).slice(0, 160)}`);
+        }
+      }
+      // A stranded box was made by a key that is gone: its registrations cannot be listed with this one.
+      for (const id of Object.keys(mount?.stranded ?? {})) failed.push(`${id}: stranded, made by another key, so its registrations cannot be reached`);
+      return { withdrawn, failed };
+    },
     async release(ctx: PluginContext, opts?: { reason?: "idle"; id?: string; forget?: boolean }): Promise<Released | Released[] | false> {
       // Which machines: the one whose box the framework named (the idle pass acts on one thing at a
       // time, each on its own clock), or every one the mount has (an operator releasing the mount, a

@@ -120,9 +120,80 @@ function github(opts: { expiring?: boolean } = {}) {
 }
 
 /** One D1, an agent object per Raft agent, and the provider handlers over both. */
-async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
+/**
+ * run9, as far as a box's GitHub access goes: boxes, commands, the egress registrations on a box, and the box's
+ * egress itself. run9 keeps a registration's value and, on a request leaving the box for one of its hosts, swaps the
+ * placeholder in the named header for it (`egress`), with no call back to antiproton: so what a box can do with the
+ * agent's token is decided by what is registered on it when it sends, and nothing else. `failDelete`: run9 refuses
+ * to delete the box (an outage, a refusal); `failWithdraw`: it refuses to remove a registration.
+ */
+function run9Fake() {
+  type Secret = { secret_id: string; name: string; value: string; placeholder: string; inject_header_name: string; allowed_hosts: string[] };
+  const boxes = new Map<string, { state: string; secrets: Secret[] }>();
+  const ws = "https://api.run.sys9.ai/projects/default/workspace";
+  let n = 0;
+  const f = { failDelete: false, failWithdraw: false };
+  const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json" } });
+  async function handle(url: string, init?: RequestInit): Promise<Response> {
+    const method = init?.method ?? "GET";
+    const path = url.startsWith(ws) ? url.slice(ws.length).split("?")[0]! : url;
+    const body = typeof init?.body === "string" ? JSON.parse(init.body) : null;
+    let m: RegExpMatchArray | null;
+    if (method === "POST" && path === "/boxes") { boxes.set(body.box_id, { state: "running", secrets: [] }); return json({ box_id: body.box_id }); }
+    if (method === "GET" && path === "/boxes") return json([...boxes].map(([box_id, b]) => ({ box_id, state: b.state })));
+    if ((m = path.match(/^\/boxes\/([^/]+)\/background-execs$/)) && method === "POST") {
+      if (!boxes.has(m[1]!)) return json({ message: "no such box" }, 404);
+      return json({ exec_id: `e${++n}` });
+    }
+    if ((m = path.match(/^\/execs\/([^/]+)$/))) return json({ state: "succeeded", exit_code: 0, output_summary: "" });
+    if ((m = path.match(/^\/execs\/([^/]+)\/kill$/))) return json({});
+    if ((m = path.match(/^\/boxes\/([^/]+)\/secrets$/))) {
+      const b = boxes.get(m[1]!);
+      if (!b) return json({ message: "no such box" }, 404);
+      if (method === "POST") {
+        b.secrets.push({ secret_id: `s${++n}`, name: body.name, value: body.value, placeholder: body.placeholder, inject_header_name: body.inject_header_name, allowed_hosts: body.allowed_hosts });
+        return json({});
+      }
+      return json(b.secrets.map((x) => ({ name: x.name, secret_id: x.secret_id })));
+    }
+    if ((m = path.match(/^\/boxes\/([^/]+)\/secrets\/([^/]+)$/)) && method === "DELETE") {
+      const b = boxes.get(m[1]!);
+      if (!b) return json({ message: "no such box" }, 404);
+      if (f.failWithdraw) return json({ message: "run9 is unavailable" }, 503);
+      b.secrets = b.secrets.filter((x) => x.secret_id !== m![2]);
+      return json({});
+    }
+    if ((m = path.match(/^\/boxes\/([^/]+)\/stop$/))) { const b = boxes.get(m[1]!); if (b) b.state = "stopped"; return json({}); }
+    if ((m = path.match(/^\/boxes\/([^/]+)$/)) && method === "DELETE") {
+      if (f.failDelete) return json({ message: "run9 is unavailable" }, 503);
+      boxes.delete(m[1]!);
+      return json({});
+    }
+    return json({});
+  }
+  /** A request leaving `boxId` for `url` with `headers`, as run9's egress forwards it. Null: there is no such box. */
+  function egress(boxId: string, url: string, headers: Record<string, string>): Record<string, string> | null {
+    const b = boxes.get(boxId);
+    if (!b) return null;
+    const host = new URL(url).hostname;
+    const out = { ...headers };
+    for (const s of b.secrets) {
+      if (!s.allowed_hosts.includes(host)) continue;
+      const k = Object.keys(out).find((h) => h.toLowerCase() === s.inject_header_name.toLowerCase());
+      if (k && out[k]!.includes(s.placeholder)) out[k] = out[k]!.replaceAll(s.placeholder, s.value);
+    }
+    return out;
+  }
+  return { boxes, handle, egress, f };
+}
+
+async function world(opts: { expiring?: boolean; github?: boolean; run9?: ReturnType<typeof run9Fake> } = {}) {
   const db = d1();
   const gh = github(opts);
+  if (opts.run9) {
+    const inner = globalThis.fetch, run9 = opts.run9;
+    globalThis.fetch = ((u: unknown, i?: RequestInit) => String(u).startsWith("https://api.run.sys9.ai") ? run9.handle(String(u), i) : inner(u as any, i)) as typeof fetch;
+  }
   const objects = new Map<string, { rt: AgentRuntime; host: ReturnType<typeof sqliteHost> }>();
   const registry = d1ProvisionedAgents(db);
   const propagated: string[] = [];
@@ -148,6 +219,7 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
       ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync }, waitUntil: (p: Promise<unknown>) => { pending.push(p); } } as any,
       bucket: {} as any, bucketName: "b", models: { resolve: () => null } as any,
       secretKek: KEK,
+      ...(opts.run9 ? { operatorRun9: { ak: "ak", sk: "sk" } } : {}),
       operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "k", HARNESS_MODEL: "deepseek-flash" } as any),
       ...(opts.github === false ? {} : {
         github: {
@@ -175,7 +247,11 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
   const deps: ProvisionDeps = {
     now: () => Date.now(), registry,
     // An agent's DELETE only: its push and its Raft credential, which these tests do not hold.
-    agent: { tool: async () => ({ ok: true, result: {} }), removeCredential: async () => true } as any,
+    agent: {
+      tool: async () => ({ ok: true, result: {} }), removeCredential: async () => true,
+      stopTurn: (t: string, a: string, trigger: any) => rtOf(a).stopTurn(t, a, trigger),
+      releaseForDelete: (t: string, a: string) => rtOf(a).releaseForDelete(t, a),
+    } as any,
     connections: {
       registry: d1Connections(db), connectors: d1Connectors(db), newId: () => `con_${++ids}`,
       attach: async (t, a, _p, sealed, refresh) => {
@@ -261,7 +337,9 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
   /** The `github.refresh` rows in an agent's trace outbox, as the export will carry them (#980). */
   const traced = (a: { agentId: string }) => pendingTrace(objects.get(a.agentId)!.host.sql as any, 0).rows.filter((r) => r.kind === "github.refresh");
   const dispose = () => { for (const o of objects.values()) o.host.dispose(); };
-  return { db, gh, agent, connect, reconnect, links, status, tool, stored, expireAt, age, call, grants, propagated, settle, dispose, traced, clearMode, hooks,
+  const sandbox = (a: { rt: AgentRuntime; agentId: string }, command = "true") =>
+    a.rt.gateway().invoke({ tenantId: TENANT, agentId: a.agentId, taskId: "t1" }, "sandbox.shell", { command } as any);
+  return { db, gh, agent, connect, sandbox, reconnect, links, status, tool, stored, expireAt, age, call, grants, propagated, settle, dispose, traced, clearMode, hooks,
     delayPropagation: (ms: number) => { propagateDelayMs = ms; } };
 }
 
@@ -1377,6 +1455,78 @@ await check("disconnecting a connector one of whose agents' objects holds no suc
   must(r.status === 200 && JSON.stringify(r.body.revokeOnGithub?.agents) === JSON.stringify(["ZB"]) && r.body.revokeOnGithub.action === "revoke_on_github"
     && msg.indexOf("#1128") < msg.indexOf("the last resort") && msg.includes("Until then") && msg.indexOf("Until then") < msg.indexOf("the last resort") && /ALL of this GitHub account's tokens/.test(msg), `the answer: ${r.status} ${r.text}`);
   must(!w.db.raw.prepare("SELECT 1 FROM provisioned_connections WHERE raft_agent_id = 'ZB'").get(), "the wiped agent's binding was kept");
+  w.dispose();
+});
+
+/** A request from inside the box to GitHub's API, as `gh` sends it: the placeholder it was given, in the header. */
+function fromBox(run9: ReturnType<typeof run9Fake>, boxId: string) {
+  const placeholder = run9.boxes.get(boxId)?.secrets.find((x) => x.name === "GH_TOKEN")?.placeholder ?? "__AP_GH_unknown__";
+  return { placeholder, send: () => run9.egress(boxId, "https://api.github.com/user", { authorization: `token ${placeholder}` }) };
+}
+
+await check("deleting an agent with a live sandbox: the box is deleted, and a request it makes carries no GitHub token", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("Y1");
+  await w.connect(a);
+  must((await w.sandbox(a) as any).status === "succeeded", "control: the command did not run");
+  const [boxId] = [...run9.boxes.keys()];
+  const req = fromBox(run9, boxId!);
+  const token = (await w.stored(a)).token!;
+  // Control: before the delete, the box's request leaves with the agent's token in it.
+  must(req.send()?.authorization === `token ${token}`, `control: the box's request did not carry the token: ${JSON.stringify(req.send())}`);
+  const del = await w.call("DELETE", "/agents/by-raft-agent/Y1");
+  must(del.status === 200 && del.body.clean === true && del.body.sandboxes?.released?.includes("sandbox") && (del.body.sandboxes.failed ?? []).length === 0,
+    `the answer: ${del.status} ${del.text}`);
+  // The box is gone: nothing it sends goes anywhere, with the token or without.
+  must(req.send() === null && !run9.boxes.has(boxId!), `the box is still there: ${JSON.stringify(req.send())}`);
+  w.dispose();
+});
+
+await check("deleting an agent whose box run9 will not delete: its registrations are withdrawn first, so the running box's request carries no token; the answer says retry_delete", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("Y2");
+  await w.connect(a);
+  await w.sandbox(a);
+  const [boxId] = [...run9.boxes.keys()];
+  const req = fromBox(run9, boxId!);
+  const token = (await w.stored(a)).token!;
+  must(req.send()?.authorization === `token ${token}`, "control: the box's request did not carry the token");
+  run9.f.failDelete = true;
+  const del = await w.call("DELETE", "/agents/by-raft-agent/Y2");
+  const failed = del.body?.sandboxes?.failed?.[0];
+  must(del.status === 200 && del.body.clean === false && failed?.alias === "sandbox" && failed.action === "retry_delete" && failed.egress === "withdrawn",
+    `the answer: ${del.status} ${del.text}`);
+  // Still running, and still sending: the request leaves with the placeholder, not the token.
+  const sent = req.send();
+  must(sent !== null && sent.authorization === `token ${req.placeholder}` && !JSON.stringify(sent).includes(token), `the box's request after the delete: ${JSON.stringify(sent)}`);
+  // run9 answers again: the repeated delete lets the box go.
+  run9.f.failDelete = false;
+  const again = await w.call("DELETE", "/agents/by-raft-agent/Y2");
+  must(again.status === 200 && again.body.clean === true && !run9.boxes.has(boxId!), `repeat: ${again.status} ${again.text}`);
+  w.dispose();
+});
+
+await check("deleting an agent whose box run9 will neither delete nor clear: the answer says the egress still holds the token, not clean", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("Y3");
+  await w.connect(a);
+  await w.sandbox(a);
+  const [boxId] = [...run9.boxes.keys()];
+  const req = fromBox(run9, boxId!);
+  const token = (await w.stored(a)).token!;
+  run9.f.failDelete = true; run9.f.failWithdraw = true;
+  const del = await w.call("DELETE", "/agents/by-raft-agent/Y3");
+  const failed = del.body?.sandboxes?.failed?.[0];
+  must(del.status === 200 && del.body.clean === false && failed?.egress === "not_withdrawn" && failed.action === "retry_delete"
+    && (del.body.sandboxes.withdrawFailed ?? []).length === 1, `the answer: ${del.status} ${del.text}`);
+  // Said as it is: this box still sends the token.
+  must(req.send()?.authorization === `token ${token}`, "the fake did not keep the registration it refused to remove");
+  run9.f.failDelete = false; run9.f.failWithdraw = false;
+  const again = await w.call("DELETE", "/agents/by-raft-agent/Y3");
+  must(again.status === 200 && again.body.clean === true && req.send() === null, `repeat: ${again.status} ${again.text}`);
   w.dispose();
 });
 

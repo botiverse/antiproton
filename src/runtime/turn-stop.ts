@@ -12,10 +12,13 @@ type Sql = SqlHost["sql"];
 
 export type StopTrigger = "provider_stop" | "admin_cancel" | "delete";
 
-/** What ending a turn did: the run aborted, nothing was running, or it could not be ended, with why. */
+/**
+ * What ending a turn did: the run aborted, nothing was running, or it could not be ended, with why. `stillRunning`:
+ * the background jobs whose cancel failed, which go on with whatever they hold.
+ */
 export type StopTurnOutcome =
-  | { result: "interrupted"; cancelledTurn: string }
-  | { result: "not_running" }
+  | { result: "interrupted"; cancelledTurn: string; stillRunning?: string[] }
+  | { result: "not_running"; stillRunning?: string[] }
   | { result: "failed"; error: string };
 
 /** What Raft is shown for each (src/runtime/activity.ts, `turn.stop`). */

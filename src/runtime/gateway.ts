@@ -1130,6 +1130,40 @@ export class ToolGateway {
     return rest;
   }
 
+  /**
+   * Every mount's `Holding.withdraw`: take back the credentials each registered at the far end for what it holds,
+   * without letting the things go (an agent's delete, before its release). Behind the same lock as a call on the
+   * mount, for an exclusive plugin, as `releaseTask` is. A mount whose plugin has no `withdraw` registers nothing.
+   */
+  async withdrawTask(ctx: CallContext): Promise<{ withdrawn: Array<{ alias: string; ids: string[] }>; failed: Array<{ alias: string; error: string }> }> {
+    const withdrawn: Array<{ alias: string; ids: string[] }> = [];
+    const failed: Array<{ alias: string; error: string }> = [];
+    for (const mount of await this.#store.listMounts(ctx.tenantId, ctx.agentId)) {
+      const plugin = this.#plugins.get(mount.plugin);
+      const holding = plugin ? holdingOf(plugin) : null;
+      if (!plugin || !holding?.withdraw) continue;
+      try {
+        const run = async () => holding.withdraw!({
+          caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
+          alias: mount.alias,
+          credential: mount.secretRef ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId }) : null,
+          credentialRefKind: secretRefKind(mount.secretRef),
+          publicConfig: mount.publicConfig,
+          db: this.#db(ctx, mount),
+          async sibling() { return null; },
+          async sandboxForms() { return []; },
+          async agentSecret() { return null; },
+        });
+        const r = isExclusive(plugin) ? await this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${mount.alias}`, run) : await run();
+        if (r.withdrawn.length) withdrawn.push({ alias: mount.alias, ids: r.withdrawn });
+        for (const f of r.failed) failed.push({ alias: mount.alias, error: f.slice(0, 200) });
+      } catch (e) {
+        failed.push({ alias: mount.alias, error: String((e as Error)?.message ?? e).slice(0, 200) });
+      }
+    }
+    return { withdrawn, failed };
+  }
+
   async releaseTask(
     ctx: CallContext,
     /** One mount rather than all of them. A plugin's `release` was always

@@ -4817,6 +4817,27 @@ export class AgentRuntime {
   }
 
   /**
+   * For an agent's delete, after its turn is stopped: take back every credential its mounts registered at the far
+   * end (`Holding.withdraw`: a sandbox's egress registrations, so a box still running stops acting with the agent's
+   * GitHub account at once), then let every held thing go (`releaseTask`, as an operator's release: a box is deleted,
+   * not parked). The withdrawal comes first because the release can fail and leave the box running. Both are
+   * repeated by a repeated delete; what each could not do is named.
+   */
+  async releaseForDelete(tenantId: string, agentId: string): Promise<{
+    withdrawn: Array<{ alias: string; ids: string[] }>; released: string[];
+    failed: Array<{ alias: string; stage: "withdraw" | "release"; error: string }>;
+  }> {
+    await this.ready();
+    const ctx = { tenantId, agentId, taskId: LEGACY_TASK };
+    const w = await this.#gateway.withdrawTask(ctx);
+    const r = await this.#gateway.releaseTask(ctx);
+    return {
+      withdrawn: w.withdrawn, released: r.released,
+      failed: [...w.failed.map((f) => ({ ...f, stage: "withdraw" as const })), ...r.failed.map((f) => ({ ...f, stage: "release" as const }))],
+    };
+  }
+
+  /**
    * End the agent's running turn from outside: the provider's stop route (`provider_stop`), the operator's
    * /admin/cancel-turn (`admin_cancel`), or a delete (`delete`), which also marks the agent so that no later pass takes
    * another step for it (`step`). Every session with a turn is cancelled as `cancelSession` cancels one. A turn that
@@ -4859,15 +4880,18 @@ export class AgentRuntime {
       let cancelled: string | null = null;
       // The main conversation's turn, read before the cancel closes it, for the row that says it was stopped.
       const stoppedTurn = pd ? null : turnIdOf(sql, MAIN_SESSION);
+      const stillRunning: string[] = [];
       for (const session of sessions) {
         const r = await this.cancelSession(tenantId, agentId, session);
         if (r.cancelledTurn && cancelled === null) cancelled = r.cancelledTurn;
+        stillRunning.push(...r.stillRunning);
         if (!pd) markSession(sql, session, false);
       }
-      if (cancelled === null) return done({ result: "not_running" });
+      const left = stillRunning.length ? { stillRunning } : {};
+      if (cancelled === null) return done({ result: "not_running", ...left });
       try { appendTrace(sql, [turnStopRow({ tenantId, agentId, operationId: cancelled, trigger, at: Date.now(), turn: stoppedTurn })]); }
       catch (e) { console.error(`the turn.stop row of ${tenantId}/${agentId} could not be written:`, e); }
-      return done({ result: "interrupted", cancelledTurn: cancelled });
+      return done({ result: "interrupted", cancelledTurn: cancelled, ...left });
     } catch (e) {
       return done({ result: "failed", error: String((e as Error)?.message ?? e).slice(0, 200) });
     }

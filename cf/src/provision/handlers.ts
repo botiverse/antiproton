@@ -80,6 +80,14 @@ export interface ProvisionAgentOps {
    * `failed`, with why. Optional: a deployment without it answers the stop route 404 and deletes without a stop.
    */
   stopTurn?(tenantId: string, agentId: string, trigger: "provider_stop" | "delete"): Promise<StopTurnResult>;
+  /**
+   * For a delete, after the stop: the agent's far-end registrations taken back (a sandbox's egress credentials) and
+   * its held things let go (`AgentRuntime.releaseForDelete`).
+   */
+  releaseForDelete?(tenantId: string, agentId: string): Promise<{
+    withdrawn: Array<{ alias: string; ids: string[] }>; released: string[];
+    failed: Array<{ alias: string; stage: "withdraw" | "release"; error: string }>;
+  }>;
 }
 
 /** What ending an agent's turn did (src/runtime/turn-stop.ts). */
@@ -1019,7 +1027,18 @@ export async function handleProvision(
     // First, and on a repeated delete too: a delete that does not end the running turn leaves the agent calling its
     // model with nobody able to see it (Raft stops taking a deleted agent's activity), which is what happened on
     // preview before deletes did this. A stop that fails does not fail the delete; it is logged (`turn.stop`).
-    if (deps.agent.stopTurn) await stopTurnOf(deps.agent.stopTurn, tenantId, row.agentId, "delete");
+    const stop = deps.agent.stopTurn ? await stopTurnOf(deps.agent.stopTurn, tenantId, row.agentId, "delete") : null;
+    // Then what its mounts hold at the far end: first the credentials registered there taken back (a sandbox's egress
+    // holds the agent's GitHub token and swaps it in with no call back here, so only this stops a box still running
+    // from using it), then each held thing let go (a box deleted). Again on a repeated delete. A failure is not a
+    // failed delete: it is in the answer (`sandboxes`), with what to do next.
+    const releaseHeld = async () => {
+      if (!deps.agent.releaseForDelete) return null;
+      try { return await deps.agent.releaseForDelete(tenantId, row.agentId); }
+      catch (e) { return { withdrawn: [], released: [], failed: [{ alias: "*", stage: "release" as const, error: `the agent's object did not answer: ${String((e as Error)?.message ?? e).slice(0, 160)}` }] }; }
+    };
+    // Right after the stop, before anything slower: a box still running acts with the agent's accounts until then.
+    const held = await releaseHeld();
     // Its holds' copies are kept as the record of who decided what for it, no longer listed, without the arguments'
     // text, which is the agent's to keep (`markAgentDeleted`). Again on a repeated delete, and by the next prune, so one
     // whose marking failed is finished. A failure is logged, not a failed delete: the list leaves a deleted agent's rows
@@ -1089,8 +1108,29 @@ export async function handleProvision(
       }
       return ends;
     };
-    const answer = (agent: ReturnType<typeof view>, ends: ConnectionEnd[] | null) => ends === null ? ok(agent)
-      : ok({ ...agent, connections: ends, connectionsClean: ends.every((e) => e.mount === "cleared" && !e.error) });
+    // What the delete could not finish, each with what to do next. Still a 200: the agent is deleted either way.
+    //  - a background job whose cancel failed goes on with whatever it holds: `turn.stillRunning`, retry_delete;
+    //  - a held thing that would not go: `sandboxes.failed`, retry_delete, and `egress` says whether the credentials
+    //    registered for it were taken back (a box still running then has none of the agent's accounts) or not.
+    // `clean` is every part clean; `connectionsClean` is the connections' alone, as before.
+    const answer = (agent: ReturnType<typeof view>, ends: ConnectionEnd[] | null) => {
+      const stillRunning = stop && stop.result !== "failed" ? stop.stillRunning ?? [] : [];
+      const turn = stop?.result === "failed" ? { stopped: false, error: stop.error, action: "retry_delete" as const }
+        : stillRunning.length ? { stopped: true, stillRunning, action: "retry_delete" as const } : null;
+      const releaseFailed = held?.failed.filter((f) => f.stage === "release") ?? [];
+      const sandboxes = held === null ? null : {
+        released: held.released,
+        failed: releaseFailed.map((f) => ({
+          alias: f.alias, error: f.error, action: "retry_delete" as const,
+          egress: held.failed.some((w) => w.stage === "withdraw" && (w.alias === f.alias || f.alias === "*")) || f.alias === "*" ? "not_withdrawn" as const : "withdrawn" as const,
+        })),
+        ...(held.failed.some((f) => f.stage === "withdraw") ? { withdrawFailed: held.failed.filter((f) => f.stage === "withdraw").map(({ alias, error }) => ({ alias, error })) } : {}),
+      };
+      const connectionsClean = ends === null ? true : ends.every((e) => e.mount === "cleared" && !e.error);
+      const clean = connectionsClean && turn === null && releaseFailed.length === 0;
+      if (ends === null && held === null && turn === null) return ok(agent);
+      return ok({ ...agent, ...(ends === null ? {} : { connections: ends, connectionsClean }), ...(turn ? { turn } : {}), ...(sandboxes ? { sandboxes } : {}), clean });
+    };
     if (row.status === "deleted") {
       const ends = await unbind(deps.now());
       await keepHolds(row.deletedAt ?? row.updatedAt);

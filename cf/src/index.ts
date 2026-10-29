@@ -1575,6 +1575,12 @@ export class AgentDO extends DurableObject<Env> {
     });
   }
 
+  /** An agent's delete, after its turn is stopped: its far-end registrations taken back, its held things let go. */
+  async releaseForDelete(tenantId: string, agentId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("releaseForDelete", () => this.runtime().releaseForDelete(tenantId, agentId));
+  }
+
   /** Cancel a session's running turn and its background work (Agents API input.cancel). */
   async apiCancelSession(tenantId: string, agentId: string, sessionId: string) {
     this.#claim(tenantId, agentId);
@@ -3853,6 +3859,7 @@ function provisionDeps(env: Env): ProvisionDeps {
       tool: (tenantId, agentId, name) => stub(tenantId, agentId).provisionTool(tenantId, agentId, name),
       pushStatus: (tenantId, agentId) => stub(tenantId, agentId).provisionPushStatus(tenantId, agentId),
       stopTurn: (tenantId, agentId, trigger) => stub(tenantId, agentId).stopTurn(tenantId, agentId, trigger),
+      releaseForDelete: (tenantId, agentId) => stub(tenantId, agentId).releaseForDelete(tenantId, agentId),
     },
     // Only where this deployment can run the flow: an OAuth App, a session secret and its own origin.
     ...(connectDeps(env) ? {

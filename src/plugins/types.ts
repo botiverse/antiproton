@@ -1892,6 +1892,12 @@ export interface Holding {
    * Letting go of several may report a fact for each (an array), and a failure among them throws with
    * every fact attached (`markReleased`).
    */
+  /**
+   * Take back every credential this mount registered at the far end for the things it holds, without letting the
+   * things go: for an agent's delete, before the release, so a thing the release cannot end (a refusal, an outage)
+   * stops acting with the agent's accounts at once. What was cleared, and what could not be, each named; never a throw.
+   */
+  withdraw?(ctx: PluginContext): Promise<{ withdrawn: string[]; failed: string[] }>;
   release(ctx: PluginContext, opts?: {
     reason?: "idle"; id?: string;
     /**
