@@ -219,8 +219,7 @@ export function d1ApprovalIndex(db: D1Database): ApprovalIndex {
         `SELECT ?, ?, ?, ?, ?, ?, ?, CASE WHEN d.at IS NULL THEN ? ELSE json_remove(?, ${AUDIT_DROPS}) END, ?, ?, ?, d.at ` +
         "FROM (SELECT (SELECT COALESCE(p.deleted_at, p.updated_at) FROM provisioned_agents p WHERE p.tenant_id = ? AND p.agent_id = ? AND p.status = 'deleted') AS at) d WHERE true " +
         "ON CONFLICT(tenant_id, agent_id, operation_id) DO UPDATE SET status = excluded.status, expires_at = excluded.expires_at, updated_at = excluded.updated_at, " +
-        "agent_deleted_at = COALESCE(provider_approvals.agent_deleted_at, excluded.agent_deleted_at), " +
-        `item = CASE WHEN COALESCE(provider_approvals.agent_deleted_at, excluded.agent_deleted_at) IS NULL THEN excluded.item ELSE json_remove(excluded.item, ${AUDIT_DROPS}) END ` +
+        "agent_deleted_at = COALESCE(provider_approvals.agent_deleted_at, excluded.agent_deleted_at), item = excluded.item " +
         `WHERE ${STATE_RANK("excluded.status")} > ${STATE_RANK("provider_approvals.status")}`,
       ).bind(r.tenantId, r.agentId, r.operationId, r.raftOrigin, r.raftServerId, r.raftAgentId, r.status, item, item,
         r.createdAt, r.expiresAt, r.updatedAt, r.tenantId, r.agentId).run();

@@ -685,10 +685,13 @@ await check("deleted agent: its rows are kept as the record of who decided what,
   must((await call(w, "DELETE", `agents/${A}`)).status === 200 && indexRow(w, op).agent_deleted_at === kept.agent_deleted_at, "a repeat moved the mark");
   const { d1ApprovalIndex } = await import("../cf/src/approvals.ts");
   const late = { tenantId: T, agentId: A, raftOrigin: ORIGIN, raftServerId: "srv-1", raftAgentId: RAFT_ID, createdAt: 1, expiresAt: null, updatedAt: Date.now() };
-  await d1ApprovalIndex(w.DB).upsert({ ...late, operationId: "op_late", status: "pending", item: { operationId: "op_late", args: { summary: "late" } } as never });
+  await d1ApprovalIndex(w.DB).upsert({ ...late, operationId: "op_late", status: "pending",
+    item: { operationId: "op_late", args: { summary: "late" }, route: { method: "POST", path: "/repos/o/r/pulls", repo: "o/r", body: "the body" } } as never });
   await d1ApprovalIndex(w.DB).upsert({ ...late, operationId: open, status: "denied", item: { ...item, operationId: open, status: "denied", args: { summary: "back" } } as never });
   const lateRow = indexRow(w, "op_late"), moved = indexRow(w, open);
-  must(lateRow?.agent_deleted_at === kept.agent_deleted_at && !("args" in JSON.parse(lateRow.item)), `a new row after the delete: ${show(lateRow)}`);
+  const lateItem = lateRow ? JSON.parse(lateRow.item) : null;
+  must(lateRow?.agent_deleted_at === kept.agent_deleted_at && !("args" in lateItem) && !("body" in lateItem.route) && lateItem.route.repo === "o/r",
+    `a new row after the delete: ${show(lateRow)}`);
   must(moved.status === "denied" && moved.agent_deleted_at === kept.agent_deleted_at && !moved.item.includes("back"), `a hold moved after the delete: ${show(moved)}`);
   const after = await call(w, "GET", "approvals");
   must(after.body.approvals.every((a: any) => a.operationId !== open && a.operationId !== "op_late"), `listed after the delete: ${after.text}`);
