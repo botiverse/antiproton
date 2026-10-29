@@ -60,12 +60,14 @@ async function gateway(heldPlace?: (ctx: typeof CTX) => HeldPlace) {
 }
 const messageOf = (r: any) => String(r?.error?.message ?? "");
 const AGAIN = "Calling this tool again with the same arguments while it waits returns this same pending approval; it does not create another.";
-const MERGED = (id: string) => `An identical call is already waiting for approval (operation ${id}); this call was not added as a second one. ` +
-  "If you need it done twice, call again after that one is decided.";
-const NOBODY_RAFT = "Nobody with access to this agent can approve it on the antiproton console today: this agent was made through Raft, " +
-  "and the console accepts no Raft sign-in, so its owner cannot open it. It does not expire. Antiproton notifies nobody of it. " +
-  "Tell your owner once that this action is blocked, then plan as if it will not run: no one is able to approve it yet. " +
+const MERGED_ONLY = (id: string) => `An identical call is already waiting for approval (operation ${id}); this call was not added as a second one.`;
+const MERGED = (id: string) => MERGED_ONLY(id) + " If you need it done twice, call again after that one is decided.";
+const NOBODY = "Nobody you can reach can approve it on the antiproton console today: ";
+const NOBODY_REST = "The operator can still approve it, from the provider's home or by its operation id; if it is approved, it runs on its own " +
+  "exactly as written, and you are not told the decision or the result. It does not expire. Antiproton notifies nobody of it. " +
+  "Tell your owner once that this action is blocked, then plan as if it will not run. " +
   "Retrying will not make it happen sooner: calling again with the same arguments returns this same pending approval.";
+const NOBODY_RAFT = NOBODY + "this agent was made through Raft, and the console accepts no Raft sign-in, so its owner cannot open it. " + NOBODY_REST;
 
 // ---------------------------------------------------------------- the held result
 
@@ -128,6 +130,16 @@ await check("an identical call while the first is pending: the same operation, o
   must(pending.length === 1 && two.status === "pending" && one.operationId === two.operationId, `${pending.length} pending: ${one.operationId} ${two.operationId}`);
   must(messageOf(two).startsWith(MERGED(one.operationId) + " No decider is known"), `the merged call's text: ${messageOf(two)}`);
   must(!messageOf(one).includes("An identical call"), `the first call's text: ${messageOf(one)}`);
+});
+
+await check("two identical calls at once (pi runs a turn's calls with Promise.all): one approval, one operation id, one merged", async () => {
+  const { gw, store } = await gateway(() => ({ decider: null, url: URL_A }));
+  const [one, two]: any[] = await Promise.all([gw.invoke(CTX, "ops.deploy", { v: 1 }), gw.invoke(CTX, "ops.deploy", { v: 1 })]);
+  const pending = await store.listApprovals("t", "pending");
+  must(pending.length === 1 && one.status === "pending" && two.status === "pending" && one.operationId === two.operationId
+    && pending[0]!.operationId === one.operationId, `${pending.length} pending: ${one.operationId} ${two.operationId}`);
+  const merged = [one, two].filter((r) => messageOf(r).startsWith(MERGED(one.operationId)));
+  must(merged.length === 1, `${merged.length} results say merged: ${messageOf(one)} | ${messageOf(two)}`);
 });
 
 await check("an identical call after the first is decided: a new approval, since the same call twice can be meant", async () => {
@@ -268,9 +280,34 @@ await check("an AgentRuntime, API agent: its first conversation links the page; 
   const { rt, host } = await runtimeFor({ openai: { name: "api" } });
   const r: any = await rt.gateway().invoke(MAIN, "ops.deploy", {});
   must(r.url === URL_A && messageOf(r).includes(URL_A), `first conversation: ${JSON.stringify(r)}`);
-  const s: any = await rt.gateway().invoke({ ...MAIN, taskId: "sess_1" }, "ops.deploy", {});
-  must(s.status === "pending" && s.url === null && messageOf(s).includes("Nobody with access to this agent can approve it on the antiproton console today")
+  // Other arguments: the same ones would be merged into the first conversation's call, and told its place.
+  const s: any = await rt.gateway().invoke({ ...MAIN, taskId: "sess_1" }, "ops.deploy", { v: 1 });
+  must(s.status === "pending" && s.url === null && messageOf(s).includes(NOBODY)
     && !messageOf(s).includes("http"), `a session: ${JSON.stringify(s)}`);
+  host.dispose();
+});
+
+await check("two identical calls at once through the Durable Object store: one approval, one operation id, one merged", async () => {
+  const { rt, host } = await runtimeFor({});
+  const [one, two]: any[] = await Promise.all([rt.gateway().invoke(MAIN, "ops.deploy", { v: 1 }), rt.gateway().invoke(MAIN, "ops.deploy", { v: 1 })]);
+  const pending = await rt.store.listApprovals("t", "pending");
+  must(pending.length === 1 && one.operationId === two.operationId, `${pending.length} pending: ${one.operationId} ${two.operationId}`);
+  must([one, two].filter((r) => messageOf(r).startsWith(MERGED(one.operationId))).length === 1, `${messageOf(one)} | ${messageOf(two)}`);
+  host.dispose();
+});
+
+await check("a call held in a child conversation, then made again from main: merged, and told the held row's place, nobody", async () => {
+  const { rt, host } = await runtimeFor({});
+  const child: any = await rt.gateway().invoke({ ...MAIN, taskId: "t_child" }, "ops.deploy", { v: 1 });
+  must(child.status === "pending" && child.url === null && messageOf(child).includes(NOBODY), `the child's: ${JSON.stringify(child)}`);
+  const r: any = await rt.gateway().invoke(MAIN, "ops.deploy", { v: 1 });
+  must(r.operationId === child.operationId && r.url === null && !messageOf(r).includes("http"), `main's: ${JSON.stringify(r)}`);
+  must(messageOf(r) === `${MERGED_ONLY(child.operationId)} ${NOBODY}` +
+    `the console's page for this agent shows only its first conversation's held calls, and this call was held in another one. ${NOBODY_REST}`,
+    `main's text: ${messageOf(r)}`);
+  // Control: main's own call with other arguments still gets the page.
+  const own: any = await rt.gateway().invoke(MAIN, "ops.deploy", { v: 2 });
+  must(own.url === URL_A && messageOf(own).includes(URL_A), `main's own: ${JSON.stringify(own)}`);
   host.dispose();
 });
 

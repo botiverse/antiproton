@@ -1012,6 +1012,25 @@ export class SqliteStore implements StorageAdapter {
       .run(a.tenantId, a.operationId, a.agentId, a.taskId, a.mountAlias, a.tool, j(a.request), now());
   }
 
+  async holdApproval(a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt">, same: (held: ApprovalRecord) => boolean) {
+    // One synchronous transaction: no await between the lookup and the insert (StorageAdapter `holdApproval`).
+    return this.#tx(() => {
+      const existing = (this.#db
+        .prepare("SELECT * FROM approvals WHERE tenant_id=? AND agent_id=? AND mount_alias=? AND tool=? AND state='pending' ORDER BY created_at ASC")
+        .all(a.tenantId, a.agentId, a.mountAlias, a.tool) as any[]).map(mapApproval).find(same);
+      if (existing) return { created: false as const, existing };
+      this.#db
+        .prepare(
+          `INSERT INTO approvals(tenant_id, operation_id, agent_id, task_id, mount_alias, tool,
+             request, state, approver, decided_at, created_at)
+           VALUES (?,?,?,?,?,?,?,'pending',NULL,NULL,?)
+           ON CONFLICT(tenant_id, operation_id) DO NOTHING`,
+        )
+        .run(a.tenantId, a.operationId, a.agentId, a.taskId, a.mountAlias, a.tool, j(a.request), now());
+      return { created: true as const };
+    });
+  }
+
   async getApproval(tenantId: string, operationId: string): Promise<ApprovalRecord | null> {
     const r = this.#db
       .prepare("SELECT * FROM approvals WHERE tenant_id=? AND operation_id=?")

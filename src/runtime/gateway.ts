@@ -521,21 +521,26 @@ function heldKey(agentId: string, mountAlias: string, tool: string, request: unk
  */
 export function heldMessage(operationId: string, place: HeldPlace, merged = false): string {
   const opening = merged
-    ? `An identical call is already waiting for approval (operation ${operationId}); this call was not added as a second one. ` +
-      "If you need it done twice, call again after that one is decided."
+    ? `An identical call is already waiting for approval (operation ${operationId}); this call was not added as a second one.`
     : `This call is held for approval (operation ${operationId}).`;
   const again = "Calling this tool again with the same arguments while it waits returns this same pending approval; it does not create another.";
   if ("nobody" in place) {
-    return `${opening} Nobody with access to this agent can approve it on the antiproton console today: ${place.nobody}. ` +
+    // Nobody the agent can reach, but the row can still be decided: the decide route takes an operation id with no
+    // page listing it (cf/src/index.ts `uiDecide`), and a Raft-made agent's provider home signs in to it. So the text
+    // keeps the warning that an approval runs it unannounced.
+    return `${opening} Nobody you can reach can approve it on the antiproton console today: ${place.nobody}. ` +
+      "The operator can still approve it, from the provider's home or by its operation id; if it is approved, it runs on its own " +
+      "exactly as written, and you are not told the decision or the result. " +
       "It does not expire. Antiproton notifies nobody of it. " +
-      "Tell your owner once that this action is blocked, then plan as if it will not run: no one is able to approve it yet. " +
+      "Tell your owner once that this action is blocked, then plan as if it will not run. " +
       "Retrying will not make it happen sooner: calling again with the same arguments returns this same pending approval.";
   }
+  const twice = merged ? " If you need it done twice, call again after that one is decided." : "";
   const page = place.url ? `the antiproton console at ${place.url}` : "this agent's approvals panel on the antiproton console";
   const who = place.decider
     ? `${place.decider} decides it on ${page}.`
     : `No decider is known: it is decided on ${page}, by a person signed in there with access to this agent.`;
-  return `${opening} ${who} ` +
+  return `${opening}${twice} ${who} ` +
     `It does not expire: it waits until someone decides. If approved, it runs on its own exactly as written; ` +
     `you are not told the decision or the result, and your turn does not wait for it. ` +
     `Antiproton notifies nobody of it: if it matters, send ${place.decider ?? "a person"} ${place.url ? "that link" : "the operation id"} in a message. ` +
@@ -1359,20 +1364,23 @@ export class ToolGateway {
       // approved, and the side effect would run twice. Only a pending one: once it is decided, the same call again is
       // a new intent (the same payment twice) and gets its own approval. This attempt's own operation, recorded above,
       // is ended as cancelled with the operation it was merged into, since nothing will ever run it.
+      // The lookup and the insert are one store transaction (`holdApproval`): pi runs a turn's tool calls together
+      // (`Promise.all`), so with an await between them two identical calls could both miss and both insert.
       const same = heldKey(ctx.agentId, r.mount.alias, r.tool, request);
-      const pending = (await this.#store.listApprovals(ctx.tenantId, "pending"))
-        .find((a) => heldKey(a.agentId, a.mountAlias, a.tool, a.request) === same);
+      const hold = await this.#store.holdApproval({
+        tenantId: ctx.tenantId, operationId, agentId: ctx.agentId, taskId: ctx.taskId,
+        mountAlias: r.mount.alias, tool: r.tool, request,
+      }, (a) => heldKey(a.agentId, a.mountAlias, a.tool, a.request) === same);
+      const pending = hold.created ? undefined : hold.existing;
       if (pending) {
         await this.#store.completeOperation(ctx.tenantId, operationId, "cancelled", null, { mergedInto: pending.operationId }, facts());
-      } else {
-        await this.#store.requireApproval({
-          tenantId: ctx.tenantId, operationId, agentId: ctx.agentId, taskId: ctx.taskId,
-          mountAlias: r.mount.alias, tool: r.tool, request,
-        });
       }
       const held = pending?.operationId ?? operationId;
+      // The place is the held row's: the key has no conversation, so a merged call may be held in another one than
+      // this caller's, and only that one's place says where it can be decided.
+      const at: CallContext = pending ? { ...ctx, taskId: pending.taskId } : ctx;
       // A place that cannot be read must not lose the hold, which is already recorded: the text then names neither.
-      const place: HeldPlace = await (async () => this.#heldPlace?.(ctx))().catch(() => undefined) ?? { decider: null, url: null };
+      const place: HeldPlace = await (async () => this.#heldPlace?.(at))().catch(() => undefined) ?? { decider: null, url: null };
       return {
         status: "pending",
         operationId: held,
