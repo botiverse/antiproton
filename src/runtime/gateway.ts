@@ -528,8 +528,8 @@ export function heldMessage(operationId: string, place: HeldPlace, merged = fals
   if ("nobody" in place) {
     return `${opening} Nobody with access to this agent can approve it on the antiproton console today: ${place.nobody}. ` +
       "It does not expire. Antiproton notifies nobody of it. " +
-      "Tell your owner in a message that this action is blocked pending an approval nobody can currently give, and do not retry it. " +
-      again;
+      "Tell your owner once that this action is blocked, then plan as if it will not run: no one is able to approve it yet. " +
+      "Retrying will not make it happen sooner: calling again with the same arguments returns this same pending approval.";
   }
   const page = place.url ? `the antiproton console at ${place.url}` : "this agent's approvals panel on the antiproton console";
   const who = place.decider

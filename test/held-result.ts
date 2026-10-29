@@ -64,7 +64,8 @@ const MERGED = (id: string) => `An identical call is already waiting for approva
   "If you need it done twice, call again after that one is decided.";
 const NOBODY_RAFT = "Nobody with access to this agent can approve it on the antiproton console today: this agent was made through Raft, " +
   "and the console accepts no Raft sign-in, so its owner cannot open it. It does not expire. Antiproton notifies nobody of it. " +
-  "Tell your owner in a message that this action is blocked pending an approval nobody can currently give, and do not retry it.";
+  "Tell your owner once that this action is blocked, then plan as if it will not run: no one is able to approve it yet. " +
+  "Retrying will not make it happen sooner: calling again with the same arguments returns this same pending approval.";
 
 // ---------------------------------------------------------------- the held result
 
@@ -113,7 +114,7 @@ await check("nobody can decide: the text says so, with no link, no expiry, nobod
   const r: any = await gw.invoke(CTX, "ops.deploy", {});
   const m = messageOf(r);
   must(r.status === "pending", `not held: ${JSON.stringify(r)}`);
-  must(m === `This call is held for approval (operation ${r.operationId}). ${NOBODY_RAFT} ${AGAIN}`, `the text: ${m}`);
+  must(m === `This call is held for approval (operation ${r.operationId}). ${NOBODY_RAFT}`, `the text: ${m}`);
   must(!m.includes("http") && !m.includes("decided on"), `a link or a place: ${m}`);
   must(r.decider === null && r.expires === null && r.url === null, `the structured fields: ${JSON.stringify(r)}`);
 });
@@ -277,7 +278,7 @@ await check("an AgentRuntime, Raft-made agent: nobody can decide, no link, tell 
   const { rt, host } = await runtimeFor({ provisionedBy: PROVISIONED_BY });
   const r: any = await rt.gateway().invoke(MAIN, "ops.deploy", {});
   must(r.status === "pending" && r.url === null && r.decider === null && r.expires === null, `${JSON.stringify(r)}`);
-  must(messageOf(r) === `This call is held for approval (operation ${r.operationId}). ${NOBODY_RAFT} ${AGAIN}`, `the text: ${messageOf(r)}`);
+  must(messageOf(r) === `This call is held for approval (operation ${r.operationId}). ${NOBODY_RAFT}`, `the text: ${messageOf(r)}`);
   host.dispose();
 });
 
