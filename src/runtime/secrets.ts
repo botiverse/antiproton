@@ -51,6 +51,21 @@ export function agentRef(name: string): string { return AGENT_REF + name; }
 export function isAgentRef(ref: string | null | undefined): boolean {
   return typeof ref === "string" && ref.startsWith(AGENT_REF);
 }
+/**
+ * The name of the agent's own key a reference names, under which it is stored in `secrets`; null when it names none
+ * (a shared account, or nothing).
+ */
+export function agentKeyName(ref: string | null | undefined): string | null {
+  return isAgentRef(ref) ? ref!.slice(AGENT_REF.length) : null;
+}
+/**
+ * The one answer to "what is this mount's key called", for reading it and for writing it: the name its reference
+ * gives, when it names a key of the agent's; otherwise the mount's alias, which is where a key attached to it goes.
+ * Its renewal record is kept under the same name (cf/src/github-refresh.ts `readMountGrant`).
+ */
+export function mountKeyName(mount: { alias: string; secretRef: string | null }): string {
+  return agentKeyName(mount.secretRef) ?? mount.alias;
+}
 
 /**
  * Whose credential a reference names, never what it is.
@@ -108,7 +123,7 @@ export function agentSecrets(
       if (!isAgentRef(ref)) return fallback.resolve(ref, scope, opts);
       if (!scope) return null;              // no owner, no lookup: the reference alone names nothing
       if (!kek) throw new Error("agent secrets are configured but the Worker has no SECRET_KEK");
-      const name = ref.slice(AGENT_REF.length);
+      const name = agentKeyName(ref)!;
       const row = await store.getSecret(scope.tenantId, scope.agentId, name);
       if (!row) return null;
       const value = await open(kek, row);

@@ -138,7 +138,7 @@ import { ToolGateway, type HeldPlace, type InvokeOpts } from "../../src/runtime/
 import { assertMountConfig, configFromForm, mergeMountSettings, repeatsMount, validateMount, type SettingValue } from "../../src/runtime/mount-config.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { OPERATOR_EXA_REF, OPERATOR_RUN9_REF, resolveOperatorRef } from "./operator-ref.ts";
-import { agentSecrets, agentRef, importKek, isAgentRef, open, OWNER_PREFIX, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
+import { agentSecrets, agentKeyName, agentRef, importKek, isAgentRef, mountKeyName, open, OWNER_PREFIX, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
 import {
   acceptInbound, claimPendingInbound, ensureInboundTable, hasPendingInbound, hookSecretName, inboundMessage, markPostingInbound, newHookId, newHookSecret,
   nextPendingInbound, pendingInboundCount, recentInbound, recordInbound, requeueInbound, seenBefore, settleInbound, underRate,
@@ -203,6 +203,8 @@ import { RunJsContinuations } from "../../src/runtime/run-js-resume.ts";
 
 /** What an operator may call a mount: it becomes the `<alias>__` prefix of every tool name. */
 export const MOUNT_ALIAS = /^[a-z][a-z0-9-]{0,23}$/;
+/** Why a mount's reference names a key that is not its own (`AgentRuntime#foreignKey`). */
+export type ForeignKeyReason = "shared" | "not_a_mount_key";
 
 /**
  * How a mount added from the console is told apart: its `installationId`
@@ -1437,7 +1439,7 @@ export class AgentRuntime {
         // Every reader of a mount's key comes through here — a tool call, the sandbox's egress before each
         // command, a program's calls — so an expiring one is renewed here, before it is handed out.
         if (isAgentRef(ref) && scope && deps.github) {
-          try { await this.#oauth.beforeUse(scope.tenantId, scope.agentId, ref.slice(agentRef("").length)); }
+          try { await this.#oauth.beforeUse(scope.tenantId, scope.agentId, agentKeyName(ref)!); }
           catch (e) { console.error("github: renewing before use failed:", String((e as Error)?.message ?? e).slice(0, 200)); }
         }
         return agentSecrets(this.store, await kekPromise, operator).resolve(ref, scope, opts);
@@ -1447,7 +1449,12 @@ export class AgentRuntime {
     this.#gateway = new ToolGateway(this.store, plugins, SEEDED_PLUGINS, this.#secrets,
       deps.hooks ? (tenantId, agentId, alias) => this.#inboundFor(tenantId, agentId, alias) : undefined,
       {
-        ...(deps.github ? { credentialRejected: (scope: { tenantId: string; agentId: string }, name: string, token: string) => this.#oauth.rejected(scope.tenantId, scope.agentId, name, token) } : {}),
+        ...(deps.github ? {
+          credentialRejected: async (scope: { tenantId: string; agentId: string }, name: string, token: string, alias: string) =>
+            // A renewal writes under `name`, which the mount the 401 came through may only be pointing at.
+            await this.#renewalSkipped(scope.tenantId, scope.agentId, { alias, secretRef: agentRef(name) }, "rejected")
+              ? null : this.#oauth.rejected(scope.tenantId, scope.agentId, name, token),
+        } : {}),
         heldPlace: async (ctx) => heldPlaceFor(agentKind((await this.store.loadAgent(ctx.tenantId, ctx.agentId))?.config),
           ctx.taskId, approvalsUrl(deps.consoleOrigin, ctx.agentId)),
         ...(deps.approvalTtlMs !== undefined ? { approvalTtlMs: deps.approvalTtlMs } : {}),
@@ -1859,6 +1866,51 @@ export class AgentRuntime {
   // ---- per-agent credentials, from the console. Value in, metadata out.
 
   /**
+   * Whether the key a mount's reference names is something else's, so this mount must not write or delete it:
+   * `shared`, another mount's (another mount's reference names it, or the key is filed under another mount's alias);
+   * `not_a_mount_key`, a name no mount can have (`MOUNT_ALIAS`), such as an inbound hook's signing secret
+   * (`hook:<id>`) or a renewal record. Null for no key of the agent's, and for this mount's own key, whether or not it
+   * is named after the alias.
+   *
+   * Writes refuse a foreign name and reads never refuse, so that this state stays visible: the key is still read,
+   * shown and listed by the credential inventory (cf/src/credential-inventory.ts), which is where it is found.
+   */
+  async #foreignKey(tenantId: string, agentId: string, mount: { alias: string; secretRef: string | null }):
+    Promise<{ name: string; reason: ForeignKeyReason } | null> {
+    const name = agentKeyName(mount.secretRef);
+    if (name === null || name === mount.alias) return null;
+    if (!MOUNT_ALIAS.test(name)) return { name, reason: "not_a_mount_key" };
+    const others = (await this.store.listMounts(tenantId, agentId)).filter((m) => m.alias !== mount.alias);
+    if (others.some((m) => m.alias === name || agentKeyName(m.secretRef) === name)) return { name, reason: "shared" };
+    return null;
+  }
+
+  /** Why an attach to a mount whose reference names a foreign key (`#foreignKey`) is refused, and the way out. */
+  static foreignKeyRefusal(alias: string, foreign: { name: string; reason: ForeignKeyReason }): string {
+    const why = foreign.reason === "shared"
+      ? `${foreign.name} is another mount's key`
+      : `${foreign.name} cannot be a mount's key, so the reference is misconfigured`;
+    return `mount_key_foreign:${foreign.reason}: ${alias}'s reference names a key that is not its own (${why}); ` +
+      `removing the credential clears the reference, and a key attached after that goes under ${alias}`;
+  }
+
+  /**
+   * Whether a renewal reaching `mount` (`why`: an adopt, a reconnect in place, a 401) must not write, because the key
+   * its reference names is not its own (`#foreignKey`): null to go ahead; otherwise the key, why, and the code
+   * (`mount_key_foreign:<reason>`), said on a `github.refresh.skipped` line. A line and not a `github.refresh` trace
+   * row: those rows are forwarded with a fixed outcome vocabulary (cf/src/trace-forward.ts, docs/runbook.md).
+   * Renewing a key from its own record before it is read (`GithubRefresher.beforeUse`) is not asked this.
+   */
+  async #renewalSkipped(tenantId: string, agentId: string, mount: { alias: string; secretRef: string | null },
+    why: "adopt" | "reconnect" | "rejected"): Promise<{ name: string; reason: ForeignKeyReason; code: string } | null> {
+    const foreign = await this.#foreignKey(tenantId, agentId, mount);
+    if (!foreign) return null;
+    const code = `mount_key_foreign:${foreign.reason}`;
+    logEvent("github.refresh.skipped", { tenantId, agentId, mount: mount.alias, key: foreign.name, why, reason: code });
+    return { ...foreign, code };
+  }
+
+  /**
    * Store a credential for one of this agent's mounts and point the mount at
    * it. `fields` is what the form posted, keyed by the plugin's declared field
    * names; a bare token comes as `{ token }`. The value is sealed before it
@@ -1898,6 +1950,8 @@ export class AgentRuntime {
           `which cannot be given back once replaced; a key of your own goes on a mount of your own`,
       };
     }
+    const foreign = await this.#foreignKey(tenantId, agentId, mount);
+    if (foreign) return { ok: false, error: AgentRuntime.foreignKeyRefusal(alias, foreign) };
     const plugin = this.#plugins.find((p) => p.id === mount.plugin);
     if (!plugin?.credential) return { ok: false, error: `${mount.plugin} takes no credential` };
     const form = credentialForm(plugin.credential);
@@ -1910,7 +1964,9 @@ export class AgentRuntime {
     // holding a key). Mount-time validation saw a mount with no key; this is
     // the moment it gains one, and "mount first, attach later" must not be a
     // way around a refusal the seed path would have made.
-    const problems = validateMount(plugin, mount.publicConfig as any, agentRef(alias));
+    // Where the key goes: the name the mount's reference already gives, or its alias (`mountKeyName`).
+    const name = mountKeyName(mount);
+    const problems = validateMount(plugin, mount.publicConfig as any, agentRef(name));
     if (problems.length) return { ok: false, error: problems.map((x) => x.message).join("; ") };
     // The value a plugin reads: a bare token, or one JSON object of the fields.
     const value = plugin.credential.shape === "token"
@@ -1930,7 +1986,6 @@ export class AgentRuntime {
     const held = await this.#releaseBeforeCredentialChange(tenantId, agentId, alias, value);
     if (held) return { ok: false, error: held };
     const sealed = await seal(kek, value);
-    const name = alias;
     await this.store.putSecret(tenantId, agentId, name, { ciphertext: sealed.ciphertext, iv: sealed.iv });
     // A key put here is renewed by nothing: what renewed the one it replaces goes with it. A connection's own
     // attach writes it again afterwards (`attachSealedConnection`).
@@ -2144,18 +2199,23 @@ export class AgentRuntime {
    * the mount's own broken flag (the renewal record is written afresh). Only while the mount is still the connector's
    * — its renewal record names the connector, or it holds the connector's previous token (`was`) — as
    * `detachConnectionIfFrom` judges it: a key put on the mount since is not the connector's to replace.
+   * A mount whose reference names a key not its own is refused, as its attach would be, with `renewalSkipped`.
    */
   async reconnectConnection(tenantId: string, agentId: string, plugin: string, connectorId: string, was: Sealed, sealed: Sealed,
-    refresh: ConnectorRefresh | null): Promise<{ ok: true; updated: boolean } | { ok: false; error: string }> {
+    refresh: ConnectorRefresh | null): Promise<{ ok: true; updated: boolean } | { ok: false; error: string; renewalSkipped?: string }> {
     await this.ready();
     const kek = await this.#kek;
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
     const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
     if (!mount || !isAgentRef(mount.secretRef)) return { ok: true, updated: false };
-    const name = mount.secretRef!.slice(agentRef("").length);
+    const name = agentKeyName(mount.secretRef)!;
     const renewedFrom = (await this.#oauth.read(tenantId, agentId, name))?.connectorId === connectorId;
     const held = await this.store.getSecret(tenantId, agentId, name);
     if (!held || (!renewedFrom && await open(kek, held) !== await open(kek, was))) return { ok: true, updated: false };
+    // A refusal, not a quiet `updated: false`: the reconnect lists it under `failed` (cf/src/provision/handlers.ts
+    // `reconnectInPlace`), which is how the person hears that this mount did not take the new pair.
+    const skipped = await this.#renewalSkipped(tenantId, agentId, mount, "reconnect");
+    if (skipped) return { ok: false, error: AgentRuntime.foreignKeyRefusal(mount.alias, skipped), renewalSkipped: skipped.code };
     const r = await this.attachSealedConnection(tenantId, agentId, plugin, sealed, refresh ? { ...refresh, connectorId } : null);
     return r.ok ? { ok: true, updated: true } : r;
   }
@@ -2177,6 +2237,9 @@ export class AgentRuntime {
     // More than one and the choice would be arbitrary; say so rather than attach to one of them.
     if (mounts.length > 1) return { ok: false, error: `this agent has ${mounts.length} ${plugin} mounts (${mounts.map((m) => m.alias).join(", ")}); connect one in the console` };
     const mount = mounts[0]!;
+    // Before the connector is renewed for it: the attach below would refuse the same, after that write.
+    const foreign = await this.#foreignKey(tenantId, agentId, mount);
+    if (foreign) return { ok: false, error: AgentRuntime.foreignKeyRefusal(mount.alias, foreign) };
     let token = grant?.accessToken ?? await open(kek, sealed);
     let rec: Omit<MountGrant, "v"> | null = refresh ? {
       refreshToken: grant?.refreshToken ?? await open(kek, refresh.sealed),
@@ -2190,23 +2253,28 @@ export class AgentRuntime {
     }
     const r = await this.attachCredential(tenantId, agentId, mount.alias, { token });
     if (!r.ok) return { ok: false, error: r.error };
-    // After the attach, which clears it: the attach is what wrote the mount's secret this renews.
-    await this.#oauth.remember(tenantId, agentId, mount.alias, rec);
+    // After the attach, which clears it: the attach is what wrote the mount's secret this renews, under the name
+    // `mountKeyName` gives (the attach wrote the reference to that name).
+    await this.#oauth.remember(tenantId, agentId, mountKeyName(mount), rec);
     return { ok: true, account: r.account };
   }
 
   /**
    * Take the pair another agent's renewal stored on a connector this agent's mount was pointed at: GitHub spent the
    * access token this mount holds when it handed out the new one, and the sandbox's egress has no 401 to learn it
-   * from. False when the mount is not on that connector (any more).
+   * from. Not adopted when the mount is not on that connector (any more), and not when its reference names a key
+   * that is not its own (`renewalSkipped`, `#renewalSkipped`).
    */
-  async adoptConnection(tenantId: string, agentId: string, plugin: string, connectorId: string): Promise<boolean> {
+  async adoptConnection(tenantId: string, agentId: string, plugin: string, connectorId: string):
+    Promise<{ adopted: boolean; renewalSkipped?: string }> {
     await this.ready();
     const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
-    if (!mount || !isAgentRef(mount.secretRef)) return false;
-    const name = mount.secretRef!.slice(agentRef("").length);
-    if ((await this.#oauth.read(tenantId, agentId, name))?.connectorId !== connectorId) return false;
-    return (await this.#oauth.renew(tenantId, agentId, name, "adopt", null)).ok;
+    if (!mount || !isAgentRef(mount.secretRef)) return { adopted: false };
+    const name = agentKeyName(mount.secretRef)!;
+    if ((await this.#oauth.read(tenantId, agentId, name))?.connectorId !== connectorId) return { adopted: false };
+    const skipped = await this.#renewalSkipped(tenantId, agentId, mount, "adopt");
+    if (skipped) return { adopted: false, renewalSkipped: skipped.code };
+    return { adopted: (await this.#oauth.renew(tenantId, agentId, name, "adopt", null)).ok };
   }
 
   /**
@@ -2223,7 +2291,7 @@ export class AgentRuntime {
     return r.ok ? { ok: true, cleared: true } : r;
   }
 
-  /** Remove the credential from this agent's mount of that plugin; false when there was none. */
+  /** Remove the credential from this agent's mount of that plugin; false when none went (`removeCredential`). */
   async detachConnection(tenantId: string, agentId: string, plugin: string): Promise<boolean> {
     await this.ready();
     const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
@@ -2244,7 +2312,7 @@ export class AgentRuntime {
     const kek = await this.#kek;
     const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
     if (!kek || !mount || !isAgentRef(mount.secretRef)) return { ok: true, removed: false };
-    const name = mount.secretRef!.slice(agentRef("").length);
+    const name = agentKeyName(mount.secretRef)!;
     // A renewed connector's token differs from the copy a mount took before the renewal reached it, so the mount
     // is also the connector's while what renews it names that connector: a key put there since cleared that.
     const renewedFrom = connectorId !== null && (await this.#oauth.read(tenantId, agentId, name))?.connectorId === connectorId;
@@ -2263,13 +2331,24 @@ export class AgentRuntime {
    * Only an agent's own reference is removable, so this cannot be a way to
    * clear the shared account: on a mount already using it, there is nothing of
    * this agent's to take back and the answer is `false`.
+   *
+   * True only when the key itself went. A reference naming a key that is not this mount's (`#foreignKey`) is
+   * cleared and the key kept, which is `false` here: the caller asked for a key to be gone, and it is not.
+   * `removeCredentialOrWhy` tells that case apart.
    */
   async removeCredential(tenantId: string, agentId: string, alias: string): Promise<boolean> {
-    return (await this.removeCredentialOrWhy(tenantId, agentId, alias)).ok;
+    const r = await this.removeCredentialOrWhy(tenantId, agentId, alias);
+    return r.ok && r.removed;
   }
 
-  /** `removeCredential`, with why it was refused: the console shows that rather than a page that did not change. */
-  async removeCredentialOrWhy(tenantId: string, agentId: string, alias: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  /**
+   * `removeCredential`, with why it was refused: the console shows that rather than a page that did not change.
+   * `removed: false` with `foreign` is a reference to a key that is not this mount's (`#foreignKey`): the reference
+   * is cleared and the key and its renewal record are left where they are, which is the way out of that state.
+   */
+  async removeCredentialOrWhy(tenantId: string, agentId: string, alias: string): Promise<
+    { ok: true; removed: true } | { ok: true; removed: false; foreign: string; reason: ForeignKeyReason } | { ok: false; error: string }
+  > {
     await this.ready();
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
     if (!mount) return { ok: false, error: `no mount named ${alias}` };
@@ -2277,11 +2356,15 @@ export class AgentRuntime {
     // The key goes only once nothing it made is still held: after this, nothing could delete it.
     const held = await this.#releaseBeforeCredentialChange(tenantId, agentId, alias);
     if (held) return { ok: false, error: held };
-    await this.store.removeSecret(tenantId, agentId, alias);
-    await this.#oauth.forget(tenantId, agentId, alias);
+    const foreign = await this.#foreignKey(tenantId, agentId, mount);
+    if (!foreign) {
+      const name = agentKeyName(mount.secretRef)!;
+      await this.store.removeSecret(tenantId, agentId, name);
+      await this.#oauth.forget(tenantId, agentId, name);
+    }
     await this.store.setMountSecretRef(tenantId, agentId, alias, AgentRuntime.seededSecretRef(mount));
     await this.#toolsAfterCredentialChange(tenantId, agentId, alias);
-    return { ok: true };
+    return foreign ? { ok: true, removed: false, foreign: foreign.name, reason: foreign.reason } : { ok: true, removed: true };
   }
 
   /**
@@ -2407,10 +2490,11 @@ export class AgentRuntime {
       const idle = Math.round(safety.live.idleMs / 60_000);
       return { ok: false, error: `${safety.reason} (${safety.live.id}, idle ${idle}m)` };
     }
-    // Only a credential this agent supplied moves. `operator:` references name
-    // something the deployment owns, under a name that has nothing to do with
-    // this mount's alias.
-    const own = isAgentRef(mount.secretRef);
+    // Only a key named after this alias moves, with its renewal record and the reference. `operator:` references
+    // name something the deployment owns, and a key the reference names under another name is not filed under this
+    // alias: moving the row named `from` would take a key that is not this mount's, and rewriting the reference
+    // would leave this mount's own key behind.
+    const own = agentKeyName(mount.secretRef) === from;
     if (this.#gateway.isRemoving(tenantId, agentId, from)) return { ok: false, error: removing };
     const r = await this.store.renameMount(tenantId, agentId, from, to, own ? { newRef: agentRef(to) } : null);
     // The last snapshot error is keyed by the alias too, and is about the same mount under its new name.
@@ -2436,7 +2520,8 @@ export class AgentRuntime {
     tenantId: string, agentId: string, mount: { alias: string; plugin: string; secretRef: string | null },
   ) {
     const attached = !!mount.secretRef;
-    const meta = isAgentRef(mount.secretRef) ? await this.store.secretMeta(tenantId, agentId, mount.alias) : null;
+    const name = agentKeyName(mount.secretRef);
+    const meta = name !== null ? await this.store.secretMeta(tenantId, agentId, name) : null;
     return {
       attached,
       // A reference the operator configured at deploy time, not one entered
