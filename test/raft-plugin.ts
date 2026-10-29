@@ -1659,7 +1659,7 @@ await check("an inbox holding only a DM is read as before: one pull, no listing,
       timestamp: "2026-10-20T08:00:00Z", channel_name: "ada", channel_type: "dm" }], { last_seen_seq: 5000, reply_target: "dm:@ada" });
   }) as any;
   const out = await raftPlugin.invoke("receive_events", {}, inTurn(mount().ctx)) as any;
-  const expected = { messages: ["[target=dm:@ada msg=m0005000 time=2026-10-20 08:00:00Z type=human] @ada: can you look at the release notes?"], hasMore: false, replyTarget: "dm:@ada" };
+  const expected = { messages: ["[target=dm:@ada msg=m0005000 time=2026-10-20 08:00:00Z type=human] @ada: can you look at the release notes?"], hasMore: false, replyTarget: "dm:@ada", status: "messages" };
   if (JSON.stringify(out) !== JSON.stringify(expected)) throw new Error(JSON.stringify(out));
   if (JSON.stringify(requests) !== JSON.stringify(["/internal/agent-api/events"])) throw new Error(`requests: ${requests}`);
 });
@@ -4734,6 +4734,124 @@ await check("the basis covers each tool's name and the capability it needs, in a
   must(toolsBasisOf(moved) !== base, "a capability change left the basis as it was");
   // And a name change does too.
   must(toolsBasisOf(tools.slice(1)) !== base, "a removed tool left the basis as it was");
+});
+
+// ---- wait_for: a notice's messages are waited for, and a notice never moves `since` --------------------------------
+
+const WAIT_CH = "0a1b2c3d-0000-4000-8000-000000000001";
+/**
+ * Raft's `/events` under ack=cursor with `wait_for`, as the Server answers it (botiverse/slock at a19e0039d: the
+ * internal agent API's `/events` route and its `agentEventsWaitFor` module):
+ * `since=n` acknowledges the previous response's rows with seq <= n; a pull returns every readable row above the read position; a `wait_for` pair whose row is not readable yet adds
+ * `has_more: true` and `retry_after_ms`. A row becomes readable at the pull numbered `readableAt` (1-based), which
+ * stands for the inbox chain catching up while Raft waits; `Infinity` never.
+ */
+function waitingRaft(retryAfterMs = 5) {
+  const rows: Array<{ seq: number; readableAt: number }> = [];
+  let readPos = 0, pending: number[] = [];
+  const pulls: URLSearchParams[] = [];
+  globalThis.fetch = (async (url: any) => {
+    const u = new URL(String(url));
+    if (!u.pathname.endsWith("/events")) return json(404, { error: "not found", code: "NOT_FOUND" });
+    pulls.push(u.searchParams);
+    const n = pulls.length;
+    const since = u.searchParams.get("since") ?? "latest";
+    if (/^\d+$/.test(since)) {
+      for (const s of pending.filter((x) => x <= Number(since))) readPos = Math.max(readPos, s);
+      pending = pending.filter((x) => x > Number(since));
+    }
+    const readable = (r: { readableAt: number }) => n >= r.readableAt;
+    const behind = (u.searchParams.get("wait_for") ?? "").split(",").filter(Boolean).some((pair) => {
+      const seq = Number(pair.slice(pair.lastIndexOf(":") + 1));
+      const row = rows.find((r) => r.seq === seq);
+      return seq > readPos && (!row || !readable(row));
+    });
+    const out = rows.filter((r) => readable(r) && r.seq > readPos).sort((a, b) => a.seq - b.seq);
+    pending = out.map((r) => r.seq);
+    return events(out.map((r) => ({ id: `m${String(r.seq).padStart(7, "0")}`, seq: r.seq, content: `msg ${r.seq}`, sender_type: "human", sender_name: "cto",
+      timestamp: "2026-10-22T08:24:50Z", channel_name: "cto", channel_type: "dm" })),
+    { last_seen_seq: out.length ? out.at(-1)!.seq : null, ...(behind ? { has_more: true, retry_after_ms: retryAfterMs } : {}) });
+  }) as any;
+  return { pulls, write: (seq: number, readableAt = 1) => rows.push({ seq, readableAt }), at: () => pulls.length };
+}
+let waitNotices = 0;
+/** A push notice for `WAIT_CH` at `latestSeq` (a decimal string, as Raft sends it). */
+async function announce(plugin: typeof raftPlugin, m: { ctx: any }, latestSeq: number) {
+  const noticeId = `ntc_${String(++waitNotices).padStart(16, "0")}`;
+  const out = await plugin.receive!(pushed(notice({ noticeId, targets: [{ target: "dm:@cto", channelId: WAIT_CH, channelType: "dm", pendingCount: 1,
+    firstPendingMsgId: null, latestMsgId: `m${latestSeq}`, latestSeq: String(latestSeq), latestSenderName: "cto", latestSenderType: "human", flags: ["dm"] }] }),
+  { deliveryId: noticeId }), PUSH_SECRET, m.ctx) as any;
+  must(out.deliver === true, `control: the notice is delivered: ${JSON.stringify(out)}`);
+}
+const pushOn = () => mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+const sinceKept = async (m: { ctx: any }) => ((await m.ctx.db.get(INBOX_STORE, "since")) as any)?.since;
+
+await check("wait_for, case A: notices never move since; the next pull sends the since the last call kept, with the latest notice as wait_for", async () => {
+  const raft = waitingRaft(); const m = pushOn();
+  raft.write(100);
+  const first = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
+  must(JSON.stringify(shownSeqs(first)) === "[100]" && first.status === "messages", `first: ${JSON.stringify(first)}`);
+  must(await sinceKept(m) === 100, `control: the first call kept since 100: ${await sinceKept(m)}`);
+  raft.write(101); raft.write(102);
+  await announce(raftPlugin, m, 101);
+  await announce(raftPlugin, m, 102);
+  // A cursor taken from a notice would be 102 here, past what the model was shown.
+  must(await sinceKept(m) === 100, `a notice moved the kept since: ${await sinceKept(m)}`);
+  const kept = await m.ctx.db.get(INBOX_STORE, "wait_for") as any;
+  must(JSON.stringify(kept) === JSON.stringify({ pairs: { [WAIT_CH]: 102 }, attempt: 0 }), `the notice pair: ${JSON.stringify(kept)}`);
+  const second = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
+  must(raft.pulls[1]!.get("since") === "100", `the second pull sent since=${raft.pulls[1]!.get("since")}`);
+  must(raft.pulls[1]!.get("wait_for") === `${WAIT_CH}:102`, `wait_for: ${raft.pulls[1]!.get("wait_for")}`);
+  must(JSON.stringify(shownSeqs(second)) === "[101,102]", `second: ${JSON.stringify(second)}`);
+  must(await sinceKept(m) === 102 && await m.ctx.db.get(INBOX_STORE, "wait_for") === undefined, `after: since ${await sinceKept(m)}, wait_for ${JSON.stringify(await m.ctx.db.get(INBOX_STORE, "wait_for"))}`);
+});
+
+await check("wait_for, case C: a noticed message not yet readable is waited for in one call; without the notice the pull is empty", async () => {
+  // Control: the lag as it was, with no notice: the pull is empty and says nothing new.
+  const lag = waitingRaft(); const c = pushOn();
+  lag.write(100);
+  await raftPlugin.invoke("receive_events", {}, c.ctx);
+  lag.write(101, 4);
+  const empty = await raftPlugin.invoke("receive_events", {}, c.ctx) as any;
+  must(empty.messages.length === 0 && empty.status === "no_new_messages" && lag.pulls.length === 2 && !lag.pulls[1]!.has("wait_for"), `control: ${JSON.stringify(empty)}`);
+  // With the notice: Raft says "not yet" twice, then the row is readable, all inside one receive_events.
+  const raft = waitingRaft(); const m = pushOn();
+  raft.write(100);
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  raft.write(101, 4);
+  await announce(raftPlugin, m, 101);
+  const out = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
+  must(JSON.stringify(shownSeqs(out)) === "[101]" && out.status === "messages", `waited: ${JSON.stringify(out)}`);
+  const sent = raft.pulls.slice(1).map((q) => `${q.get("since")}|${q.get("wait_for")}|${q.get("wait_attempt")}`);
+  // Only the first sends the kept since; a re-pull sends none, so it acknowledges nothing.
+  must(JSON.stringify(sent) === JSON.stringify([`100|${WAIT_CH}:101|0`, `latest|${WAIT_CH}:101|1`, `latest|${WAIT_CH}:101|2`]), `pulls: ${JSON.stringify(sent)}`);
+  must(await sinceKept(m) === 101 && await m.ctx.db.get(INBOX_STORE, "wait_for") === undefined, `after: since ${await sinceKept(m)}`);
+});
+
+await check("wait_for cap: a message still not readable at the cap ends the call with status still_arriving, apart from no_new_messages, and the pair is kept", async () => {
+  const capped = createRaftPlugin({ waitForMaxMs: 60 });
+  const raft = waitingRaft(20); const m = pushOn();
+  raft.write(100);
+  await capped.invoke("receive_events", {}, m.ctx);
+  raft.write(101, Infinity);
+  await announce(capped, m, 101);
+  const started = Date.now();
+  const out = await capped.invoke("receive_events", {}, m.ctx) as any;
+  const took = Date.now() - started;
+  must(out.status === "still_arriving" && out.messages.length === 0 && /receive_events again/.test(out.note), `capped: ${JSON.stringify(out)}`);
+  // 20 ms apart under a 60 ms cap: the pull at 0, 20 and 40 ms, and no wait past the cap.
+  const pulls = raft.pulls.length - 1;
+  must(pulls >= 2 && pulls <= 4 && took < 1_000, `pulls ${pulls} in ${took} ms`);
+  const kept = await m.ctx.db.get(INBOX_STORE, "wait_for") as any;
+  must(kept?.pairs?.[WAIT_CH] === 101 && kept.attempt === pulls, `the pair after the cap: ${JSON.stringify(kept)}`);
+  must(await sinceKept(m) === null, `the kept since after an empty pull: ${await sinceKept(m)}`);
+  // The next call goes on where Raft's backoff was.
+  await capped.invoke("receive_events", {}, m.ctx);
+  must(raft.pulls[pulls + 1]!.get("wait_attempt") === String(pulls), `the next call's wait_attempt: ${raft.pulls[pulls + 1]!.get("wait_attempt")}`);
+  // The other answer: nothing announced and nothing new.
+  const idle = waitingRaft(); const n = pushOn();
+  const none = await capped.invoke("receive_events", {}, n.ctx) as any;
+  must(none.status === "no_new_messages" && none.status !== out.status && !("note" in none), `nothing new: ${JSON.stringify(none)} ${idle.pulls.length}`);
 });
 
 globalThis.fetch = originalFetch;

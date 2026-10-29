@@ -2011,8 +2011,10 @@ export const DOORBELL_TYPES: readonly string[] = ["owner_inbox_updated", "owner_
  * `sources` is the conversations that rang it, each at its highest seq (slock#10499); empty when the doorbell names none,
  * which is every doorbell from before Raft did, and an entry that is not a channel id and a seq is left out.
  * `check` is the check Raft ran for it (`payload.check`, src/plugins/raft-assistant-check.ts), or null with none.
+ * `eventId` is the event's own id (`third_party_event.id`, lowercased), or null when it is not one: what this
+ * runtime reports delivered once the doorbell has been handled (`reportDelivered`).
  */
-export function doorbellOf(raw: unknown): { firstChangeAt: string | null; lastChangeAt: string | null; sources: ChangeSources; check: RaftCheck | RefusedCheck | null } | null {
+export function doorbellOf(raw: unknown): { firstChangeAt: string | null; lastChangeAt: string | null; sources: ChangeSources; check: RaftCheck | RefusedCheck | null; eventId: string | null } | null {
   const e = raw && typeof raw === "object" ? (raw as Record<string, unknown>).third_party_event : null;
   if (!e || typeof e !== "object") return null;
   const ev = e as Record<string, unknown>;
@@ -2025,7 +2027,8 @@ export function doorbellOf(raw: unknown): { firstChangeAt: string | null; lastCh
     const seq = seqOf(o.max_seq);
     if (typeof o.channel_id === "string" && o.channel_id && seq !== null) sources = mergeSources(sources, { [o.channel_id]: seq });
   }
-  return { firstChangeAt: at(p.first_change_at), lastChangeAt: at(p.last_change_at), sources, check: raftCheckOf(p.check) };
+  const eventId = typeof ev.id === "string" && EVENT_ID.test(ev.id) ? ev.id.toLowerCase() : null;
+  return { firstChangeAt: at(p.first_change_at), lastChangeAt: at(p.last_change_at), sources, check: raftCheckOf(p.check), eventId };
 }
 
 /**
@@ -2046,7 +2049,7 @@ export function isDoorbellTarget(t: unknown): boolean {
  */
 export async function noteDoorbell(
   ctx: PluginContext, now = Date.now(), firstChangeAt: string | null = null, sources: Readonly<ChangeSources> = {},
-  checks: ReadonlyArray<RaftCheck | RefusedCheck> = [],
+  checks: ReadonlyArray<(RaftCheck & { eventIds?: readonly string[] }) | RefusedCheck> = [], eventIds: readonly string[] = [],
 ): Promise<boolean> {
   const owner = await loadOwner(ctx);
   if (!owner) return false;
@@ -2057,6 +2060,8 @@ export async function noteDoorbell(
     if ("refused" in c) refusedCheck(ctx, c);
     else await keepCheck(ctx, c, now);
   }
+  // The doorbells that brought no check of their own wait for whichever wake handles the doorbell (`settleRung`).
+  if (eventIds.length) await noteRung(ctx, eventIds);
   const changeAt = owner.changeAt === null || (firstChangeAt !== null && Date.parse(firstChangeAt) < Date.parse(owner.changeAt)) ? firstChangeAt ?? owner.changeAt : owner.changeAt;
   const changeSources = mergeSources(owner.changeSources, sources);
   if (owner.doorbellAt === null || changeAt !== owner.changeAt || JSON.stringify(changeSources) !== JSON.stringify(owner.changeSources)) {
@@ -2071,7 +2076,8 @@ export async function noteDoorbell(
  * one is kept too, so its wake can say why on its trace row.
  */
 export const PENDING_CHECKS_KEY = "raft_checks";
-type PendingCheck = RaftCheck & { at: number };
+/** `eventIds`: the doorbells that brought this check, and any older check of its trigger it replaced (`keepCheck`). */
+type PendingCheck = RaftCheck & { at: number; eventIds?: string[] };
 
 function pendingOf(raw: unknown): Partial<Record<CheckTrigger, PendingCheck>> {
   const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
@@ -2090,9 +2096,12 @@ function refusedCheck(ctx: PluginContext, c: RefusedCheck): void {
   logEvent("raft.assistant_wake", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, outcome: "check_refused", ...attrs });
 }
 
-async function keepCheck(ctx: PluginContext, check: RaftCheck, now: number): Promise<void> {
+async function keepCheck(ctx: PluginContext, check: RaftCheck & { eventIds?: readonly string[] }, now: number): Promise<void> {
   const kept = pendingOf(await ctx.db.get(ASSISTANT_STORE, PENDING_CHECKS_KEY));
-  kept[check.trigger] = { ...check, at: now };
+  // The older check never runs, but the newer covers what it did, so its doorbells are handled with the newer one's turn.
+  const eventIds = uniqueIds([...(kept[check.trigger]?.eventIds ?? []), ...(check.eventIds ?? [])]);
+  const { eventIds: _given, ...bare } = check;
+  kept[check.trigger] = { ...bare, at: now, ...(eventIds.length ? { eventIds } : {}) };
   await ctx.db.put(ASSISTANT_STORE, kept as unknown as Json, PENDING_CHECKS_KEY);
 }
 
@@ -2113,6 +2122,137 @@ async function takeCheck(ctx: PluginContext): Promise<{ check: PendingCheck; lef
   delete kept[trigger];
   await ctx.db.put(ASSISTANT_STORE, kept as unknown as Json, PENDING_CHECKS_KEY);
   return { check, left: all.length - 1 };
+}
+
+// ---- reporting a handled event delivered ------------------------------------------------------------------------------
+
+/**
+ * A third-party event's id, as Raft gives it (a UUID). An event a pull of `/events` hands out is marked delivered by
+ * that pull; one read any other way stays `delivering` until the receiver says `POST /third-party-events/delivered`.
+ * A doorbell is read by its address (`GET /history`, `consume: false`), which marks nothing, so only that report does.
+ */
+const EVENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Raft's cap on one report's `eventIds`. */
+export const DELIVERED_REPORT_MAX_IDS = 200;
+/** The most ids kept for a later report, and the most turns kept waiting for their end: a bound, not a quota. */
+const DELIVERY_IDS_MAX = 1_000;
+const DELIVERY_TURNS_MAX = 20;
+
+/** Raft's `POST /third-party-events/delivered` for these ids; throws when it did not answer 2xx. */
+export type DeliveredReport = (ctx: PluginContext, eventIds: readonly string[]) => Promise<void>;
+
+/**
+ * Where each fetched event stands between its fetch and its report, as `{ rung, turns, unreported }`:
+ * - `rung`: doorbells with no check of their own, until a wake handles the doorbell (`settleRung`);
+ * - `turns`: by turn key, the events whose content went into that short session, reported only if it ends completed;
+ * - `unreported`: handled, but the report failed; sent again with the next report or at the next wake.
+ * An event is reported only once something handled it, and never because Raft still says `delivering`: the runtime
+ * reads no event back by its status, so a row it never handled stays as Raft has it.
+ */
+export const DELIVERY_KEY = "event_delivery";
+interface Delivery { rung: string[]; turns: Record<string, string[]>; unreported: string[] }
+
+function uniqueIds(ids: readonly string[]): string[] {
+  return [...new Set(ids.filter((id) => EVENT_ID.test(id)).map((id) => id.toLowerCase()))];
+}
+
+function deliveryOf(raw: unknown): Delivery {
+  const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const ids = (v: unknown) => (Array.isArray(v) ? uniqueIds(v.filter((x): x is string => typeof x === "string")) : []);
+  const turns: Record<string, string[]> = {};
+  if (o.turns && typeof o.turns === "object" && !Array.isArray(o.turns)) {
+    for (const [k, v] of Object.entries(o.turns as Record<string, unknown>)) { const list = ids(v); if (list.length) turns[k] = list; }
+  }
+  return { rung: ids(o.rung), turns, unreported: ids(o.unreported) };
+}
+
+async function updateDelivery(ctx: PluginContext, change: (d: Delivery) => void): Promise<Delivery> {
+  const d = deliveryOf(await ctx.db.get(ASSISTANT_STORE, DELIVERY_KEY));
+  change(d);
+  d.rung = d.rung.slice(-DELIVERY_IDS_MAX);
+  d.unreported = d.unreported.slice(-DELIVERY_IDS_MAX);
+  const keys = Object.keys(d.turns);
+  for (const k of keys.slice(0, Math.max(0, keys.length - DELIVERY_TURNS_MAX))) delete d.turns[k];
+  await ctx.db.put(ASSISTANT_STORE, d as unknown as Json, DELIVERY_KEY);
+  return d;
+}
+
+async function noteRung(ctx: PluginContext, ids: readonly string[]): Promise<void> {
+  const fresh = uniqueIds(ids);
+  if (fresh.length) await updateDelivery(ctx, (d) => { d.rung = uniqueIds([...d.rung, ...fresh]); });
+}
+
+/** The doorbells waiting as a wake starts: only these are settled by its outcome, not one that rings during it. */
+async function rungNow(ctx: PluginContext): Promise<string[]> {
+  return deliveryOf(await ctx.db.get(ASSISTANT_STORE, DELIVERY_KEY)).rung;
+}
+
+/**
+ * The doorbells `ids` handled: by code, at a final outcome (`report`), or by a short session's input (`turnKey`), then
+ * reported when that session ends completed (`turnDelivered`). Taken out of `rung` either way.
+ */
+async function settleRung(ctx: PluginContext, ids: readonly string[], to: { report: DeliveredReport | undefined } | { turnKey: string }): Promise<void> {
+  if (!ids.length) return;
+  const taken = new Set(ids);
+  await updateDelivery(ctx, (d) => {
+    d.rung = d.rung.filter((id) => !taken.has(id));
+    if ("turnKey" in to) d.turns[to.turnKey] = uniqueIds([...(d.turns[to.turnKey] ?? []), ...ids]);
+  });
+  if ("report" in to) await reportDelivered(ctx, to.report, ids);
+}
+
+/** Events handled by a short session under `turnKey`, reported when it ends completed. */
+async function awaitTurn(ctx: PluginContext, turnKey: string, ids: readonly string[]): Promise<void> {
+  const list = uniqueIds(ids);
+  if (list.length) await updateDelivery(ctx, (d) => { d.turns[turnKey] = uniqueIds([...(d.turns[turnKey] ?? []), ...list]); });
+}
+
+/**
+ * Report `ids` delivered, with any an earlier report failed to send (Raft's update is idempotent, so a repeat is safe).
+ * A failure is said on a warn line and the ids kept for the next report or wake (`retryDelivered`); it fails nothing
+ * else. With no `report` (a caller that wires none), nothing is sent and nothing kept.
+ */
+export async function reportDelivered(ctx: PluginContext, report: DeliveredReport | undefined, ids: readonly string[]): Promise<boolean> {
+  if (!report) return false;
+  const d = deliveryOf(await ctx.db.get(ASSISTANT_STORE, DELIVERY_KEY));
+  const all = uniqueIds([...d.unreported, ...ids]);
+  if (!all.length) return true;
+  const sent: string[] = [];
+  let error: string | null = null;
+  for (let i = 0; i < all.length && error === null; i += DELIVERED_REPORT_MAX_IDS) {
+    const part = all.slice(i, i + DELIVERED_REPORT_MAX_IDS);
+    try { await report(ctx, part); sent.push(...part); }
+    catch (e) { error = String((e as Error)?.message ?? e).slice(0, 160); }
+  }
+  const done = new Set(sent);
+  await updateDelivery(ctx, (now) => { now.unreported = uniqueIds([...now.unreported, ...all]).filter((id) => !done.has(id)); });
+  const attrs = { reported: sent.length, unreported: all.length - sent.length, ...(error ? { error } : {}) };
+  logEvent("raft.event_delivered", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, ...attrs });
+  if (error !== null) {
+    console.warn(`raft mount ${ctx.alias}: could not report ${all.length - sent.length} handled event(s) delivered; kept to report again: ${error}`);
+  }
+  return error === null;
+}
+
+/** The reports an earlier failure left, sent again; nothing when none is left. */
+export async function retryDelivered(ctx: PluginContext, report: DeliveredReport | undefined): Promise<void> {
+  if (!report || !deliveryOf(await ctx.db.get(ASSISTANT_STORE, DELIVERY_KEY)).unreported.length) return;
+  await reportDelivered(ctx, report, []);
+}
+
+/**
+ * The end of a short session this mount asked for: the events its input carried are reported delivered when it ended
+ * completed, and only then. A session that failed or was cancelled leaves them as Raft has them (`delivering`), since
+ * nothing can say their content was read; they are forgotten here, as the session is not run again.
+ */
+export async function turnDelivered(ctx: PluginContext, end: Pick<TurnEnd, "turnKey" | "outcome" | "isolated">, report: DeliveredReport | undefined): Promise<void> {
+  if (!end.isolated || !end.turnKey) return;
+  const key = end.turnKey;
+  const ids = deliveryOf(await ctx.db.get(ASSISTANT_STORE, DELIVERY_KEY)).turns[key];
+  if (!ids?.length) return;
+  await updateDelivery(ctx, (d) => { delete d.turns[key]; });
+  if (end.outcome === "completed") { await reportDelivered(ctx, report, ids); return; }
+  logEvent("raft.event_delivered", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, reported: 0, left_delivering: ids.length, outcome: end.outcome });
 }
 
 // ---- the code before any model call ----------------------------------------------------------------------------------
@@ -2469,6 +2609,8 @@ export interface WakeDeps {
   mode?(ctx: PluginContext): Promise<boolean | null>;
   /** Raft's assistant routes, for the switch-over import (`pushBriefImport`). */
   api?: AssistantApi;
+  /** Raft's delivered report for the doorbells a wake handles (`reportDelivered`). */
+  delivered?: DeliveredReport;
   now?: () => number;
 }
 
@@ -2494,6 +2636,11 @@ async function readMode(ctx: PluginContext, deps: WakeDeps, owner: AssistantOwne
 async function raftCheckWake(ctx: PluginContext, deps: WakeDeps, owner0: AssistantOwner, taken: { check: PendingCheck; left: number }, now: number): Promise<PluginNext> {
   const c = taken.check;
   const trigger: CheckTrigger = c.trigger;
+  // The check covers everything waiting on the owner when Raft made it, so the doorbells waiting without one of their
+  // own are handled with it: its doorbells and those go into its session, or are settled here if it is refused, which
+  // is final: nothing will run it.
+  const rung = await rungNow(ctx);
+  const refused = () => settleRung(ctx, [...rung, ...(c.eventIds ?? [])], { report: deps.delivered });
   const owner: AssistantOwner = { ...owner0, pausedAt: null, doorbellAt: null, changeAt: null, changeSources: {}, lagReads: 0 };
   await saveOwner(ctx, owner);
   const zone = zoneOf(owner), next = nextBriefAt(now, zone), day = localDay(now, zone);
@@ -2504,6 +2651,7 @@ async function raftCheckWake(ctx: PluginContext, deps: WakeDeps, owner0: Assista
   // The turn exists to call notify once: without it there is nothing it could do.
   if (!tools.includes(NOTIFY_TOOL)) {
     await record(ctx, day, trigger, "check_refused", { ...id, raft_check: true, reason: "no_notify", tools_dropped: dropped });
+    await refused();
     return { wakeAt };
   }
   const sub = substituteTools(c.instruction, ctx.alias, tools);
@@ -2511,12 +2659,15 @@ async function raftCheckWake(ctx: PluginContext, deps: WakeDeps, owner0: Assista
   const bytes = utf8Length(sub.text);
   if (bytes > CHECK_INSTRUCTION_MAX_UTF8) {
     await record(ctx, day, trigger, "check_refused", { ...id, raft_check: true, reason: "instruction_too_large", instruction_bytes: bytes });
+    await refused();
     return { wakeAt };
   }
   const counts = Object.fromEntries(CHECK_COUNT_KEYS.flatMap((k) => (typeof c.counts[k] === "number" ? [[k, c.counts[k]!]] : [])));
   await record(ctx, day, trigger, "invoked", {
     ...id, raft_check: true, tools_offered: tools.length, tools_dropped: dropped, placeholders_unknown: sub.unknown, placeholders_unoffered: sub.unoffered, ...counts,
   });
+  await settleRung(ctx, rung, { turnKey: checkTurnKey(c) });
+  await awaitTurn(ctx, checkTurnKey(c), c.eventIds ?? []);
   return { turn: sub.text, isolated: true, turnKey: checkTurnKey(c), tools, wakeAt };
 }
 
@@ -2531,8 +2682,11 @@ async function raftIdleWake(ctx: PluginContext, deps: WakeDeps, owner: Assistant
   // found nothing; turned off since, the doorbell is this file's to check, as it always was.
   if (read && !(await readMode(ctx, deps, owner, now)).raftCheck) return null;
   if (owner.doorbellAt !== null) {
+    const rung = await rungNow(ctx);
     await saveOwner(ctx, { ...owner, doorbellAt: null, changeAt: null, changeSources: {}, lagReads: 0 });
     await record(ctx, localDay(now, zone), "doorbell", "skipped_no_check", { raft_check: true });
+    // Handled in code: Raft found nothing worth a model, and this is that doorbell's last word.
+    await settleRung(ctx, rung, { report: deps.delivered });
   }
   const retry = await pushBriefImport(ctx, deps.api, now).catch(() => null);
   return { wakeAt: retry !== null ? Math.min(retry, next) : next };
@@ -2552,6 +2706,8 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
   const now = (deps.now ?? Date.now)();
   let owner = await loadOwner(ctx);
   if (!owner) return;
+  // A report that failed before goes again now: the wake is the next pass that has the means to send it.
+  await retryDelivered(ctx, deps.delivered);
   // Raft's check is posted only while Raft's flag is on: kept off here, Raft's is read first, since a check says Raft
   // turned it on. Off after that (a rollback), the checks queued before it are dropped, each said on its row, and the
   // wake goes on as it always did, the doorbell's own state untouched.
@@ -2560,6 +2716,8 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
   if (!owner.raftCheck) {
     for (const c of await dropChecks(ctx)) {
       await record(ctx, localDay(now, zoneOf(owner)), c.trigger, "check_refused", { check_id: c.id, raft_check: true, reason: "raft_check_off" });
+      // Its doorbells are still noted, so the local check handles them: they wait with the others for its outcome.
+      await noteRung(ctx, c.eventIds ?? []);
     }
   } else {
     const taken = await takeCheck(ctx);
@@ -2574,6 +2732,11 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
   const briefDue = hour >= BRIEF_HOUR && hour < BRIEF_LATEST_HOUR && owner.lastBrief !== day;
   const trigger = briefDue ? "brief" : owner.doorbellAt !== null ? "doorbell" : null;
   if (trigger === null) return { wakeAt: nextBriefAt(now, zone0) };
+  // The doorbells this wake handles, if it reaches an outcome that handles them: a final one in code reports them
+  // delivered, a model call hands them to its session (`settleRung`). A wake that stops short (quiet hours, a pause, a
+  // lagging inbox, a failure) leaves them waiting for the next.
+  const rung = await rungNow(ctx);
+  const handled = () => settleRung(ctx, rung, { report: deps.delivered });
   // The brief's timer reads Raft's flag before it briefs: switched on since the last listing, Raft briefs, not this.
   if (trigger === "brief" && deps.mode) {
     owner = await readMode(ctx, deps, owner);
@@ -2730,12 +2893,15 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
       if (!candidates.length) {
         if (failed.length) {
           await record(ctx, day, trigger, "unreadable", { ...counts, said: await sayUnreadable(failed, kept) });
+          await handled();
           return { wakeAt };
         }
         await record(ctx, day, trigger, items.length ? "skipped_filtered" : "skipped_empty", counts);
+        await handled();
         return { wakeAt };
       }
       await record(ctx, day, trigger, "invoked", counts);
+      await settleRung(ctx, rung, { turnKey: "assistant.check" });
       return { turn: checkInstruction(ctx.alias, candidates, { why: f.why, rulesLine: modelRulesLine(rules, rowsCarryIds(items), now), language: owner.language }), isolated: true, turnKey: "assistant.check", wakeAt };
     }
     const unread = await read("unread");
@@ -2760,12 +2926,15 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
       await saveOwner(ctx, { ...owner, briefSent: day });
       if (failed.length) {
         await record(ctx, day, trigger, "unreadable", { ...counts, said: await sayUnreadable(failed, kept) });
+        await handled();
         return { wakeAt };
       }
       await record(ctx, day, trigger, unread.length || recent.length ? "skipped_filtered" : "skipped_empty", counts);
+      await handled();
       return { wakeAt };
     }
     await record(ctx, day, trigger, "invoked", counts);
+    await settleRung(ctx, rung, { turnKey: "assistant.brief" });
     return { turn: briefInstruction(ctx.alias, { zone, held, waiting, active, rulesLine: modelRulesLine(rules, rowsCarryIds(all), now), language: owner.language }), isolated: true, turnKey: "assistant.brief", wakeAt };
   } catch (e) {
     const paused = (await loadOwner(ctx))?.pausedAt !== null;

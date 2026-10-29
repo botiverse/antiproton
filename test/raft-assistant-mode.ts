@@ -218,6 +218,8 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string;
     /** Every login body; every request to the app (`METHOD path`), each action call's body and cookie; the action's answer. */
     logins: [] as any[], appRequests: [] as string[], actionCalls: [] as Array<{ action: string; body: any; cookie: string | null }>,
     actionAnswer: { status: 200, body: { ok: true, result: { reminder: { id: "rem_1", title: "APP-ANSWER-TITLE" } } } as unknown },
+    /** Every delivered report's `eventIds`, and how Raft answers the next: a status, or `drop` for no answer. */
+    delivered: [] as string[][], deliveredAnswer: 200 as number | "drop",
   };
   globalThis.fetch = (async (url: any, init?: any) => {
     const u = new URL(String(url));
@@ -252,6 +254,14 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string;
       const id = `${channel.slice("agent-event:".length)}-2222-4333-8444-555566667777`;
       return json(200, { messages: [{ message_id: id, sender_name: "system.assistant", sender_type: "third_party_app", channel_type: "dm", content: "System event: ...",
         third_party_event: { id, kind: "event", client_id: "system.assistant", client_name: "system.assistant", payload } }], has_more: false, has_older: false, has_newer: false });
+    }
+    if (path === "/third-party-events/delivered" && init?.method === "POST") {
+      const answer = r.deliveredAnswer;
+      if (answer === "drop") throw new TypeError("fetch failed");
+      if (answer !== 200) return json(answer, { error: "Failed to record third-party event delivery" });
+      const ids = JSON.parse(String(init?.body ?? "{}")).eventIds as string[];
+      r.delivered.push(ids);
+      return json(200, { ok: true, delivered: ids.length });
     }
     if (path === "/assistant/send-as-owner" && init?.method === "POST") {
       r.asOwner.push(JSON.parse(String(init?.body ?? "{}")));
@@ -3672,6 +3682,86 @@ await check("reminder end to end: the chat's call reaches the app; a check is no
       w.host.dispose();
     }
   }
+});
+
+// ---- a doorbell fetched by its id is reported delivered once handled ------------------------------------------------
+
+/** The id of the doorbell `ring` last rang, as the fake `/history` gives it. */
+const lastBellId = (a: { r: ReturnType<typeof raft> }) => `${Object.keys(a.r.bellEvents).at(-1)!.slice("agent-event:".length)}-2222-4333-8444-555566667777`;
+const checkEnd = (turnKey: string, outcome: string) => ({ turnId: `op_${turnKey}_${outcome}`, turnKey, finalText: null, outcome, isolated: true });
+
+await check("delivered: a Raft check's doorbell is reported only after its session ends completed, once; never at the wake", async () => {
+  const a = await raftAssistant();
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
+  const id = lastBellId(a);
+  const out = await atTime(DAY, () => wake(a.ctx));
+  must(out.turnKey === `assistant.raft_check:doorbell:${CHECK_ID}`, `control: the check is posted: ${show(out)}`);
+  must(a.r.delivered.length === 0, `reported before the session ran: ${show(a.r.delivered)}`);
+  await afterTurn(a.ctx, checkEnd(out.turnKey, "completed"));
+  must(show(a.r.delivered) === show([[id]]), `after the session: ${show(a.r.delivered)}`);
+  // The same end told again reports nothing more.
+  await afterTurn(a.ctx, checkEnd(out.turnKey, "completed"));
+  must(a.r.delivered.length === 1, `told twice: ${show(a.r.delivered)}`);
+});
+
+await check("delivered: a check session that fails or is cancelled reports nothing, and a later end of that key does not either", async () => {
+  for (const outcome of ["failed", "cancelled"]) {
+    const a = await raftAssistant();
+    await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
+    const out = await atTime(DAY, () => wake(a.ctx));
+    await afterTurn(a.ctx, checkEnd(out.turnKey, outcome));
+    must(a.r.delivered.length === 0, `${outcome}: reported ${show(a.r.delivered)}`);
+    await afterTurn(a.ctx, checkEnd(out.turnKey, "completed"));
+    must(a.r.delivered.length === 0, `${outcome}, then a stray completed end: reported ${show(a.r.delivered)}`);
+  }
+});
+
+await check("delivered: a report Raft does not take is said on a warn line and sent again at the next wake; nothing is lost or sent twice", async () => {
+  const a = await raftAssistant();
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
+  const id = lastBellId(a);
+  const out = await atTime(DAY, () => wake(a.ctx));
+  a.r.deliveredAnswer = 500;
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+  try { await afterTurn(a.ctx, checkEnd(out.turnKey, "completed")); } finally { console.warn = warn; }
+  must(a.r.delivered.length === 0 && warned.some((w) => /could not report 1 handled event\(s\) delivered/.test(w)), `warned: ${show(warned)}`);
+  must(show(a.read(ASSISTANT_STORE, "event_delivery")?.unreported) === show([id]), `kept: ${show(a.read(ASSISTANT_STORE, "event_delivery"))}`);
+  // No answer at all is the same.
+  a.r.deliveredAnswer = "drop";
+  console.warn = () => {};
+  try { await atTime(DAY, () => wake(a.ctx)); } finally { console.warn = warn; }
+  must(a.r.delivered.length === 0 && show(a.read(ASSISTANT_STORE, "event_delivery")?.unreported) === show([id]), "a dropped report was forgotten");
+  a.r.deliveredAnswer = 200;
+  await atTime(DAY, () => wake(a.ctx));
+  must(show(a.r.delivered) === show([[id]]) && a.read(ASSISTANT_STORE, "event_delivery")?.unreported.length === 0, `retried: ${show(a.r.delivered)}`);
+  await atTime(DAY, () => wake(a.ctx));
+  must(a.r.delivered.length === 1, `sent again with nothing left: ${show(a.r.delivered)}`);
+});
+
+await check("delivered, code-only: skipped_no_check and the local check's final outcome report at once; a local check's model call waits for its end", async () => {
+  // Raft runs the check and sent none: handled in code, at that outcome.
+  const a = await raftAssistant();
+  await atTime(DAY, () => ring(a, { first_change_at: DAY, last_change_at: DAY }));
+  const idle = lastBellId(a);
+  await atTime(DAY, () => wake(a.ctx));
+  must(wakeRows(a).at(-1)?.status === "skipped_no_check" && show(a.r.delivered) === show([[idle]]), `skipped_no_check: ${show(a.r.delivered)}`);
+  // The local check with nothing to look at: skipped_empty.
+  const b = await assistant(raft({ dm: "dm:@ada" }));
+  await atTime(DAY, () => ring(b, {}));
+  const empty = lastBellId(b);
+  await atTime(DAY, () => wake(b.ctx));
+  must(wakeRows(b).at(-1)?.status === "skipped_empty" && show(b.r.delivered) === show([[empty]]), `skipped_empty: ${show(wakeRows(b).at(-1))} ${show(b.r.delivered)}`);
+  // The local check that asks the model: reported when that session ends completed, not before.
+  const c = await assistant(raft({ dm: "dm:@ada" }));
+  c.r.unread = [conv(1, { hasMention: true })];
+  await atTime(DAY, () => ring(c, {}));
+  const asked = lastBellId(c);
+  const out = await atTime(DAY, () => wake(c.ctx));
+  must(out.turnKey === "assistant.check" && c.r.delivered.length === 0, `invoked: ${show(out)} ${show(c.r.delivered)}`);
+  await afterTurn(c.ctx, checkEnd("assistant.check", "completed"));
+  must(show(c.r.delivered) === show([[asked]]), `after the local check: ${show(c.r.delivered)}`);
 });
 
 const failed = results.filter((r) => !r.ok);
