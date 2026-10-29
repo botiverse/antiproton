@@ -775,18 +775,22 @@ export function statusesOnly(text: string): string {
 export type UncleanCode = "not_withdrawn" | "listing_failed" | "project_listing_failed" | "project_residue" | "stranded" | "no_credential" | "deletion_unconfirmed";
 /**
  * What to do about each: `retry_delete` (the next delete can finish it); `needs_operator_cleanup` (a known object an
- * operator can reach, #1128); `await_provider_reclaim` (nothing reachable with any current key: a stranded box, which
- * #1128 cannot list or reach either, holds the credential until run9 reclaims it). Only the first is retryable.
+ * operator can reach, #1128: project-scope residue, or a box whose deletion cannot be believed); `await_provider_reclaim`
+ * (nothing reachable with any current key: a stranded box, or a box whose mount holds no key at all, which #1128,
+ * starting from the agent's mount as well, cannot list or reach either; it holds the credential until run9 reclaims
+ * it). Only the first is retryable.
  */
 export type UncleanAction = "retry_delete" | "needs_operator_cleanup" | "await_provider_reclaim";
 const ACTION_OF: Record<UncleanCode, UncleanAction> = {
   not_withdrawn: "retry_delete", listing_failed: "retry_delete", project_listing_failed: "retry_delete",
-  project_residue: "needs_operator_cleanup", no_credential: "needs_operator_cleanup", deletion_unconfirmed: "needs_operator_cleanup",
-  stranded: "await_provider_reclaim",
+  project_residue: "needs_operator_cleanup", deletion_unconfirmed: "needs_operator_cleanup",
+  stranded: "await_provider_reclaim", no_credential: "await_provider_reclaim",
 };
 const MESSAGE_OF: Partial<Record<UncleanAction, string>> = {
   needs_operator_cleanup: "retrying the delete cannot clear this; it needs an operator (botiverse/antiproton#1128, planned)",
-  await_provider_reclaim: "this box cannot be located or deleted with any current key; the credential registered on it stays usable until run9 reclaims the box",
+  // Nothing here says waiting fixes it: reclaim needs the box idle, and the token itself does not expire.
+  await_provider_reclaim: "Cannot be located or deleted with current keys. The credential stops working only after the provider reclaims this box, " +
+    "and reclaim requires that nothing uses the box any more; a running background job keeps it alive. OAuth App tokens do not expire on their own.",
 };
 
 /**

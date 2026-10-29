@@ -1592,7 +1592,9 @@ await check("clean only on positive evidence: no key to reach the box, a box mad
     await w.sandbox(a);
     await a.rt.store.setMountSecretRef(TENANT, a.agentId, "sandbox", null);
     const del = await w.call("DELETE", "/agents/by-raft-agent/Y4");
-    must(del.body?.clean === false && boxOf(del.body)?.clean === false && /no credential/.test(boxOf(del.body).why), `no key: ${del.text}`);
+    // No key on the mount: #1128 starts from the mount too, so nothing can reach the box; await its reclaim, no retry.
+    must(del.body?.clean === false && boxOf(del.body)?.clean === false && /no credential/.test(boxOf(del.body).why)
+      && boxOf(del.body).code === "no_credential" && boxOf(del.body).action === "await_provider_reclaim" && del.body.retry === false, `no key: ${del.text}`);
     w.dispose();
   }
   // A box with no recorded key (made by older code): run9's "not found" on delete is not believed, and the
@@ -1710,7 +1712,8 @@ await check("every unclean box has a reason code, and the action follows it: ret
     run9.f.deleteNotFound = true;
     const r = await w.call("DELETE", "/agents/by-raft-agent/YF");
     const box = (r.body?.sandboxes?.boxes ?? []).find((b: any) => b.id === machine.boxId);
-    must(box?.code === "stranded" && box.action === "await_provider_reclaim" && /until run9 reclaims/.test(box.message) && r.body.clean === false && r.body.retry === false,
+    must(box?.code === "stranded" && box.action === "await_provider_reclaim" && /stops working only after the provider reclaims/.test(box.message)
+      && /a running background job keeps it alive/.test(box.message) && /do not expire on their own/.test(box.message) && r.body.clean === false && r.body.retry === false,
       `stranded: ${r.text}`);
     w.dispose();
   }
@@ -1772,7 +1775,7 @@ await check("a release run9 refuses with a body holding a token comes back as it
   w.dispose();
 });
 
-await check("withdraw never deletes project-scope secrets (shared run9 project: would stop prod injection)", async () => {
+await check("withdraw never deletes project-scope secrets (shared run9 project: would stop prod injection); withdraw runs while the box exists: after a delete there is nothing to withdraw", async () => {
   const run9 = run9Fake();
   const w = await world({ run9 });
   const a = await w.agent("YA");
