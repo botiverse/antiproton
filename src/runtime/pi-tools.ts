@@ -573,7 +573,7 @@ export function pausedNote(p: Paused, held: readonly HeldCall[], resumable = fal
   }
   const also = held.length
     ? ` ${held.length === 1 ? "A call is" : `${held.length} calls are`} also held for approval ` +
-      "(see held); if approved, each runs on its own exactly as written, and you are not told the decision or the result."
+      "(see held); if approved, each runs on its own exactly as written, and you will be woken with its outcome in a notice. Do not retry them."
     : "";
   return "The program stopped where you called pause(); nothing after that line ran. " + rest +
     " Think, then send a new run_js program to continue — carry what you need from data and outputs, " +

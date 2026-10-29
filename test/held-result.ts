@@ -272,6 +272,12 @@ await check("a program's hold carries the same text as data.approval, and the no
   must(/data\.approval says who decides it/.test(pausedNote(p, [])), `note: ${pausedNote(p, [])}`);
 });
 
+await check("a pause with calls also held says the agent is woken with their outcome, not that it is never told", () => {
+  const note = pausedNote({ cause: "pause", reason: "check", data: null } as any, [{ tool: "ops__deploy", operationId: "op_1", status: "pending" }]);
+  must(/woken with its outcome/.test(note), `note: ${note}`);
+  must(!/not told/.test(note), `note: ${note}`);
+});
+
 // ---------------------------------------------------------------- the deployment's wiring
 
 await check("approvalsUrl: the agent's console page, ids only, and none without an origin", () => {
