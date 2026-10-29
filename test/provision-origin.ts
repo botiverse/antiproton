@@ -20,7 +20,8 @@
  * nothing past the lookup touched. A tenant-scoped token likewise: its own tenant at its origin is served, another
  * origin or another tenant is refused.
  */
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { handleProvision, tenantFor, type ProvisionDeps } from "../cf/src/provision/handlers.ts";
 import { CONNECTION_PROVIDERS } from "../cf/src/provision/connect.ts";
 import type { ProvisionedAgent } from "../cf/src/control-plane.ts";
@@ -217,14 +218,23 @@ await check("a tenant-scoped token: its tenant at its origin is served; another 
 // ---- the cases outside /agents/<id>/…: a route that reaches an agent another way --------------------------------
 
 const SEALED = { ciphertext: "c", iv: "i" };
-const CONNECTOR = { id: "k1", tenantId: TENANT, provider: "github", account: "octo", accountId: "1", creatorRaftUserId: "u-1", sealed: SEALED, createdAt: 1 };
-/** Connections whose calls are recorded: `acted` names each agent a call changed, `touched` everything else reached. */
-function connections(acted: string[], bound: string[]) {
+/** This origin's connector, which another origin's token must never reach. */
+const CONNECTOR = { id: "k1", tenantId: TENANT, provider: "github", account: "octo", accountId: "1", creatorRaftUserId: "u-1", raftOrigin: OURS, sealed: SEALED, createdAt: 1 };
+/**
+ * Connections whose calls are recorded: `acted` names each agent a call changed, and each connector written or removed.
+ * `store` is the tenant's connectors, every origin's, as D1 holds them.
+ */
+function connections(acted: string[], bound: string[], store: Array<typeof CONNECTOR> = [CONNECTOR]) {
   return {
     newId: () => "k-new",
     confirm: async () => ({ ok: true, account: "octo", accountId: "1", sealed: SEALED, refresh: null, reconnect: { connectorId: "k1", actingRole: "admin" } }),
+    link: async () => ({ url: "https://link.example/x", expiresAt: "2026-01-01T00:00:00.000Z" }),
     connectors: {
-      get: async () => CONNECTOR, reconnect: async () => true, record: async () => {}, remove: async () => { acted.push("connector removed"); }, create: async () => {},
+      get: async (_t: string, id: string) => store.find((k) => k.id === id) ?? null,
+      list: async (_t: string, provider: string) => store.filter((k) => k.provider === provider),
+      reconnect: async (_t: string, id: string) => { acted.push(`connector ${id} reconnected`); return true; },
+      record: async () => {}, checked: async () => {},
+      remove: async () => { acted.push("connector removed"); }, create: async () => {},
     },
     registry: { boundTo: async () => bound, remove: async () => {}, put: async () => {}, get: async () => null },
     reconnect: async (_t: string, agentId: string) => { acted.push(agentId); return { ok: true, updated: true }; },
@@ -274,6 +284,100 @@ await check("outside /agents/<id>: each case serves its own origin, and refuses 
     else if (r.open) problems.push(`${name}: another origin was served (${r.seen})`);
   }
   assert(problems.length === 0, problems.join("\n        "));
+});
+
+await check("handlers.ts reads a connector only through ownConnector, and never holds the registry or the connectors under another name", async () => {
+  const src = HANDLERS_TEXT;
+  const reads = [...src.matchAll(/connectors\.(?:get|list)\(/g)].map((m) => lineOf(m.index!));
+  const own = src.split("\n").flatMap((l, i) => /^async function ownConnectors?\(/.test(l) ? [i + 1] : []);
+  // Each read is the body of one of the two helpers: the line after its signature.
+  const outside = reads.filter((n) => !own.some((o) => n === o + 1));
+  assert(own.length === 2 && reads.length === 2 && outside.length === 0, `connector reads outside ownConnector: handlers.ts:${outside.join(",")} (helpers at ${own.join(",")})`);
+  // A name for the registry or the connectors would let a lookup, or a read, past both checks above.
+  const aliases = [
+    ...src.matchAll(/=\s*(?:deps|c|connections)\s*\.\s*(?:registry|connectors)\s*[;,)\n]/g),
+    ...src.matchAll(/\{[^}]*\b(?:registry|connectors)\b[^}]*\}\s*=\s*(?:deps|c)\b/g),
+    ...src.matchAll(/\[\s*["'`](?:registry|connectors|get|getByAgentId|list)["'`]\s*\]/g),
+  ].map((m) => `${lineOf(m.index!)}: ${m[0].trim()}`);
+  assert(aliases.length === 0, `aliased: ${aliases.join("; ")}`);
+});
+
+// ---- another origin's own agent, and this origin's connector --------------------------------------------------
+
+/**
+ * Another Raft origin's platform token names this server's id, so it is in this tenant, and makes an agent of its
+ * own there (a create checks the body's origin against the token's, nothing more). Through that agent it must not
+ * list, attach, reconnect or disconnect this origin's connector, and each answer must be the bytes a connector that
+ * does not exist gets: any difference would tell it that one does.
+ */
+const ACTING = { actingRaftUserId: "u-9", actingRole: "admin" };
+const FOREIGN_OPS: Record<string, { method: string; path: (agent: string) => string; body: (origin: string, id: string) => unknown; who: "agent" | "token" }> = {
+  list: { method: "GET", path: (a) => `/agents/${a}/connections/github`, body: () => ({}), who: "agent" },
+  attach: { method: "PUT", path: (a) => `/agents/${a}/connections/github`, body: (_o, id) => ({ connectorId: id, ...ACTING }), who: "agent" },
+  "reconnect (the link)": { method: "POST", path: (a) => `/agents/${a}/connections/github`,
+    body: (o, id) => ({ returnUrl: `${o}/back`, initiatedBy: { raftUserId: "u-9" }, connectorId: id, actingRole: "admin" }), who: "agent" },
+  "reconnect (the confirm)": { method: "POST", path: (a) => `/agents/${a}/connections/github/confirm`, body: () => ({ pending: "pending-123", raftUserId: "u-9" }), who: "agent" },
+  disconnect: { method: "DELETE", path: () => "/connectors/k1", body: () => ACTING, who: "token" },
+};
+
+await check("another origin's own agent cannot list, attach, reconnect or disconnect this origin's connector, and each answer is a missing connector's, byte for byte", async () => {
+  const problems: string[] = [];
+  for (const [name, op] of Object.entries(FOREIGN_OPS)) {
+    const run = async (origin: string, store: Array<typeof CONNECTOR>, id = "k1") => {
+      const acted: string[] = [];
+      const agent = origin === OURS ? row : THEIR_AGENT;
+      const d = deps(agent, { connections: connections(acted, [agent.raftAgentId], store) }, origin === OURS ? [THEIR_AGENT] : [row]);
+      const path = op.path(agent.agentId).replace("/connectors/k1", `/connectors/${id}`);
+      const r = await send(d.deps, op.method, path, origin, op.body(origin, id));
+      return { ...r, acted, touched: d.touched };
+    };
+    // Control: this origin's own agent and token reach it.
+    const ours = await run(OURS, [CONNECTOR]);
+    const reached = op.method === "GET" ? ours.text.includes('"k1"') : ours.acted.length > 0 || ours.status === 200;
+    if (!reached) { problems.push(`${name}: the control did not reach the connector (${ours.status} ${ours.text.slice(0, 160)})`); continue; }
+    const foreign = await run(THEIRS, [CONNECTOR]);
+    const absent = await run(THEIRS, []);
+    const other = await run(THEIRS, [], "k-0b5e7c1d");
+    if (foreign.acted.some((a) => a.includes("k1") || a === AGENT || a === "connector removed")) problems.push(`${name}: changed ${foreign.acted.join(", ")}`);
+    if (foreign.text.includes("octo") || foreign.text.includes("u-1")) problems.push(`${name}: the connector's account or creator was shown: ${foreign.text.slice(0, 200)}`);
+    if (foreign.status !== absent.status || foreign.text !== absent.text) {
+      problems.push(`${name}: not a missing connector's answer:\n          foreign ${foreign.status} ${foreign.text.slice(0, 200)}\n          absent  ${absent.status} ${absent.text.slice(0, 200)}`);
+    }
+    // A random id that never existed: the same bytes but for the id the request named, which the answer echoes.
+    if (other.status !== absent.status || other.text.replaceAll("k-0b5e7c1d", "k1") !== absent.text) {
+      problems.push(`${name}: a random missing id answers otherwise: ${other.status} ${other.text.slice(0, 200)}`);
+    }
+  }
+  assert(problems.length === 0, problems.join("\n        "));
+});
+
+await check("migration 0030: each existing connector gets the origin of the agent it was made for, else its bound agents' one origin, else none", async () => {
+  const db = new DatabaseSync(":memory:");
+  const dir = new URL("../cf/migrations/", import.meta.url);
+  const files = readdirSync(dir).filter((n) => n.endsWith(".sql")).sort();
+  const at = files.findIndex((n) => n.startsWith("0030_"));
+  assert(at > 0, "no migration 0030");
+  for (const f of files.slice(0, at)) db.exec(readFileSync(new URL(f, dir), "utf8"));
+  const agent = (id: string, origin: string) => db.prepare("INSERT INTO provisioned_agents(tenant_id, raft_agent_id, agent_id, raft_server_id, raft_origin, name, instructions, status, created_at, updated_at) VALUES (?, ?, ?, 'srv-1', ?, 'n', '', 'active', 1, 1)")
+    .run(TENANT, id, `raft_${id}`, origin);
+  // One connection per agent and provider: an agent for each binding.
+  for (const [id, origin] of [["A", OURS], ["B", THEIRS], ["C", OURS], ["D", THEIRS], ["E", OURS], ["F", OURS], ["G", THEIRS]] as const) agent(id, origin);
+  const connector = (id: string) => db.prepare("INSERT INTO connectors(id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at) VALUES (?, ?, 'github', 'octo', 'u-1', 'c', 'i', 1)").run(id, TENANT);
+  const bind = (agentId: string, id: string) => db.prepare("INSERT INTO provisioned_connections(tenant_id, raft_agent_id, provider, account, connected_by, connected_at, connector_id) VALUES (?, ?, 'github', 'octo', 'u-1', 1, ?)").run(TENANT, agentId, id);
+  const made = (agentId: string, id: string) => db.prepare("INSERT INTO connector_events(tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at) VALUES (?, ?, ?, 'create', 'u-1', 'creator', 1)").run(TENANT, id, agentId);
+  // Made for A (ours), since bound to B of another origin too: the maker's.
+  connector("k_made"); made("A", "k_made"); bind("A", "k_made"); bind("B", "k_made");
+  // Made for an agent with no row any more, bound to D alone: D's.
+  connector("k_orphan"); made("GONE", "k_orphan"); bind("D", "k_orphan");
+  // No event, bound to C and E, both ours: ours.
+  connector("k_bound"); bind("C", "k_bound"); bind("E", "k_bound");
+  // No event, bound to agents of two origins; and none bound: no origin.
+  connector("k_split"); bind("F", "k_split"); bind("G", "k_split");
+  connector("k_none");
+  for (const f of files.slice(at)) db.exec(readFileSync(new URL(f, dir), "utf8"));
+  const got = Object.fromEntries((db.prepare("SELECT id, raft_origin FROM connectors ORDER BY id").all() as any[]).map((r) => [r.id, r.raft_origin]));
+  const want = { k_bound: OURS, k_made: OURS, k_none: null, k_orphan: THEIRS, k_split: null };
+  assert(JSON.stringify(got) === JSON.stringify(want), `backfilled: ${JSON.stringify(got)}`);
 });
 
 console.log(`  ${routes.size} (method, path) pairs take an agent id; ${served.length} (both spellings) served for their own origin; ${Object.keys(OUTSIDE).length} cases outside /agents/<id>`);

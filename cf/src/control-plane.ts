@@ -580,6 +580,11 @@ export interface Connector {
   /** GitHub's numeric user id for `account`, which a rename does not change (0024); null on a connector from before. */
   accountId?: string | null;
   creatorRaftUserId: string;
+  /**
+   * The Raft origin that made it (migration 0030); null on one whose origin could not be told, which no token sees.
+   * Every provider route compares it with the token's (cf/src/provision/handlers.ts `ownConnector`).
+   */
+  raftOrigin: string | null;
   /** The access token, sealed. Rotated in place when an expiring one is refreshed (0023). */
   sealed: { ciphertext: string; iv: string };
   createdAt: number;
@@ -645,11 +650,11 @@ export function d1Connectors(db: D1Database): ConnectorStore {
       const f = c.refresh ?? null;
       await db.prepare(
         `INSERT INTO connectors (id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at,
-           refresh_ciphertext, refresh_iv, expires_at, refresh_expires_at, refreshed_at, last_checked_at, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           refresh_ciphertext, refresh_iv, expires_at, refresh_expires_at, refreshed_at, last_checked_at, account_id, raft_origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(c.id, c.tenantId, c.provider, c.account, c.creatorRaftUserId, c.sealed.ciphertext, c.sealed.iv, c.createdAt,
         f?.sealed.ciphertext ?? null, f?.sealed.iv ?? null, f?.expiresAt ?? null, f?.refreshExpiresAt ?? null, f ? c.createdAt : null,
         // Made from a confirm, whose attach has just checked the credential with GitHub.
-        c.createdAt, c.accountId ?? null).run();
+        c.createdAt, c.accountId ?? null, c.raftOrigin).run();
     },
     async reconnect(tenantId, id, next) {
       const f = next.refresh;
@@ -695,7 +700,7 @@ function connectorRow(r: any): Connector {
   return {
     id: String(r.id), tenantId: String(r.tenant_id), provider: String(r.provider), account: r.account === null ? null : String(r.account),
     accountId: r.account_id == null ? null : String(r.account_id),
-    creatorRaftUserId: String(r.creator_raft_user_id), sealed: { ciphertext: String(r.ciphertext), iv: String(r.iv) }, createdAt: Number(r.created_at),
+    creatorRaftUserId: String(r.creator_raft_user_id), raftOrigin: r.raft_origin == null ? null : String(r.raft_origin), sealed: { ciphertext: String(r.ciphertext), iv: String(r.iv) }, createdAt: Number(r.created_at),
     refresh: r.refresh_ciphertext == null ? null
       : { sealed: { ciphertext: String(r.refresh_ciphertext), iv: String(r.refresh_iv) }, expiresAt: n(r.expires_at), refreshExpiresAt: n(r.refresh_expires_at) },
     brokenAt: n(r.broken_at), brokenReason: r.broken_reason == null ? null : String(r.broken_reason),

@@ -974,7 +974,7 @@ await check("another tenant's connector, and one deleted after the link was made
   const a = await w.agent("R6");
   const id = await w.connect(a);
   const theirs = connectorRow(w, id);
-  await d1Connectors(w.db).create({ id: "con_theirs", tenantId: "t-other", provider: "github", account: "octocat", accountId: "1", creatorRaftUserId: "u_owner",
+  await d1Connectors(w.db).create({ id: "con_theirs", tenantId: "t-other", provider: "github", account: "octocat", accountId: "1", creatorRaftUserId: "u_owner", raftOrigin: WHO.raftOrigin,
     sealed: { ciphertext: theirs.ciphertext, iv: theirs.iv }, createdAt: Date.now() });
   const other = await w.reconnect(a, "con_theirs");
   must(other.status === 404 && other.body.error.code === "not_found" && w.links.length === 0, `another tenant's: ${other.status} ${other.text}`);

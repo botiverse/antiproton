@@ -1297,6 +1297,22 @@ function importView(rec: ImportRecord, row: ProvisionedAgent) {
  * agent only. A connector as a whole goes through `DELETE /connectors/:id`. No credential passes
  * here in the clear: the flow in connect.ts seals it, and the handlers carry it only sealed.
  */
+/**
+ * A connector of the tenant as a token of `raftOrigin` may see it: one that origin made, else null, which every route
+ * answers exactly as a connector that does not exist. The only way a provider route reads a connector
+ * (test/provision-origin.ts checks it).
+ */
+// This guards a credential boundary, not a convenience: a connector carries a GitHub credential, and a platform token
+// of another Raft origin reaches this tenant by naming the server's id.
+async function ownConnector(c: NonNullable<ProvisionDeps["connections"]>, tenantId: string, id: string, raftOrigin: string) {
+  const k = await c.connectors.get(tenantId, id);
+  return k && k.raftOrigin === raftOrigin ? k : null;
+}
+/** The tenant's connectors of `provider` that `raftOrigin` made (`ownConnector`). */
+async function ownConnectors(c: NonNullable<ProvisionDeps["connections"]>, tenantId: string, provider: string, raftOrigin: string) {
+  return (await c.connectors.list(tenantId, provider)).filter((k) => k.raftOrigin === raftOrigin);
+}
+
 async function connection(
   method: string, rest: string[], body: unknown, tenantId: string, byRaft: boolean, deps: ProvisionDeps,
   pathAgent: () => Promise<ProvisionedAgent | null>,
@@ -1336,7 +1352,8 @@ async function connection(
     // A plain connect again mends only this agent: a new connector, and this agent's row written afresh, which clears
     // its broken state. A reconnect in place (above) mends the connector for every agent on it.
     const connectedAt = deps.now();
-    await c.connectors.create({ id: connectorId, tenantId, provider: p, account: r.account, accountId: r.accountId ?? null, creatorRaftUserId: b.raftUserId, sealed: r.sealed, refresh: r.refresh ?? null, createdAt: connectedAt });
+    await c.connectors.create({ id: connectorId, tenantId, provider: p, account: r.account, accountId: r.accountId ?? null, creatorRaftUserId: b.raftUserId,
+      raftOrigin: row.raftOrigin, sealed: r.sealed, refresh: r.refresh ?? null, createdAt: connectedAt });
     await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: b.raftUserId, connectedAt, connectorId });
     await c.connectors.record({ tenantId, connectorId, raftAgentId: row.raftAgentId, action: "create", actingRaftUserId: b.raftUserId, actingRole: "creator", at: connectedAt });
     return ok({ connected: true, connectorId, account: r.account, connectedAt: new Date(connectedAt).toISOString(), connectedBy: b.raftUserId });
@@ -1365,7 +1382,7 @@ async function connection(
       if (b.actingRole !== "creator" && b.actingRole !== "admin") {
         return fail({ status: 422, code: "invalid", message: "actingRole is creator or admin: the capacity Raft checked the initiator reconnects this connector in", param: "actingRole" });
       }
-      const k = await c.connectors.get(tenantId, b.connectorId);
+      const k = await ownConnector(c, tenantId, b.connectorId, row.raftOrigin);
       if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${b.connectorId} in this tenant` });
       const refused = creatorRefused(k, { actingRaftUserId: by, actingRole: b.actingRole });
       if (refused) return fail(refused);
@@ -1380,7 +1397,7 @@ async function connection(
   if (method === "GET") {
     const got = await c.registry.get(tenantId, row.raftAgentId, p);
     const current = got?.connectorId ?? null;
-    const all = await c.connectors.list(tenantId, p);
+    const all = await ownConnectors(c, tenantId, p, row.raftOrigin);
     const connectors = all.map((k) => ({
       id: k.id, account: k.account, creatorRaftUserId: k.creatorRaftUserId, createdAt: new Date(k.createdAt).toISOString(), current: k.id === current,
       ...oauthState(k.brokenAt ?? null, k.lastCheckedAt ?? k.brokenAt ?? k.createdAt),
@@ -1403,7 +1420,7 @@ async function connection(
     if (isFail(acting)) return fail(acting);
     const connectorId = (body as Record<string, unknown>).connectorId;
     if (typeof connectorId !== "string" || !connectorId) return fail({ status: 422, code: "invalid", message: "connectorId is required", param: "connectorId" });
-    const k = await c.connectors.get(tenantId, connectorId);
+    const k = await ownConnector(c, tenantId, connectorId, row.raftOrigin);
     if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${connectorId} in this tenant` });
     const refused = creatorRefused(k, acting);
     if (refused) return fail(refused);
@@ -1451,7 +1468,7 @@ async function reconnectInPlace(
 ): Promise<Response> {
   const c = deps.connections!;
   const acting: Acting = { actingRaftUserId: raftUserId, actingRole: target.actingRole };
-  const k = await c.connectors.get(tenantId, target.connectorId);
+  const k = await ownConnector(c, tenantId, target.connectorId, row.raftOrigin);
   if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${target.connectorId} in this tenant; it may have been disconnected since the link was made` });
   const refused = creatorRefused(k, acting);
   if (refused) return fail(refused);
@@ -1463,7 +1480,7 @@ async function reconnectInPlace(
   const at = deps.now();
   if (!(await c.connectors.reconnect(tenantId, k.id, { sealed: r.sealed, refresh: r.refresh, account: r.account, accountId: r.accountId, at }))) {
     // Gone, or given another account's id, between the read and the write.
-    const now = await c.connectors.get(tenantId, k.id);
+    const now = await ownConnector(c, tenantId, k.id, row.raftOrigin);
     return now ? mismatch() : fail({ status: 404, code: "not_found", message: `no ${p} connector ${k.id} in this tenant; it was disconnected meanwhile` });
   }
   await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, action: "reconnect", ...acting, at });
@@ -1555,7 +1572,7 @@ async function disconnect(tenantId: string, connectorId: string, body: unknown, 
   if (!c) return fail({ status: 404, code: "not_found", message: "this deployment has no connectors" });
   const acting = actingField(body, []);
   if (isFail(acting)) return fail(acting);
-  const k = await c.connectors.get(tenantId, connectorId);
+  const k = await ownConnector(c, tenantId, connectorId, who.raftOrigin);
   if (!k) return fail({ status: 404, code: "not_found", message: `no connector ${connectorId} in this tenant` });
   const refused = creatorRefused(k, acting);
   if (refused) return fail(refused);

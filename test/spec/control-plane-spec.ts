@@ -236,11 +236,11 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
   add("a connector is the tenant's: found only in its tenant, listed by provider, removed once; its events are kept", async () => {
     const k = d1Connectors(db);
     const sealed = { ciphertext: "c", iv: "i" };
-    await k.create({ id: "con_a", tenantId: "t", provider: "github", account: "octocat", creatorRaftUserId: "u1", sealed, createdAt: 1 });
-    await k.create({ id: "con_b", tenantId: "t", provider: "github", account: null, creatorRaftUserId: "u2", sealed, createdAt: 2 });
-    await k.create({ id: "con_c", tenantId: "t2", provider: "github", account: "x", creatorRaftUserId: "u3", sealed, createdAt: 3 });
+    await k.create({ id: "con_a", tenantId: "t", provider: "github", account: "octocat", creatorRaftUserId: "u1", raftOrigin: "https://a.example", sealed, createdAt: 1 });
+    await k.create({ id: "con_b", tenantId: "t", provider: "github", account: null, creatorRaftUserId: "u2", raftOrigin: null, sealed, createdAt: 2 });
+    await k.create({ id: "con_c", tenantId: "t2", provider: "github", account: "x", creatorRaftUserId: "u3", raftOrigin: "https://a.example", sealed, createdAt: 3 });
     const a = await k.get("t", "con_a");
-    assert(a?.account === "octocat" && a.creatorRaftUserId === "u1" && a.sealed.ciphertext === "c" && a.sealed.iv === "i" && a.createdAt === 1, `get: ${JSON.stringify(a)}`);
+    assert(a?.account === "octocat" && a.creatorRaftUserId === "u1" && a.raftOrigin === "https://a.example" && a.sealed.ciphertext === "c" && a.sealed.iv === "i" && a.createdAt === 1, `get: ${JSON.stringify(a)}`);
     assert((await k.get("t2", "con_a")) === null, "a connector was found from another tenant");
     assert((await k.list("t", "github")).map((x) => x.id).join() === "con_a,con_b", "list");
     assert((await k.list("t", "linear")).length === 0, "list by provider");
