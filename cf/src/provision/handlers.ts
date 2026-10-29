@@ -27,7 +27,7 @@ import {
   MAIN_SESSION_ID, redactCredentials, TRACE_LIMIT_DEFAULT, TRACE_LIMIT_MAX, TRACE_WINDOW_MAX_MS, TRANSCRIPT_LIMIT_DEFAULT, TRANSCRIPT_LIMIT_MAX,
   type EvalTranscript, type TraceQuery, type TraceWindow,
 } from "../eval-read.ts";
-import { AGENT_BUDGETS, type AgentBudget, type ConnectionRegistry, type ConnectorRefresh, type ConnectorStore, type ProviderTokenIdentity, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
+import { AGENT_BUDGETS, SYSTEM_ACTOR, type AgentBudget, type ConnectionRegistry, type ConnectorRefresh, type ConnectorStore, type ProviderTokenIdentity, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
 import { MAX_BUDGET_CENTS, PLANS, type BudgetWrite, type Plan, type TenantPlanStore } from "../spend-limit.ts";
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider, type ReconnectTarget } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
@@ -189,6 +189,8 @@ export interface ProvisionDeps {
     detachIfFrom(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string }, connectorId?: string | null): Promise<boolean>;
     /** Remove the provider's credential from the agent's mount. */
     detach(tenantId: string, agentId: string, provider: ConnectionProvider): Promise<boolean>;
+    /** The same, for an agent's delete, telling nothing to clear from a refusal (`AgentRuntime.clearConnection`). */
+    clear(tenantId: string, agentId: string, provider: ConnectionProvider): Promise<{ ok: true; cleared: boolean } | { ok: false; error: string }>;
     /** Make a held connection the mount's credential, for the Raft user it was held for (connect.ts), as connector `connectorId`. */
     confirm(tenantId: string, agentId: string, provider: ConnectionProvider, pending: string, raftUserId: string, connectorId?: string):
       Promise<{ ok: true; account: string | null; accountId?: string | null; sealed: { ciphertext: string; iv: string }; refresh?: ConnectorRefresh | null;
@@ -1026,7 +1028,36 @@ export async function handleProvision(
       try { await deps.approvals.index.markAgentDeleted(tenantId, row.agentId, at); }
       catch (e) { console.warn(`keeping the approval copies of ${tenantId}/${row.agentId} failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`); }
     };
-    if (row.status === "deleted") { await keepHolds(row.deletedAt ?? row.updatedAt); return ok(view(row)); }
+    // Its connections go: each binding to a connector, recorded as the connector's event, and the credential copy on
+    // the agent's mount. The binding goes whatever happens to the mount (the object may be unreachable, or wiped): a
+    // deleted agent is never handed a renewed pair, and finds no connector to renew through (`d1ConnectorGrants`), so
+    // a copy left behind expires and is not renewed. A mount that could not be cleared is logged, and the next delete
+    // of the same agent tries again: its mounts are cleared whether or not a binding is left.
+    const unbind = async (at: number) => {
+      const c = deps.connections;
+      if (!c) return;
+      for (const p of CONNECTION_PROVIDERS) {
+        let error: string | null = null;
+        try {
+          const r = await c.clear(tenantId, row.agentId, p);
+          if (!r.ok) error = r.error;
+        } catch (e) { error = String((e as Error)?.message ?? e).slice(0, 200); }
+        if (error !== null) logEvent("connect.agent_delete", { tenantId, agentId: row.agentId, provider: p, outcome: "mount-not-cleared", reason: error.slice(0, 200) });
+        try {
+          const bound = await c.registry.get(tenantId, row.raftAgentId, p);
+          if (!bound) continue;
+          if (bound.connectorId) {
+            await c.connectors.record({ tenantId, connectorId: bound.connectorId, raftAgentId: row.raftAgentId, action: "deleted_agent_unbound",
+              actingRaftUserId: SYSTEM_ACTOR, actingRole: "system", at, reason: error === null ? null : "the mount could not be cleared" });
+          }
+          await c.registry.remove(tenantId, row.raftAgentId, p);
+          logEvent("connect.agent_delete", { tenantId, agentId: row.agentId, provider: p, connectorId: bound.connectorId ?? null, outcome: "unbound", mountCleared: error === null });
+        } catch (e) {
+          logEvent("connect.agent_delete", { tenantId, agentId: row.agentId, provider: p, outcome: "unbind-failed", reason: String((e as Error)?.message ?? e).slice(0, 200) });
+        }
+      }
+    };
+    if (row.status === "deleted") { await unbind(deps.now()); await keepHolds(row.deletedAt ?? row.updatedAt); return ok(view(row)); }
     // Raft revokes the credential itself, so pushes stop even if this fails half-way; what is
     // reported is what could not be undone here. The object and its transcript stay: data is
     // never destroyed by a delete, here as for every agent.
@@ -1036,6 +1067,7 @@ export async function handleProvision(
     const patch = { status: "deleted" as const, pushRegistered: false, pushError: off.ok ? null : off.error, deletedAt: t };
     // After the registry says deleted, so a publish racing this adds nothing the mark misses (`d1ApprovalIndex.upsert`).
     await deps.registry.update(tenantId, row.raftAgentId, patch);
+    await unbind(t);
     await keepHolds(t);
     return ok(view({ ...row, ...patch, updatedAt: t }));
   }

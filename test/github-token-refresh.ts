@@ -14,7 +14,7 @@ import { AgentRuntime } from "../cf/src/runtime.ts";
 import { adoptProvisionedAgent } from "../cf/src/provision/steps.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
-import { d1ConnectorGrants, d1Connections, d1Connectors, d1ProvisionedAgents } from "../cf/src/control-plane.ts";
+import { d1ConnectorGrants, d1Connections, d1Connectors, d1ProvisionedAgents, renewalAudience } from "../cf/src/control-plane.ts";
 import { handleProvision, type ProvisionDeps } from "../cf/src/provision/handlers.ts";
 import { githubExchangeCode, GITHUB_TOKEN } from "../cf/src/auth.ts";
 import { OAUTH_PREFIX, RECONNECT_REASON, reasonCode } from "../cf/src/github-refresh.ts";
@@ -133,6 +133,8 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
   const grants = d1ConnectorGrants(db);
   let ids = 0;
   const links: any[] = [];
+  /** Agents whose object does not answer the delete's mount clear. */
+  const clearFails = new Set<string>();
   const rtOf = (agentId: string) => objects.get(agentId)!.rt;
   async function agent(raftAgentId: string, twinOf?: { agentId: string }) {
     const agentId = twinOf?.agentId ?? `raft_${raftAgentId}`;
@@ -145,14 +147,13 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
       ...(opts.github === false ? {} : {
         github: {
           app: { clientId: "cid", clientSecret: "csecret" }, grants,
-          // As cf/src/index.ts does it: every other agent pointed at the connector, in its own object.
+          // As cf/src/index.ts does it: every other agent the renewal audience names, in its own object.
           async propagate(tenantId: string, connectorId: string, fromAgentId: string) {
-            for (const r of await d1Connections(db).boundTo(tenantId, connectorId)) {
-              const row = await registry.get(tenantId, r);
-              if (!row || row.agentId === fromAgentId) continue;
-              propagated.push(row.agentId);
+            for (const agentId of (await renewalAudience(db, tenantId, connectorId)).to) {
+              if (agentId === fromAgentId) continue;
+              propagated.push(agentId);
               if (propagateDelayMs) await sleep(propagateDelayMs);
-              await rtOf(row.agentId).adoptConnection(tenantId, row.agentId, "github", connectorId);
+              await rtOf(agentId).adoptConnection(tenantId, agentId, "github", connectorId);
             }
           },
         },
@@ -167,7 +168,9 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
     return { rt, agentId, raftAgentId };
   }
   const deps: ProvisionDeps = {
-    now: () => Date.now(), registry, agent: {} as any,
+    now: () => Date.now(), registry,
+    // An agent's DELETE only: its push and its Raft credential, which these tests do not hold.
+    agent: { tool: async () => ({ ok: true, result: {} }), removeCredential: async () => true } as any,
     connections: {
       registry: d1Connections(db), connectors: d1Connectors(db), newId: () => `con_${++ids}`,
       attach: (t, a, _p, sealed, refresh) => rtOf(a).attachSealedConnection(t, a, "github", sealed, refresh ?? null),
@@ -175,6 +178,7 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
       reconnect: (t, a, _p, connectorId, was, sealed, refresh) => rtOf(a).reconnectConnection(t, a, "github", connectorId, was, sealed, refresh),
       detachIfFrom: (t, a, _p, sealed, connectorId) => rtOf(a).detachConnectionIfFrom(t, a, "github", sealed, connectorId ?? null),
       detach: (t, a) => rtOf(a).detachConnection(t, a, "github"),
+      clear: (t, a) => (clearFails.has(a) ? Promise.reject(new Error("the agent's object did not answer")) : rtOf(a).clearConnection(t, a, "github")),
       confirm: (t, a, _p, pending, user, connectorId) => rtOf(a).confirmConnection(t, a, "github", pending, user, connectorId ?? null),
     },
   };
@@ -233,7 +237,7 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
   /** The `github.refresh` rows in an agent's trace outbox, as the export will carry them (#980). */
   const traced = (a: { agentId: string }) => pendingTrace(objects.get(a.agentId)!.host.sql as any, 0).rows.filter((r) => r.kind === "github.refresh");
   const dispose = () => { for (const o of objects.values()) o.host.dispose(); };
-  return { db, gh, agent, connect, reconnect, links, status, tool, stored, expireAt, age, call, grants, propagated, settle, dispose, traced,
+  return { db, gh, agent, connect, reconnect, links, status, tool, stored, expireAt, age, call, grants, propagated, settle, dispose, traced, clearFails,
     delayPropagation: (ms: number) => { propagateDelayMs = ms; } };
 }
 
@@ -1087,6 +1091,49 @@ await check("nothing logged carries a token value: not the exchange's, a renewal
   // And the lines that should be there are: the exchange's keys and the renewals' outcomes.
   must(logged.some((l) => /"evt":"github.refresh"/.test(l) && /"outcome":"rotated"/.test(l)), "no renewal was logged");
   must(logged.some((l) => /"evt":"github.refresh"/.test(l) && /"outcome":"broken"/.test(l)), "no broken connection was logged");
+});
+
+await check("deleting an agent bound to a connector: it leaves the renewal audience, its binding goes, and the credential copy on its mount goes", async () => {
+  const w = await world();
+  const a = await w.agent("X1");
+  const b = await w.agent("X2");
+  const id = await w.connect(a);
+  must((await w.call("PUT", `/agents/by-raft-agent/X2/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" })).status === 200, "bind X2");
+  const bindingOf = (raftAgentId: string) => w.db.raw.prepare("SELECT * FROM provisioned_connections WHERE raft_agent_id = ?").get(raftAgentId) as any;
+  // Control: both are in the audience, X2 is bound, and its mount holds the connector's credential.
+  must(JSON.stringify((await renewalAudience(w.db, TENANT, id)).to) === JSON.stringify([a.agentId, b.agentId]) && bindingOf("X2")?.connector_id === id
+    && (await w.stored(b)).token !== null, "control");
+  const del = await w.call("DELETE", "/agents/by-raft-agent/X2");
+  must(del.status === 200 && del.body.status === "deleted", `delete: ${del.status} ${del.text}`);
+  const after = await renewalAudience(w.db, TENANT, id);
+  must(JSON.stringify(after) === JSON.stringify({ to: [a.agentId], filtered: 0, skipped: 0 }), `audience after the delete: ${JSON.stringify(after)}`);
+  must(!bindingOf("X2") && bindingOf("X1")?.connector_id === id, "the deleted agent's binding is still there, or the other's went");
+  must((await w.stored(b)).token === null && (await w.stored(b)).rec === null, "the credential copy is still on the deleted agent's mount");
+  const ev = w.db.raw.prepare("SELECT * FROM connector_events WHERE action = 'deleted_agent_unbound'").all() as any[];
+  must(ev.length === 1 && ev[0].connector_id === id && ev[0].raft_agent_id === "X2" && ev[0].acting_role === "system", `the record: ${JSON.stringify(ev)}`);
+  // And a deleted agent whose object still runs finds no connector to renew through.
+  must((await w.grants.grant(TENANT, id, b.agentId)) === null && (await w.grants.grant(TENANT, id, a.agentId)) !== null, "a deleted agent can still renew");
+  w.dispose();
+});
+
+await check("deleting an agent whose object does not answer: the binding goes anyway, the failed mount clear is logged, and a repeated delete clears it", async () => {
+  const w = await world();
+  const a = await w.agent("X3");
+  const id = await w.connect(a);
+  const bindingOf = () => w.db.raw.prepare("SELECT * FROM provisioned_connections WHERE raft_agent_id = 'X3'").get() as any;
+  w.clearFails.add(a.agentId);
+  const from = logged.length;
+  const del = await w.call("DELETE", "/agents/by-raft-agent/X3");
+  must(del.status === 200 && !bindingOf() && (await renewalAudience(w.db, TENANT, id)).to.length === 0, `delete: ${del.status} ${del.text}`);
+  must((await w.stored(a)).token !== null, "control: the mount was cleared though its object did not answer");
+  must(logged.slice(from).some((l) => /"evt":"connect.agent_delete"/.test(l) && /"outcome":"mount-not-cleared"/.test(l)), "the failed clear was not logged");
+  const ev = w.db.raw.prepare("SELECT reason FROM connector_events WHERE action = 'deleted_agent_unbound'").get() as any;
+  must(ev?.reason === "the mount could not be cleared", `the record: ${JSON.stringify(ev)}`);
+  // The object answers again: the same delete, repeated, clears the mount, with no binding left to go.
+  w.clearFails.clear();
+  const again = await w.call("DELETE", "/agents/by-raft-agent/X3");
+  must(again.status === 200 && (await w.stored(a)).token === null, `repeat: ${again.status} ${(await w.stored(a)).token}`);
+  w.dispose();
 });
 
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

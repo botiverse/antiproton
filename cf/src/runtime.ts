@@ -2164,6 +2164,18 @@ export class AgentRuntime {
     return (await this.#oauth.renew(tenantId, agentId, name, "adopt", null)).ok;
   }
 
+  /**
+   * Take whatever key this agent put on its mount of that plugin, for its delete: cleared, or nothing there to clear
+   * (no such mount, or no key of the agent's on it), or refused with why (something the key made is still held).
+   */
+  async clearConnection(tenantId: string, agentId: string, plugin: string): Promise<{ ok: true; cleared: boolean } | { ok: false; error: string }> {
+    await this.ready();
+    const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
+    if (!mount || !isAgentRef(mount.secretRef)) return { ok: true, cleared: false };
+    const r = await this.removeCredentialOrWhy(tenantId, agentId, mount.alias);
+    return r.ok ? { ok: true, cleared: true } : r;
+  }
+
   /** Remove the credential from this agent's mount of that plugin; false when there was none. */
   async detachConnection(tenantId: string, agentId: string, plugin: string): Promise<boolean> {
     await this.ready();

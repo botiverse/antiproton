@@ -135,6 +135,7 @@ const NOT_THE_PATH: Array<{ call: string; why: string }> = [
   { call: "const a = raftAgentId === row.raftAgentId ? row : await deps.registry.get(tenantId, raftAgentId);", why: "reconnect in place: the other agents bound to the connector" },
   { call: "const row = await deps.registry.get(tenantId, raftAgentId).catch(() => undefined);", why: "DELETE /connectors/:id: the agents bound to the connector" },
   { call: "const got = await c.registry.get(tenantId, row.raftAgentId, p);", why: "the connection registry, keyed by an agent already found (two calls)" },
+  { call: "const bound = await c.registry.get(tenantId, row.raftAgentId, p);", why: "an agent's DELETE: its connections, keyed by the agent already found" },
 ];
 const HANDLERS_TEXT = readFileSync(HANDLERS, "utf8");
 const lineOf = (offset: number) => HANDLERS_TEXT.slice(0, offset).split("\n").length;
@@ -459,12 +460,13 @@ await check("renewal: a connector's pair reaches only its own origin's agents; a
   assert(JSON.stringify(to) === JSON.stringify(["raft_A", "raft_C"]), `handed to: ${JSON.stringify(to)}`);
   assert((await connectorAudience(f.D1, TENANT, "k_null")).length === 0, "a connector with no origin was handed to its agents");
   // What the renewal push logs: the agents bound but left out, by origin or by the connector having none.
-  // A deleted agent of the connector's origin still bound is no origin's leak: in `to` as before, never `filtered`. A
-  // binding whose agent has no row is `skipped`.
+  // A deleted agent of the connector's origin still bound is no origin's leak: left out of `to` and counted `skipped`,
+  // never `filtered`; so is a binding whose agent has no row. In production `skipped` goes from 0 to 1 for the one
+  // deleted agent that was still bound until 0031 removes that binding, and that is expected.
   f.agent("H", OURS); f.db.prepare("UPDATE provisioned_agents SET status = 'deleted', deleted_at = 2 WHERE raft_agent_id = 'H'").run();
   f.bind("H", "k1"); f.bind("NOROW", "k1");
   const k1 = await renewalAudience(f.D1, TENANT, "k1"), kNull = await renewalAudience(f.D1, TENANT, "k_null");
-  assert(JSON.stringify(k1) === JSON.stringify({ to: ["raft_A", "raft_C", "raft_H"], filtered: 1, skipped: 1 })
+  assert(JSON.stringify(k1) === JSON.stringify({ to: ["raft_A", "raft_C"], filtered: 1, skipped: 2 })
     && JSON.stringify(kNull) === JSON.stringify({ to: [], filtered: 1, skipped: 0 }), `filtered: ${JSON.stringify(k1)} ${JSON.stringify(kNull)}`);
 });
 

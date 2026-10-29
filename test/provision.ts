@@ -442,6 +442,7 @@ function connectionsFake() {
     async attach(_t, agentId, _p, sealed) { attached.push({ agentId, sealed }); return { ok: true, account: "octocat" }; },
     async link(spec) { links.push(spec); return { url: "https://ap.example/connect/start?t=signed", expiresAt: "2026-09-29T07:00:00.000Z" }; },
     async detach(_t, agentId, provider) { detached.push(`${agentId}/${provider}`); return true; },
+    async clear(_t, agentId, provider) { detached.push(`${agentId}/${provider}/cleared`); return { ok: true, cleared: true }; },
     async detachIfFrom(_t, agentId, provider, sealed) {
       if (failDetach.has(agentId)) throw new Error("the agent's object did not answer");
       detached.push(`${agentId}/${provider}/${sealed.ciphertext}`); return true;
