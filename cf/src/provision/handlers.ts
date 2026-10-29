@@ -1001,8 +1001,8 @@ export async function handleProvision(
     // preview before deletes did this. A stop that fails does not fail the delete; it is logged (`turn.stop`).
     if (deps.agent.stopTurn) await stopTurnOf(deps.agent.stopTurn, tenantId, row.agentId, "delete");
     // Its holds' copies are kept as the record of who decided what for it, no longer listed, without the arguments'
-    // summaries, which are the agent's to keep (`markAgentDeleted`). Again on a repeated delete, so one whose marking
-    // failed is finished by the next. A failure is logged, not a failed delete: the list leaves a deleted agent's rows
+    // text, which is the agent's to keep (`markAgentDeleted`). Again on a repeated delete, and by the next prune, so one
+    // whose marking failed is finished. A failure is logged, not a failed delete: the list leaves a deleted agent's rows
     // out by the registry anyway (`d1ApprovalIndex`).
     const keepHolds = async (at: number) => {
       if (!deps.approvals) return;

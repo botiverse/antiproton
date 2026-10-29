@@ -157,16 +157,22 @@ export function decodeCursor(s: string): Cursor | null {
 export type IndexScope = { raftOrigin: string; tenantId: string | null };
 
 export interface ApprovalIndex {
-  /** Write a hold's state. It only moves forward (`STATE_RANK`), and the same state twice changes nothing. */
+  /**
+   * Write a hold's state. It only moves forward (`STATE_RANK`), and the same state twice changes nothing. A deleted
+   * agent's hold is still written, as its kept record (`markAgentDeleted`): marked, without the arguments' text.
+   */
   upsert(row: IndexRow): Promise<void>;
   list(scope: IndexScope, q: { status: ApprovalState | null; updatedSince: number | null; after: Cursor | null; limit: number }):
     Promise<{ rows: IndexRow[]; next: Cursor | null }>;
   /**
    * The agent was deleted at `at`: its copies are kept as the record of who decided what (migration 0029), no longer
-   * listed, without the argument and outcome summaries. Repeating it keeps the first `at`.
+   * listed, without the arguments' text (`AUDIT_DROPS`). Repeating it keeps the first `at`.
    */
   markAgentDeleted(tenantId: string, agentId: string, at: number): Promise<void>;
-  /** A live agent's ended holds whose last change is before `ended`; a deleted agent's holds whose delete is before `deleted`. */
+  /**
+   * A live agent's ended holds whose last change is before `ended`; a deleted agent's holds whose delete is before
+   * `deleted`. First marks the holds of an agent the registry says is deleted whose delete did not mark them.
+   */
   prune(before: { ended: number; deleted: number }): Promise<void>;
 }
 
@@ -177,13 +183,21 @@ export interface ApprovalIndex {
 export const APPROVAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 /**
  * How long a deleted agent's holds are kept after its delete: a year. Once deleted, no provider route reads its object,
- * so these rows are where who decided what for it is read; nothing is added to them after the delete, so they are
- * bounded by the deletes of a year.
+ * so these rows are where who decided what for it is read. Each deleted agent's rows are the holds it had made by its
+ * delete, moving forward only, so they are bounded by the deletes of a year.
  */
 export const AUDIT_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
 
-/** The item's fields a deleted agent's copy drops: what was asked and what came of it, the agent's to keep. */
-const AUDIT_DROPS = "'$.args', '$.outcome', '$.route', '$.description'";
+/**
+ * The item's fields a deleted agent's copy drops: the free text of what was asked (the arguments' summary, a bridged
+ * request's body), the agent's to keep. Kept: the route's method, path, repository and pull request, which say what
+ * the decision applied to; `outcome`, which tells `policy_denied` from a failed run; and the description, built from
+ * the mount, tool and route alone. `outcome` is the run's result or error, redacted and bounded (`outcomeSummary`), and
+ * can still carry free text of the result's own.
+ */
+const AUDIT_DROPS = "'$.args', '$.route.body'";
+/** When the row's agent was deleted, by the registry; null for a live agent. Correlated on `provider_approvals`. */
+const DELETED_AT = "(SELECT COALESCE(p.deleted_at, p.updated_at) FROM provisioned_agents p WHERE p.tenant_id = provider_approvals.tenant_id AND p.agent_id = provider_approvals.agent_id AND p.status = 'deleted')";
 /** The row's agent is deleted in the registry. */
 const AGENT_DELETED = "EXISTS (SELECT 1 FROM provisioned_agents p WHERE p.tenant_id = provider_approvals.tenant_id AND p.agent_id = provider_approvals.agent_id AND p.status = 'deleted')";
 
@@ -196,19 +210,25 @@ const STATE_RANK = (col: string) => `(CASE ${col} WHEN 'pending' THEN 0 WHEN 'ap
 export function d1ApprovalIndex(db: D1Database): ApprovalIndex {
   return {
     async upsert(r) {
-      // A publish that read the registry before the delete and writes after it writes nothing: with no row selected there
-      // is no conflict either, so a kept record never gets its summaries back and every row of a deleted agent is marked.
+      // Whether the agent is deleted is read here, in the statement, not from the publisher's registry read: a hold
+      // decided or expired after the delete still reaches its kept record, and one that lands as the delete marks the
+      // rows is written marked and without the arguments' text either way.
+      const item = JSON.stringify(r.item);
       await db.prepare(
-        "INSERT INTO provider_approvals(tenant_id, agent_id, operation_id, raft_origin, raft_server_id, raft_agent_id, status, item, created_at, expires_at, updated_at) " +
-        "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM provisioned_agents p WHERE p.tenant_id = ? AND p.agent_id = ? AND p.status = 'deleted') " +
-        "ON CONFLICT(tenant_id, agent_id, operation_id) DO UPDATE SET status = excluded.status, item = excluded.item, expires_at = excluded.expires_at, updated_at = excluded.updated_at " +
+        "INSERT INTO provider_approvals(tenant_id, agent_id, operation_id, raft_origin, raft_server_id, raft_agent_id, status, item, created_at, expires_at, updated_at, agent_deleted_at) " +
+        `SELECT ?, ?, ?, ?, ?, ?, ?, CASE WHEN d.at IS NULL THEN ? ELSE json_remove(?, ${AUDIT_DROPS}) END, ?, ?, ?, d.at ` +
+        "FROM (SELECT (SELECT COALESCE(p.deleted_at, p.updated_at) FROM provisioned_agents p WHERE p.tenant_id = ? AND p.agent_id = ? AND p.status = 'deleted') AS at) d WHERE true " +
+        "ON CONFLICT(tenant_id, agent_id, operation_id) DO UPDATE SET status = excluded.status, expires_at = excluded.expires_at, updated_at = excluded.updated_at, " +
+        "agent_deleted_at = COALESCE(provider_approvals.agent_deleted_at, excluded.agent_deleted_at), " +
+        `item = CASE WHEN COALESCE(provider_approvals.agent_deleted_at, excluded.agent_deleted_at) IS NULL THEN excluded.item ELSE json_remove(excluded.item, ${AUDIT_DROPS}) END ` +
         `WHERE ${STATE_RANK("excluded.status")} > ${STATE_RANK("provider_approvals.status")}`,
-      ).bind(r.tenantId, r.agentId, r.operationId, r.raftOrigin, r.raftServerId, r.raftAgentId, r.status, JSON.stringify(r.item),
+      ).bind(r.tenantId, r.agentId, r.operationId, r.raftOrigin, r.raftServerId, r.raftAgentId, r.status, item, item,
         r.createdAt, r.expiresAt, r.updatedAt, r.tenantId, r.agentId).run();
     },
     async list(scope, q) {
-      // A deleted agent's rows are left out, marked (`markAgentDeleted`) or not yet: the registry says it is deleted first.
-      const where = ["raft_origin = ?", `NOT ${AGENT_DELETED}`];
+      // A deleted agent's rows are left out, marked (`markAgentDeleted`) or not yet: the registry says it is deleted
+      // first. Either one alone hides them.
+      const where = ["raft_origin = ?", "agent_deleted_at IS NULL", `NOT ${AGENT_DELETED}`];
       const binds: unknown[] = [scope.raftOrigin];
       if (scope.tenantId !== null) { where.push("tenant_id = ?"); binds.push(scope.tenantId); }
       if (q.status !== null) { where.push("status = ?"); binds.push(q.status); }
@@ -237,9 +257,12 @@ export function d1ApprovalIndex(db: D1Database): ApprovalIndex {
       ).bind(at, tenantId, agentId).run();
     },
     async prune(before) {
-      // Each spelled as its partial index (migration 0029). A deleted agent's row its delete failed to mark is not a
-      // live agent's: it stays for the delete's repeat to mark, not dropped at 30 days.
+      // Each spelled as its partial index (migration 0029). The mark first, from the registry's deleted agents (a few
+      // rows, not a scan of the copy): a delete whose mark failed leaves rows only until the next prune, and they are
+      // then a deleted agent's, dropped a year after its delete. Until marked they are not a live agent's either.
       await db.batch([
+        db.prepare(`UPDATE provider_approvals SET agent_deleted_at = ${DELETED_AT}, item = json_remove(item, ${AUDIT_DROPS}) ` +
+          "WHERE agent_deleted_at IS NULL AND (tenant_id, agent_id) IN (SELECT tenant_id, agent_id FROM provisioned_agents WHERE status = 'deleted')"),
         db.prepare("DELETE FROM provider_approvals WHERE agent_deleted_at IS NULL AND status IN ('denied', 'expired', 'executed', 'failed') AND updated_at < ? " +
           `AND NOT ${AGENT_DELETED}`).bind(before.ended),
         db.prepare("DELETE FROM provider_approvals WHERE agent_deleted_at IS NOT NULL AND agent_deleted_at < ?").bind(before.deleted),
@@ -329,8 +352,8 @@ function ensurePublishTable(sql: Sql) {
 /**
  * Publish every hold whose state has not been published yet: the item to D1, then the hint. Bounded per pass. A
  * failure is kept with when to try again (`publishBackoffMs`); after HINT_ATTEMPTS failed hints the state is marked
- * published anyway, since the copy in D1 is what Raft's reconcile reads. An agent that was not provisioned, or was
- * deleted, publishes nothing. Answers when the next try is due (null: nothing left).
+ * published anyway, since the copy in D1 is what Raft's reconcile reads. An agent that was not provisioned publishes
+ * nothing; a deleted one writes D1 only, its kept record, and hints nothing. Answers when the next try is due (null: nothing left).
  */
 export async function publishApprovals(d: PublishDeps): Promise<{ published: number; failed: number; nextAt: number | null }> {
   const { sql } = d;
@@ -363,10 +386,13 @@ export async function publishApprovals(d: PublishDeps): Promise<{ published: num
       console.warn(`approval publish of ${d.tenantId}/${d.agentId}: the registry could not be read: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
       return { published: 0, failed: due.length, nextAt: now + publishBackoffMs(1) };
     }
-    if (!reg || reg.status === "deleted") {
+    if (!reg) {
       for (const r of due) markPublished(r);
       return { published: 0, failed: 0, nextAt: null };
     }
+    // A deleted agent's holds still reach D1, as its kept record (a decision or expiry that lands after the delete),
+    // and no hint goes to Raft, which retired the agent's cards with it.
+    const deleted = reg.status === "deleted";
     for (const r of due) {
       const attempts = fresh(r) ? Number(r.p_attempts ?? 0) : 0;
       let indexed = fresh(r) && Number(r.p_indexed ?? 0) === 1;
@@ -379,7 +405,7 @@ export async function publishApprovals(d: PublishDeps): Promise<{ published: num
           });
           indexed = true;
         }
-        const target = d.target(reg);
+        const target = deleted ? null : d.target(reg);
         if (target) {
           const body = JSON.stringify({ type: hintType(r.state), operationId: r.operation_id, providerAgentId: d.agentId,
             raftAgentId: reg.raftAgentId, raftServerId: reg.raftServerId, status: r.state });

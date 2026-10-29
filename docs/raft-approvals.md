@@ -269,8 +269,9 @@ This is the reconcile. Rows come oldest change first.
 - It can lag the agent by one alarm pass, normally seconds, and by longer while D1 is unreachable. The per-agent
   route is always current.
 - When an agent is deleted, its rows are no longer listed, but they are kept as the record of who decided what for
-  it: ids, status, tool, `decidedBy` and timestamps, without the argument and outcome summaries (those stay in the
-  agent's own object). They are dropped a year after the delete.
+  it: ids, status, tool, route (method, path, repository), outcome, `decidedBy` and timestamps, without the
+  arguments' text (`args`, a bridged request's body), which stays in the agent's own object. A decision or expiry
+  that lands after the delete still reaches the kept row. They are dropped a year after the delete.
 - A live agent's row in a final state is dropped 30 days after its last change.
 
 ## How Raft learns of changes: a signed hint, then a pull
