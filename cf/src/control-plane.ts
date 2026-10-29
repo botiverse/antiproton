@@ -521,9 +521,21 @@ export interface ProvisionedConnection {
   brokenReason?: string | null;
 }
 
+/**
+ * The agent statuses that may hold, renew or be handed a connection's credential: an allow list, so a status added
+ * later gets none by default. `provisioning` is a live agent whose create is finishing (a replay completes it).
+ */
+export const LIVE_AGENT_STATUSES = ["provisioning", "active"] as const;
+const LIVE_AGENT_SQL = `(${LIVE_AGENT_STATUSES.map((s) => `'${s}'`).join(", ")})`;
+
 export interface ConnectionRegistry {
   get(tenantId: string, raftAgentId: string, provider: string): Promise<ProvisionedConnection | null>;
-  put(c: ProvisionedConnection): Promise<void>;
+  /**
+   * Bind the agent, only while it is live (`LIVE_AGENT_STATUSES`), in the same statement: false when it is not, and
+   * then nothing was written. A DELETE that lands between a connection route's read of the agent and this write
+   * leaves no binding behind.
+   */
+  put(c: ProvisionedConnection): Promise<boolean>;
   remove(tenantId: string, raftAgentId: string, provider: string): Promise<boolean>;
   /** The agents whose connection came from this connector. */
   boundTo(tenantId: string, connectorId: string): Promise<string[]>;
@@ -545,11 +557,13 @@ export function d1Connections(db: D1Database): ConnectionRegistry {
       };
     },
     async put(c) {
-      await db.prepare(
-        `INSERT INTO provisioned_connections (tenant_id, raft_agent_id, provider, account, connected_by, connected_at, connector_id) VALUES (?, ?, ?, ?, ?, ?, ?)
+      const r = await db.prepare(
+        `INSERT INTO provisioned_connections (tenant_id, raft_agent_id, provider, account, connected_by, connected_at, connector_id)
+         SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM provisioned_agents WHERE tenant_id = ? AND raft_agent_id = ? AND status IN ${LIVE_AGENT_SQL})
          ON CONFLICT (tenant_id, raft_agent_id, provider) DO UPDATE SET account = excluded.account, connected_by = excluded.connected_by,
            connected_at = excluded.connected_at, connector_id = excluded.connector_id, broken_at = NULL, broken_reason = NULL`,
-      ).bind(c.tenantId, c.raftAgentId, c.provider, c.account, c.connectedBy, c.connectedAt, c.connectorId).run();
+      ).bind(c.tenantId, c.raftAgentId, c.provider, c.account, c.connectedBy, c.connectedAt, c.connectorId, c.tenantId, c.raftAgentId).run();
+      return Number(r.meta?.changes ?? 0) > 0;
     },
     async boundTo(tenantId, connectorId) {
       const r = await db.prepare("SELECT raft_agent_id FROM provisioned_connections WHERE tenant_id = ? AND connector_id = ? ORDER BY raft_agent_id")
@@ -749,17 +763,17 @@ export interface ConnectorGrants {
 
 /**
  * The agents a connector's renewed pair is handed to (cf/src/index.ts `githubRenewal`): those bound to it of the
- * connector's own Raft origin (0030), and not deleted. Another origin's agent bound to it is never handed the pair, a
- * connector with no origin is handed to nobody, and a deleted agent gets no new credential. An agent still
- * `provisioning` is: it is a live agent whose create is finishing (a replay completes it), the connection routes let
- * it be bound, and a pair withheld would leave its mount holding a spent token.
+ * connector's own Raft origin (0030), and live (`LIVE_AGENT_STATUSES`). Another origin's agent bound to it is never
+ * handed the pair, a connector with no origin is handed to nobody, and a deleted agent gets no new credential. An
+ * agent still `provisioning` is: the connection routes let it be bound, and a pair withheld would leave its mount
+ * holding a spent token.
  */
 export async function connectorAudience(db: D1Database, tenantId: string, connectorId: string): Promise<string[]> {
   const r = await db.prepare(
     `SELECT p.agent_id FROM provisioned_connections pc
        JOIN connectors c ON c.tenant_id = pc.tenant_id AND c.id = pc.connector_id
        JOIN provisioned_agents p ON p.tenant_id = pc.tenant_id AND p.raft_agent_id = pc.raft_agent_id
-      WHERE pc.tenant_id = ? AND pc.connector_id = ? AND c.raft_origin = p.raft_origin AND p.status != 'deleted' ORDER BY p.agent_id`,
+      WHERE pc.tenant_id = ? AND pc.connector_id = ? AND c.raft_origin = p.raft_origin AND p.status IN ${LIVE_AGENT_SQL} ORDER BY p.agent_id`,
   ).bind(tenantId, connectorId).all<any>();
   return (r.results ?? []).map((x: any) => String(x.agent_id));
 }
@@ -789,7 +803,7 @@ export function d1ConnectorGrants(db: D1Database): ConnectorGrants {
     async grant(tenantId, id, agentId) {
       const r = await db.prepare(
         `SELECT c.* FROM connectors c JOIN provisioned_agents p ON p.tenant_id = c.tenant_id AND p.agent_id = ?
-          WHERE c.tenant_id = ? AND c.id = ? AND c.raft_origin = p.raft_origin AND p.status != 'deleted'`,
+          WHERE c.tenant_id = ? AND c.id = ? AND c.raft_origin = p.raft_origin AND p.status IN ${LIVE_AGENT_SQL}`,
       ).bind(agentId, tenantId, id).first<any>();
       if (!r) return null;
       return { ...connectorRow(r), refreshedAt: r.refreshed_at == null ? null : Number(r.refreshed_at), refreshingUntil: r.refreshing_until == null ? null : Number(r.refreshing_until) };

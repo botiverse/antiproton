@@ -420,7 +420,7 @@ function connectionsFake() {
   f.deps.connections = {
     registry: {
       async get(t, r, p) { return conns.get(`${t}/${r}/${p}`) ?? null; },
-      async put(c) { conns.set(`${c.tenantId}/${c.raftAgentId}/${c.provider}`, c); },
+      async put(c) { conns.set(`${c.tenantId}/${c.raftAgentId}/${c.provider}`, c); return true; },
       async remove(t, r, p) { return conns.delete(`${t}/${r}/${p}`); },
       async boundTo(t, id) { return [...conns.values()].filter((c) => c.tenantId === t && c.connectorId === id).map((c) => c.raftAgentId).sort(); },
     },
