@@ -1248,6 +1248,66 @@ await check("a renewal that finishes after its agent was deleted puts no pair ba
   w.dispose();
 });
 
+/** The `unbind` events of an agent's connection, as recorded, oldest first. */
+const unbinds = (w: Awaited<ReturnType<typeof world>>, raftAgentId: string) =>
+  (w.db.raw.prepare("SELECT * FROM connector_events WHERE action = 'unbind' AND raft_agent_id = ? ORDER BY rowid").all(raftAgentId) as any[])
+    .map((e) => ({ actor: e.acting_raft_user_id, role: e.acting_role, ...JSON.parse(e.reason ?? "{}") }));
+
+for (const mode of ["refused", "unreachable"] as const) {
+  await check(`removing an agent's GitHub connection whose mount clear is ${mode}: 409, the binding kept, the credential still there, recorded not_cleared; the retry removes it`, async () => {
+    const w = await world();
+    const a = await w.agent(mode === "refused" ? "Z1" : "Z2");
+    const id = await w.connect(a);
+    const bindingOf = () => w.db.raw.prepare("SELECT connector_id FROM provisioned_connections WHERE raft_agent_id = ?").get(a.raftAgentId) as any;
+    w.clearMode.set(a.agentId, mode);
+    const r = await w.call("DELETE", `/agents/by-raft-agent/${a.raftAgentId}/connections/github`, { actingRaftUserId: "u_owner", actingRole: "creator" });
+    must(r.status === 409 && r.body.error.code === "mount_not_cleared" && /still holds the connection's credential/.test(r.body.error.message)
+      && r.body.binding === "kept" && r.body.action === "retry_delete", `the answer: ${r.status} ${r.text}`);
+    must(bindingOf()?.connector_id === id && (await w.stored(a)).token !== null, "the binding went, or the mount was cleared");
+    const ev = unbinds(w, a.raftAgentId);
+    must(ev.length === 1 && ev[0].outcome === "not_cleared" && ev[0].bindingKept === true && ev[0].actor === "u_owner", `the record: ${JSON.stringify(ev)}`);
+    // The object answers again: the same request takes effect, 204, recorded cleared.
+    w.clearMode.clear();
+    const again = await w.call("DELETE", `/agents/by-raft-agent/${a.raftAgentId}/connections/github`, { actingRaftUserId: "u_owner", actingRole: "creator" });
+    must(again.status === 204 && !bindingOf() && (await w.stored(a)).token === null, `retry: ${again.status} ${again.text}`);
+    must(unbinds(w, a.raftAgentId).at(-1)?.outcome === "cleared", `the retry's record: ${JSON.stringify(unbinds(w, a.raftAgentId))}`);
+    w.dispose();
+  });
+}
+
+await check("removing an agent's GitHub connection with no actor named: 204, and the event is recorded all the same", async () => {
+  const w = await world();
+  const a = await w.agent("Z3");
+  await w.connect(a);
+  const r = await w.call("DELETE", "/agents/by-raft-agent/Z3/connections/github");
+  must(r.status === 204 && (await w.stored(a)).token === null, `${r.status} ${r.text}`);
+  const ev = unbinds(w, "Z3");
+  must(ev.length === 1 && ev[0].outcome === "cleared" && ev[0].actorNamed === false && ev[0].role === "system", `the record: ${JSON.stringify(ev)}`);
+  w.dispose();
+});
+
+await check("removing an agent's GitHub connection whose mount already holds nothing: 204, recorded none", async () => {
+  const w = await world();
+  const a = await w.agent("Z4");
+  await w.connect(a);
+  must((await a.rt.removeCredentialOrWhy(TENANT, a.agentId, "gh")).ok, "control: the key could not be taken off");
+  const r = await w.call("DELETE", "/agents/by-raft-agent/Z4/connections/github", { actingRaftUserId: "u_owner", actingRole: "creator" });
+  must(r.status === 204 && !w.db.raw.prepare("SELECT 1 FROM provisioned_connections WHERE raft_agent_id = 'Z4'").get(), `${r.status} ${r.text}`);
+  must(unbinds(w, "Z4")[0]?.outcome === "none", `the record: ${JSON.stringify(unbinds(w, "Z4"))}`);
+  w.dispose();
+});
+
+await check("removing an agent's GitHub connection whose object holds no such agent: the binding goes, recorded not_cleared, and the answer says revoke_on_github", async () => {
+  const w = await world();
+  const a = await w.agent("Z5");
+  await w.connect(a);
+  w.clearMode.set(a.agentId, "gone");
+  const r = await w.call("DELETE", "/agents/by-raft-agent/Z5/connections/github", { actingRaftUserId: "u_owner", actingRole: "creator" });
+  must(r.status === 200 && r.body.binding === "removed" && r.body.action === "revoke_on_github" && /#1128/.test(r.body.message), `${r.status} ${r.text}`);
+  must(!w.db.raw.prepare("SELECT 1 FROM provisioned_connections WHERE raft_agent_id = 'Z5'").get() && unbinds(w, "Z5")[0]?.outcome === "not_cleared", "binding or record");
+  w.dispose();
+});
+
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);

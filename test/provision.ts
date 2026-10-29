@@ -524,7 +524,7 @@ await check("connections: a link for the agent's Raft only, bound to who asked, 
   const got = await call(f.deps, "GET", path);
   if (got.body.connected !== true || got.body.account !== "octocat" || got.body.connectedBy !== "u_owner" || /token|secret|ghp_/.test(got.text)) throw new Error(JSON.stringify(got.body));
   const gone = await call(f.deps, "DELETE", path);
-  if (gone.status !== 204 || detached[0] !== `${[...f.rows.values()][0]!.agentId}/github` || (await call(f.deps, "GET", path)).body.connected !== false) throw new Error(`delete: ${gone.status} ${JSON.stringify(detached)}`);
+  if (gone.status !== 204 || detached[0] !== `${[...f.rows.values()][0]!.agentId}/github/cleared` || (await call(f.deps, "GET", path)).body.connected !== false) throw new Error(`delete: ${gone.status} ${JSON.stringify(detached)}`);
 
   const agent = await call(f.deps, "GET", "/agents/by-raft-agent/01JAGENT");
   if (JSON.stringify(agent.body.connections) !== '["github"]') throw new Error(`the agent does not say what it can connect: ${JSON.stringify(agent.body)}`);

@@ -1527,12 +1527,37 @@ async function connection(
   }
   if (method === "DELETE") {
     const got = await c.registry.get(tenantId, row.raftAgentId, p);
-    await c.detach(tenantId, row.agentId, p);
-    await c.registry.remove(tenantId, row.raftAgentId, p);
-    // Who asked is optional here: removing a connection from an agent gives nobody an identity.
+    // The mount cleared first, then the binding, as an agent's delete does it (`clearConnection`): cleared, nothing
+    // there, refused (something the key made is still held), the object not answering, or the object holding no such
+    // agent. Refused or not answering: the binding is kept, so the next DELETE finds it, and the answer is 409 with
+    // `action: "retry_delete"`, not a 204 that says the connection is gone while the mount still holds its credential.
+    // Gone: nothing here can reach the copy; the binding goes, and the answer says to revoke on GitHub.
+    let error: string | null = null, gone = false, took = false;
+    try {
+      const r = await c.clear(tenantId, row.agentId, p);
+      if (r.ok) took = r.cleared; else { error = r.error; gone = r.gone === true; }
+    } catch (e) { error = `the agent's object did not answer: ${String((e as Error)?.message ?? e).slice(0, 160)}`; }
+    const outcome = error === null ? (took ? "cleared" : "none") : "not_cleared";
+    const keep = error !== null && !gone;
+    if (!keep) await c.registry.remove(tenantId, row.raftAgentId, p);
+    // Who asked is optional here: removing a connection from an agent gives nobody an identity. The event is recorded
+    // all the same (with the deployment as the actor when none was named), with what became of the mount.
     const acting = body === undefined || body === null ? null : actingField(body, []);
-    if (got?.connectorId && acting && !isFail(acting)) {
-      await c.connectors.record({ tenantId, connectorId: got.connectorId, raftAgentId: row.raftAgentId, action: "unbind", ...acting, at: deps.now() });
+    const named = acting && !isFail(acting) ? acting : null;
+    if (got?.connectorId) {
+      await c.connectors.record({ tenantId, connectorId: got.connectorId, raftAgentId: row.raftAgentId, action: "unbind",
+        ...(named ?? { actingRaftUserId: SYSTEM_ACTOR, actingRole: "system" as const }), at: deps.now(),
+        reason: JSON.stringify({ outcome, bindingKept: keep, actorNamed: named !== null, ...(error ? { error } : {}) }) });
+    }
+    logEvent("connect.disconnect_agent", { tenantId, agentId: row.agentId, provider: p, outcome, bindingKept: keep });
+    if (keep) {
+      return Response.json({ error: { code: "mount_not_cleared", message: `the agent's mount still holds the connection's credential (${error}); the connection was kept, DELETE it again` },
+        binding: "kept", mount: "not_cleared", action: "retry_delete" }, { status: 409, headers: { "cache-control": "no-store" } });
+    }
+    if (gone) {
+      return ok({ binding: "removed", mount: "not_cleared", action: "revoke_on_github",
+        message: "this agent's object holds nothing to clear, so a copy it was handed cannot be removed here; revoke the connection on GitHub " +
+          "to end it, which also makes every other agent on this connector re-authorise, since they share the token (botiverse/antiproton#1128)" });
     }
     return new Response(null, { status: 204 });
   }
