@@ -2000,7 +2000,7 @@ await check("the inventory's read of a mount, by outcome: a key present (with it
 
 await check("a mount whose reference names a key other than its alias: read, shown, renewed, reconnected and removed under the reference's name, never the alias", async () => {
   const w = await world();
-  const { importKek, mountKeyName } = await import("../src/runtime/secrets.ts");
+  const { importKek } = await import("../src/runtime/secrets.ts");
   const kek = await importKek(KEK);
   const a = await w.agent("ZK");
   const connectorId = await w.connect(a);
@@ -2013,7 +2013,7 @@ await check("a mount whose reference names a key other than its alias: read, sho
   await a.rt.store.setMountSecretRef(TENANT, a.agentId, alias, `agent:${KEY}`);
   const names = () => (host.sql.exec("SELECT name FROM secrets ORDER BY name").toArray() as any[]).map((r) => String(r.name));
   const mount = async () => (await a.rt.store.findMountsByPlugin(TENANT, a.agentId, "github"))[0]!;
-  must(mountKeyName(await mount()) === KEY && JSON.stringify(names()) === JSON.stringify([KEY, OAUTH_PREFIX + KEY].sort()), `the fixture: ${JSON.stringify(names())}`);
+  must((await mount()).secretRef === `agent:${KEY}` && JSON.stringify(names()) === JSON.stringify([KEY, OAUTH_PREFIX + KEY].sort()), `the fixture: ${JSON.stringify(names())}`);
   // The console's view reads the key's own record.
   const meta = await a.rt.credentialMeta(TENANT, a.agentId, await mount());
   must(meta.attached && meta.verified === true && typeof meta.account === "string", `the console's view: ${JSON.stringify(meta)}`);
