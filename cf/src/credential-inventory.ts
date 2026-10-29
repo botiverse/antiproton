@@ -8,7 +8,7 @@
  * kept, so its mounts are asked too.
  *
  * Read-only and bounded: one page of agents per call (at most INVENTORY_PAGE_MAX objects asked), resumed by `cursor`,
- * optionally within one tenant. Every call, refused ones included, is a row in admin_audit (migration 0033). Never a
+ * optionally within one tenant. Every call past the token, refusals included, is a row in admin_audit (migration 0033); a 401 is a log line only. Never a
  * credential value, nor anything derived from one: a key on a mount is reported by its presence and the connector its
  * renewal names (`readConnectionHoldings`). A hash of a key would confirm a guessed or leaked one and match it across
  * systems, so there is none.
@@ -22,7 +22,7 @@ import { isOperator } from "./auth.ts";
 import { CONNECTION_PLUGIN, type ConnectionProvider } from "./provision/connect.ts";
 import { logEvent } from "../../src/core/log.ts";
 import { agentRef, isAgentRef, open, type Sealed } from "../../src/runtime/secrets.ts";
-import { OAUTH_PREFIX } from "./github-refresh.ts";
+import { OAUTH_PREFIX, reasonCode } from "./github-refresh.ts";
 import type { MountRecord } from "../../src/core/types.ts";
 
 /** One mount of a connection plugin, as the agent's object reads it (`readConnectionHoldings`). */
@@ -83,11 +83,35 @@ export const NO_OBJECT_NOTE = "cannot distinguish never provisioned from storage
 export const INVENTORY_PAGE_DEFAULT = 10;
 export const INVENTORY_PAGE_MAX = 25;
 /** Objects asked at once within a page. */
-const ASK_AT_ONCE = 5;
+export const ASK_AT_ONCE = 5;
+/** How long one object is waited for before it is listed `failed` (`unknown`): a hung object must not hold the page. */
+export const OBJECT_TIMEOUT_MS = 10_000;
 const EVENTS_PER_AGENT = 20;
 const UNLISTED_RESIDUE_MAX = 100;
 /** The events that take a binding away: a mount still holding a key after one of these is what this list looks for. */
 const REMOVALS = ["unbind", "disconnect", "origin_mismatch_removed", "deleted_agent_unbound"];
+/** The events that make one. */
+const BINDINGS = ["create", "bind"];
+
+/**
+ * An event's `reason` as codes only. Stored reasons hold free text (an object's error message, origins): never
+ * answered. A JSON reason keeps its booleans, numbers and code-shaped `outcome`, `via` and `provider`; any other text
+ * is reduced to its renewal reason code (`reasonCode`).
+ */
+export function reasonCodes(reason: string | null): Record<string, string | number | boolean> | null {
+  if (reason === null) return null;
+  let v: unknown;
+  try { v = JSON.parse(reason); } catch { return { code: reasonCode(reason) ?? "other" }; }
+  if (!v || typeof v !== "object" || Array.isArray(v)) return { code: "other" };
+  const out: Record<string, string | number | boolean> = {};
+  for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof x === "boolean" || typeof x === "number") out[k] = x;
+    else if ((k === "outcome" || k === "via" || k === "provider") && typeof x === "string" && /^[a-z_]{1,40}$/.test(x)) out[k] = x;
+  }
+  return out;
+}
+
+const DB_FAILED = "the inventory's records could not be read or written, so nothing is answered";
 
 export interface InventoryDeps {
   token: string | undefined;
@@ -95,6 +119,7 @@ export interface InventoryDeps {
   /** The agent's object's answer; null when the object holds no such agent (its storage was wiped). */
   holdings: (tenantId: string, agentId: string, plugins: readonly string[]) => Promise<ConnectionHolding[] | null>;
   now: () => number;
+  objectTimeoutMs?: number;
 }
 
 type Cursor = { t: string; r: string };
@@ -109,11 +134,25 @@ function decodeCursor(s: string): Cursor | null {
 export async function adminCredentialInventory(request: Request, url: URL, deps: InventoryDeps): Promise<Response> {
   const db = deps.db;
   const claimedCaller = (request.headers.get("x-claimed-caller") ?? "").trim().slice(0, 64) || null;
-  // As /admin/withdraw-egress: no id is written until the token is checked, and none past 128 characters.
+  // No id is kept from an unchecked caller, nor one past 128 characters.
   let tenantId = url.searchParams.get("tenantId") ?? "";
   const tooLong = tenantId.length > 128;
   const authorized = isOperator(deps.token, request.headers.get("x-harness-token"));
   if (tooLong || !authorized) tenantId = "";
+  // A 401 is logged only, never a D1 row: this route is in production for good, and a stranger's requests must not
+  // write to the database at their own rate.
+  if (!authorized) {
+    logEvent("admin.credential_inventory", { tenantId: null, claimedCaller, outcome: "unauthorized", at: new Date(deps.now()).toISOString() });
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  // Past the token, every D1 failure is a fixed 503 and a log line with the error's class: D1's text never reaches a
+  // response.
+  try { return await inventory(); } catch (e) {
+    logEvent("admin.credential_inventory", { tenantId: tenantId || null, claimedCaller, outcome: "db_failed", errorName: (e as Error)?.name ?? "unknown" });
+    return Response.json({ error: DB_FAILED }, { status: 503 });
+  }
+
+  async function inventory(): Promise<Response> {
   const audit = async (outcome: string, counts?: Record<string, number>, id?: number): Promise<number | null> => {
     const at = deps.now();
     logEvent("admin.credential_inventory", { tenantId: tenantId || null, claimedCaller, outcome, at: new Date(at).toISOString(), ...(counts ?? {}) });
@@ -127,7 +166,6 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
     ).bind(at, tenantId || null, claimedCaller, outcome, counts ? JSON.stringify(counts) : null).first<{ id: number }>();
     return row ? Number(row.id) : null;
   };
-  if (!authorized) { await audit("unauthorized"); return Response.json({ error: "unauthorized" }, { status: 401 }); }
   if (tooLong) { await audit("ids_too_long"); return Response.json({ error: "tenantId is at most 128 characters" }, { status: 400 }); }
   if (request.method !== "GET") { await audit("wrong_method"); return Response.json({ error: "GET" }, { status: 405 }); }
   if (!claimedCaller) {
@@ -149,7 +187,7 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
 
   // Written before any object is asked: a call the Worker does not live to finish stays 'started'.
   const id = await audit("started");
-  if (id === null) return Response.json({ error: "the audit row could not be written, so nothing was read" }, { status: 503 });
+  if (id === null) return Response.json({ error: DB_FAILED }, { status: 503 });
 
   const page = (await db.prepare(
     "SELECT tenant_id, raft_agent_id, agent_id, status, deleted_at FROM provisioned_agents" +
@@ -171,17 +209,30 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
   const agentView = async (a: typeof rows[number]) => {
     let object: "answered" | "no_agent" | "failed" = "answered";
     let mounts: ConnectionHolding[] = [];
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const h = await deps.holdings(a.tenant_id, a.agent_id, plugins);
+      const h = await Promise.race([
+        deps.holdings(a.tenant_id, a.agent_id, plugins),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), deps.objectTimeoutMs ?? OBJECT_TIMEOUT_MS); }),
+      ]);
+      if (h !== null && !Array.isArray(h)) throw new TypeError("not a list");
       // Field by field: whatever else an object answers (an older build's, or a mistake) is not passed on.
       if (h === null) object = "no_agent"; else mounts = h.map((m) => ({ alias: m.alias, plugin: m.plugin, key: m.key, connectorId: m.connectorId }));
-    } catch { object = "failed"; }
+    } catch (e) {
+      object = "failed";
+      // Its class or shape only: an object's error message can quote what it was reading.
+      logEvent("admin.credential_inventory", { tenantId: a.tenant_id, agentId: a.agent_id, outcome: "object_failed",
+        errorName: (e as Error)?.message === "timeout" ? "timeout" : (e as Error)?.name ?? typeof e });
+    } finally { clearTimeout(timer); }
     const bindings = (await db.prepare(
       "SELECT provider, connector_id, account, connected_at, broken_at FROM provisioned_connections WHERE tenant_id = ? AND raft_agent_id = ?",
     ).bind(a.tenant_id, a.raft_agent_id).all<{ provider: string; connector_id: string | null; account: string | null; connected_at: number; broken_at: number | null }>()).results;
+    type EventRow = { action: string; connector_id: string | null; provider: string | null; acting_role: string; at: number; reason: string | null };
+    // `reasonCode`, not `reason`: the stored text never comes back under a name that invites it.
+    const asCodes = (e: EventRow | null) => e && { action: e.action, connector_id: e.connector_id, provider: e.provider, acting_role: e.acting_role, at: e.at, reasonCode: reasonCodes(e.reason) };
     const events = (await db.prepare(
       "SELECT action, connector_id, provider, acting_role, at, reason FROM connector_events WHERE tenant_id = ? AND raft_agent_id = ? ORDER BY at DESC LIMIT ?",
-    ).bind(a.tenant_id, a.raft_agent_id, EVENTS_PER_AGENT).all<{ action: string; connector_id: string | null; provider: string | null; acting_role: string; at: number; reason: string | null }>()).results;
+    ).bind(a.tenant_id, a.raft_agent_id, EVENTS_PER_AGENT).all<EventRow>()).results.map(asCodes);
     const eventCount = (await db.prepare("SELECT COUNT(*) AS n FROM connector_events WHERE tenant_id = ? AND raft_agent_id = ?")
       .bind(a.tenant_id, a.raft_agent_id).first<{ n: number }>())?.n ?? 0;
     // By egress_residue's own columns: no join to the registry, so nothing is left out for the agent's status.
@@ -189,14 +240,16 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
       "SELECT alias, box_id, secret_id, title, reason_code, first_seen, last_seen, reopened_count FROM egress_residue" +
       " WHERE tenant_id = ? AND agent_id = ? AND resolved_at IS NULL ORDER BY first_seen",
     ).bind(a.tenant_id, a.agent_id).all()).results;
-    // Per provider, by its own query: the newest event that took a binding away, however many events came after it (an
-    // event recorded before 0032 names no provider).
-    const removals = new Map<string, typeof events[number] | null>();
+    // Per provider, each by its own query, however many events came after: the newest event that took a binding away,
+    // and the newest that made one (an event recorded before 0032 names no provider).
+    const newest = (actions: string[], provider: string) => db.prepare(
+      `SELECT action, connector_id, provider, acting_role, at, reason FROM connector_events WHERE tenant_id = ? AND raft_agent_id = ?` +
+      ` AND action IN (${actions.map(() => "?").join(", ")}) AND (provider = ? OR provider IS NULL) ORDER BY at DESC LIMIT 1`,
+    ).bind(a.tenant_id, a.raft_agent_id, ...actions, provider).first<EventRow>();
+    const removals = new Map<string, EventRow | null>(), bound = new Map<string, EventRow | null>();
     for (const provider of providers) {
-      removals.set(provider, await db.prepare(
-        `SELECT action, connector_id, provider, acting_role, at, reason FROM connector_events WHERE tenant_id = ? AND raft_agent_id = ?` +
-        ` AND action IN (${REMOVALS.map(() => "?").join(", ")}) AND (provider = ? OR provider IS NULL) ORDER BY at DESC LIMIT 1`,
-      ).bind(a.tenant_id, a.raft_agent_id, ...REMOVALS, provider).first<typeof events[number]>());
+      removals.set(provider, await newest(REMOVALS, provider));
+      bound.set(provider, await newest(BINDINGS, provider));
     }
     const connections = providers.map((provider) => {
       const plugin = CONNECTION_PLUGIN[provider];
@@ -206,13 +259,18 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
       const state: Reconciled = object === "failed" ? "unknown" : object === "no_agent" ? "no_object"
         : onMount && binding ? "both" : onMount ? "mount_only" : binding ? "binding_only" : "neither";
       const lastRemoval = removals.get(provider) ?? null;
+      // A removal speaks for the present only when nothing bound it since: neither the current binding nor a later
+      // bind event. An older removal, followed by a re-bind, must not cover a later removal nothing recorded.
+      // connected_at is the latest bind's time: a re-bind overwrites it, and a disconnect deletes the row
+      // (`d1Connections` `put`, cf/src/control-plane.ts).
+      const boundAt = Math.max(binding?.connected_at ?? -Infinity, bound.get(provider)?.at ?? -Infinity);
+      const removalRecorded = lastRemoval !== null && lastRemoval.at >= boundAt;
       return {
         provider, plugin, state, mounts: mine,
         binding: binding ? { connector_id: binding.connector_id, account: binding.account, connected_at: binding.connected_at, broken_at: binding.broken_at } : null,
         // Whether the key's renewal record names the connector the binding names; false when it names another, or none.
         ...(state === "both" ? { sameConnector: mine.some((m) => m.key === "agent" && m.connectorId !== null && m.connectorId === binding!.connector_id) } : {}),
-        ...(state === "mount_only" ? { removalRecorded: lastRemoval !== null } : {}),
-        lastRemoval,
+        removalRecorded, lastRemoval: asCodes(lastRemoval),
       };
     });
     return {
@@ -226,8 +284,7 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
     for (let i = 0; i < rows.length; i += ASK_AT_ONCE) agents.push(...await Promise.all(rows.slice(i, i + ASK_AT_ONCE).map(agentView)));
   } catch (e) {
     await audit("failed", undefined, id).catch(() => {});
-    logEvent("admin.credential_inventory", { tenantId: tenantId || null, failed: true, errorName: (e as Error)?.name ?? "unknown" });
-    return Response.json({ error: "the inventory could not be read" }, { status: 503 });
+    throw e;
   }
   // Residue whose agent is not in the registry at all, once, on the scope's last page: read by its own columns, so a
   // row is never lost to a registry that no longer lists its agent.
@@ -248,5 +305,6 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
     ...(unlisted ? { residueOfUnlistedAgents: unlisted.slice(0, UNLISTED_RESIDUE_MAX), ...(unlisted.length > UNLISTED_RESIDUE_MAX ? { residueOfUnlistedAgentsTruncated: true } : {}) } : {}),
     ...(more && last ? { cursor: encodeCursor({ t: last.tenant_id, r: last.raft_agent_id }) } : {}),
   }, { headers: { "cache-control": "no-store" } });
+  }
 }
 

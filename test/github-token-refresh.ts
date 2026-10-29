@@ -1933,6 +1933,8 @@ await check("the credential inventory's read of a mount: the key's presence and 
   const empty = await readConnectionHoldings(a.rt.store, kek, TENANT, a.agentId, ["github"]);
   must(JSON.stringify(empty) === JSON.stringify([{ alias: "gh", plugin: "github", key: empty[0]?.key === "shared" ? "shared" : "none", connectorId: null }]), `before the connect: ${JSON.stringify(empty)}`);
   const connectorId = await w.connect(a);
+  // Expired, so a read that went through the renewal path would renew it.
+  await w.expireAt(a, Date.now() - 1000, connectorId);
   const rows = () => JSON.stringify(w.hostOf(a.agentId).sql.exec("SELECT * FROM secrets ORDER BY name").toArray());
   const before = rows(), renewals = w.gh.s.refreshes;
   const got = await readConnectionHoldings(a.rt.store, kek, TENANT, a.agentId, ["github"]);

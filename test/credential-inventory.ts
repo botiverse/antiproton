@@ -16,6 +16,7 @@ const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx 
 register("data:text/javascript," + encodeURIComponent(
   `export async function resolve(s, c, next) { if (s.startsWith("cloudflare:")) return { url: ${JSON.stringify("data:text/javascript," + encodeURIComponent(STAND_IN))}, shortCircuit: true }; return next(s, c); }`));
 const { default: worker, AgentDO } = await import("../cf/src/index.ts");
+const { adminCredentialInventory, ASK_AT_ONCE } = await import("../cf/src/credential-inventory.ts");
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { agentRef, importKek, seal } from "../src/runtime/secrets.ts";
 import { OAUTH_PREFIX } from "../cf/src/github-refresh.ts";
@@ -118,6 +119,11 @@ await check("the mount comes from the object, not from D1: a binding with a key 
   const w = world({ "a/t-a/raft_A": [], "a/t-a/raft_C": [held("k1")] });
   const r = await get(w, "?tenantId=t-a&limit=25");
   must(stateOf(r.body, "A") === "binding_only" && stateOf(r.body, "C") === "both", `A ${stateOf(r.body, "A")}, C ${stateOf(r.body, "C")}`);
+  // A shared account's ref, or a ref to a key that is not stored, is not a key the agent holds.
+  const w3 = world({ "a/t-a/raft_D": [{ alias: "github", plugin: "github", key: "shared", connectorId: null }, { alias: "gh2", plugin: "github", key: "dangling", connectorId: null }],
+    "a/t-a/raft_C": [{ alias: "github", plugin: "github", key: "dangling", connectorId: null }] });
+  const r3 = await get(w3, "?tenantId=t-a&limit=25");
+  must(stateOf(r3.body, "D") === "neither" && stateOf(r3.body, "C") === "binding_only", `D ${stateOf(r3.body, "D")}, C ${stateOf(r3.body, "C")}`);
   // An object that holds no such agent: no mount to read, never "nothing there", and said so.
   for (const r0 of ["A", "D"]) {
     const w2 = world({ [`a/t-a/raft_${r0}`]: null });
@@ -139,6 +145,27 @@ await check("the event table is audited: a mount-only key says whether a removal
   const later = (await get(w, "?tenantId=t-a&limit=25")).body.agents.find((a: any) => a.raft_agent_id === "B");
   must(later.events.recent.length === 20 && !later.events.recent.some((e: any) => e.action === "deleted_agent_unbound")
     && later.connections[0].removalRecorded === true && later.connections[0].lastRemoval?.at === 9, `B after 26 newer events: ${JSON.stringify(later.connections[0])}`);
+  // Codes only from a stored reason: never its free text, and under `reasonCode`.
+  w.db.raw.prepare(`INSERT INTO connector_events(tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at, reason, provider) VALUES ('t-a', 'k1', 'B', 'unbind', 'u', 'system', 300, ?, 'github')`)
+    .run(JSON.stringify({ via: "disconnect", outcome: "not_cleared", bindingKept: false, error: "gh is held by a background task in /secret/path", agentOrigin: "https://x.example" }));
+  w.db.raw.prepare("INSERT INTO connector_events(tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at, reason, provider) VALUES ('t-a', 'k1', 'B', 'broken', 'u', 'system', 301, 'the token endpoint answered 502 without an OAuth error', 'github')").run();
+  const coded = await get(w, "?tenantId=t-a&limit=25");
+  const be = coded.body.agents.find((a: any) => a.raft_agent_id === "B");
+  must(JSON.stringify(be.connections[0].lastRemoval.reasonCode) === JSON.stringify({ via: "disconnect", outcome: "not_cleared", bindingKept: false })
+    && JSON.stringify(be.events.recent[0].reasonCode) === JSON.stringify({ code: "http-502" }) && be.events.recent.every((e: any) => !("reason" in e)) && !("reason" in be.connections[0].lastRemoval)
+    && !coded.text.includes("background task") && !coded.text.includes("x.example") && !coded.text.includes("token endpoint"), `codes: ${JSON.stringify(be.connections[0].lastRemoval)} ${JSON.stringify(be.events.recent.slice(0, 2))}`);
+  // A removal followed by a re-bind no longer speaks for the present: a later gap nothing recorded is not covered.
+  w.db.raw.prepare("INSERT INTO connector_events(tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at, reason, provider) VALUES ('t-a', 'k1', 'B', 'bind', 'u', 'system', 400, NULL, 'github')").run();
+  const rebound = (await get(w, "?tenantId=t-a&limit=25")).body.agents.find((a: any) => a.raft_agent_id === "B").connections[0];
+  must(rebound.state === "mount_only" && rebound.removalRecorded === false && rebound.lastRemoval.at === 300, `after a re-bind: ${JSON.stringify(rebound)}`);
+  // And against the current binding's connected_at, whatever the state: A was bound at 5; a removal at 3 is older.
+  w.db.raw.prepare("INSERT INTO connector_events(tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at, reason, provider) VALUES ('t-a', 'k1', 'A', 'unbind', 'u', 'system', 3, NULL, 'github')").run();
+  const aNow = (await get(w, "?tenantId=t-a&limit=25")).body.agents.find((a: any) => a.raft_agent_id === "A").connections[0];
+  must(aNow.state === "both" && aNow.removalRecorded === false && aNow.lastRemoval.at === 3, `A: ${JSON.stringify(aNow)}`);
+  w.db.raw.prepare("DELETE FROM connector_events WHERE raft_agent_id = 'A' AND action = 'create'").run();
+  w.db.raw.prepare("UPDATE provisioned_connections SET connected_at = 2 WHERE raft_agent_id = 'A'").run();
+  const aOld = (await get(w, "?tenantId=t-a&limit=25")).body.agents.find((a: any) => a.raft_agent_id === "A").connections[0];
+  must(aOld.removalRecorded === true, `A with its binding older than the removal: ${JSON.stringify(aOld)}`);
   const rb = await get(w, "?tenantId=t-b&limit=25");
   const f = rb.body.agents.find((a: any) => a.raft_agent_id === "F").connections[0];
   must(f.state === "mount_only" && f.removalRecorded === false && f.lastRemoval === null, `F: ${JSON.stringify(f)}`);
@@ -190,34 +217,74 @@ await check("never a credential value or anything derived from one: a mount is i
   must(!r.text.includes("sha256:") && !r.text.includes(SECRET) && !r.text.includes(TOKEN) && !logged.slice(from).some((l) => l.includes(TOKEN)) && !JSON.stringify(w.rows()).includes(TOKEN), "a token in the answer, the log or the audit");
 });
 
-await check("every call is an admin_audit row, refusals included: a 401 names no tenant, a listing is written started before any object is asked", async () => {
+await check("every authenticated call is an admin_audit row, refusals included; a 401 is a log line only; a listing is written started before any object is asked", async () => {
   const w = world();
   let atFirstAsk: string[] | null = null;
   const get0 = w.env.AGENT.get;
   w.env.AGENT.get = (n: string) => { const o = get0(n); return { adminConnectionHoldings: async (...x: [string, string, string[]]) => { atFirstAsk ??= w.rows().map((r) => r.outcome); return o.adminConnectionHoldings(...x); } }; };
+  const from = logged.length;
   must((await get(w, "?tenantId=t-a", { "x-harness-token": "wrong", "x-claimed-caller": "cody" })).status === 401, "a wrong token was let in");
+  must(w.rows().length === 0 && logged.slice(from).some((l) => /"outcome":"unauthorized"/.test(l) && /"tenantId":null/.test(l)), "a 401 wrote a row, or logged nothing");
   must((await get(w, "?tenantId=t-a", { "x-harness-token": TOKEN })).status === 400, "no claimed caller was let in");
   must((await get(w, "?tenantId=t-a", { "x-harness-token": TOKEN, "x-claimed-caller": "cody" }, "POST")).status === 405, "a POST was let in");
   must((await get(w, `?tenantId=${"t".repeat(129)}`)).status === 400, "a long tenant id was let in");
   const ok = await get(w, "?tenantId=t-a&limit=25");
   must(ok.status === 200 && w.asked.length === 5, `${ok.status}, asked ${w.asked.length}`);
   const rows = w.rows();
-  must(JSON.stringify(rows.map((r) => r.outcome)) === JSON.stringify(["unauthorized", "no_claimed_caller", "wrong_method", "ids_too_long", "listed"]), `outcomes: ${JSON.stringify(rows.map((r) => r.outcome))}`);
-  must(rows[0].tenant_id === null && rows[3].tenant_id === null && rows[4].tenant_id === "t-a" && rows[4].claimed_caller === "cody" && rows.every((r) => r.route === "/admin/credential-inventory" && r.agent_id === null), `rows: ${JSON.stringify(rows)}`);
-  must(JSON.parse(rows[4].counts).mount_only === 1 && typeof rows[4].finished_at === "number", `the listing's row: ${JSON.stringify(rows[4])}`);
-  must(JSON.stringify(atFirstAsk) === JSON.stringify(["unauthorized", "no_claimed_caller", "wrong_method", "ids_too_long", "started"]), `rows when the first object was asked: ${JSON.stringify(atFirstAsk)}`);
+  must(JSON.stringify(rows.map((r) => r.outcome)) === JSON.stringify(["no_claimed_caller", "wrong_method", "ids_too_long", "listed"]), `outcomes: ${JSON.stringify(rows.map((r) => r.outcome))}`);
+  must(rows[2].tenant_id === null && rows[3].tenant_id === "t-a" && rows[3].claimed_caller === "cody" && rows.every((r) => r.route === "/admin/credential-inventory" && r.agent_id === null), `rows: ${JSON.stringify(rows)}`);
+  must(JSON.parse(rows[3].counts).mount_only === 1 && typeof rows[3].finished_at === "number", `the listing's row: ${JSON.stringify(rows[3])}`);
+  must(JSON.stringify(atFirstAsk) === JSON.stringify(["no_claimed_caller", "wrong_method", "ids_too_long", "started"]), `rows when the first object was asked: ${JSON.stringify(atFirstAsk)}`);
   // Reads only: nothing in D1 but the audit rows changed.
   const counts = ["provisioned_agents", "provisioned_connections", "connector_events", "egress_residue"].map((t) => (w.db.raw.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as any).n);
   must(JSON.stringify(counts) === JSON.stringify([6, 3, 3, 3]), `rows per table: ${JSON.stringify(counts)}`);
 });
 
-await check("an audit row that cannot be written: nothing is read and no object is asked", async () => {
+const DB_FAILED = "the inventory's records could not be read or written, so nothing is answered";
+await check("D1 failing: a fixed 503 and never D1's text; an audit row that cannot be written, or comes back with no id, and no object is asked; a 401 does not touch D1", async () => {
   const w = world();
   w.db.raw.exec("DROP TABLE admin_audit");
-  let threw = false;
-  let r: Awaited<ReturnType<typeof get>> | null = null;
-  try { r = await get(w, "?tenantId=t-a"); } catch { threw = true; }
-  must(w.asked.length === 0 && (threw || (r !== null && r.status >= 500)), `asked ${w.asked.length}, ${r?.status} ${r?.text}`);
+  const r = await get(w, "?tenantId=t-a");
+  must(r.status === 503 && r.body?.error === DB_FAILED && !/no such table|admin_audit|SQLITE/i.test(r.text) && w.asked.length === 0, `no audit table: ${r.status} ${r.text}, asked ${w.asked.length}`);
+  must((await get(w, "?tenantId=t-a", { "x-harness-token": "wrong" })).status === 401, "a 401 reached D1");
+  // An insert that answers no row.
+  const w2 = world();
+  const real = w2.env.CONTROL_DB as any;
+  w2.env.CONTROL_DB = { prepare: (q: string) => q.startsWith("INSERT INTO admin_audit") ? { bind: () => ({ first: async () => null }) } : real.prepare(q) } as any;
+  const r2 = await get(w2, "?tenantId=t-a");
+  must(r2.status === 503 && r2.body?.error === DB_FAILED && w2.asked.length === 0, `no id back: ${r2.status} ${r2.text}, asked ${w2.asked.length}`);
+  // A read failing after the objects are asked, and the unlisted-residue read on the last page.
+  for (const table of ["egress_residue", "connector_events"]) {
+    const w3 = world();
+    w3.db.raw.exec(`DROP TABLE ${table}`);
+    const r3 = await get(w3, "?tenantId=t-a&limit=25");
+    must(r3.status === 503 && r3.body?.error === DB_FAILED && !/no such table|SQLITE/i.test(r3.text), `no ${table}: ${r3.status} ${r3.text}`);
+    must(w3.rows().at(-1)?.outcome === "failed", `the row after ${table} failed: ${JSON.stringify(w3.rows())}`);
+  }
+});
+
+await check("objects are asked at most ASK_AT_ONCE at a time; one that hangs is listed failed after its timeout, logged by class only", async () => {
+  const w = world();
+  let inFlight = 0, most = 0;
+  const get0 = w.env.AGENT.get;
+  w.env.AGENT.get = (n: string) => ({ adminConnectionHoldings: async (...x: [string, string, string[]]) => {
+    inFlight++; most = Math.max(most, inFlight);
+    await new Promise((r) => setTimeout(r, 20));
+    inFlight--;
+    if (n === "a/t-a/raft_C") return new Promise(() => {});
+    return get0(n).adminConnectionHoldings(...x);
+  } }) as any;
+  const from = logged.length;
+  const res = await adminCredentialInventory(new Request("https://x/admin/credential-inventory?limit=6", { headers: { "x-harness-token": TOKEN, "x-claimed-caller": "cody" } }),
+    new URL("https://x/admin/credential-inventory?limit=6"), { token: TOKEN, db: w.env.CONTROL_DB as any, now: () => Date.now(), objectTimeoutMs: 60,
+      holdings: (t, a, p) => (w.env.AGENT.get(`a/${t}/${a}`) as any).adminConnectionHoldings(t, a, p) });
+  const body: any = await res.json();
+  must(ASK_AT_ONCE === 5 && most === ASK_AT_ONCE, `at most ${most} at once`);
+  const c = body.agents.find((a: any) => a.raft_agent_id === "C");
+  must(c.object === "failed" && c.connections[0].state === "unknown", `the hung object: ${JSON.stringify(c)}`);
+  const lines = logged.slice(from).filter((l) => /"outcome":"object_failed"/.test(l));
+  must(lines.some((l) => /"agentId":"raft_C"/.test(l) && /"errorName":"timeout"/.test(l)) && lines.some((l) => /"agentId":"raft_E"/.test(l) && /"errorName":"Error"/.test(l))
+    && !lines.some((l) => l.includes("the object is away")), `the failure lines: ${lines.join(" | ")}`);
 });
 
 /**
@@ -243,60 +310,69 @@ function wholeObject(host = sqliteHost()) {
     id: { toString: () => "do-1" }, getWebSockets: () => [], exports: {}, waitUntil: () => {}, blockConcurrencyWhile: async (f: () => Promise<unknown>) => f(),
   };
   const D: any = new AgentDO(ctx as never, { SECRET_KEK: KEK_B64, ARTIFACT_BUCKET: "b", CONTROL_DB: d1() } as never);
+  /** Rows only, by table: an empty table (schema the runtime may create, idempotently) is no row. */
   const rows = () => {
     const out: Record<string, unknown[]> = {};
-    for (const t of host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").toArray()) out[String(t.name)] = host.sql.exec(`SELECT * FROM "${t.name}"`).toArray();
+    for (const t of host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").toArray()) {
+      const r = host.sql.exec(`SELECT * FROM "${t.name}"`).toArray();
+      if (r.length) out[String(t.name)] = r;
+    }
     return JSON.stringify(out);
   };
-  return { D, host, kv, writes, statements, rows, alarm: () => alarmAt };
+  const count = (table: string) => { try { return Number((host.sql.exec(`SELECT COUNT(*) AS n FROM "${table}"`).toArray()[0] as any).n); } catch { return 0; } };
+  return { D, host, kv, writes, statements, rows, count, alarm: () => alarmAt };
 }
 const KEK_B64 = Buffer.from(new Uint8Array(32).fill(9)).toString("base64");
-const wroteSql = (s: string[]) => s.filter((q) => !/^\s*SELECT\b/i.test(q));
+/** Every request the process makes while `fn` runs: a renewal is one. */
+async function fetchesDuring<T>(fn: () => Promise<T>): Promise<{ value: T; fetched: string[] }> {
+  const inner = globalThis.fetch, fetched: string[] = [];
+  globalThis.fetch = (async (u: unknown) => { fetched.push(String(u)); return new Response("{}", { status: 500 }); }) as typeof fetch;
+  try { return { value: await fn(), fetched }; } finally { globalThis.fetch = inner; }
+}
 
 // The object's constructor runs on any call to any object, this one included, and makes its tables (and pi's `main`
-// session row) itself: that is the object being made, before this method runs. What is checked is that the method adds
-// nothing to it.
-await check("the object's half: an object with no storage for the agent answers null, and the call leaves it as it was made: no row, no KV, no alarm, no statement but a SELECT", async () => {
+// session row) itself; the runtime's schema creation is idempotent. An empty schema is allowed; an owner row is not.
+await check("the object's half, no agent in it: null, and afterwards no owner row, no secret, no alarm, and a second call is still null (empty schema allowed)", async () => {
   const o = wholeObject();
   try {
-    const made = o.rows();
-    o.statements.length = 0;
-    must((await o.D.adminConnectionHoldings("t-a", "raft_X", ["github"])) === null, "an object with no agent answered");
-    must(o.rows() === made && JSON.parse(made).owner?.length === 0, `rows: ${o.rows().slice(0, 300)}`);
-    must(o.kv.size === 0 && (await o.D.ctx.storage.list()).size === 0 && o.writes.length === 0 && o.alarm() === null, `writes: ${JSON.stringify(o.writes)}`);
-    must(wroteSql(o.statements).length === 0, `statements: ${JSON.stringify(wroteSql(o.statements))}`);
+    const { value, fetched } = await fetchesDuring(() => o.D.adminConnectionHoldings("t-a", "raft_X", ["github"]));
+    must(value === null, "an object with no agent answered");
+    must(o.count("owner") === 0 && o.count("secrets") === 0 && o.alarm() === null && !o.writes.includes("setAlarm") && fetched.length === 0,
+      `owner ${o.count("owner")}, secrets ${o.count("secrets")}, alarm ${o.alarm()}, writes ${JSON.stringify(o.writes)}, fetched ${fetched.length}`);
+    must((await o.D.adminConnectionHoldings("t-a", "raft_X", ["github"])) === null && o.count("owner") === 0, "a second call");
     // Through the route, as for an agent with a registry row and no storage in its object.
     const w = world();
     w.env.AGENT = { idFromName: (n: string) => n, get: () => o.D } as any;
     const r = await get(w, "?tenantId=t-a&limit=1");
     must(r.body.agents[0].object === "no_agent" && r.body.agents[0].connections[0].state === "no_object", `the route: ${r.text}`);
-    must(o.rows() === made && o.kv.size === 0 && o.writes.length === 0 && o.alarm() === null && wroteSql(o.statements).length === 0, "the route's call left something behind");
+    must(o.count("owner") === 0 && o.count("secrets") === 0 && o.alarm() === null, "the route's call left an owner, a secret or an alarm");
+    // An owner table that cannot be read is not an agent either: null (no_object), never "nothing on the mount".
+    o.host.sql.exec("DROP TABLE owner");
+    must((await o.D.adminConnectionHoldings("t-a", "raft_X", ["github"])) === null, "an unreadable owner table");
   } finally { o.host.dispose(); }
 });
 
-await check("the object's half: a deleted agent's kept storage is read with SELECTs only, by a cold object: key present, its connector, nothing written, no alarm", async () => {
+await check("the object's half, a deleted agent's kept storage, by a cold object: key present with its connector, a dangling ref not held, no row changed, no alarm, no request", async () => {
   const host = sqliteHost();
   try {
-    // The agent's storage as a provisioned agent left it: the object claimed, a github mount, a key and its renewal record.
+    // The agent's storage as a provisioned agent left it: the object claimed, a github mount with a key and its
+    // (expired) renewal record, and a second whose key is not stored.
     const first = wholeObject(host);
     first.D.ctx.storage.sql.exec("INSERT INTO owner(k, tenant_id, agent_id) VALUES ('self', 't-a', 'raft_B')");
-    const rt = first.D.runtime();
-    await rt.ready();
-    host.sql.exec("INSERT INTO mounts(tenant_id, agent_id, alias, installation_id, plugin, tool_version, public_config, secret_ref) VALUES ('t-a', 'raft_B', 'gh', 'i', 'github', '1', '{}', ?)", agentRef("gh"));
+    await first.D.runtime().ready();
+    for (const alias of ["gh", "gh2"]) host.sql.exec("INSERT INTO mounts(tenant_id, agent_id, alias, installation_id, plugin, tool_version, public_config, secret_ref) VALUES ('t-a', 'raft_B', ?, 'i', 'github', '1', '{}', ?)", alias, agentRef(alias));
     const kek = await importKek(KEK_B64);
     const put = async (name: string, value: string) => { const s = await seal(kek, value); host.sql.exec("INSERT INTO secrets(tenant_id, agent_id, name, ciphertext, iv, created_at, updated_at) VALUES ('t-a', 'raft_B', ?, ?, ?, 1, 1)", name, s.ciphertext, s.iv); };
     await put("gh", "ghu_" + "k".repeat(36));
-    await put(OAUTH_PREFIX + "gh", JSON.stringify({ v: 1, refreshToken: "r", expiresAt: null, refreshExpiresAt: null, connectorId: "k1" }));
+    await put(OAUTH_PREFIX + "gh", JSON.stringify({ v: 1, refreshToken: "ghr_r", expiresAt: 1, refreshExpiresAt: Date.now() + 1e9, connectorId: "k1" }));
     // A cold object over it, as after the delete: nothing of the runtime built.
     const o = wholeObject(host);
     const before = o.rows();
-    o.statements.length = 0;
-    const got = await o.D.adminConnectionHoldings("t-a", "raft_B", ["github"]);
-    must(JSON.stringify(got) === JSON.stringify([{ alias: "gh", plugin: "github", key: "agent", connectorId: "k1" }]), `the answer: ${JSON.stringify(got)}`);
-    must(o.rows() === before && o.writes.length === 0 && o.alarm() === null && o.kv.size === 0, `writes: ${JSON.stringify(o.writes)}`);
-    must(wroteSql(o.statements).length === 0, `statements: ${JSON.stringify(wroteSql(o.statements))}`);
-    // Another agent's name on this object: null, and still nothing written.
-    must((await o.D.adminConnectionHoldings("t-a", "raft_C", ["github"])) === null && wroteSql(o.statements).length === 0 && o.rows() === before, "another agent's name");
+    const { value: got, fetched } = await fetchesDuring(() => o.D.adminConnectionHoldings("t-a", "raft_B", ["github"]));
+    must(JSON.stringify(got) === JSON.stringify([{ alias: "gh", plugin: "github", key: "agent", connectorId: "k1" }, { alias: "gh2", plugin: "github", key: "dangling", connectorId: null }]), `the answer: ${JSON.stringify(got)}`);
+    must(o.rows() === before && o.alarm() === null && !o.writes.includes("setAlarm") && fetched.length === 0, `rows changed, an alarm, or a request: ${JSON.stringify(o.writes)} ${JSON.stringify(fetched)}`);
+    // Another agent's name on this object: null, and still nothing changed.
+    must((await o.D.adminConnectionHoldings("t-a", "raft_C", ["github"])) === null && o.rows() === before, "another agent's name");
   } finally { host.dispose(); }
 });
 
