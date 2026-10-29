@@ -580,6 +580,11 @@ export interface Connector {
   /** GitHub's numeric user id for `account`, which a rename does not change (0024); null on a connector from before. */
   accountId?: string | null;
   creatorRaftUserId: string;
+  /**
+   * The Raft origin that made it (migration 0030); null on one whose origin could not be told, which no token sees.
+   * Every provider route compares it with the token's (cf/src/provision/handlers.ts `ownConnector`).
+   */
+  raftOrigin: string | null;
   /** The access token, sealed. Rotated in place when an expiring one is refreshed (0023). */
   sealed: { ciphertext: string; iv: string };
   createdAt: number;
@@ -601,7 +606,7 @@ export interface ConnectorRefresh {
 
 export interface ConnectorEvent {
   tenantId: string; connectorId: string; raftAgentId: string | null;
-  action: "create" | "bind" | "unbind" | "disconnect" | "broken" | "reconnect";
+  action: "create" | "bind" | "unbind" | "disconnect" | "broken" | "reconnect" | "origin_mismatch_removed";
   /** `system` for what the deployment records itself (`broken`), with SYSTEM_ACTOR as the user. */
   actingRaftUserId: string; actingRole: "creator" | "admin" | "system"; at: number;
   /** Why, for `broken`: GitHub's error, never a token. */
@@ -645,11 +650,11 @@ export function d1Connectors(db: D1Database): ConnectorStore {
       const f = c.refresh ?? null;
       await db.prepare(
         `INSERT INTO connectors (id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at,
-           refresh_ciphertext, refresh_iv, expires_at, refresh_expires_at, refreshed_at, last_checked_at, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           refresh_ciphertext, refresh_iv, expires_at, refresh_expires_at, refreshed_at, last_checked_at, account_id, raft_origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(c.id, c.tenantId, c.provider, c.account, c.creatorRaftUserId, c.sealed.ciphertext, c.sealed.iv, c.createdAt,
         f?.sealed.ciphertext ?? null, f?.sealed.iv ?? null, f?.expiresAt ?? null, f?.refreshExpiresAt ?? null, f ? c.createdAt : null,
         // Made from a confirm, whose attach has just checked the credential with GitHub.
-        c.createdAt, c.accountId ?? null).run();
+        c.createdAt, c.accountId ?? null, c.raftOrigin).run();
     },
     async reconnect(tenantId, id, next) {
       const f = next.refresh;
@@ -695,7 +700,7 @@ function connectorRow(r: any): Connector {
   return {
     id: String(r.id), tenantId: String(r.tenant_id), provider: String(r.provider), account: r.account === null ? null : String(r.account),
     accountId: r.account_id == null ? null : String(r.account_id),
-    creatorRaftUserId: String(r.creator_raft_user_id), sealed: { ciphertext: String(r.ciphertext), iv: String(r.iv) }, createdAt: Number(r.created_at),
+    creatorRaftUserId: String(r.creator_raft_user_id), raftOrigin: r.raft_origin == null ? null : String(r.raft_origin), sealed: { ciphertext: String(r.ciphertext), iv: String(r.iv) }, createdAt: Number(r.created_at),
     refresh: r.refresh_ciphertext == null ? null
       : { sealed: { ciphertext: String(r.refresh_ciphertext), iv: String(r.refresh_iv) }, expiresAt: n(r.expires_at), refreshExpiresAt: n(r.refresh_expires_at) },
     brokenAt: n(r.broken_at), brokenReason: r.broken_reason == null ? null : String(r.broken_reason),
@@ -715,7 +720,12 @@ export interface ConnectorGrant extends Connector {
  * token is single-use, and GitHub spends the old access token with it.
  */
 export interface ConnectorGrants {
-  grant(tenantId: string, id: string): Promise<ConnectorGrant | null>;
+  /**
+   * The connector, for renewing `agentId`'s copy of it: only when that agent is of the connector's Raft origin (0030).
+   * Another origin's agent, or any agent of a connector with no origin, finds none, so it is never handed a pair
+   * nor can it mark the connector broken.
+   */
+  grant(tenantId: string, id: string, agentId: string): Promise<ConnectorGrant | null>;
   /** Take the right to trade the refresh token until `until`, as `holder`; false while someone else holds it. */
   lease(tenantId: string, id: string, now: number, until: number, holder: string): Promise<boolean>;
   /** Give it back; only `holder`'s own lease is released. */
@@ -737,10 +747,48 @@ export interface ConnectorGrants {
   markAgentBroken(tenantId: string, agentId: string, provider: string, reason: string, at: number): Promise<boolean>;
 }
 
+/**
+ * The agents a connector's renewed pair is handed to (cf/src/index.ts `githubRenewal`): those bound to it of the
+ * connector's own Raft origin (0030). Another origin's agent bound to it is never handed the pair, and a connector
+ * with no origin is handed to nobody.
+ */
+export async function connectorAudience(db: D1Database, tenantId: string, connectorId: string): Promise<string[]> {
+  const r = await db.prepare(
+    `SELECT p.agent_id FROM provisioned_connections pc
+       JOIN connectors c ON c.tenant_id = pc.tenant_id AND c.id = pc.connector_id
+       JOIN provisioned_agents p ON p.tenant_id = pc.tenant_id AND p.raft_agent_id = pc.raft_agent_id
+      WHERE pc.tenant_id = ? AND pc.connector_id = ? AND c.raft_origin = p.raft_origin ORDER BY p.agent_id`,
+  ).bind(tenantId, connectorId).all<any>();
+  return (r.results ?? []).map((x: any) => String(x.agent_id));
+}
+
+/**
+ * `connectorAudience`, and the agents bound to the connector it left out, in two counts: `filtered`, left out by
+ * origin (another origin's agent, or any agent of a connector with no origin); `skipped`, left out for anything else
+ * (a binding whose agent or connector has no row). An agent's status is not a reason: a deleted agent of the
+ * connector's origin is in `to`, as it was before connectors had an origin.
+ */
+export async function renewalAudience(db: D1Database, tenantId: string, connectorId: string): Promise<{ to: string[]; filtered: number; skipped: number }> {
+  const to = await connectorAudience(db, tenantId, connectorId);
+  const r = await db.prepare(
+    `SELECT COUNT(*) AS bound,
+            COUNT(CASE WHEN p.agent_id IS NOT NULL AND c.id IS NOT NULL AND (c.raft_origin IS NULL OR p.raft_origin != c.raft_origin) THEN 1 END) AS filtered
+       FROM provisioned_connections pc
+       LEFT JOIN connectors c ON c.tenant_id = pc.tenant_id AND c.id = pc.connector_id
+       LEFT JOIN provisioned_agents p ON p.tenant_id = pc.tenant_id AND p.raft_agent_id = pc.raft_agent_id
+      WHERE pc.tenant_id = ? AND pc.connector_id = ?`,
+  ).bind(tenantId, connectorId).first<any>();
+  const filtered = Number(r?.filtered ?? 0);
+  return { to, filtered, skipped: Math.max(0, Number(r?.bound ?? 0) - to.length - filtered) };
+}
+
 export function d1ConnectorGrants(db: D1Database): ConnectorGrants {
   return {
-    async grant(tenantId, id) {
-      const r = await db.prepare("SELECT * FROM connectors WHERE tenant_id = ? AND id = ?").bind(tenantId, id).first<any>();
+    async grant(tenantId, id, agentId) {
+      const r = await db.prepare(
+        `SELECT c.* FROM connectors c JOIN provisioned_agents p ON p.tenant_id = c.tenant_id AND p.agent_id = ?
+          WHERE c.tenant_id = ? AND c.id = ? AND c.raft_origin = p.raft_origin`,
+      ).bind(agentId, tenantId, id).first<any>();
       if (!r) return null;
       return { ...connectorRow(r), refreshedAt: r.refreshed_at == null ? null : Number(r.refreshed_at), refreshingUntil: r.refreshing_until == null ? null : Number(r.refreshing_until) };
     },

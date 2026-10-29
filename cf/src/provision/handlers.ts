@@ -642,6 +642,18 @@ async function providerApprovals(who: ProviderTokenIdentity, raftServerId: strin
   });
 }
 
+/**
+ * The agent a provider path names (`/agents/<providerAgentId>/…`, `/agents/by-raft-agent/<raftAgentId>/…`), or null
+ * when there is none for this token, which every route answers 404. The token's Raft origin must be the agent's, as
+ * well as its tenant: a platform token derives the tenant from `?raftServerId=` alone, so without this another Raft
+ * deployment's token naming this server's id would reach this server's agents. A tenant token is held to it too.
+ * test/provision-origin.ts checks that no route looks an agent up by its path id any other way.
+ */
+async function agentAt(registry: ProvisionRegistry, who: ProviderTokenIdentity, tenantId: string, byRaft: boolean, id: string): Promise<ProvisionedAgent | null> {
+  const row = byRaft ? await registry.get(tenantId, id) : await registry.getByAgentId(tenantId, id);
+  return row && row.raftOrigin === who.raftOrigin ? row : null;
+}
+
 export async function handleProvision(
   method: string, path: string,
   headers: { idempotencyKey: string | null; raftServerId: string | null; credentialId?: string | null; readReason?: string | null }, body: unknown,
@@ -653,7 +665,7 @@ export async function handleProvision(
   if (seg[0] === "connectors" && seg.length === 2 && method === "DELETE") {
     const tenant = tenantFor(who, headers.raftServerId);
     if (isFail(tenant)) return fail(tenant);
-    return disconnect(tenant, seg[1]!, body, deps);
+    return disconnect(tenant, seg[1]!, body, deps, who);
   }
   if (seg[0] === "models" && seg.length === 1 && method === "GET") {
     if (!deps.models) return null;
@@ -818,6 +830,11 @@ export async function handleProvision(
     const credentialHash = await sha256Hex(credential);
     let row = await deps.registry.get(tenantId, raftAgentId);
     let created = false;
+    // Another Raft origin's agent under this id (a platform token derives the tenant from the server id alone): the
+    // id is taken, as the unique index would say, and nothing of the agent is compared, answered or run.
+    if (row && row.raftOrigin !== who.raftOrigin) {
+      return fail({ status: 409, code: "agent_id_taken", message: `${agentId} already belongs to another Raft agent in this tenant` });
+    }
     if (row) {
       if (row.status === "deleted") {
         return fail({ status: 409, code: "deleted", message: "this Raft agent was deleted here; a new agent needs a new id" });
@@ -892,14 +909,16 @@ export async function handleProvision(
   // providerAgentId, and a delete must still reach the agent it made (Tenny's orphan case).
   const byRaft = seg[1] === "by-raft-agent";
   const rest = byRaft ? seg.slice(2) : seg.slice(1);
+  // Every route below reaches the agent its path names through this, and only this (`agentAt`).
+  const pathAgent = () => agentAt(deps.registry, who, tenantId, byRaft, rest[0]!);
   if ((rest.length === 3 || (rest.length === 4 && rest[3] === "confirm")) && rest[1] === "connections") {
-    return connection(method, rest, body, tenantId, byRaft, deps);
+    return connection(method, rest, body, tenantId, byRaft, deps, pathAgent);
   }
   // `…/usage`, `…/workspace-files`, `…/workspace-files/read`: the agent's own surface, read through
   // the core the public API uses; only how the agent is found, and the envelope, are this binding's.
   if (rest.length === 2 && rest[1] === "import" && method === "POST") {
     if (!deps.imports) return null;
-    const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+    const found = await pathAgent();
     if (!found || found.status === "deleted") {
       return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
     }
@@ -907,7 +926,7 @@ export async function handleProvision(
   }
   if (EVAL_ROUTES.has(rest.slice(1).join("/"))) {
     if (!deps.seed) return null;
-    const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+    const found = await pathAgent();
     if (!found || found.status === "deleted") {
       return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
     }
@@ -917,10 +936,8 @@ export async function handleProvision(
   // `…/approvals` and `…/approvals/{operationId}/decide`: this agent's held calls, from its own object.
   if (rest[1] === "approvals" && ((rest.length === 2 && method === "GET") || (rest.length === 4 && rest[3] === "decide" && method === "POST"))) {
     if (!deps.approvals) return null;
-    const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
-    // The token's own origin, as well as its tenant: a platform token derives the tenant from `?raftServerId=` alone, so
-    // without this another Raft deployment's token naming this server's id would read and decide its holds.
-    if (!found || found.status === "deleted" || found.raftOrigin !== who.raftOrigin) {
+    const found = await pathAgent();
+    if (!found || found.status === "deleted") {
       return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
     }
     return rest.length === 2
@@ -929,7 +946,7 @@ export async function handleProvision(
   }
   const read = method === "GET" && rest.length >= 2 ? surfaceReadOf(rest.slice(1), "provider") : null;
   if (read && deps.surface) {
-    const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+    const found = await pathAgent();
     if (!found || found.status === "deleted") {
       return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
     }
@@ -939,7 +956,7 @@ export async function handleProvision(
   }
   if (rest.length === 2 && rest[1] === "model") {
     if (!deps.models) return null;
-    const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+    const found = await pathAgent();
     if (!found || found.status === "deleted") {
       return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
     }
@@ -949,14 +966,14 @@ export async function handleProvision(
   // a turn that outlived its delete is exactly the one that needs it. Repeating it answers `not_running`.
   if (rest.length === 2 && rest[1] === "stop" && method === "POST") {
     if (!deps.agent.stopTurn) return null;
-    const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+    const found = await pathAgent();
     if (!found) return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
     const r = await stopTurnOf(deps.agent.stopTurn, tenantId, found.agentId, "provider_stop");
     if (r.result === "failed") return fail({ status: 503, code: "stop_failed", message: `the agent's turn could not be stopped; try again: ${r.error}` });
     return ok(r.result === "interrupted" ? { result: "interrupted", cancelledTurn: r.cancelledTurn } : { result: "not_running" });
   }
   if (rest.length < 1 || rest.length > 2 || (rest.length === 2 && rest[1] !== "credential")) return null;
-  const row = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+  const row = await pathAgent();
   const gone = () => fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
 
   if (rest.length === 1 && method === "GET") {
@@ -1280,8 +1297,25 @@ function importView(rec: ImportRecord, row: ProvisionedAgent) {
  * agent only. A connector as a whole goes through `DELETE /connectors/:id`. No credential passes
  * here in the clear: the flow in connect.ts seals it, and the handlers carry it only sealed.
  */
+/**
+ * A connector of the tenant as a token of `raftOrigin` may see it: one that origin made, else null, which every route
+ * answers exactly as a connector that does not exist. The only way a provider route reads a connector
+ * (test/provision-origin.ts checks it).
+ */
+// This guards a credential boundary, not a convenience: a connector carries a GitHub credential, and a platform token
+// of another Raft origin reaches this tenant by naming the server's id.
+async function ownConnector(c: NonNullable<ProvisionDeps["connections"]>, tenantId: string, id: string, raftOrigin: string) {
+  const k = await c.connectors.get(tenantId, id);
+  return k && k.raftOrigin === raftOrigin ? k : null;
+}
+/** The tenant's connectors of `provider` that `raftOrigin` made (`ownConnector`). */
+async function ownConnectors(c: NonNullable<ProvisionDeps["connections"]>, tenantId: string, provider: string, raftOrigin: string) {
+  return (await c.connectors.list(tenantId, provider)).filter((k) => k.raftOrigin === raftOrigin);
+}
+
 async function connection(
   method: string, rest: string[], body: unknown, tenantId: string, byRaft: boolean, deps: ProvisionDeps,
+  pathAgent: () => Promise<ProvisionedAgent | null>,
 ): Promise<Response | null> {
   const c = deps.connections;
   if (!c) return null;
@@ -1290,7 +1324,7 @@ async function connection(
     return fail({ status: 404, code: "unknown_provider", message: `no provider ${provider}; this deployment connects ${CONNECTION_PROVIDERS.join(", ")}` });
   }
   const p = provider as ConnectionProvider;
-  const row = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+  const row = await pathAgent();
   if (!row || row.status === "deleted") return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
 
   if (rest.length === 4) {
@@ -1318,7 +1352,8 @@ async function connection(
     // A plain connect again mends only this agent: a new connector, and this agent's row written afresh, which clears
     // its broken state. A reconnect in place (above) mends the connector for every agent on it.
     const connectedAt = deps.now();
-    await c.connectors.create({ id: connectorId, tenantId, provider: p, account: r.account, accountId: r.accountId ?? null, creatorRaftUserId: b.raftUserId, sealed: r.sealed, refresh: r.refresh ?? null, createdAt: connectedAt });
+    await c.connectors.create({ id: connectorId, tenantId, provider: p, account: r.account, accountId: r.accountId ?? null, creatorRaftUserId: b.raftUserId,
+      raftOrigin: row.raftOrigin, sealed: r.sealed, refresh: r.refresh ?? null, createdAt: connectedAt });
     await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: b.raftUserId, connectedAt, connectorId });
     await c.connectors.record({ tenantId, connectorId, raftAgentId: row.raftAgentId, action: "create", actingRaftUserId: b.raftUserId, actingRole: "creator", at: connectedAt });
     return ok({ connected: true, connectorId, account: r.account, connectedAt: new Date(connectedAt).toISOString(), connectedBy: b.raftUserId });
@@ -1344,10 +1379,12 @@ async function connection(
     let reconnect: ReconnectTarget | undefined;
     if (b.connectorId !== undefined) {
       if (typeof b.connectorId !== "string" || !b.connectorId) return fail({ status: 422, code: "invalid", message: "connectorId is the connector to reconnect in place", param: "connectorId" });
+      // Raft's claim, unverified: `admin` is taken as said, relying on the caller being Raft (`creatorRefused`,
+      // botiverse/antiproton#1122). The connector read below is origin-checked; the role never stands in for that.
       if (b.actingRole !== "creator" && b.actingRole !== "admin") {
         return fail({ status: 422, code: "invalid", message: "actingRole is creator or admin: the capacity Raft checked the initiator reconnects this connector in", param: "actingRole" });
       }
-      const k = await c.connectors.get(tenantId, b.connectorId);
+      const k = await ownConnector(c, tenantId, b.connectorId, row.raftOrigin);
       if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${b.connectorId} in this tenant` });
       const refused = creatorRefused(k, { actingRaftUserId: by, actingRole: b.actingRole });
       if (refused) return fail(refused);
@@ -1362,7 +1399,7 @@ async function connection(
   if (method === "GET") {
     const got = await c.registry.get(tenantId, row.raftAgentId, p);
     const current = got?.connectorId ?? null;
-    const all = await c.connectors.list(tenantId, p);
+    const all = await ownConnectors(c, tenantId, p, row.raftOrigin);
     const connectors = all.map((k) => ({
       id: k.id, account: k.account, creatorRaftUserId: k.creatorRaftUserId, createdAt: new Date(k.createdAt).toISOString(), current: k.id === current,
       ...oauthState(k.brokenAt ?? null, k.lastCheckedAt ?? k.brokenAt ?? k.createdAt),
@@ -1385,7 +1422,7 @@ async function connection(
     if (isFail(acting)) return fail(acting);
     const connectorId = (body as Record<string, unknown>).connectorId;
     if (typeof connectorId !== "string" || !connectorId) return fail({ status: 422, code: "invalid", message: "connectorId is required", param: "connectorId" });
-    const k = await c.connectors.get(tenantId, connectorId);
+    const k = await ownConnector(c, tenantId, connectorId, row.raftOrigin);
     if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${connectorId} in this tenant` });
     const refused = creatorRefused(k, acting);
     if (refused) return fail(refused);
@@ -1433,7 +1470,7 @@ async function reconnectInPlace(
 ): Promise<Response> {
   const c = deps.connections!;
   const acting: Acting = { actingRaftUserId: raftUserId, actingRole: target.actingRole };
-  const k = await c.connectors.get(tenantId, target.connectorId);
+  const k = await ownConnector(c, tenantId, target.connectorId, row.raftOrigin);
   if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${target.connectorId} in this tenant; it may have been disconnected since the link was made` });
   const refused = creatorRefused(k, acting);
   if (refused) return fail(refused);
@@ -1445,7 +1482,7 @@ async function reconnectInPlace(
   const at = deps.now();
   if (!(await c.connectors.reconnect(tenantId, k.id, { sealed: r.sealed, refresh: r.refresh, account: r.account, accountId: r.accountId, at }))) {
     // Gone, or given another account's id, between the read and the write.
-    const now = await c.connectors.get(tenantId, k.id);
+    const now = await ownConnector(c, tenantId, k.id, row.raftOrigin);
     return now ? mismatch() : fail({ status: 404, code: "not_found", message: `no ${p} connector ${k.id} in this tenant; it was disconnected meanwhile` });
   }
   await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, action: "reconnect", ...acting, at });
@@ -1455,7 +1492,8 @@ async function reconnectInPlace(
   for (const raftAgentId of bound) {
     try {
       const a = raftAgentId === row.raftAgentId ? row : await deps.registry.get(tenantId, raftAgentId);
-      if (!a) continue;
+      // Another Raft origin's agent on the same connector is not this origin's to change.
+      if (!a || a.raftOrigin !== row.raftOrigin) continue;
       const got = await c.reconnect(tenantId, a.agentId, p, k.id, k.sealed, r.sealed, r.refresh);
       if (!got.ok) { failed.push({ raftAgentId, error: got.error }); continue; }
       if (got.updated) updated.push(raftAgentId);
@@ -1518,6 +1556,11 @@ function actingField(body: unknown, also: string[]): Acting | Fail {
  * Pointing an agent at a connector hands it that account's identity, so only its creator or a server
  * admin may. Raft checks both before calling, and only Raft knows who is an admin; a claim to be the
  * creator can be checked here as well, and is.
+ *
+ * `actingRole` is the capacity Raft claims for its session's user, and is not verified here: `admin` passes
+ * unchecked, relying on the caller being Raft, the same trust as `decidedBy.role` on an approval, with the provider
+ * token as the anchor. It is never what keeps another Raft origin out; that is the origin check (`agentAt`,
+ * `ownConnector`). What rests on one platform token per deployment: botiverse/antiproton#1122.
  */
 function creatorRefused(k: { creatorRaftUserId: string }, acting: Acting): Fail | null {
   if (acting.actingRole === "creator" && acting.actingRaftUserId !== k.creatorRaftUserId) {
@@ -1531,39 +1574,74 @@ function creatorRefused(k: { creatorRaftUserId: string }, acting: Acting): Fail 
  * The connector is removed only once every agent has been detached: a partial failure answers 502 with
  * the agents still holding it, and the same call finishes the job.
  */
-async function disconnect(tenantId: string, connectorId: string, body: unknown, deps: ProvisionDeps): Promise<Response> {
+async function disconnect(tenantId: string, connectorId: string, body: unknown, deps: ProvisionDeps, who: ProviderTokenIdentity): Promise<Response> {
   const c = deps.connections;
   if (!c) return fail({ status: 404, code: "not_found", message: "this deployment has no connectors" });
   const acting = actingField(body, []);
   if (isFail(acting)) return fail(acting);
-  const k = await c.connectors.get(tenantId, connectorId);
+  const k = await ownConnector(c, tenantId, connectorId, who.raftOrigin);
   if (!k) return fail({ status: 404, code: "not_found", message: `no connector ${connectorId} in this tenant` });
   const refused = creatorRefused(k, acting);
   if (refused) return fail(refused);
   const provider = k.provider as ConnectionProvider;
   // Not atomic with a PUT that lands between `boundTo` and the delete below: that agent keeps a copy of
   // the credential and a connectorId that no longer exists, until it is pointed elsewhere or disconnected.
+  //
+  // Every agent bound to it gives the credential up, another origin's too: one bound before connectors had an origin
+  // (0030) holds this origin's credential, which is this origin's to take back. First by the connector's own
+  // credential, by value or by what renews it (`detachIfFrom`). When that matches nothing:
+  //  - another origin's agent is cleared by the agent: it may hold an older copy, a non-expiring token from before a
+  //    reconnect in place, which skips another origin's agents;
+  //  - this origin's agent keeps what it holds, which is not the connector's: a key put on the mount since, in the
+  //    console, clears what renewed it, and is the person's, not the connector's to take.
+  // Each agent ends one of four ways, and only the first is clean:
+  //  - detached: this origin's agent, the connector's credential removed;
+  //  - kept: this origin's agent, holding another credential (above), left as it is and said so;
+  //  - cleared elsewhere: another origin's agent, its copy removed, but that origin has held a working token for this
+  //    connector, which only re-authorising or revoking it on GitHub ends (a person's decision, not made here);
+  //  - failed: nothing could be removed; the connector stays, and the same call tries again.
+  // Another origin's agents are counted in the answer and named only in the log: their ids are that origin's.
   const detached: string[] = [];
+  const kept: string[] = [];
   const failed: Array<{ raftAgentId: string; error: string }> = [];
+  const elsewhere: string[] = [];
+  const elsewhereFailed: Array<{ raftAgentId: string; error: string }> = [];
   for (const raftAgentId of await c.registry.boundTo(tenantId, k.id)) {
+    const row = await deps.registry.get(tenantId, raftAgentId).catch(() => undefined);
+    const ours = !row || row.raftOrigin === who.raftOrigin;
     try {
-      const row = await deps.registry.get(tenantId, raftAgentId);
-      if (row) await c.detachIfFrom(tenantId, row.agentId, provider, k.sealed, k.id);
+      if (row === undefined) throw new Error("the agent could not be read");
+      let held = false;
+      if (row) {
+        const matched = await c.detachIfFrom(tenantId, row.agentId, provider, k.sealed, k.id);
+        // False from the detach by the agent: the mount holds nothing of the agent's own, so nothing is left there.
+        if (!matched && !ours) await c.detach(tenantId, row.agentId, provider);
+        held = !matched && ours;
+      }
       await c.registry.remove(tenantId, raftAgentId, provider);
-      detached.push(raftAgentId);
+      (held ? kept : ours ? detached : elsewhere).push(raftAgentId);
     } catch (e) {
-      failed.push({ raftAgentId, error: String((e as { message?: unknown })?.message ?? e).slice(0, 200) });
+      (ours ? failed : elsewhereFailed).push({ raftAgentId, error: String((e as { message?: unknown })?.message ?? e).slice(0, 200) });
     }
   }
-  if (failed.length) {
+  const otherOrigins = elsewhere.length || elsewhereFailed.length ? {
+    otherOrigins: {
+      cleared: elsewhere.length, failed: elsewhereFailed.length,
+      message: "agents of another Raft origin held this connector's credential: their copies are removed here, but that origin has had a working token; re-authorise or revoke it on GitHub to end it",
+    },
+  } : {};
+  logEvent("connect.disconnect", { tenantId, connectorId: k.id, detached: detached.join(" "), kept: kept.join(" "), failed: failed.map((f) => f.raftAgentId).join(" "),
+    clearedElsewhere: elsewhere.join(" "), failedElsewhere: elsewhereFailed.map((f) => f.raftAgentId).join(" "),
+    errors: [...failed, ...elsewhereFailed].map((f) => f.error).join(" | ").slice(0, 500) });
+  if (failed.length || elsewhereFailed.length) {
     return Response.json({
       error: { code: "partially_disconnected", message: "some agents still hold this connector's credential; the same call finishes the job" },
-      detached, failed,
+      detached, ...(kept.length ? { kept } : {}), failed, ...otherOrigins,
     }, { status: 502, headers: { "cache-control": "no-store" } });
   }
   await c.connectors.remove(tenantId, k.id);
   await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: null, action: "disconnect", ...acting, at: deps.now() });
-  return ok({ disconnected: true, connectorId: k.id, detached });
+  return ok({ disconnected: true, connectorId: k.id, detached, ...(kept.length ? { kept } : {}), ...otherOrigins });
 }
 
 /**

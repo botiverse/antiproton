@@ -460,8 +460,8 @@ await check("connections: a reconnect in place names its connector and role at t
   await call(f.deps, "POST", "/agents", body(), "01JAGENT");
   const path = "/agents/by-raft-agent/01JAGENT/connections/github";
   const ret = `${WHO.raftOrigin}/agents/01JAGENT`;
-  connectors.set("con_mine", { id: "con_mine", tenantId: "t-raft", provider: "github", account: "octocat", accountId: "1", creatorRaftUserId: "u_owner", sealed: { ciphertext: "s", iv: "i" }, createdAt: 1 });
-  connectors.set("con_theirs", { id: "con_theirs", tenantId: "t-other", provider: "github", account: "octocat", accountId: "1", creatorRaftUserId: "u_owner", sealed: { ciphertext: "s", iv: "i" }, createdAt: 1 });
+  connectors.set("con_mine", { id: "con_mine", tenantId: "t-raft", provider: "github", account: "octocat", accountId: "1", creatorRaftUserId: "u_owner", raftOrigin: WHO.raftOrigin, sealed: { ciphertext: "s", iv: "i" }, createdAt: 1 });
+  connectors.set("con_theirs", { id: "con_theirs", tenantId: "t-other", provider: "github", account: "octocat", accountId: "1", creatorRaftUserId: "u_owner", raftOrigin: WHO.raftOrigin, sealed: { ciphertext: "s", iv: "i" }, createdAt: 1 });
   const ask = (extra: Record<string, unknown>, by = "u_owner") => call(f.deps, "POST", path, { returnUrl: ret, initiatedBy: { raftUserId: by }, ...extra });
   const made = await ask({ connectorId: "con_mine", actingRole: "creator" });
   assert(made.status === 200 && made.body.reconnect === "con_mine" && JSON.stringify(links.at(-1).reconnect) === '{"connectorId":"con_mine","actingRole":"creator"}', `${made.status} ${made.text}`);
