@@ -567,7 +567,7 @@ await check("connectors: a confirmed connection is the tenant's; another agent i
   if ((await call(f.deps, "DELETE", `/connectors/${id}`, { actingRaftUserId: "u_stranger", actingRole: "creator" })).status !== 403 || !connectors.has(id)) throw new Error("a stranger disconnected it");
   failDetach.add(other);
   const half = await call(f.deps, "DELETE", `/connectors/${id}`, { actingRaftUserId: "u_owner", actingRole: "creator" });
-  if (half.status !== 502 || !connectors.has(id) || half.body.failed?.[0]?.raftAgentId !== "01JOTHER") throw new Error(`partial: ${half.status} ${half.text}`);
+  if (half.status !== 409 || half.body.outcome !== "not_cleared" || half.body.retry !== true || !connectors.has(id) || half.body.failed?.[0]?.raftAgentId !== "01JOTHER") throw new Error(`partial: ${half.status} ${half.text}`);
   failDetach.clear();
   const done = await call(f.deps, "DELETE", `/connectors/${id}`, { actingRaftUserId: "u_owner", actingRole: "creator" });
   if (done.status !== 200 || connectors.has(id) || [...conns.values()].some((c) => c.connectorId === id) || !detached.includes(`${other}/github/sealed-token`)) {

@@ -1266,7 +1266,8 @@ for (const mode of ["refused", "unreachable"] as const) {
     const bindingOf = () => w.db.raw.prepare("SELECT connector_id FROM provisioned_connections WHERE raft_agent_id = ?").get(a.raftAgentId) as any;
     w.clearMode.set(a.agentId, mode);
     const r = await w.call("DELETE", `/agents/by-raft-agent/${a.raftAgentId}/connections/github`, { actingRaftUserId: "u_owner", actingRole: "creator" });
-    must(r.status === 409 && r.body.error.code === "mount_not_cleared" && /still holds the connection's credential/.test(r.body.error.message)
+    must(r.status === 409 && r.body.outcome === "not_cleared" && r.body.retry === true && JSON.stringify(r.body.agents) === JSON.stringify([a.raftAgentId])
+      && r.body.error.code === "mount_not_cleared" && /still holds the connection's credential/.test(r.body.error.message)
       && r.body.binding === "kept" && r.body.action === "retry_delete", `the answer: ${r.status} ${r.text}`);
     must(bindingOf()?.connector_id === id && (await w.stored(a)).token !== null, "the binding went, or the mount was cleared");
     const ev = unbinds(w, a.raftAgentId);
@@ -1341,7 +1342,7 @@ await check("removing a connection with no binding: an object holding no such ag
   w.dispose();
 });
 
-await check("disconnecting a connector one of whose agents refuses the clear: 502, that binding and the connector kept, the others unbound; each recorded; the retry finishes", async () => {
+await check("disconnecting a connector one of whose agents refuses the clear: 409, that binding and the connector kept, the others unbound; each recorded; the retry finishes", async () => {
   const w = await world();
   const a = await w.agent("Z8");
   const b = await w.agent("Z9");
@@ -1349,7 +1350,8 @@ await check("disconnecting a connector one of whose agents refuses the clear: 50
   must((await w.call("PUT", `/agents/by-raft-agent/Z9/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" })).status === 200, "bind Z9");
   w.clearMode.set(b.agentId, "refused");
   const r = await w.call("DELETE", `/connectors/${id}`, { actingRaftUserId: "u_owner", actingRole: "creator" });
-  must(r.status === 502 && r.body.error.code === "partially_disconnected" && JSON.stringify(r.body.detached) === JSON.stringify(["Z8"])
+  must(r.status === 409 && r.body.outcome === "not_cleared" && r.body.retry === true && JSON.stringify(r.body.agents) === JSON.stringify(["Z9"])
+    && r.body.error.code === "partially_disconnected" && JSON.stringify(r.body.detached) === JSON.stringify(["Z8"])
     && r.body.failed?.[0]?.raftAgentId === "Z9" && r.body.failed[0].action === "retry_delete", `the answer: ${r.status} ${r.text}`);
   const bound = (agent: string) => !!w.db.raw.prepare("SELECT 1 FROM provisioned_connections WHERE raft_agent_id = ?").get(agent);
   must(!bound("Z8") && bound("Z9") && !!w.db.raw.prepare("SELECT 1 FROM connectors WHERE id = ?").get(id) && (await w.stored(b)).token !== null, "bindings, connector or mount");

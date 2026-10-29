@@ -1566,6 +1566,9 @@ async function connection(
         error: { code: "mount_not_cleared", message: got
           ? `the agent's mount still holds the connection's credential (${error}); the connection was kept, DELETE it again`
           : `the agent's mount still holds a credential (${error}), with no connection left to keep; DELETE it again` },
+        // The one shape a removal that did not take answers with, here and for a connector's disconnect: 409 (a 502 is
+        // retried by many clients on their own), outcome, retry, and the agents it is about.
+        outcome: "not_cleared", retry: true, agents: [row.raftAgentId],
         binding: got ? "kept" : "none", mount: "not_cleared", action: "retry_delete" }, { status: 409, headers: { "cache-control": "no-store" } });
     }
     if (gone) {
@@ -1792,8 +1795,11 @@ async function disconnect(tenantId: string, connectorId: string, body: unknown, 
   if (failed.length || elsewhereFailed.length) {
     return Response.json({
       error: { code: "partially_disconnected", message: "some agents still hold this connector's credential; their bindings and the connector were kept, and the same call finishes the job" },
+      // As a single connection's removal answers it (409, outcome, retry, agents): this origin's agents by id, another
+      // origin's counted under `otherOrigins`.
+      outcome: "not_cleared", retry: true, agents: failed.map((f) => f.raftAgentId),
       detached, ...(kept.length ? { kept } : {}), failed, ...revokeOnGithub, ...otherOrigins,
-    }, { status: 502, headers: { "cache-control": "no-store" } });
+    }, { status: 409, headers: { "cache-control": "no-store" } });
   }
   await c.connectors.remove(tenantId, k.id);
   await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: null, action: "disconnect", ...acting, at: deps.now() });
