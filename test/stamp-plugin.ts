@@ -699,6 +699,22 @@ await check("with no mount policy, approve, merge and api wait for a person; rea
   must(read.status === "succeeded", `pr_view: ${JSON.stringify(read)}`);
 });
 
+await check("api and api_get never reach /api/auth: the exchange, the refresh, the session and the revoke, refused before a card", async () => {
+  // The exchange needs no credential, so the only thing between a grant an agent obtained and a session in its
+  // conversation is that no stamp tool sends it; the bridge's half is test/stamp-bridge.ts item 6.
+  const call = await gatewayMount({ write: "approval", read: "approval" });
+  const cards = (await call.store.listApprovals("t")).length;
+  for (const path of ["/api/auth/agent/exchange", "/api/auth/agent/refresh", "/api/auth/agent/revoke", "/api/auth/agent/login", "/API/AUTH/agent/exchange"]) {
+    reset();
+    const r = await call("api", { path, method: "POST", body: { schema: "raft-cli-agent-login-exchange.v1", grant: "g", code_verifier: "v" } });
+    must(r.status === "rejected" && r.error?.code === "route_refused" && /path must start with/.test(r.error.message), `api ${path}: ${JSON.stringify(r)}`);
+    const threw = await refusal(invoke("api_get", { path }, makeCtx().ctx));
+    must(/path must start with/.test(threw), `api_get ${path}: ${threw}`);
+    must(seen.length === 0, `${path} reached ${seen.map((x) => x.path).join(", ")}`);
+  }
+  must((await call.store.listApprovals("t")).length === cards, "a card was made for an /api/auth call");
+});
+
 await check("only the mount naming the tool lifts the hold: a mount-wide write allow does not", async () => {
   const wide = await gatewayMount({ write: "allow" });
   reset();

@@ -135,6 +135,57 @@ export function notInstalled(e: unknown): boolean {
 export interface AgentLoginDeps {
   raft: () => Raft;
   timeoutMs: number;
+  /**
+   * The plugin whose own login tool a service's Agent Login belongs to (`Plugin.agentLogin`), looked up by the
+   * service as written or resolved; null for any other service. Present only on the agent's own calls of
+   * `integrations_login` and `integrations_invoke`, never on `grantAgentLogin`, which is that plugin's way in.
+   */
+  sealed?: (service: string) => SealedLogin | null;
+  /** Told every service record Raft's list answered, so a client id or name can be refused by spelling as well. */
+  learn?: (services: readonly ServiceRecord[]) => void;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// A service whose Agent Login belongs to another plugin (`Plugin.agentLogin`, botiverse/antiproton#1084).
+
+/** A declared service, the plugin that declared it, and that plugin's own login tool (null when it named none). */
+export interface SealedLogin { service: string; plugin: string; tool: string | null }
+
+/**
+ * A service as compared against the declarations: compatibility forms folded (NFKC), invisible controls dropped,
+ * trimmed and lower-cased. Wider than what Raft or `matchService` resolves (an exact id, or a client id or name
+ * case-insensitively), so every spelling that reaches a declared service folds to it: it may refuse a spelling Raft
+ * would not have resolved, never the other way round.
+ */
+export function loginKey(service: string): string {
+  return service.normalize("NFKC").replace(INVISIBLE, "").trim().toLowerCase();
+}
+
+/** Whether an action name is Agent Login's (`agent-login`), whatever its case or separators: `Agent_Login`, `agentLogin`. */
+export function isAgentLoginAction(action: string): boolean {
+  return action.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "") === "agentlogin";
+}
+
+/** The sentence a raw Agent Login for a declared service is refused with: who logs in instead, and why. */
+export function sealedLoginMessage(tool: string, written: string, s: SealedLogin): string {
+  const what = tool === INVOKE_TOOL ? "run agent-login for" : "sign in to";
+  const instead = s.tool ? `call ${s.tool} on your ${s.plugin} mount instead` : `use the ${s.plugin} plugin's own login tool instead`;
+  return `${tool} may not ${what} ${JSON.stringify(clip(written, 60))}: its Agent Login belongs to the ${s.plugin} plugin. ` +
+    `${instead}, which a person approves and which keeps the ${s.service} session sealed in that mount, never in this conversation. Nothing was sent.`;
+}
+
+/**
+ * Why the agent's own call is a raw Agent Login for a declared service, from its arguments alone, or null: an
+ * `integrations_login` naming one, or an `integrations_invoke` of one's `agent-login` action. Local and synchronous,
+ * for `Plugin.refuse`; the handlers check again once Raft has said which service a client id or name is.
+ */
+export function sealedLoginRefusal(tool: string, args: unknown, sealed: AgentLoginDeps["sealed"]): string | null {
+  if (!sealed || (tool !== LOGIN_TOOL && tool !== INVOKE_TOOL)) return null;
+  const a = obj(args);
+  if (typeof a.service !== "string") return null;
+  if (tool === INVOKE_TOOL && (typeof a.action !== "string" || !isAgentLoginAction(a.action))) return null;
+  const s = sealed(a.service);
+  return s ? sealedLoginMessage(tool, a.service, s) : null;
 }
 
 /** A Raft service record as the login and list routes answer it (the fields this module reads). */
@@ -590,8 +641,13 @@ type Signed =
   | { kind: "session"; service: ServiceRecord; scopes: string[]; row: StoredSession; cookies: SessionCookie[]; grantOnly?: { scopes: string[]; hint: string | null } }
   | { kind: "no_session"; service: ServiceRecord; scopes: string[]; reason: string; grantOnly?: { scopes: string[]; hint: string | null } };
 
-async function signIn(ctx: PluginContext, deps: AgentLoginDeps, service: string, scopes: string[] | undefined, target: string | undefined, tool: string): Promise<Signed> {
+async function signIn(
+  ctx: PluginContext, deps: AgentLoginDeps, service: string, scopes: string[] | undefined, target: string | undefined, tool: string,
+  /** Asked of the service Raft answered with, before any handoff: a throw leaves no session made. */
+  guard?: (s: ServiceRecord) => void,
+): Promise<Signed> {
   const first = await raftLogin(deps, service, scopes, target);
+  guard?.(first.service);
   if (first.status === "approval_required" || first.status === "install_required") return { kind: "not_signed_in", result: notSignedIn(first, tool) };
   if (!first.service.returnUrl) {
     return { kind: "no_session", service: first.service, scopes: first.scopes, reason: "the app registered no return URL, so Raft has no session to hand over; follow the app's own documentation" };
@@ -606,6 +662,7 @@ async function signIn(ctx: PluginContext, deps: AgentLoginDeps, service: string,
   if (!scopes) throw fail(`The Raft grant is active, but the app made no session for an unscoped login${got.hint ? `: ${got.hint}` : ""}`);
   const grantOnly = { scopes: first.scopes, hint: got.hint };
   const second = await raftLogin(deps, first.service.id, undefined, target);
+  guard?.(second.service);
   if (second.status === "approval_required" || second.status === "install_required") {
     return { kind: "not_signed_in", result: { ...notSignedIn(second, tool), grantRecorded: { scopes: grantOnly.scopes } } };
   }
@@ -622,7 +679,21 @@ export async function integrationsLogin(args: unknown, ctx: PluginContext, deps:
   if (!service) throw fail("service is required: the app's Raft service id, client id, or exact name");
   const scopes = normalizeScopes(a.scopes);
   const target = str(a.target);
-  const signed = await signIn(ctx, deps, service, scopes, target, LOGIN_TOOL);
+  // A declared service's login is its plugin's (`Plugin.agentLogin`): refused as written, then as the installed app
+  // the name resolves to, then as the app Raft answered for — a name only Raft resolves still makes no session here.
+  let guard: ((s: ServiceRecord) => void) | undefined;
+  const sealed = deps.sealed;
+  if (sealed) {
+    const early = sealedLoginRefusal(LOGIN_TOOL, a, sealed);
+    if (early) throw fail(early);
+    guard = (s) => {
+      const owner = sealed(s.id);
+      if (owner) throw fail(sealedLoginMessage(LOGIN_TOOL, service, owner));
+    };
+    const found = await matchService(deps, service);
+    if (found) guard(found);
+  }
+  const signed = await signIn(ctx, deps, service, scopes, target, LOGIN_TOOL, guard);
   if (signed.kind === "not_signed_in") return signed.result;
   const grant = signed.grantOnly
     ? { grantRecorded: { scopes: signed.grantOnly.scopes, note: "the app recorded this grant without a session; the session below comes from an unscoped login" } }
@@ -841,6 +912,7 @@ async function listed(deps: AgentLoginDeps): Promise<Obj> {
 /** The installed app `query` names in Raft's list, by the rule every Agent Login tool uses, or undefined. */
 async function matchService(deps: AgentLoginDeps, query: string): Promise<ServiceRecord | undefined> {
   const services = (obj(await listed(deps)).services as unknown[]).map(serviceOf).filter((s): s is ServiceRecord => s !== null);
+  deps.learn?.(services);
   const q = query.trim().toLowerCase();
   // An exact service id first: another app named like it must not stand in for it.
   return services.find((s) => s.id === query) ?? services.find((s) => s.clientId.toLowerCase() === q || s.name.toLowerCase() === q);
@@ -1023,10 +1095,21 @@ export async function integrationsInvoke(args: unknown, ctx: PluginContext, deps
   if (a.params !== undefined && (a.params === null || typeof a.params !== "object" || Array.isArray(a.params))) throw fail("params must be an object");
   const payload = (a.params ?? {}) as Record<string, unknown>;
   const target = str(a.target);
+  const early = sealedLoginRefusal(INVOKE_TOOL, a, deps.sealed);
+  if (early) throw fail(early);
   const service = await findService(deps, query);
+  const owner = deps.sealed?.(service.id) ?? null;
   const manifest = await fetchManifest(ctx, deps, service, cache);
   if (manifest.mode !== "http_api") throw fail(`${service.name}'s actions run as a local command line, which this mount cannot run`);
   const action = manifest.actions.find((x) => x.name === name);
+  if (owner) {
+    // As the app resolved and the action as its manifest has it: an action by another name that reaches Agent Login's
+    // endpoint is the same request, so it is refused too.
+    const login = manifest.actions.filter((x) => isAgentLoginAction(x.name)).map((x) => `${x.endpoint.method} ${x.endpoint.path}`);
+    if (isAgentLoginAction(name) || (action && login.includes(`${action.endpoint.method} ${action.endpoint.path}`))) {
+      throw fail(sealedLoginMessage(INVOKE_TOOL, query, owner));
+    }
+  }
   if (!action) {
     throw fail(`${service.name}'s manifest has no action ${JSON.stringify(name)}; it has ${manifest.actions.map((x) => x.name).join(", ") || "none"}. Nothing was sent.`);
   }

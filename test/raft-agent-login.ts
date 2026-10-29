@@ -5,7 +5,10 @@
  * code into a `reminder_session` cookie (or answers `grant_recorded_no_session` for a scoped login), and actions under
  * /api/raft/actions/<name> that need the cookie.
  */
+import { readFileSync, readdirSync } from "node:fs";
 import { createRaftPlugin } from "../src/plugins/raft.ts";
+import { stampPlugin } from "../src/plugins/stamp.ts";
+import { githubPlugin } from "../src/plugins/github.ts";
 import {
   ACTION_MAX_BYTES, AGENT_LOGIN_TOOLS, LIST_TOOL, SESSION_STORE, actionUrl, followsTemplate, appUrlProblem, cookieHeaderFor, freshCookies, parseSetCookie, readManifest, withheld,
 } from "../src/plugins/raft-agent-login.ts";
@@ -905,6 +908,178 @@ await check("through the gateway: yes and no from the raft mount's own credentia
   await store.removeMount("tenant", "agent", "raft", null);
   must(await gateway.integrationInstalled("tenant", "agent", "reminder-app") === "unknown", "no mount not unknown");
   must(w.seen.length === reads, `Raft was asked without a usable mount: ${w.seen.length - reads} requests`);
+});
+
+// ---- A service another plugin declares (`Plugin.agentLogin`): its raw Agent Login is refused ----------------------
+//
+// The bypass these pin: an agent with no Stamp session calls `integrations_invoke {service: "stamp", action:
+// "agent-login"}` with a code challenge of its own, gets Stamp's one-time grant back, and exchanges it itself at
+// Stamp's `POST /api/auth/agent/exchange` — skipping the card `stamp_login` raises and putting the session in the
+// conversation. The declarations are read from the real plugins, never from a list written here.
+
+const STAMP_SVC = {
+  ...SERVICE, id: "stamp", clientId: "stamp-client-7f3a", name: "Stamp", homepageUrl: APP, returnUrl: `${APP}/auth/raft/callback`, agentManifestUrl: MANIFEST_URL,
+};
+const AGENT_LOGIN_ACTION = { name: "agent-login", description: "a grant for the CLI", endpoint: { method: "POST", path: "/api/auth/agent/login" },
+  parameters: { schema: { type: "string", required: true }, code_challenge: { type: "string", required: true }, code_challenge_method: { type: "string", required: true } } };
+const HELP_ACTION = { name: "help", description: "the command map", endpoint: { method: "POST", path: "/api/help" }, parameters: {} };
+const stampManifest = (extra: unknown[] = []) => manifest({ service: "stamp", actions: [HELP_ACTION, AGENT_LOGIN_ACTION, ...extra] });
+const GRANT_BODY = JSON.stringify({ schema: "raft-cli-agent-login-grant.v1", service: "stamp", grant: "GRANT-ONE-TIME", expires_at: "2026-10-29T00:05:00Z" });
+/** Both apps installed; Raft's login answers for `svc`. */
+const bothListed = (svc: Record<string, unknown>) => ({ body: { services: [{ ...SERVICE }, { ...STAMP_SVC, ...svc }], activeLogins: [] } });
+const RUNTIME_PLUGINS = () => [stampPlugin, githubPlugin];
+const INVOKE_ARGS = { service: "stamp", action: "agent-login", params: { schema: "raft-cli-agent-login-request.v1", code_challenge: "C".repeat(43), code_challenge_method: "S256" } };
+
+/** A gateway over a raft mount built as the runtime builds it (`registry`), its writes held for a person. */
+async function sealedGateway(policy: any = { write: "approval" }) {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("tenant", "agent");
+  const plugin = createRaftPlugin({ registry: RUNTIME_PLUGINS });
+  await store.addMount({
+    tenantId: "tenant", agentId: "agent", alias: "raft", plugin: "raft", installationId: "i", connectionId: null,
+    toolVersion: plugin.version, publicConfig: { serverUrl: RAFT }, secretRef: "secret:raft", policy,
+  });
+  const gateway = new ToolGateway(store, [plugin], new Set([plugin.id]), { async resolve() { return CREDENTIAL; } });
+  const caller = { tenantId: "tenant", agentId: "agent", taskId: "task", contextId: "ctx_turn" } as any;
+  return { store, plugin, caller, call: (tool: string, args: unknown) => gateway.invoke(caller, `raft.${tool}`, args as any) as Promise<any> };
+}
+/** The raft mount's context, built as the runtime builds the plugin. */
+function sealedMount() {
+  const m = mount();
+  const plugin = createRaftPlugin({ registry: RUNTIME_PLUGINS });
+  return { ...m, plugin };
+}
+
+await check("the declaration is the plugins' own: stamp declares stamp with stamp_login, and no other runtime plugin declares one", async () => {
+  must(JSON.stringify(stampPlugin.agentLogin) === JSON.stringify({ services: ["stamp"], tool: "stamp_login" }), JSON.stringify(stampPlugin.agentLogin));
+  must(stampPlugin.tools.some((t) => t.name === stampPlugin.agentLogin!.tool), "the declared login tool is not one of stamp's tools");
+  // Any other plugin of cf/src/runtime.ts declaring a service is a new security decision, and turns this red until read.
+  const runtime = readFileSync(new URL("../cf/src/runtime.ts", import.meta.url), "utf8");
+  const declaring = readdirSync(new URL("../src/plugins/", import.meta.url)).filter((f) => f.endsWith(".ts"))
+    .filter((f) => /\bagentLogin:\s*\{\s*services/.test(readFileSync(new URL(`../src/plugins/${f}`, import.meta.url), "utf8")));
+  must(JSON.stringify(declaring) === JSON.stringify(["stamp.ts"]), `plugins declaring agentLogin: ${declaring.join(", ")}`);
+  must(/createRaftPlugin\(\{[^)]*registry: \(\) => plugins/.test(runtime), "the runtime does not hand the raft plugin its plugins");
+});
+
+await check("the bypass, walked: no Stamp session, integrations_invoke {stamp, agent-login} is refused before any card or operation is held, naming stamp_login", async () => {
+  const w = world({ service: STAMP_SVC, manifest: stampManifest(), actionBody: GRANT_BODY, list: bothListed({}) });
+  w.install();
+  const g = await sealedGateway();
+  const r = await g.call("integrations_invoke", INVOKE_ARGS);
+  must(r.status === "rejected" && r.error?.code === "route_refused", `answer: ${JSON.stringify(r)}`);
+  must(/stamp_login/.test(r.error.message) && /sealed/.test(r.error.message) && /agent-login/.test(r.error.message), `message: ${r.error.message}`);
+  must((await g.store.listApprovals("tenant")).length === 0, "a card was made for a refused agent-login");
+  must(w.seen.length === 0, `something was sent: ${w.seen.map((x) => x.url).join(", ")}`);
+  // Its record: the operation ended rejected (none left pending), and its tool.call row names the tool and the service.
+  const dump = g.store.dumpTables() as any;
+  const ops = Object.entries(dump).filter(([k]) => /operation/i.test(k)).flatMap(([, rows]) => rows as any[]);
+  must(ops.length >= 1 && ops.every((o) => o.status === "rejected"), `operations: ${JSON.stringify(ops).slice(0, 400)}`);
+  const rows = JSON.stringify(dump);
+  must(/raft\.integrations_invoke/.test(rows) && /route_refused/.test(rows) && /run agent-login for \\+"stamp\\+"/.test(rows), "the refusal left no record naming tool and service");
+  must(!rows.includes("GRANT-ONE-TIME") && !rows.includes(CREDENTIAL), "the record carries a secret");
+  // Control: the same gateway holds an undeclared app's write for a person, so "no card" above is the refusal's doing.
+  const held = await g.call("integrations_invoke", { service: "reminder-app", action: "list-reminders" });
+  must(held.status === "pending" && held.error?.code === "awaiting_approval", `undeclared under approval: ${JSON.stringify(held)}`);
+});
+
+await check("integrations_login for a declared service is refused the same way, before a card and before Raft is asked", async () => {
+  const w = world({ service: STAMP_SVC, manifest: stampManifest(), list: bothListed({}) });
+  w.install();
+  const g = await sealedGateway();
+  const r = await g.call("integrations_login", { service: "stamp", target: "#general" });
+  must(r.status === "rejected" && r.error?.code === "route_refused" && /stamp_login/.test(r.error.message) && /sign in to/.test(r.error.message), JSON.stringify(r));
+  must((await g.store.listApprovals("tenant")).length === 0 && w.seen.length === 0, "a card was made or Raft was asked");
+});
+
+await check("every spelling of the service and the action is refused before a card: case, padding, compatibility forms, invisible characters, separators", async () => {
+  const w = world({ service: STAMP_SVC, manifest: stampManifest(), list: bothListed({}) });
+  w.install();
+  const g = await sealedGateway();
+  const services = ["stamp", "STAMP", "Stamp", "  stamp ", "ｓｔａｍｐ", "st​amp", "﻿stamp"];
+  const actions = ["agent-login", "Agent-Login", "AGENT_LOGIN", "agentLogin", "agent login", "agent.login", "ａｇｅｎｔ－ｌｏｇｉｎ"];
+  for (const service of services) {
+    for (const action of actions) {
+      const r = await g.call("integrations_invoke", { ...INVOKE_ARGS, service, action });
+      must(r.status === "rejected" && r.error?.code === "route_refused" && /stamp_login/.test(r.error.message), `${JSON.stringify(service)} ${JSON.stringify(action)}: ${JSON.stringify(r)}`);
+    }
+    const l = await g.call("integrations_login", { service });
+    must(l.status === "rejected" && l.error?.code === "route_refused", `login ${JSON.stringify(service)}: ${JSON.stringify(l)}`);
+  }
+  must((await g.store.listApprovals("tenant")).length === 0 && w.seen.length === 0, "a variant made a card or reached Raft");
+  // Not every stamp call is refused: its other actions are the agent's to hold for a person as before.
+  const help = await g.call("integrations_invoke", { service: "stamp", action: "help" });
+  must(help.status === "pending", `stamp help: ${JSON.stringify(help)}`);
+});
+
+await check("a client id only Raft's list resolves is refused by the handler before any login, and before a card once a list has been read", async () => {
+  const w = world({ service: STAMP_SVC, manifest: stampManifest(), actionBody: GRANT_BODY, list: bothListed({}) });
+  w.install();
+  const m = sealedMount();
+  const e = await failure(() => m.plugin.invoke("integrations_invoke", { ...INVOKE_ARGS, service: "stamp-client-7f3a" }, m.ctx));
+  must(/stamp_login/.test(e.message), `handler: ${e.message}`);
+  must(w.logins.length === 0 && w.actions().length === 0, `signed in or sent: ${w.logins.length} logins, ${w.actions().length} actions`);
+  const l = await failure(() => m.plugin.invoke("integrations_login", { service: "STAMP-CLIENT-7F3A" }, m.ctx));
+  must(/stamp_login/.test(l.message) && w.logins.length === 0, `login handler: ${l.message}, ${w.logins.length} logins`);
+  // The list that resolved it taught the refusal hook the spelling: refused before the policy from now on.
+  must(/stamp_login/.test(m.plugin.refuse!("integrations_invoke", { service: "Stamp-Client-7f3a", action: "agent-login" }) ?? ""), "the learned client id is not refused up front");
+});
+
+await check("a name only Raft resolves to a declared service makes no session: the login stops before the handoff", async () => {
+  // Raft's list does not have it under that name, but Raft's login route answers for stamp.
+  const w = world({ service: STAMP_SVC, manifest: stampManifest(), list: { body: { services: [SERVICE], activeLogins: [] } } });
+  w.install();
+  const m = sealedMount();
+  const e = await failure(() => m.plugin.invoke("integrations_login", { service: "stamp-by-another-name" }, m.ctx));
+  must(/stamp_login/.test(e.message), `message: ${e.message}`);
+  must(w.logins.length === 1 && w.callbacks().length === 0 && !m.tables.get(m.scope, SESSION_STORE, "stamp"), "a session was handed off or kept");
+});
+
+await check("an action by another name that reaches Agent Login's endpoint is the same request, and refused", async () => {
+  const mint = { ...AGENT_LOGIN_ACTION, name: "mint-cli-grant" };
+  const w = world({ service: STAMP_SVC, manifest: stampManifest([mint]), actionBody: GRANT_BODY, list: bothListed({}) });
+  w.install();
+  const m = sealedMount();
+  const e = await failure(() => m.plugin.invoke("integrations_invoke", { ...INVOKE_ARGS, action: "mint-cli-grant" }, m.ctx));
+  must(/stamp_login/.test(e.message) && w.logins.length === 0 && w.actions().length === 0, `${e.message}; ${w.logins.length} logins`);
+});
+
+await check("an undeclared service is unchanged: its agent-login runs, through the gateway and the handler", async () => {
+  const w = world({ manifest: manifest({ actions: [AGENT_LOGIN_ACTION] }), actionBody: GRANT_BODY });
+  w.install();
+  const g = await sealedGateway(null);
+  const plugin = createRaftPlugin({ registry: RUNTIME_PLUGINS });
+  must(plugin.refuse!("integrations_invoke", { ...INVOKE_ARGS, service: "reminder-app" }) === undefined, "an undeclared service was refused up front");
+  must(plugin.refuse!("integrations_login", { service: "Reminder" }) === undefined, "an undeclared login was refused up front");
+  const r = await g.call("integrations_invoke", { ...INVOKE_ARGS, service: "reminder-app" });
+  must(r.status === "succeeded" && JSON.stringify(r).includes("GRANT-ONE-TIME"), `undeclared agent-login: ${JSON.stringify(r).slice(0, 300)}`);
+  // And with no plugins handed in (a raft plugin built alone), nothing is declared.
+  must(createRaftPlugin().refuse!("integrations_invoke", INVOKE_ARGS) === undefined, "a plugin built alone refused stamp");
+});
+
+await check("stamp_login's own way in, grantAgentLogin, is not refused: it reaches the agent-login action and returns the grant to the plugin", async () => {
+  const w = world({ service: STAMP_SVC, manifest: stampManifest(), actionBody: GRANT_BODY, list: bothListed({}) });
+  w.install();
+  const m = sealedMount();
+  const out = await m.plugin.grantAgentLogin!(m.ctx, "stamp", "C".repeat(43)) as any;
+  must(out.status === "grant" && out.grant === "GRANT-ONE-TIME", JSON.stringify(out));
+  must(w.actions().some((r) => new URL(r.url).pathname === "/api/auth/agent/login"), "the agent-login action was not sent");
+});
+
+await check("structural: only the raft plugin asks Raft for Agent Login, and no other plugin reads a sibling mount's credential beyond the reviewed set", async () => {
+  const dir = new URL("../src/plugins/", import.meta.url);
+  const files = readdirSync(dir, { recursive: true }).map(String).filter((f) => f.endsWith(".ts"));
+  const text = (f: string) => readFileSync(new URL(f, dir), "utf8");
+  // Raft's Agent Login routes (`routes.integrations.*`, `integrations.call`) are named in these files only, all the raft
+  // plugin's: the Agent Login tools, and the assistant's Reminder tool, which picks the Reminder app alone (`reminderServiceOf`).
+  const login = files.filter((f) => /routes\.integrations\.|\.integrations\.(call|login|invoke)\(|integrations\/login/.test(text(f)));
+  must(JSON.stringify(login.sort()) === JSON.stringify(["raft-agent-login.ts", "raft-assistant-reminder.ts", "raft.ts"]), `Agent Login callers: ${login.join(", ")}`);
+  // A plugin that reads another mount (`ctx.sibling`) can hold the Raft credential; each of these was read for what it does with it.
+  const siblings = files.filter((f) => /\.sibling\(/.test(text(f)));
+  must(JSON.stringify(siblings.sort()) === JSON.stringify(["appworld.ts", "raft-identity.ts", "raftbench.ts", "reminder.ts", "stamp.ts"]), `sibling readers: ${siblings.join(", ")}`);
+  // A container is given the credentials of mounts whose plugin declares a sandbox form: raft must never be one.
+  const forms = files.filter((f) => /\bsandboxForm:\s*\{/.test(text(f)));
+  must(JSON.stringify(forms) === JSON.stringify(["github.ts"]), `sandbox forms: ${forms.join(", ")}`);
 });
 
 globalThis.fetch = originalFetch;
