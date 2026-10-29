@@ -38,6 +38,7 @@ import {
 import {
   admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult, stopSessionJobs,
 } from "../../src/runtime/background-jobs.ts";
+import { unknownOutcomeNotice } from "../../src/runtime/approval-notice.ts";
 import {
   bridgeTools, bridgeModulesFor, harnessTools, offeredToolName, offersPlugin, replayPolicy, offersCapability, qualifyMountedTools, resumeTool, runJsTools, type MountedTool,
   withholdTools,
@@ -316,17 +317,17 @@ export function approvalsUrl(origin: string | undefined, agentId: string): strin
 
 /**
  * Where a held call can be decided, for the held result (src/runtime/gateway.ts `heldMessage`), and so what it may
- * truthfully tell the agent. Nobody, for a Raft-made agent: the console accepts no Raft sign-in (cf/src/auth.ts
- * `viewerOfToken`), and the agent is listed under the provider's home (cf/src/index.ts `agent.adopt`), so its owner's own
- * sign-in gets a 404. Nobody, too, for a call held outside the agent's first conversation (`main`): the agent's page
- * lists only that conversation's held calls (its chat panel polls /ui/chat?held=1, which names no conversation) and
- * offers no other, so an API session's, a child's or a check's held call is on no page a person can decide it from.
- * Otherwise the agent's page, by whoever may open it: an API agent is listed in its key owner's directory, a console
- * agent in its maker's. No record names a person, so `decider` is null: a Raft-provisioned agent's row has no owner
- * (cf/src/control-plane.ts `ProvisionedAgent`), and Raft's context names one only for a personal assistant.
+ * truthfully tell the agent. Raft, for a Raft-made agent, whichever conversation held it: Raft lists every hold through
+ * the provider routes and shows its owner a card (docs/raft-approvals.md). Nobody, for a console or API agent's call
+ * held outside its first conversation (`main`): the agent's page lists only that conversation's held calls (its chat
+ * panel polls /ui/chat?held=1, which names no conversation) and offers no other, so an API session's, a child's or a
+ * check's held call is on no page a person can decide it from. Otherwise the agent's page, by whoever may open it: an
+ * API agent is listed in its key owner's directory, a console agent in its maker's. No record names a person, so
+ * `decider` is null.
  */
 export function heldPlaceFor(kind: AgentKind, taskId: string, url: string | null): HeldPlace {
-  if (kind === "raft") return { nobody: "this agent was made through Raft, and the console accepts no Raft sign-in, so its owner cannot open it" };
+  // Raft lists and decides every conversation's holds through the provider routes (docs/raft-approvals.md).
+  if (kind === "raft") return { raft: true };
   if (taskId !== LEGACY_TASK) return { nobody: "the console's page for this agent shows only its first conversation's held calls, and this call was held in another one" };
   return { decider: null, url };
 }
@@ -907,6 +908,11 @@ export interface RuntimeDeps {
    */
   runJsResumeMs?: number;
   /**
+   * How long a held call waits for a decision before it is denied as expired (APPROVAL_TTL_HOURS, cf/src/index.ts).
+   * Absent: the default, 24 hours (src/store/approvals-schema.ts).
+   */
+  approvalTtlMs?: number;
+  /**
    * Asked to wake the object by `at`, because a run_js program is suspended in
    * its memory and the object must not be evicted under it. Never later than
    * a wake already set: it only ever brings the alarm forward.
@@ -1237,6 +1243,12 @@ export function messageLanded(
 }
 
 /** A post refused because the conversation needs a reset (`SessionNeedsReset`) is logged and dropped; anything else is thrown on. */
+/**
+ * How long an approved call's run may go unended before it is ended `failed`, outcome unknown (`settleApproved`): longer
+ * than any call runs in one object's pass, so only a run the object stopped during is ended this way.
+ */
+const NOTICE_GRACE_MS = 15 * 60_000;
+
 function refusedForReset(e: unknown, tenantId: string, agentId: string, what: string): void {
   if (!(e instanceof SessionNeedsReset)) throw e;
   logEvent("session.needs_reset.refused", { tenantId, agentId, what });
@@ -1394,6 +1406,7 @@ export class AgentRuntime {
         ...(deps.github ? { credentialRejected: (scope: { tenantId: string; agentId: string }, name: string, token: string) => this.#oauth.rejected(scope.tenantId, scope.agentId, name, token) } : {}),
         heldPlace: async (ctx) => heldPlaceFor(agentKind((await this.store.loadAgent(ctx.tenantId, ctx.agentId))?.config),
           ctx.taskId, approvalsUrl(deps.consoleOrigin, ctx.agentId)),
+        ...(deps.approvalTtlMs !== undefined ? { approvalTtlMs: deps.approvalTtlMs } : {}),
       });
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
@@ -5621,6 +5634,76 @@ export class AgentRuntime {
   }
 
   /**
+   * Expire what is due, and tell the agent every decision it has not heard of (`#tellApprovals`).
+   */
+  async #approvalPass(tenantId: string, agentId: string): Promise<void> {
+    const now = Date.now();
+    try {
+      await this.#gateway.expireDue(tenantId, now);
+      // Approved calls run here, after their decision was answered (the provider route answers at once).
+      await this.#gateway.settleApproved(tenantId, now, NOTICE_GRACE_MS);
+      await this.#tellApprovals(tenantId, agentId);
+    } catch (e) {
+      // The hold and its notice stay in their rows for the next pass; a pass that cannot do this one part still steps.
+      console.error(`the approval pass of ${tenantId}/${agentId} failed:`, e);
+    }
+  }
+
+  /** The soonest deadline of a pending hold (ms since the epoch), or null: when the alarm must come back to expire it. */
+  async approvalDeadline(tenantId: string): Promise<number | null> {
+    let soonest: number | null = null;
+    for (const a of await this.store.listApprovals(tenantId, "pending")) {
+      if (a.expiresAt !== null && (soonest === null || a.expiresAt < soonest)) soonest = a.expiresAt;
+    }
+    return soonest;
+  }
+
+  /**
+   * Each ended hold the agent has not been told of, posted as a notice (src/runtime/approval-notice.ts) to the
+   * conversation whose call it was, the way a background job's ending is posted (`step`): the agent never polls. Posted
+   * once, by the row's `told_at`. A subagent's call is told to the main conversation, which can act on it: a post to the subagent would start
+   * a turn nothing tracks. Only ended holds are told: an approved call is told once its run ends (`settleApproved`).
+   */
+  async #tellApprovals(tenantId: string, agentId: string) {
+    for (const a of await this.store.untoldApprovals(tenantId)) {
+      if (a.agentId !== agentId) continue;
+      let text = a.notice ?? unknownOutcomeNotice(a);
+      const sub = isSubagentSession(a.taskId);
+      const session = sub ? MAIN_SESSION : a.taskId;
+      if (sub) text = `${text}
+This call was made by your subagent ${a.taskId}.`;
+      // Told once by the row, not by searching the conversation for the text (which the agent, or a tool result it read,
+      // could have written first): `told_at` is set at the last synchronous point before the engine's write (`unless`),
+      // so a pass that loses the race to another finds it set and posts nothing, and it is cleared again when the post
+      // did not land.
+      const sql = this.#deps.ctx.storage.sql;
+      let claimed = false;
+      const release = () => {
+        if (claimed) sql.exec("UPDATE approvals SET told_at = NULL WHERE tenant_id = ? AND operation_id = ?", tenantId, a.operationId);
+      };
+      try {
+        const out = await this.postMessage(tenantId, agentId, text, "prompt", session, {
+          unless: () => {
+            const r = sql.exec("SELECT told_at FROM approvals WHERE tenant_id = ? AND operation_id = ?", tenantId, a.operationId).toArray()[0] as { told_at?: unknown } | undefined;
+            if (!r || r.told_at !== null) return true;
+            sql.exec("UPDATE approvals SET told_at = ? WHERE tenant_id = ? AND operation_id = ?", Date.now(), tenantId, a.operationId);
+            claimed = true;
+            return false;
+          },
+        });
+        if ((out as { skipped?: true }).skipped) continue;
+        if ((out.result as { ok?: unknown } | null)?.ok === false) { release(); continue; }
+      } catch (e) {
+        // Left untold, so the next pass tries again: a conversation waiting for a reset or an import takes it later.
+        release();
+        console.warn(`the approval notice of ${tenantId}/${agentId} ${a.operationId} was not posted: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+        continue;
+      }
+      logEvent("approval.told", { tenantId, agentId, operationId: a.operationId, state: a.state, session });
+    }
+  }
+
+  /**
    * One pass over every session with work, which is all an alarm should ever
    * do. A session is stepped when its last step left something open or a
    * model call of its is still out; the rest stay closed and cost nothing.
@@ -5702,6 +5785,10 @@ export class AgentRuntime {
       }
       await this.postMessage(tenantId, agentId, text, "prompt", session).catch((e) => refusedForReset(e, tenantId, agentId, "background completion"));
     });
+    // Held calls next: a hold past its deadline is expired, and every decision the agent has not heard of is posted to
+    // the conversation that asked, which gives that session work for the loop below. The soonest deadline left is not
+    // a wake of the step's: it would keep an idle object from standing down. The alarm arms it (`approvalDeadline`).
+    await this.#approvalPass(tenantId, agentId);
     // pd: one harness runs every conversation of the object, and one step drives it whole
     // (`DurableAgent.step`), so there is nothing to choose. pi085: the sessions its list says have work.
     const sessions = pd ? [MAIN_SESSION] : sessionsWithWork(sql);

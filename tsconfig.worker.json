@@ -168,6 +168,7 @@
     "test/workspace-import.ts",
     "test/prewarm.ts",
     "test/provision-model.ts",
+    "test/raft-approvals.ts",
     "test/provision-usage.ts",
     "test/admin-fail-closed.ts",
     "test/mount-settings.ts",

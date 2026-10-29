@@ -20,7 +20,12 @@ import type { AgentProfile } from "../../src/runtime/agent-profile.ts";
 import { adminModels } from "./admin-models.ts";
 import { agentModel } from "./agent-model.ts";
 import { html, conditional, holds, notModified } from "./version.ts";
-import type { Json } from "../../src/core/types.ts";
+import type { ApprovalRecord, ApprovalState, DecidedBy, Json } from "../../src/core/types.ts";
+import { approvalItem, d1ApprovalIndex, hintTarget, publishApprovals, type ApprovalItem, type ProvisionDecideResult } from "./approvals.ts";
+import { DEFAULT_APPROVAL_TTL_MS } from "../../src/store/approvals-schema.ts";
+
+/** The states an approval is in from its decision on: being run, then its end. */
+const APPROVED_STATES: readonly ApprovalState[] = ["approved", "executed", "failed"];
 import { canonJson } from "../../src/core/canon-json.ts";
 import { bearerKey, hashApiKey, newApiKey } from "./agents-api/keys.ts";
 import { handleAgentsApi, type AgentsApiDeps } from "./agents-api/handlers.ts";
@@ -211,6 +216,19 @@ export interface Env {
   REBUILD_POLICY?: string;
   /** How long a run_js program suspended at `await pause(...)` waits for `resume`, in ms (default 60000). */
   RUN_JS_RESUME_MS?: string;
+  /**
+   * How long a held call waits for a decision before it is denied as expired, in hours (docs/raft-approvals.md,
+   * "Expiry"). Unset or not a positive number: 24. A change applies to holds made after it; a hold keeps its deadline.
+   */
+  APPROVAL_TTL_HOURS?: string;
+  /**
+   * The path on an agent's own Raft origin that is sent a signed "go pull" hint when one of its held calls changes
+   * (cf/src/approvals.ts `hintTarget`, docs/raft-approvals.md). Unset, or without RAFT_APPROVAL_CALLBACK_SECRET: no
+   * hints are sent, and Raft finds holds by reconciling `GET /provision/approvals`.
+   */
+  RAFT_APPROVAL_CALLBACK_PATH?: string;
+  /** The HMAC-SHA256 key the hints are signed with, shared with Raft (a Worker secret). */
+  RAFT_APPROVAL_CALLBACK_SECRET?: string;
   /** "1" opens the demo UI with no identity at all. Off by default. */
   UI_ALLOW_ANONYMOUS?: string;
   /**
@@ -457,6 +475,7 @@ export class AgentDO extends DurableObject<Env> {
       makeToolBinding: (execId) =>
         (this.ctx as any).exports.SandboxTools({ props: { execId, doId: this.ctx.id.toString() } }),
       runJsResumeMs: Number(this.env.RUN_JS_RESUME_MS) || undefined,
+      approvalTtlMs: approvalTtlMs(this.env),
       keepAlive: (at) => this.#keepAlive(at),
       operatorModel: operatorModelOf(this.env),
       versionId: this.env.CF_VERSION_METADATA?.id,
@@ -915,6 +934,7 @@ export class AgentDO extends DurableObject<Env> {
       makeToolBinding: (execId) =>
         (this.ctx as any).exports.SandboxTools({ props: { execId, doId: this.ctx.id.toString() } }),
       runJsResumeMs: Number(this.env.RUN_JS_RESUME_MS) || undefined,
+      approvalTtlMs: approvalTtlMs(this.env),
       keepAlive: (at) => this.#keepAlive(at),
       operatorModel: operatorModelOf(this.env),
       versionId: this.env.CF_VERSION_METADATA?.id,
@@ -2597,11 +2617,86 @@ export class AgentDO extends DurableObject<Env> {
     await this.#conversation(tenantId, agentId, t);
     taskId = t;
     await this.#busy("uiDecide", async () => {
-      await rt.gateway().applyApproval(tenantId, operationId, decision, approver);
-      // The decision produced a completion event; let the agent pick it up.
+      await rt.gateway().applyApproval(tenantId, operationId, decision, approver, { via: "console", approver });
+      // The next pass tells the agent the decision (`#tellApprovals`) and publishes it to the provider.
       await this.#wake();
     });
     return this.uiApprovals(tenantId, agentId, taskId);
+  }
+
+  /** Publish held calls' changes to the provider that made this agent (cf/src/approvals.ts `publishApprovals`). */
+  async #publishApprovals(tenantId: string, agentId: string) {
+    const rt = this.runtime();
+    return publishApprovals({
+      sql: this.sql as never, tenantId, agentId, now: () => Date.now(),
+      registry: () => d1ProvisionedAgents(this.env.CONTROL_DB).getByAgentId(tenantId, agentId),
+      item: (a, reg) => this.#approvalItem(rt, a, { providerAgentId: agentId, raftAgentId: reg.raftAgentId, raftServerId: reg.raftServerId }),
+      index: d1ApprovalIndex(this.env.CONTROL_DB),
+      target: (reg) => hintTarget(this.env, reg.raftOrigin),
+      fetch: (input, init) => fetch(input, init),
+      newId: () => crypto.randomUUID(),
+    });
+  }
+
+  /**
+   * The provider's view of one held call (cf/src/approvals.ts `ApprovalItem`): arguments redacted with this agent's
+   * sealed values, or withheld when those cannot be opened.
+   */
+  async #approvalItem(rt: AgentRuntime, a: ApprovalRecord, ids: { providerAgentId: string; raftAgentId: string; raftServerId: string }) {
+    const secrets = await agentSecretValues(this.sql, a.tenantId, a.agentId, this.env);
+    const mount = await rt.store.getMountByAlias(a.tenantId, a.agentId, a.mountAlias).catch(() => null);
+    return approvalItem(a, ids, mount?.plugin ?? null, (v) => secrets.ok ? redactCredentials(v, { secrets: secrets.values }) : null);
+  }
+
+  /**
+   * `GET /provision/agents/{id}/approvals` in this object: what is due expires first, so the list never offers a hold
+   * that can no longer be approved. Null for an agent this object does not hold.
+   */
+  async provisionApprovals(tenantId: string, agentId: string, ids: { raftAgentId: string; raftServerId: string }, status: ApprovalState | null) {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return this.#busy("provisionApprovals", async () => {
+      const rt = this.runtime();
+      await rt.ready();
+      if ((await rt.gateway().expireDue(tenantId)).length) await this.#wake();
+      const rows = (await rt.store.listApprovals(tenantId, status ?? undefined)).filter((a) => a.agentId === agentId);
+      const out: ApprovalItem[] = [];
+      for (const a of rows) out.push(await this.#approvalItem(rt, a, { providerAgentId: agentId, ...ids }));
+      return out;
+    });
+  }
+
+  /**
+   * `POST /provision/agents/{id}/approvals/{operationId}/decide` in this object. `decidedBy` is Raft's, checked by Raft's
+   * server (docs/raft-approvals.md): recorded as said. Answered once the decision is recorded: an approved call is run
+   * by the pass the wake below starts, which ends its hold `executed` or `failed`. The same decision again answers the
+   * first one (`replay`), whether its run has ended or not; the other is refused with what was decided. Null for an
+   * agent this object does not hold.
+   */
+  async provisionDecide(tenantId: string, agentId: string, ids: { raftAgentId: string; raftServerId: string }, operationId: string,
+    decision: "approved" | "denied", decidedBy: Extract<DecidedBy, { via: "raft" }>): Promise<ProvisionDecideResult | null> {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return this.#busy("provisionDecide", async () => {
+      const rt = this.runtime();
+      await rt.ready();
+      const full = { providerAgentId: agentId, ...ids };
+      const held = await rt.store.getApproval(tenantId, operationId);
+      if (!held || held.agentId !== agentId) return { ok: false as const, code: "approval_not_found" as const };
+      const r = await rt.gateway().applyApproval(tenantId, operationId, decision, `raft:${decidedBy.raftUserId}`, decidedBy, { run: "later" });
+      // Whatever happened, a pass runs what was approved, tells the agent and publishes the change.
+      await this.#wake();
+      const now = await rt.store.getApproval(tenantId, operationId);
+      const item = now ? await this.#approvalItem(rt, now, full) : undefined;
+      if (r.ok) return { ok: true as const, replay: false, item: item! };
+      if (r.reason === "expired") return { ok: false as const, code: "approval_expired" as const, item };
+      if (r.reason === "already_decided" && now) {
+        // An approval is still the same decision while it runs and after: `approved`, `executed` and `failed` all are.
+        const same = decision === "approved" ? APPROVED_STATES.includes(now.state) : now.state === "denied";
+        if (same) return { ok: true as const, replay: true, item: item! };
+        if (now.state === "expired") return { ok: false as const, code: "approval_expired" as const, item };
+        return { ok: false as const, code: "approval_already_decided" as const, item };
+      }
+      return { ok: false as const, code: "approval_not_found" as const };
+    });
   }
 
   async startTask(tenantId: string, agentId: string, taskId: string, text: string) {
@@ -2783,6 +2878,9 @@ export class AgentDO extends DurableObject<Env> {
         // A start without its end, below, is a pass that was cut short (a deploy cancels one).
         logEvent("alarm.start", { tenantId: who.tenantId, agentId: who.agentId, failures });
         await this.#deliverInbound(who.tenantId, who.agentId);
+        // A decision is published before the step runs its call, so Raft hears "approved" before "executed".
+        try { await this.#publishApprovals(who.tenantId, who.agentId); }
+        catch (e: any) { console.warn(`approval publish failed for ${who.agentId}: ${String(e?.message ?? e).slice(0, 200)}`); }
         const out = await rt.step(who.tenantId, who.agentId);
         // A container that could not be handed back is billed for merely
         // existing, so it is written down where diagnose can find it rather
@@ -2816,8 +2914,15 @@ export class AgentDO extends DurableObject<Env> {
         // The pass says when to come back — a retry has a time, a model call has a poll interval,
         // held usage a minute — or nothing, when it is genuinely idle and stands down rather than
         // waking every 30s for ever. Whatever input asked for during the pass is kept (alarm-next.ts).
-        const planned = out.wakeInMs !== null ? Date.now() + Math.max(50, out.wakeInMs)
+        // Held calls whose state Raft has not been given (cf/src/approvals.ts): after the step, which may have made or
+        // expired some. Never a reason for the pass to fail: what is left says when to come back.
+        let publishAt: number | null = null;
+        try { publishAt = (await this.#publishApprovals(who.tenantId, who.agentId)).nextAt; }
+        catch (e: any) { console.warn(`approval publish failed for ${who.agentId}: ${String(e?.message ?? e).slice(0, 200)}`); }
+        const plannedStep = out.wakeInMs !== null ? Date.now() + Math.max(50, out.wakeInMs)
           : usagePending ? Date.now() + 60_000 : null;
+        const planned = publishAt === null ? plannedStep : plannedStep === null ? Math.max(publishAt, Date.now() + 50) : Math.min(plannedStep, Math.max(publishAt, Date.now() + 50));
+        const deadline = await rt.approvalDeadline(who.tenantId).catch(() => null);
         let next = nextAlarm(this.#wakeAsked, planned);
         let comeBackInMs: number | null = null;
         if (next === null) {
@@ -2837,9 +2942,13 @@ export class AgentDO extends DurableObject<Env> {
           const moved = drainCursors(this.sql as any).some((c, i) => c > drainedFrom[i]!);
           comeBackInMs = standDownDelay(this.sql as any, hasUnsent(this.sql as any), moved);
           next = nextAlarm(this.#wakeAsked, comeBackInMs === null ? null : Date.now() + comeBackInMs);
-          if (next === null) await this.ctx.storage.deleteAlarm();
-          else await this.ctx.storage.setAlarm(next);
-        } else await this.ctx.storage.setAlarm(next);
+        }
+        // A held call's deadline is armed last, after the stand-down above was decided without it: an object with a
+        // hold still stands down (flushing as it does), and comes back only to expire it. Read before the stand-down,
+        // so nothing awaits between its look at the outboxes and the arming.
+        if (deadline !== null) next = next === null ? Math.max(deadline, Date.now() + 50) : Math.min(next, Math.max(deadline, Date.now() + 50));
+        if (next === null) await this.ctx.storage.deleteAlarm();
+        else await this.ctx.storage.setAlarm(next);
         // The forward's send, last: the next alarm is already as decided above, so a receiver that is slow or hangs
         // decides nothing about when the agent runs next. A Durable Object runs one alarm at a time, though, so what
         // the send spends still delays that alarm: it is bounded per pass (FORWARD_PASS_MS, every lane together), and
@@ -3627,6 +3736,12 @@ function surfaceDeps(env: Env): SurfaceDeps {
   };
 }
 
+/** How long a held call waits for a decision (APPROVAL_TTL_HOURS): a positive number of hours, else the default 24. */
+export function approvalTtlMs(env: Pick<Env, "APPROVAL_TTL_HOURS">): number {
+  const h = Number(env.APPROVAL_TTL_HOURS);
+  return Number.isFinite(h) && h > 0 ? Math.round(h * 3_600_000) : DEFAULT_APPROVAL_TTL_MS;
+}
+
 /** Whether this deployment serves an evaluation's setup routes and records their evidence: exactly "1", nothing looser. */
 export function evalSeedRoutes(env: Pick<Env, "EVAL_SEED_ROUTES">): boolean {
   return env.EVAL_SEED_ROUTES === "1";
@@ -3671,6 +3786,12 @@ function provisionDeps(env: Env): ProvisionDeps {
       enforcePicker: modelPickerEnforced(env),
     },
     readAudit: d1ReadAudit(env.CONTROL_DB),
+    approvals: {
+      list: (tenantId, agentId, ids, status) => stub(tenantId, agentId).provisionApprovals(tenantId, agentId, ids, status) as Promise<ApprovalItem[] | null>,
+      decide: (tenantId, agentId, ids, operationId, decision, decidedBy) =>
+        stub(tenantId, agentId).provisionDecide(tenantId, agentId, ids, operationId, decision, decidedBy) as Promise<ProvisionDecideResult | null>,
+      index: d1ApprovalIndex(env.CONTROL_DB),
+    },
     ...(evalSeedRoutes(env) ? {
       seed: {
         write: (tenantId, agentId, f) => stub(tenantId, agentId).seedWrite(tenantId, agentId, f.path, f.mode, f.text),

@@ -2,10 +2,11 @@
  * What a held call tells the model (#1112), and what the person it is sent to finds.
  *
  * Three halves. The gateway's held result: each sentence of `heldMessage` pinned to the fact it states (who decides,
- * where, no expiry, what happens next, and that an identical call while one is pending is merged into it), with a
- * decider, without one, and where nobody can decide. The deployment's wiring: an AgentRuntime with a console origin
- * links the agent's console page for a console or API agent's first conversation, and says nobody can decide for a
- * Raft-made agent or a call held in another conversation. The page itself,
+ * where, when it expires, that the outcome is told, the operation id and tool to pass on, and that an identical call
+ * while one is pending is merged into it), with a decider, without one, for a Raft-made agent, and where nobody can
+ * decide. The deployment's wiring: an AgentRuntime with a console origin links the agent's console page for a console
+ * or API agent's first conversation, says a Raft card goes to a Raft-made agent's owner, and says nobody can decide
+ * for a call held in another conversation. The page itself,
  * through the Worker's own `fetch` and `AgentDO` (the stand-in test/console-mounts.ts uses): the link decides
  * nothing, it asks for a sign-in, a decision without one is refused, and the card's account of the call is the
  * server's, from the row.
@@ -63,45 +64,57 @@ const AGAIN = "Calling this tool again with the same arguments while it waits re
 const MERGED_ONLY = (id: string) => `An identical call is already waiting for approval (operation ${id}); this call was not added as a second one.`;
 const MERGED = (id: string) => MERGED_ONLY(id) + " If you need it done twice, call again after that one is decided.";
 const NOBODY = "Nobody you can reach can approve it on the antiproton console today: ";
-const NOBODY_REST = "The operator can still approve it, from the provider's home or by its operation id; if it is approved, it runs on its own " +
-  "exactly as written, and you are not told the decision or the result. It does not expire. Antiproton notifies nobody of it. " +
-  "Tell your owner once that this action is blocked, then plan as if it will not run. " +
+/** The two sentences every hold now says: when it expires, and that the outcome comes as a notice. */
+const EXPIRES = (at: number) => `If nobody decides by ${new Date(at).toISOString()} (24 hours after it was held), it expires and is not run.`;
+const TOLD = "You will be woken with the outcome in a notice: executed (with its result), failed, denied, expired, or policy_denied " +
+  "(approved, but the mount's policy now refuses it); your turn does not wait for it.";
+const IDS = (id: string) => `giving the operation id (${id}) and the tool (ops.deploy)`;
+const NOBODY_REST = (id: string, at: number) => "The operator can still approve it by its operation id; if it is approved, it runs on its own exactly as written. " +
+  `${EXPIRES(at)} ${TOLD} Antiproton notifies nobody of it. ` +
+  `Tell your owner once that this action is blocked, ${IDS(id)}, then plan as if it will not run. ` +
   "Retrying will not make it happen sooner: calling again with the same arguments returns this same pending approval.";
-const NOBODY_RAFT = NOBODY + "this agent was made through Raft, and the console accepts no Raft sign-in, so its owner cannot open it. " + NOBODY_REST;
+const RAFT_TEXT = (id: string, at: number) => `This call is held for approval (operation ${id}). An approval card for it goes to your owner in Raft, and they approve or deny it there; ` +
+  `if approved, it runs on its own exactly as written. ${EXPIRES(at)} ${TOLD} If you tell your owner about it, give the operation id (${id}) and the tool (ops.deploy). ` +
+  `Do not retry it. ${AGAIN}`;
+/** The default deadline, give or take the test's own run time. */
+const DAY = 24 * 60 * 60 * 1000;
+const deadlineOk = (r: any, before: number) => typeof r.expires === "number" && r.expires >= before + DAY && r.expires <= Date.now() + DAY;
 
 // ---------------------------------------------------------------- the held result
 
-await check("with a decider: the result names them, the page and the operation, and says what happens next", async () => {
+await check("with a decider: the result names them, the page and the operation, when it expires, and that the outcome is told", async () => {
   const { gw } = await gateway(() => ({ decider: "artin", url: URL_A }));
+  const before = Date.now();
   const r: any = await gw.invoke(CTX, "ops.deploy", {});
   must(r.status === "pending" && r.error?.code === "awaiting_approval", `not held: ${JSON.stringify(r)}`);
   const m = messageOf(r);
   must(m.includes(`(operation ${r.operationId})`), `the operation id: ${m}`);
   must(m.includes(`artin decides it on the antiproton console at ${URL_A}.`), `who and where: ${m}`);
-  must(m.includes("It does not expire: it waits until someone decides."), `the expiry: ${m}`);
-  must(m.includes("you are not told the decision or the result, and your turn does not wait for it"), `what happens next: ${m}`);
-  must(m.includes("Antiproton notifies nobody of it: if it matters, send artin that link in a message."), `meanwhile: ${m}`);
+  must(deadlineOk(r, before) && m.includes(EXPIRES(r.expires)), `the expiry: ${m}`);
+  must(m.includes(TOLD), `what happens next: ${m}`);
+  must(m.includes(`Antiproton notifies nobody of it: if it matters, send artin that link once, ${IDS(r.operationId)}.`), `meanwhile: ${m}`);
   must(m.endsWith(AGAIN), `the second call: ${m}`);
-  must(r.decider === "artin" && r.expires === null && r.url === URL_A, `the structured fields: ${JSON.stringify(r)}`);
+  must(r.decider === "artin" && r.url === URL_A, `the structured fields: ${JSON.stringify(r)}`);
 });
 
-await check("without a decider: it says none is known and who can decide, and to ask a person", async () => {
+await check("without a decider: it says none is known and who can decide, and to ask a person with the operation id and tool", async () => {
   const { gw } = await gateway(() => ({ decider: null, url: URL_A }));
+  const before = Date.now();
   const r: any = await gw.invoke(CTX, "ops.deploy", {});
   const m = messageOf(r);
   must(m.includes(`No decider is known: it is decided on the antiproton console at ${URL_A}, by a person signed in there with access to this agent.`), `no decider: ${m}`);
-  must(m.includes("Antiproton notifies nobody of it: if it matters, send a person that link in a message."), `meanwhile: ${m}`);
-  must(m.includes("It does not expire"), `the expiry: ${m}`);
-  must(r.decider === null && r.expires === null && r.url === URL_A, `the structured fields: ${JSON.stringify(r)}`);
+  must(m.includes(`Antiproton notifies nobody of it: if it matters, send a person that link once, ${IDS(r.operationId)}.`), `meanwhile: ${m}`);
+  must(deadlineOk(r, before) && m.includes(EXPIRES(r.expires)) && m.includes(TOLD), `the expiry and the notice: ${m}`);
+  must(r.decider === null && r.url === URL_A, `the structured fields: ${JSON.stringify(r)}`);
 });
 
-await check("without a console origin or a place at all: the panel is named, the operation id is what to send", async () => {
+await check("without a console origin or a place at all: the panel is named, a message with the operation id and tool is what to send", async () => {
   const { gw } = await gateway();
   const r: any = await gw.invoke(CTX, "ops.deploy", {});
   const m = messageOf(r);
   must(m.includes("No decider is known: it is decided on this agent's approvals panel on the antiproton console, by a person signed in there with access to this agent."), `where: ${m}`);
-  must(m.includes("send a person the operation id in a message."), `meanwhile: ${m}`);
-  must(r.decider === null && r.expires === null && r.url === null, `the structured fields: ${JSON.stringify(r)}`);
+  must(m.includes(`send a person a message once, ${IDS(r.operationId)}.`), `meanwhile: ${m}`);
+  must(r.decider === null && typeof r.expires === "number" && r.url === null, `the structured fields: ${JSON.stringify(r)}`);
 });
 
 await check("a place that throws still holds the call, and the text names neither decider nor link", async () => {
@@ -111,14 +124,48 @@ await check("a place that throws still holds the call, and the text names neithe
   must((await store.listApprovals("t", "pending")).length === 1, "the hold was not recorded");
 });
 
-await check("nobody can decide: the text says so, with no link, no expiry, nobody notified, tell the owner and do not retry", async () => {
+await check("a Raft-made agent: the text says a Raft card goes to the owner, when it expires, that the outcome is told, and the ids", async () => {
   const { gw } = await gateway(() => heldPlaceFor("raft", "main", URL_A));
   const r: any = await gw.invoke(CTX, "ops.deploy", {});
   const m = messageOf(r);
   must(r.status === "pending", `not held: ${JSON.stringify(r)}`);
-  must(m === `This call is held for approval (operation ${r.operationId}). ${NOBODY_RAFT}`, `the text: ${m}`);
+  must(m === RAFT_TEXT(r.operationId, r.expires), `the text: ${m}`);
+  must(!m.includes("http") && !m.includes("does not expire") && !m.includes("notifies nobody"), `a link, no expiry or nobody told: ${m}`);
+  must(r.decider === null && typeof r.expires === "number" && r.url === null, `the structured fields: ${JSON.stringify(r)}`);
+});
+
+await check("nobody can decide (a console agent's call in another conversation): it says so, expires, is told, and the owner gets the ids", async () => {
+  const { gw } = await gateway(() => heldPlaceFor("console", "k", URL_A));
+  const r: any = await gw.invoke(CTX, "ops.deploy", {});
+  const m = messageOf(r);
+  must(m.startsWith(`This call is held for approval (operation ${r.operationId}). ${NOBODY}`) && m.endsWith(NOBODY_REST(r.operationId, r.expires)), `the text: ${m}`);
   must(!m.includes("http") && !m.includes("decided on"), `a link or a place: ${m}`);
-  must(r.decider === null && r.expires === null && r.url === null, `the structured fields: ${JSON.stringify(r)}`);
+});
+
+await check("a deployment with expiry off: the text says it does not expire, and `expires` is null", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "ops", plugin: "ops", installationId: "i", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: { write: "approval" } });
+  const gw = new ToolGateway(store, [PLUGIN], new Set(["ops"]), { async resolve() { return null; } }, undefined, { approvalTtlMs: 0 });
+  const r: any = await gw.invoke(CTX, "ops.deploy", {});
+  must(r.expires === null && messageOf(r).includes("It does not expire: it waits until someone decides.") && messageOf(r).includes(TOLD), messageOf(r));
+  must((await store.getApproval("t", r.operationId))?.expiresAt === null, "the row has a deadline");
+});
+
+await check("a deployment's own TTL is the one the text names, for the first call and for an identical one merged into it", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "ops", plugin: "ops", installationId: "i", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: { write: "approval" } });
+  const gw = new ToolGateway(store, [PLUGIN], new Set(["ops"]), { async resolve() { return null; } }, undefined, { approvalTtlMs: 30 * 60_000 });
+  const first: any = await gw.invoke(CTX, "ops.deploy", {});
+  const second: any = await gw.invoke(CTX, "ops.deploy", {});
+  for (const r of [first, second]) {
+    must(r.expires === first.expires && messageOf(r).includes(`If nobody decides by ${new Date(first.expires).toISOString()} (30 minutes after it was held), it expires`), messageOf(r));
+  }
 });
 
 await check("an identical call while the first is pending: the same operation, one approval, and the result says it was merged", async () => {
@@ -200,11 +247,11 @@ await check("a secret-shaped argument is in neither the held text nor a program'
   must(!data.approval.includes(token) && !data.approval.includes("ghp_") && !JSON.stringify(data).includes("ghp_"), `in data: ${JSON.stringify(data)}`);
 });
 
-await check("the no-expiry claim: the approval row has no deadline, and deciding it later still runs it", async () => {
+await check("the deadline claim: the row has the deadline the text gives, and deciding before it still runs it", async () => {
   const { gw, store } = await gateway(() => ({ decider: null, url: URL_A }));
   const r: any = await gw.invoke(CTX, "ops.deploy", {});
   const [row] = await store.listApprovals("t", "pending");
-  must(row && !Object.keys(row).some((k) => /expir|deadline|until/i.test(k)), `the row: ${JSON.stringify(row)}`);
+  must(row && row.expiresAt === r.expires && messageOf(r).includes(EXPIRES(row.expiresAt!)), `the row: ${JSON.stringify(row)}`);
   const ok = await gw.applyApproval("t", r.operationId, "approved", "someone");
   must(ok.ok && ok.executed, `the decision did not run it: ${JSON.stringify(ok)}`);
 });
@@ -225,6 +272,12 @@ await check("a program's hold carries the same text as data.approval, and the no
   must(/data\.approval says who decides it/.test(pausedNote(p, [])), `note: ${pausedNote(p, [])}`);
 });
 
+await check("a pause with calls also held says the agent is woken with their outcome, not that it is never told", () => {
+  const note = pausedNote({ cause: "pause", reason: "check", data: null } as any, [{ tool: "ops__deploy", operationId: "op_1", status: "pending" }]);
+  must(/woken with its outcome/.test(note), `note: ${note}`);
+  must(!/not told/.test(note), `note: ${note}`);
+});
+
 // ---------------------------------------------------------------- the deployment's wiring
 
 await check("approvalsUrl: the agent's console page, ids only, and none without an origin", () => {
@@ -234,7 +287,7 @@ await check("approvalsUrl: the agent's console page, ids only, and none without 
   must([...u.searchParams.keys()].join(",") === "view,agentId" && u.searchParams.get("agentId") === "a b&c", `params: ${u.search}`);
 });
 
-await check("heldPlaceFor: a console or API agent's first conversation has the page; a Raft agent or another conversation has nobody", () => {
+await check("heldPlaceFor: a console or API agent's first conversation has the page, another conversation nobody; a Raft agent has Raft", () => {
   for (const kind of ["console", "api"] as const) {
     const p = heldPlaceFor(kind, "main", URL_A);
     must("url" in p && p.url === URL_A && p.decider === null, `${kind}: ${JSON.stringify(p)}`);
@@ -243,7 +296,7 @@ await check("heldPlaceFor: a console or API agent's first conversation has the p
   }
   for (const task of ["main", "sess_1"]) {
     const p = heldPlaceFor("raft", task, URL_A);
-    must("nobody" in p && /made through Raft/.test(p.nobody), `raft in ${task}: ${JSON.stringify(p)}`);
+    must("raft" in p && p.raft === true, `raft in ${task}: ${JSON.stringify(p)}`);
   }
 });
 
@@ -303,7 +356,7 @@ await check("a call held in a child conversation, then made again from main: mer
   const r: any = await rt.gateway().invoke(MAIN, "ops.deploy", { v: 1 });
   must(r.operationId === child.operationId && r.url === null && !messageOf(r).includes("http"), `main's: ${JSON.stringify(r)}`);
   must(messageOf(r) === `${MERGED_ONLY(child.operationId)} ${NOBODY}` +
-    `the console's page for this agent shows only its first conversation's held calls, and this call was held in another one. ${NOBODY_REST}`,
+    `the console's page for this agent shows only its first conversation's held calls, and this call was held in another one. ${NOBODY_REST(child.operationId, child.expires)}`,
     `main's text: ${messageOf(r)}`);
   // Control: main's own call with other arguments still gets the page.
   const own: any = await rt.gateway().invoke(MAIN, "ops.deploy", { v: 2 });
@@ -311,30 +364,32 @@ await check("a call held in a child conversation, then made again from main: mer
   host.dispose();
 });
 
-await check("an AgentRuntime, Raft-made agent: nobody can decide, no link, tell the owner, do not retry", async () => {
+await check("an AgentRuntime, Raft-made agent: a Raft card to the owner, the deadline, the coming notice, no link", async () => {
   const { rt, host } = await runtimeFor({ provisionedBy: PROVISIONED_BY });
+  const before = Date.now();
   const r: any = await rt.gateway().invoke(MAIN, "ops.deploy", {});
-  must(r.status === "pending" && r.url === null && r.decider === null && r.expires === null, `${JSON.stringify(r)}`);
-  must(messageOf(r) === `This call is held for approval (operation ${r.operationId}). ${NOBODY_RAFT}`, `the text: ${messageOf(r)}`);
+  must(r.status === "pending" && r.url === null && r.decider === null && deadlineOk(r, before), `${JSON.stringify(r)}`);
+  must(messageOf(r) === RAFT_TEXT(r.operationId, r.expires), `the text: ${messageOf(r)}`);
   host.dispose();
 });
 
-await check("current behaviour, until Raft approvals deliver decisions: after a decision the agent receives nothing", async () => {
-  // What `heldMessage` tells the agent ("you are not told the decision or the result"). The Raft approvals work
-  // (botiverse/antiproton#1112 follow-up) is meant to change this; this case is then the one to rewrite.
+await check("a decision writes the notice the agent is told at its next step, and the decision itself writes nothing to the conversation", async () => {
+  // What `heldMessage` promises ("You are woken with the outcome in a notice"). The post itself is the step's
+  // (cf/src/runtime.ts `#tellApprovals`), read where it reaches the model in test/raft-approvals.ts.
   const { rt, host } = await runtimeFor({});
   const conversationRows = () => (host.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'pi_%entries'").toArray() as any[])
     .reduce((n, t) => n + Number((host.sql.exec(`SELECT COUNT(*) AS c FROM ${t.name}`).toArray()[0] as any).c), 0);
-  const inConversation = (needle: string) => (host.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'pi_%entries'").toArray() as any[])
-    .some((t) => (host.sql.exec(`SELECT * FROM ${t.name}`).toArray() as any[]).some((row) => JSON.stringify(row).includes(needle)));
   const before = conversationRows();
   const approved: any = await rt.gateway().invoke(MAIN, "ops.deploy", { marker: "approved-marker" });
   const denied: any = await rt.gateway().invoke(MAIN, "ops.deploy", { marker: "denied-marker" });
   const ran = await rt.gateway().applyApproval("t", approved.operationId, "approved", "someone");
   must(ran.ok && ran.executed && (ran.result as any)?.status === "succeeded", `control: the approved call did not run: ${JSON.stringify(ran)}`);
   must((await rt.gateway().applyApproval("t", denied.operationId, "denied", "someone")).ok, "control: not denied");
-  must(conversationRows() === before, `the conversation changed: ${before} -> ${conversationRows()} rows`);
-  for (const needle of [approved.operationId, denied.operationId, "approved-marker"]) must(!inConversation(needle), `${needle} reached the conversation`);
+  must(conversationRows() === before, `the decision wrote the conversation: ${before} -> ${conversationRows()} rows`);
+  const untold = await rt.store.untoldApprovals("t");
+  const said = (id: string) => untold.find((a: any) => a.operationId === id)?.notice ?? "";
+  must(said(approved.operationId).startsWith(`[approval ${approved.operationId} — ops.deploy — approved by someone and run: succeeded;`), `approved: ${said(approved.operationId)}`);
+  must(said(denied.operationId).startsWith(`[approval ${denied.operationId} — ops.deploy — denied by someone;`), `denied: ${said(denied.operationId)}`);
   host.dispose();
 });
 
@@ -426,7 +481,7 @@ await check("the signed-in owner's panel describes the call from its row: agent,
   must(html.includes("Approving runs this one call, exactly as shown, with the agent's <code>stamp</code> mount; denying runs nothing."), "what approving does");
 });
 
-await check("why a Raft-made agent is told nobody can decide: it is listed under the provider's home, so its owner's own sign-in cannot open its panel", async () => {
+await check("why a Raft-made agent's holds are decided in Raft, not on the console: it is listed under the provider's home, so its owner's own sign-in cannot open its panel", async () => {
   // What provisioning does (cf/src/index.ts `agent.adopt`): the agent is recorded under PROVIDER_HOME, nobody's sign-in.
   const RAFT_AGENT = "raft-made";
   const store = (objects.get(agentObjectName(T, RAFT_AGENT)) ?? fresh(agentObjectName(T, RAFT_AGENT)));
@@ -458,7 +513,7 @@ await check("/ui/approvals lists every held call of the agent, a second conversa
 
 await check("the card's account is escaped: a tool name cannot write markup into the panel", () => {
   const html = approvals([{ tenantId: "t", operationId: "op<x>", agentId: "a", taskId: "main", mountAlias: "m", tool: "<b>t</b>",
-    request: { args: {} }, state: "pending", approver: null, decidedAt: null, createdAt: 0 }]);
+    request: { args: {} }, state: "pending", approver: null, decidedAt: null, createdAt: 0, expiresAt: null, decidedBy: null, outcome: null, runAt: null }]);
   must(!html.includes("<b>t</b>") && html.includes("&lt;b&gt;t&lt;/b&gt;") && html.includes("op&lt;x&gt;"), html);
 });
 

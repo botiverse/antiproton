@@ -4,6 +4,7 @@
 |---|---|---|
 | [`agents-api.md`](agents-api.md) | OpenAI Agents API compatibility guide, SDK configuration, and endpoint reference | yes — preview API guide |
 | [`agent-surface.md`](agent-surface.md) | an agent's usage and workspace files: the three read-only endpoints on `/v1` and their Raft provider binding | yes — endpoint contract |
+| [`raft-approvals.md`](raft-approvals.md) | held calls of Raft-hosted agents: the provider routes to list and decide them, the signed hint, expiry, and what the agent is told | yes — contract with Raft |
 | [`ax-design.md`](ax-design.md) | Agent Experience (AX) architecture: how official apps talk to agents in two layers, premise tracking, and structured interruptions | yes — design specification |
 | [`metering.md`](metering.md) | how a model call is metered on the pd engine: at delivery, verdict markers for unaccepted answers, and the drift check against pi-durable's `pi.usage`; prices (1 credit = $1), who pays, and the ledger's retention | yes — metering contract |
 | [`runbook.md`](runbook.md) | operating the deployment: finding and stopping a runaway agent | yes — operator procedure |

@@ -1,12 +1,15 @@
 import type { SeedNoticeRow, SeedPassResult, SeedPlan, SeedRecord } from "../store/seed-record.ts";
 import type { SealHow, SeedFileMeta, SeedSeal, SeedStoreResult, SeedWrite } from "../store/seed-files.ts";
 import type { ImportedFile, ImportExcerpt } from "../store/workspace-import.ts";
+import type { DecideOutcome, UntoldApproval } from "../store/approvals-schema.ts";
 import type { ToolConfig } from "./tool-config.ts";
 import type {
   AdvanceTxn,
   CommitResult,
   Json,
   ApprovalRecord,
+  ApprovalState,
+  DecidedBy,
   Lease,
   ModelBinding,
   OperationRecord,
@@ -346,29 +349,47 @@ export interface StorageAdapter {
   getModelBinding(tenantId: string, agentId: string): Promise<ModelBinding | null>;
 
   /** Hold a call for a human. The request is stored verbatim: an approver has
-   *  to be able to see exactly what they are approving. */
+   *  to be able to see exactly what they are approving. `expiresAt` absent or
+   *  null: no deadline (the gateway always gives one unless its TTL is 0). */
   requireApproval(
-    a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt">,
+    a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt" | "decidedBy" | "expiresAt" | "outcome" | "runAt"> & { expiresAt?: number | null },
   ): Promise<void>;
   /**
    * Hold a call unless the same call is already held: the agent's pending approvals for this mount and tool are
-   * matched with `same`, and the first match is returned instead of a second row. The lookup and the insert are one
+   * matched with `same`, and the first match is returned instead of a second row. A pending row past its deadline
+   * (`expiresAt`, not yet swept) is not matched: it is about to expire, and the call deserves a hold that can still be
+   * decided. `expiresAt` is written in the same transaction as the row. The lookup and the insert are one
    * synchronous transaction, so two calls of one turn (pi runs them with `Promise.all`) cannot both miss and both
    * insert. `same` must be synchronous: an await inside it would reopen that gap.
    */
   holdApproval(
-    a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt">,
+    a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt" | "decidedBy" | "expiresAt" | "outcome" | "runAt"> & { expiresAt?: number | null },
     same: (held: ApprovalRecord) => boolean,
   ): Promise<{ created: true } | { created: false; existing: ApprovalRecord }>;
   getApproval(tenantId: string, operationId: string): Promise<ApprovalRecord | null>;
   /** Decide once. A second decision is refused rather than applied, so an
-   *  approval cannot be replayed into a second execution. */
+   *  approval cannot be replayed into a second execution; the refusal carries
+   *  the row, so a caller can say what the first decision was. `expired` lands
+   *  only on a hold past its deadline, and a person's decision never does
+   *  (src/store/approvals-schema.ts `decisionProblem`). `notice` is what the
+   *  agent is told (`untoldApprovals`); an approval's is written when its run
+   *  ends (`finishApproval`). */
   decideApproval(
-    tenantId: string, operationId: string, decision: "approved" | "denied", approver: string,
-  ): Promise<{ ok: true; record: ApprovalRecord } | { ok: false; reason: "not_found" | "already_decided" }>;
+    tenantId: string, operationId: string, decision: "approved" | "denied" | "expired", approver: string,
+    opts?: { decidedBy?: DecidedBy; notice?: string },
+  ): Promise<DecideOutcome>;
   listApprovals(
-    tenantId: string, state?: "pending" | "approved" | "denied",
+    tenantId: string, state?: ApprovalState,
   ): Promise<ApprovalRecord[]>;
+  /**
+   * Take an approved call's run: true for exactly one caller, which then runs it and ends it (`finishApproval`). A
+   * run taken and never ended (the object stopped during it) is not taken again: it may have landed.
+   */
+  claimApprovalRun(tenantId: string, operationId: string, at: number): Promise<boolean>;
+  /** End an approved call's run as `executed` or `failed`, with what it gave back and the agent's notice. Once. */
+  finishApproval(tenantId: string, operationId: string, state: "executed" | "failed", outcome: { summary: string }, notice: string): Promise<boolean>;
+  /** Holds that ended (FINAL_STATES) the agent has not been told of, oldest decision first. */
+  untoldApprovals(tenantId: string): Promise<UntoldApproval[]>;
 
   addMount(m: MountRecord): Promise<void>;
   /**

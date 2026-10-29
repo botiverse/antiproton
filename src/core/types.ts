@@ -137,8 +137,10 @@ export interface ModelBinding {
  *
  * Evaluated at the gateway, the same choke point that holds credentials, so a
  * policy cannot be bypassed by any harness or any sandbox. `approval` does not
- * block a thread: the call is recorded and the task parks, because in a service
- * the approver may take hours and nothing should be holding a process for them.
+ * block a thread: the call is recorded and the model is told it is held, because
+ * in a service the approver may take hours and nothing should be holding a
+ * process for them. The decision, or the hold's expiry, reaches the agent later
+ * as a notice (cf/src/runtime.ts `#tellApprovals`).
  */
 export type PolicyDecision = "allow" | "deny" | "approval";
 
@@ -161,11 +163,43 @@ export interface ApprovalRecord {
   tool: string;
   /** Exactly what was asked for — this is what an approver is approving. */
   request: Json;
-  state: "pending" | "approved" | "denied";
+  state: ApprovalState;
   approver: string | null;
   decidedAt: number | null;
   createdAt: number;
+  /**
+   * When an undecided hold is denied as `expired` (src/runtime/gateway.ts `expireApproval`). Null only on a row the
+   * gateway was told to keep open (a TTL of 0); every pending row from before the column existed was given its
+   * creation plus the default TTL when the column was added (src/store/approvals-schema.ts).
+   */
+  expiresAt: number | null;
+  /** Who decided, as the deciding path said it: Raft's server-side checked user, a console sign-in, or the expiry. */
+  decidedBy: DecidedBy | null;
+  /**
+   * What an approved call's run came to, once it ended (`executed` or `failed`): a summary of its result or error, at
+   * most NOTICE_RESULT_MAX characters (src/runtime/approval-notice.ts), as the tool gave it. Not redacted here: a reader
+   * that shows it to anyone but the agent redacts it (cf/src/approvals.ts). Null before the run ends.
+   */
+  outcome: { summary: string } | null;
+  /** When an approved call's run was claimed (`StorageAdapter.claimApprovalRun`); null before, and for other states. */
+  runAt: number | null;
 }
+
+/**
+ * Where a held call stands. `approved` is a decision whose run has not ended yet; the run ends it as `executed` or
+ * `failed`. `expired` is its own end, not a `denied`: nobody refused it, nobody decided in time, and the agent is told
+ * exactly that.
+ */
+export type ApprovalState = "pending" | "approved" | "denied" | "expired" | "executed" | "failed";
+
+/**
+ * Who decided a held call. `raft` is what Raft's server said after its own identity check (docs/raft-approvals.md):
+ * antiproton records it and does not re-check it, since the caller is the provider token.
+ */
+export type DecidedBy =
+  | { via: "raft"; raftUserId: string; role: "agent_owner" | "server_owner" | "server_admin" }
+  | { via: "console"; approver: string }
+  | { via: "expiry" };
 
 /** Config-time binding. The agent addresses `alias`, never a connection id. */
 export interface MountRecord {

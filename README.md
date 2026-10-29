@@ -152,9 +152,14 @@ Four things the picture is meant to make obvious:
 
 A mount carries a policy — `{read, write, tools}`, each `allow`, `deny` or
 `approval`. A denied tool never reaches the plugin. A call marked `approval`
-is not performed: the operation is recorded, the task **parks on it**, and a
-person sees the request verbatim and signs it. The decision wakes the task,
-and the call is then performed exactly once.
+is not performed: the operation is recorded as a hold, the model is told it
+is held, and its turn goes on. A person sees the request verbatim and signs
+it, on the console or, for an agent Raft hosts, on a Raft action card
+([`docs/raft-approvals.md`](docs/raft-approvals.md)). An approved call is then
+performed exactly once, under the mount's policy as it is then: a `deny` set
+since the hold wins. A hold nobody decides within the TTL (`APPROVAL_TTL_HOURS`,
+24 hours by default) expires and is not performed. Whichever way it ends, the
+agent is told at its next step.
 
 **A gate binds the mount it is set on, so two mounts of one plugin are two
 authorities.** That is worth stating because the default runs the other way: a

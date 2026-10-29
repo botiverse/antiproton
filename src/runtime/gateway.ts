@@ -19,6 +19,10 @@ import { PLUGIN_TRACE_KINDS } from "../trace/outbox.ts";
 import { openPluginDatabase } from "./plugin-db.ts";
 import { AGENT_SCOPE_ALIAS } from "../store/plugin-db.ts";
 import { payerKey, toolCallRows } from "../usage/outbox.ts";
+import type { DecidedBy } from "../core/types.ts";
+import { DEFAULT_APPROVAL_TTL_MS } from "../store/approvals-schema.ts";
+import type { ApprovalRecord } from "../core/types.ts";
+import { approvalOutcome, approvedNotice, deniedNotice, expiredNotice, unknownOutcomeNotice } from "./approval-notice.ts";
 
 /** One mount's answer to a plugin hook the runtime called (`ToolGateway.afterTurn`, `wake`). */
 export type PluginHookAnswer = { alias: string; next: PluginNext | null } | { alias: string; skipped: string } | { alias: string; failed: string };
@@ -496,7 +500,14 @@ function routeCard(decl: BridgeDecl, req: { method: string; path: string; body: 
  * the deployment has no console origin. Or `nobody`: no person with access to the agent can open a page that decides
  * it today, and why, in words for the model (a Raft-made agent; a call held where the console's page does not look).
  */
-export type HeldPlace = { decider: string | null; url: string | null } | { nobody: string };
+export type HeldPlace = { decider: string | null; url: string | null } | { nobody: string } | { raft: true };
+
+/** A hold's time to live in words: whole hours from one hour up (APPROVAL_TTL_HOURS), minutes below. */
+function ttlWords(ms: number): string {
+  if (ms >= 3_600_000) { const h = Math.round(ms / 3_600_000); return `${h} hour${h === 1 ? "" : "s"}`; }
+  const m = Math.max(1, Math.round(ms / 60_000));
+  return `${m} minute${m === 1 ? "" : "s"}`;
+}
 
 /** Canonical JSON: object keys sorted at every depth, so two calls with the same arguments compare equal as text. */
 export function canonicalJson(v: unknown): string {
@@ -511,39 +522,50 @@ function heldKey(agentId: string, mountAlias: string, tool: string, request: unk
 }
 
 /**
- * What the model reads when a call is held: who decides, where, what happens next, what to do meanwhile.
+ * What the model reads when a call is held: who decides, where, when it expires, what happens next, what to do meanwhile.
  *
- * Each sentence states what the code does, because the model acts on it. Nothing is sent anywhere when a call is held:
- * the approval is a row the console's panel reads (cf/src/ui.ts `approvals`), so a person learns of it only from the
- * agent or by opening the console. The row has no expiry (src/store/sqlite.ts `requireApproval`). The decision runs the
- * call (`applyApproval`) but is not put into the conversation, so the agent is not told it. An identical call made
- * while one is pending is merged into it (`#invoke`), so `merged` says that this call added nothing.
+ * Each sentence states what the code does, because the model acts on it. For an agent Raft hosts, Raft is told of the
+ * hold (cf/src/approvals.ts `publishApprovals`) and puts an action card in the owner's DM (docs/raft-approvals.md);
+ * for any other agent the hold is a row the console's panel reads (cf/src/ui.ts `approvals`), so a person learns of it
+ * only from the agent or by opening the console. Every hold expires at `expiresAt` unless the deployment turned expiry
+ * off (`expireDue`), and its outcome is posted to the conversation (cf/src/runtime.ts `#tellApprovals`), so the agent
+ * is told without polling. Where the text tells the agent to tell someone, it says to give the operation id and the
+ * tool, which is what an operator looks the hold up by. An identical call made while one is pending returns that one
+ * (`heldKey`).
  */
-export function heldMessage(operationId: string, place: HeldPlace, merged = false): string {
+export function heldMessage(operationId: string, place: HeldPlace, merged = false,
+  call: { tool: string; expiresAt: number | null; ttlMs?: number | null } = { tool: "this tool", expiresAt: null }): string {
   const opening = merged
     ? `An identical call is already waiting for approval (operation ${operationId}); this call was not added as a second one.`
     : `This call is held for approval (operation ${operationId}).`;
   const again = "Calling this tool again with the same arguments while it waits returns this same pending approval; it does not create another.";
+  const expiry = call.expiresAt === null
+    ? "It does not expire: it waits until someone decides."
+    : `If nobody decides by ${new Date(call.expiresAt).toISOString()}${call.ttlMs ? ` (${ttlWords(call.ttlMs)} after it was held)` : ""}, it expires and is not run.`;
+  // `policy_denied`: an approved call is run under the mount's policy as it is then, and a `deny` set since wins (`#invoke`).
+  const told = "You will be woken with the outcome in a notice: executed (with its result), failed, denied, expired, or policy_denied " +
+    "(approved, but the mount's policy now refuses it); your turn does not wait for it.";
+  const ids = `giving the operation id (${operationId}) and the tool (${call.tool})`;
+  const twice = merged ? " If you need it done twice, call again after that one is decided." : "";
+  if ("raft" in place) {
+    return `${opening}${twice} An approval card for it goes to your owner in Raft, and they approve or deny it there; if approved, it runs on its own ` +
+      `exactly as written. ${expiry} ${told} If you tell your owner about it, give the operation id (${operationId}) and the tool (${call.tool}). Do not retry it. ${again}`;
+  }
   if ("nobody" in place) {
     // Nobody the agent can reach, but the row can still be decided: the decide route takes an operation id with no
-    // page listing it (cf/src/index.ts `uiDecide`), and a Raft-made agent's provider home signs in to it. So the text
-    // keeps the warning that an approval runs it unannounced.
+    // page listing it (cf/src/index.ts `uiDecide`).
     return `${opening} Nobody you can reach can approve it on the antiproton console today: ${place.nobody}. ` +
-      "The operator can still approve it, from the provider's home or by its operation id; if it is approved, it runs on its own " +
-      "exactly as written, and you are not told the decision or the result. " +
-      "It does not expire. Antiproton notifies nobody of it. " +
-      "Tell your owner once that this action is blocked, then plan as if it will not run. " +
+      "The operator can still approve it by its operation id; if it is approved, it runs on its own exactly as written. " +
+      `${expiry} ${told} Antiproton notifies nobody of it. ` +
+      `Tell your owner once that this action is blocked, ${ids}, then plan as if it will not run. ` +
       "Retrying will not make it happen sooner: calling again with the same arguments returns this same pending approval.";
   }
-  const twice = merged ? " If you need it done twice, call again after that one is decided." : "";
   const page = place.url ? `the antiproton console at ${place.url}` : "this agent's approvals panel on the antiproton console";
   const who = place.decider
     ? `${place.decider} decides it on ${page}.`
     : `No decider is known: it is decided on ${page}, by a person signed in there with access to this agent.`;
-  return `${opening}${twice} ${who} ` +
-    `It does not expire: it waits until someone decides. If approved, it runs on its own exactly as written; ` +
-    `you are not told the decision or the result, and your turn does not wait for it. ` +
-    `Antiproton notifies nobody of it: if it matters, send ${place.decider ?? "a person"} ${place.url ? "that link" : "the operation id"} in a message. ` +
+  return `${opening}${twice} ${who} ${expiry} If approved, it runs on its own exactly as written. ${told} ` +
+    `Antiproton notifies nobody of it: if it matters, send ${place.decider ?? "a person"} ${place.url ? "that link" : "a message"} once, ${ids}. ` +
     again;
 }
 
@@ -625,9 +647,14 @@ export class ToolGateway {
     store: StorageAdapter, plugins: Plugin[], seeded: ReadonlySet<string>,
     secrets: SecretResolver = envSecrets,
     inbound?: (tenantId: string, agentId: string, alias: string) => InboundHooks,
-    opts: { credentialRejected?: CredentialRejected; heldPlace?: (ctx: CallContext) => HeldPlace | Promise<HeldPlace> } = {},
-  ) {
+    opts: {
+      credentialRejected?: CredentialRejected;
+      heldPlace?: (ctx: CallContext) => HeldPlace | Promise<HeldPlace>;
+      /** How long a held call waits for a decision before it is denied as expired; 0 keeps holds open. */
+      approvalTtlMs?: number;
+    } = {},  ) {
     for (const p of plugins) checkBridge(p);
+    this.#approvalTtlMs = opts.approvalTtlMs ?? DEFAULT_APPROVAL_TTL_MS;
     this.#store = store;
     this.#plugins = new Map(plugins.map((p) => [p.id, p]));
     this.#secrets = secrets;
@@ -642,6 +669,7 @@ export class ToolGateway {
   /** Who decides a held call and where; without it the held result names neither (`heldMessage`). */
   #heldPlace?: (ctx: CallContext) => HeldPlace | Promise<HeldPlace>;
 
+  readonly #approvalTtlMs: number;
   readonly #seeded: ReadonlySet<string>;
 
   #inbound?: (tenantId: string, agentId: string, alias: string) => InboundHooks;
@@ -721,27 +749,109 @@ export class ToolGateway {
    * Deciding is atomic and happens once, so one approval can never authorise
    * two executions. On approval the recorded request is executed exactly as it
    * was recorded — an approver approved that request, not whatever the agent
-   * might ask for next. The result, or the denial, ends the operation and is on
-   * its completion event, which only the console reads: nothing puts it into the
-   * conversation, so the agent is not told (`heldMessage` says so).
-   */
+   * might ask for next. `run: "now"` (the console) runs it before answering;
+   * `run: "later"` (the provider route) answers once the decision is recorded,
+   * and the object's next pass runs it (`runApproved`). Either way the run ends
+   * the hold `executed` or `failed` with its outcome and the agent's notice
+   * (cf/src/runtime.ts `#tellApprovals`); the caller wakes the object. A
+   * decision on a hold past its deadline expires it instead (`expireApproval`)
+   * and answers `expired`.   */
   async applyApproval(
     tenantId: string,
     operationId: string,
     decision: "approved" | "denied",
     approver: string,
-  ): Promise<{ ok: false; reason: string } | { ok: true; executed: boolean; result?: ToolResult }> {
-    const decided = await this.#store.decideApproval(tenantId, operationId, decision, approver);
-    if (!decided.ok) return { ok: false, reason: decided.reason };
+    decidedBy?: DecidedBy,
+    opts: { run?: "now" | "later" } = {},
+  ): Promise<{ ok: false; reason: string; record?: ApprovalRecord } | { ok: true; executed: boolean; result?: ToolResult; record: ApprovalRecord }> {
+    // A denial's notice is known now, so it is written with the decision; an approval's is written when its run ends.
+    const held = decision === "denied" ? await this.#store.getApproval(tenantId, operationId) : null;
+    const decided = await this.#store.decideApproval(tenantId, operationId, decision, approver, {
+      ...(decidedBy ? { decidedBy } : {}),
+      ...(held ? { notice: deniedNotice({ ...held, state: "denied", approver, decidedBy: decidedBy ?? null }) } : {}),
+    });
+    if (!decided.ok) {
+      if (decided.reason === "expired") {
+        const e = await this.expireApproval(tenantId, operationId);
+        return { ok: false, reason: "expired", record: e.ok ? e.record : decided.record };
+      }
+      return { ok: false, reason: decided.reason, ...("record" in decided ? { record: decided.record } : {}) };
+    }
 
     const a = decided.record;
     if (decision === "denied") {
       await this.#store.completeOperation(tenantId, operationId, "cancelled", null, {
         denied: true, approver,
       }, { denied: true });
-      return { ok: true, executed: false };
+      return { ok: true, executed: false, record: a };
     }
+    if (opts.run === "later") return { ok: true, executed: false, record: a };
+    const ran = await this.runApproved(tenantId, operationId);
+    return { ok: true, executed: ran?.executed ?? false, ...(ran ? { result: ran.result } : {}), record: a };
+  }
 
+  /**
+   * Run one approved call and end its hold: `executed` when the call succeeded (or went to the background), `failed`
+   * otherwise. Null when the run was not this caller's to take (`claimApprovalRun`): taken already, or not approved.
+   */
+  async runApproved(tenantId: string, operationId: string): Promise<{ executed: boolean; result: ToolResult } | null> {
+    if (!(await this.#store.claimApprovalRun(tenantId, operationId, Date.now()))) return null;
+    const a = await this.#store.getApproval(tenantId, operationId);
+    if (!a) return null;
+    let r0: { executed: boolean; result: ToolResult };
+    try {
+      r0 = await this.#runApproved(tenantId, operationId, a);
+    } catch (e) {
+      // The run threw past the gateway's own handling: it is ended as failed, saying so, rather than left approved.
+      r0 = { executed: false, result: { status: "failed", operationId, error: { code: "run_failed", message: String((e as Error)?.message ?? e).slice(0, 300) } } };
+    }
+    const out = approvalOutcome(r0.result);
+    await this.#store.finishApproval(tenantId, operationId, out.state, { summary: out.summary }, approvedNotice(a, r0.result));
+    return r0;
+  }
+
+  /**
+   * The pass's share of approved calls (cf/src/runtime.ts `#approvalPass`): each approved and not yet run is run; one
+   * taken longer than `staleMs` ago and never ended (the object stopped during its run) is ended `failed`, saying its
+   * outcome is not known, and never run again. Answers how many it ended.
+   */
+  async settleApproved(tenantId: string, now: number, staleMs: number): Promise<number> {
+    let ended = 0;
+    for (const a of await this.#store.listApprovals(tenantId, "approved")) {
+      if (a.runAt === null) { if (await this.runApproved(tenantId, a.operationId)) ended++; continue; }
+      if (now - a.runAt < staleMs) continue;
+      const summary = "the run was started but its end was not recorded; whether it landed is not known";
+      if (await this.#store.finishApproval(tenantId, a.operationId, "failed", { summary }, unknownOutcomeNotice({ ...a, state: "approved" }))) ended++;
+    }
+    return ended;
+  }
+
+  /**
+   * Deny a hold nobody decided in time, as `expired`: the operation ends `rejected` with `approval_expired`, nothing
+   * runs, and the agent is told at its next step. Refused (`not_due`) before the deadline, and for a decided row.
+   */
+  async expireApproval(tenantId: string, operationId: string):
+    Promise<{ ok: true; record: ApprovalRecord } | { ok: false; reason: string; record?: ApprovalRecord }> {
+    const held = await this.#store.getApproval(tenantId, operationId);
+    const decided = await this.#store.decideApproval(tenantId, operationId, "expired", "expiry", {
+      decidedBy: { via: "expiry" }, ...(held ? { notice: expiredNotice(held) } : {}),
+    });
+    if (!decided.ok) return { ok: false, reason: decided.reason, ...("record" in decided ? { record: decided.record } : {}) };
+    await this.#store.completeOperation(tenantId, operationId, "rejected", null, {
+      status: "rejected", error: { code: "approval_expired", message: "nobody decided this held call before it expired, so it was not run" },
+    } as Json, {});
+    return { ok: true, record: decided.record };
+  }
+
+  /** Every pending hold of the tenant whose deadline has passed, expired; the ids it expired. */
+  async expireDue(tenantId: string, now: number = Date.now()): Promise<string[]> {
+    const due = (await this.#store.listApprovals(tenantId, "pending")).filter((a) => a.expiresAt !== null && a.expiresAt <= now);
+    const done: string[] = [];
+    for (const a of due) if ((await this.expireApproval(tenantId, a.operationId)).ok) done.push(a.operationId);
+    return done;
+  }
+
+  async #runApproved(tenantId: string, operationId: string, a: ApprovalRecord): Promise<{ executed: boolean; result: ToolResult }> {
     const req = a.request as { tool: string; args: Json };
     const ctx: CallContext = { tenantId, agentId: a.agentId, taskId: a.taskId };
     // A model-only tool (`ToolSchema.modelOnly`) run here runs with no model reading the result, which is the one
@@ -761,7 +871,7 @@ export class ToolGateway {
         },
       };
       await this.#store.completeOperation(tenantId, operationId, "cancelled", null, result as unknown as Json);
-      return { ok: true, executed: false, result };
+      return { executed: false, result };
     }
     // `approved` bypasses the policy check for this one recorded call only.
     let result = await this.invoke(ctx, req.tool, req.args, { approved: true, operationId });
@@ -787,7 +897,7 @@ export class ToolGateway {
     await this.#store.completeOperation(
       tenantId, operationId, result.status === "succeeded" ? "succeeded" : result.status === "rejected" ? "rejected" : "failed", null, result as Json,
     );
-    return { ok: true, executed: true, result };
+    return { executed: true, result };
   }
 
   /**
@@ -1316,7 +1426,9 @@ export class ToolGateway {
       : stricter(own, key === false ? "approval" : policyFor(r.mount.policy, key, side, defaults));
     // `confirm` can only add a person, never take one away nor lift a refusal: a confirmed call the policy denies is
     // denied, since an approval card for it would let one click run what the mount owner closed.
-    const verdict = opts.approved ? "allow" : confirm ? stricter(decided, "approval") : decided;
+    // `approved` lifts the hold the person signed, never a refusal: the mount's policy is read as it is now, so a mount
+    // switched to `deny` after the call was held refuses the approved run too (#1097).
+    const verdict = opts.approved ? (decided === "deny" ? "deny" : "allow") : confirm ? stricter(decided, "approval") : decided;
     if (verdict === "deny") {
       // The operation was recorded above, before the policy was asked, so a
       // refusal has to end it or the row stays "pending" for ever — an attempt
@@ -1349,9 +1461,10 @@ export class ToolGateway {
     }
     if (verdict === "approval") {
       // Recorded, not executed, and not blocking a thread: the approver may
-      // take hours and nothing should hold a process for them. Nothing parks
-      // or wakes the task on the decision: `applyApproval` runs the call and
-      // ends the operation, and the conversation is not told.
+      // take hours and nothing should hold a process for them. Nothing parks:
+      // the model gets this answer now and its turn goes on. The decision, or
+      // the hold's expiry (`expiresAt`, swept by `expireDue`), is told to the
+      // agent later as a notice (cf/src/runtime.ts `#tellApprovals`).
       // `heldBy` tells the card who asked for it: a policy, or the agent. `policyKey` is the second name the call was
       // decided under, so an owner who allowed the tool sees which setting is still missing; `route` is what a person
       // signs for a bridged request, since its arguments are an SDK's, not a sentence.
@@ -1367,9 +1480,12 @@ export class ToolGateway {
       // The lookup and the insert are one store transaction (`holdApproval`): pi runs a turn's tool calls together
       // (`Promise.all`), so with an await between them two identical calls could both miss and both insert.
       const same = heldKey(ctx.agentId, r.mount.alias, r.tool, request);
+      const deadline = this.#approvalTtlMs > 0 ? Date.now() + this.#approvalTtlMs : null;
       const hold = await this.#store.holdApproval({
         tenantId: ctx.tenantId, operationId, agentId: ctx.agentId, taskId: ctx.taskId,
         mountAlias: r.mount.alias, tool: r.tool, request,
+        // Set in the store's transaction with the row, so a hold is never written without its deadline.
+        expiresAt: deadline,
       }, (a) => heldKey(a.agentId, a.mountAlias, a.tool, a.request) === same);
       const pending = hold.created ? undefined : hold.existing;
       if (pending) {
@@ -1381,13 +1497,17 @@ export class ToolGateway {
       const at: CallContext = pending ? { ...ctx, taskId: pending.taskId } : ctx;
       // A place that cannot be read must not lose the hold, which is already recorded: the text then names neither.
       const place: HeldPlace = await (async () => this.#heldPlace?.(at))().catch(() => undefined) ?? { decider: null, url: null };
+      const expiresAt = pending ? pending.expiresAt : deadline;
       return {
         status: "pending",
         operationId: held,
-        decider: "nobody" in place ? null : place.decider,
-        expires: null,
-        url: "nobody" in place ? null : place.url,
-        error: { code: "awaiting_approval", message: heldMessage(held, place, pending !== undefined) },
+        decider: "decider" in place ? place.decider : null,
+        expires: expiresAt,
+        url: "url" in place ? place.url : null,
+        error: { code: "awaiting_approval", message: heldMessage(held, place, pending !== undefined, {
+          tool: `${r.mount.alias}.${r.tool}`, expiresAt,
+          ttlMs: expiresAt === null ? null : pending ? expiresAt - pending.createdAt : this.#approvalTtlMs,
+        }) },
       };
     }
 
