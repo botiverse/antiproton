@@ -1661,6 +1661,59 @@ await check("a project-scope registration carrying the box's placeholder is name
   w.dispose();
 });
 
+await check("every unclean box has a reason code, and the action follows it: retry_delete only for what a retry can finish; residue and stranded boxes never set retry", async () => {
+  // Registrations left, or run9 refusing: retry_delete, and the answer says a retry helps.
+  {
+    const run9 = run9Fake();
+    const w = await world({ run9 });
+    const a = await w.agent("YD");
+    await w.connect(a);
+    await w.sandbox(a);
+    run9.f.failDelete = true; run9.f.failWithdraw = true;
+    const r = await w.call("DELETE", "/agents/by-raft-agent/YD");
+    must(boxOf(r.body)?.code === "listing_failed" && boxOf(r.body).action === "retry_delete" && r.body.retry === true, `run9 refusing: ${r.text}`);
+    run9.f.failWithdraw = false; run9.f.ignoreWithdraw = true;
+    const left = await w.call("DELETE", "/agents/by-raft-agent/YD");
+    must(boxOf(left.body)?.code === "not_withdrawn" && boxOf(left.body).action === "retry_delete" && left.body.retry === true, `registrations left: ${left.text}`);
+    w.dispose();
+  }
+  // Only project-scope residue left, the box itself deleted: needs_operator_cleanup (#1128), and no retry.
+  {
+    const run9 = run9Fake();
+    const w = await world({ run9 });
+    const a = await w.agent("YE");
+    await w.connect(a);
+    await w.sandbox(a);
+    const [boxId] = [...run9.boxes.keys()];
+    run9.project.push({ secret_id: "p9", name: "X", value: "x", placeholder: run9.boxes.get(boxId!)!.secrets[0]!.placeholder, inject_header_name: "authorization", allowed_hosts: ["api.github.com"] });
+    const r = await w.call("DELETE", "/agents/by-raft-agent/YE");
+    must(!run9.boxes.has(boxId!) && boxOf(r.body)?.code === "project_residue" && boxOf(r.body).action === "needs_operator_cleanup" && /#1128/.test(boxOf(r.body).message)
+      && r.body.clean === false && r.body.retry === false, `residue only: ${r.text}`);
+    w.dispose();
+  }
+  // A stranded box (made under a key since replaced): await_provider_reclaim, and no retry.
+  {
+    const run9 = run9Fake();
+    const w = await world({ run9 });
+    const a = await w.agent("YF");
+    await w.connect(a);
+    await w.sandbox(a);
+    const host = w.hostOf(a.agentId);
+    const row = host.sql.exec("SELECT rowid AS r, value FROM plugin_db WHERE agent_id = ? AND alias = 'sandbox' AND store = 'box'", a.agentId).toArray()[0] as any;
+    const state = JSON.parse(String(row.value));
+    const [name, machine] = Object.entries(state.machines as Record<string, any>)[0]!;
+    state.stranded = { [machine.boxId]: { ...machine, strandedAt: 1, strandReason: "the key changed" } };
+    delete state.machines[name];
+    host.sql.exec("UPDATE plugin_db SET value = ? WHERE rowid = ?", JSON.stringify(state), row.r);
+    run9.f.deleteNotFound = true;
+    const r = await w.call("DELETE", "/agents/by-raft-agent/YF");
+    const box = (r.body?.sandboxes?.boxes ?? []).find((b: any) => b.id === machine.boxId);
+    must(box?.code === "stranded" && box.action === "await_provider_reclaim" && /until run9 reclaims/.test(box.message) && r.body.clean === false && r.body.retry === false,
+      `stranded: ${r.text}`);
+    w.dispose();
+  }
+});
+
 await check("withdraw never deletes project-scope secrets (shared run9 project: would stop prod injection)", async () => {
   const run9 = run9Fake();
   const w = await world({ run9 });
@@ -1670,10 +1723,10 @@ await check("withdraw never deletes project-scope secrets (shared run9 project: 
   const [boxId] = [...run9.boxes.keys()];
   const placeholder = run9.boxes.get(boxId!)!.secrets[0]!.placeholder;
   run9.project.push({ secret_id: "p3", name: "GH_TOKEN", value: "x", placeholder, inject_header_name: "authorization", allowed_hosts: ["api.github.com"] });
-  await w.call("DELETE", "/agents/by-raft-agent/YA");
-  // The operator's withdrawal (the route's answer) names it too.
+  // The operator's withdrawal (the route's answer) names it too, while the box is there.
   const op = await a.rt.withdrawEgress(TENANT, a.agentId);
   must(op.things[0]?.projectResidue?.[0]?.secretId === "p3", `the operator's answer: ${JSON.stringify(op)}`);
+  await w.call("DELETE", "/agents/by-raft-agent/YA");
   const writes = run9.sent.filter((x) => x.method !== "GET" && /^\/projects\/default\/secrets/.test(x.path));
   must(writes.length === 0 && run9.sent.some((x) => x.method === "GET" && x.path === "/projects/default/secrets"), `project-scope writes: ${JSON.stringify(writes.map((x) => `${x.method} ${x.path}`))}`);
   must(run9.project.length === 1, "a project secret went");

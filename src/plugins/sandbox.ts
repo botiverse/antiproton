@@ -2388,7 +2388,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       const mount = await readMount(ctx);
       const cfg = cfgOf(ctx);
       const backend = backendFor(cfg);
-      const out: Array<{ id: string; clean: boolean; ownKey: boolean; why?: string; review?: string;
+      const out: Array<{ id: string; clean: boolean; ownKey: boolean; code?: "no_credential" | "stranded" | "listing_failed" | "not_withdrawn"; why?: string; review?: string;
         projectResidue?: Array<{ secretId: string; name: string; reason: string }> }> = [];
       for (const machine of boxedMachines(mount)) {
         const state = await readView(ctx, machine);
@@ -2397,7 +2397,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         if (!backend.caps.boxSecrets) { out.push({ id: state.boxId, clean: true, ownKey: false, why: `${backend.name} wires no account into a box` }); continue; }
         // A deletion by this mount's release is believed only for a box recorded as made under this kind of key.
         const ownKey = !!ctx.credential && state.credentialRef !== undefined && state.credentialRef === ctx.credentialRefKind;
-        if (!ctx.credential) { out.push({ id: state.boxId, clean: false, ownKey: false, why: "no credential to reach the box with" }); continue; }
+        if (!ctx.credential) { out.push({ id: state.boxId, clean: false, ownKey: false, code: "no_credential", why: "no credential to reach the box with" }); continue; }
         try {
           const provider = backend.open(cfg, ctx.credential);
           const before = await provider.listSecrets(state.boxId);
@@ -2426,19 +2426,20 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
             delete next.wired; delete next.leftOut;
             await writeView(ctx, machine, next);
           }
+          // `clean` is the box's own registrations; project-scope residue is named beside it, for the caller to weigh.
           const why = left.length ? `${left.length} registration(s) still on the box after removal`
             : injected ? `${injected} project-scope registration(s) carry this box's placeholder, so run9 still injects them` : undefined;
-          out.push({ id: state.boxId, clean: !left.length && !injected, ownKey, ...(why ? { why } : {}),
+          out.push({ id: state.boxId, clean: !left.length, ownKey, ...(left.length ? { code: "not_withdrawn" as const } : {}), ...(why ? { why } : {}),
             ...(named ? { review: `${named} project-scope registration(s) share a name with this box's accounts; a person should look` } : {}),
             ...(injected ? { projectResidue } : {}) });
         } catch (e) {
           // What run9 answered is never repeated here, only its status: this text reaches Raft in a DELETE's answer.
           const why = e instanceof ProviderError ? `run9 refused (${e.status ? `HTTP ${e.status}` : e.code})` : String((e as Error)?.message ?? e).slice(0, 200);
-          out.push({ id: state.boxId, clean: false, ownKey, why });
+          out.push({ id: state.boxId, clean: false, ownKey, code: "listing_failed", why });
         }
       }
       for (const id of Object.keys(mount?.stranded ?? {})) {
-        out.push({ id, clean: false, ownKey: false, why: "stranded: made under a key since replaced, so with this one its registrations can be neither listed nor removed, nor the box deleted" });
+        out.push({ id, clean: false, ownKey: false, code: "stranded", why: "stranded: made under a key since replaced, so with this one its registrations can be neither listed nor removed, nor the box deleted" });
       }
       return out;
     },

@@ -759,13 +759,39 @@ export const isOperatorModelRef = (ref: string) => providerOfRef(ref) !== null;
 export { OPERATOR_RUN9_REF, OPERATOR_INSTABOX_REF, OPERATOR_EXA_REF } from "./operator-ref.ts";
 
 /**
+ * Why a held thing is not clean after an agent's delete. `not_withdrawn` and `listing_failed` (registrations left,
+ * or run9 refusing, unreachable or answering what cannot be read) are what the next delete retries. The rest no retry
+ * fixes: `project_residue` (the box is clear, a project-scope registration still acts for it), `stranded` (made under
+ * a key since replaced), `no_credential` (no key to reach it), `deletion_unconfirmed` (let go, but not made under this
+ * kind of key, so a "deleted" cannot be believed).
+ */
+export type UncleanCode = "not_withdrawn" | "listing_failed" | "project_residue" | "stranded" | "no_credential" | "deletion_unconfirmed";
+/**
+ * What to do about each: `retry_delete` (the next delete can finish it); `needs_operator_cleanup` (a known object an
+ * operator can reach, #1128); `await_provider_reclaim` (nothing reachable with any current key: a stranded box, which
+ * #1128 cannot list or reach either, holds the credential until run9 reclaims it). Only the first is retryable.
+ */
+export type UncleanAction = "retry_delete" | "needs_operator_cleanup" | "await_provider_reclaim";
+const ACTION_OF: Record<UncleanCode, UncleanAction> = {
+  not_withdrawn: "retry_delete", listing_failed: "retry_delete",
+  project_residue: "needs_operator_cleanup", no_credential: "needs_operator_cleanup", deletion_unconfirmed: "needs_operator_cleanup",
+  stranded: "await_provider_reclaim",
+};
+const MESSAGE_OF: Partial<Record<UncleanAction, string>> = {
+  needs_operator_cleanup: "retrying the delete cannot clear this; it needs an operator (botiverse/antiproton#1128, planned)",
+  await_provider_reclaim: "this box cannot be located or deleted with any current key; the credential registered on it stays usable until run9 reclaims the box",
+};
+
+/**
  * What an agent's delete did to what its mounts hold (`AgentRuntime.releaseForDelete`): for each held thing, whether
  * it is clean and how that was seen (`withdrawn`: nothing registered for it any more; `deleted`: let go by a release
  * that can be believed), or why not; the mounts let go; and every step that failed.
  */
 export interface ReleaseForDelete {
   things: Array<{ alias: string; id: string; clean: boolean; via?: "withdrawn" | "deleted"; why?: string; review?: string;
-    projectResidue?: Array<{ secretId: string; name: string; reason: string }> }>;
+    projectResidue?: Array<{ secretId: string; name: string; reason: string }>;
+    /** Why not clean, and what to do: retried by the next delete, or a person's (#1128). */
+    code?: UncleanCode; action?: UncleanAction; message?: string }>;
   released: string[];
   failed: Array<{ alias: string; stage: "withdraw" | "release"; error: string }>;
 }
@@ -4860,9 +4886,17 @@ export class AgentRuntime {
         // A project-scope registration carrying the box's placeholder outlives the box: run9 injects it into whatever
         // its label matches. Never clean while one is there, deleted box or not, and always named.
         const residue = t.projectResidue?.length ? t.projectResidue : null;
-        const via = residue ? null : t.clean ? "withdrawn" as const : t.ownKey && !releaseFailed.has(t.alias) ? "deleted" as const : null;
-        return { alias: t.alias, id: t.id, clean: via !== null, ...(via ? { via } : {}), ...(via || !t.why ? {} : { why: t.why }),
-          ...(t.review ? { review: t.review } : {}), ...(residue ? { projectResidue: residue } : {}) };
+        const via = t.clean ? "withdrawn" as const : t.ownKey && !releaseFailed.has(t.alias) ? "deleted" as const : null;
+        const common = { alias: t.alias, id: t.id, ...(t.review ? { review: t.review } : {}), ...(residue ? { projectResidue: residue } : {}) };
+        if (via && !residue) return { ...common, clean: true, via };
+        // The action follows the reason (`ACTION_OF`): only what the next delete can do is `retry_delete`.
+        const code: UncleanCode = via ? "project_residue"
+          : t.code === "stranded" || t.code === "no_credential" ? t.code
+          : !releaseFailed.has(t.alias) ? "deletion_unconfirmed"
+          : t.code === "listing_failed" ? "listing_failed" : "not_withdrawn";
+        const action = ACTION_OF[code];
+        return { ...common, clean: false, ...(via ? { via } : {}), code, action, ...(t.why ? { why: t.why } : {}),
+          ...(MESSAGE_OF[action] ? { message: MESSAGE_OF[action] } : {}) };
       }),
       released: r.released,
       failed: [...w.failed.map((f) => ({ ...f, stage: "withdraw" as const })), ...r.failed.map((f) => ({ ...f, stage: "release" as const }))],

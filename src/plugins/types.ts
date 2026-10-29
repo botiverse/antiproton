@@ -1887,11 +1887,13 @@ export interface Holding {
    * Take back every credential this mount registered at the far end for the things it holds, without letting the
    * things go: for an agent's delete, before the release, so a thing the release cannot end (a refusal, an outage)
    * stops acting with the agent's accounts at once. Never a throw: an answer for each held thing, `clean` only on
-   * positive evidence that nothing is registered for it any more (a complete listing, read with a key that sees it,
-   * showing none), and `ownKey` when the thing records being made under the mount's current kind of key, so a
+   * positive evidence that nothing is registered on it any more (a complete listing, read with a key that sees it,
+   * showing none; registrations made outside it are `projectResidue`), and `ownKey` when the thing records being made under the mount's current kind of key, so a
    * deletion of it by this mount's release can be believed.
    */
   withdraw?(ctx: PluginContext): Promise<Array<{ id: string; clean: boolean; ownKey: boolean; why?: string; review?: string;
+    /** Why not clean: no key to reach it, made under a key since replaced, a listing that failed, or registrations left. */
+    code?: "no_credential" | "stranded" | "listing_failed" | "not_withdrawn";
     /** Registrations made outside the thing (run9's project scope) that still act for it, which this never removes. */
     projectResidue?: Array<{ secretId: string; name: string; reason: string }> }>>;
   /**

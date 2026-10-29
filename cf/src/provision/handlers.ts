@@ -86,7 +86,8 @@ export interface ProvisionAgentOps {
    */
   releaseForDelete?(tenantId: string, agentId: string): Promise<{
     things: Array<{ alias: string; id: string; clean: boolean; via?: "withdrawn" | "deleted"; why?: string; review?: string;
-      projectResidue?: Array<{ secretId: string; name: string; reason: string }> }>;
+      projectResidue?: Array<{ secretId: string; name: string; reason: string }>;
+      code?: string; action?: "retry_delete" | "needs_operator_cleanup" | "await_provider_reclaim"; message?: string }>;
     released: string[];
     failed: Array<{ alias: string; stage: "withdraw" | "release"; error: string }>;
   }>;
@@ -1123,13 +1124,23 @@ export async function handleProvision(
         : stillRunning.length ? { stopped: true, stillRunning, action: "retry_delete" as const } : null;
       const sandboxes = held === null ? null : {
         released: held.released,
-        boxes: held.things.map((t) => t.clean ? t : { ...t, action: "retry_delete" as const }),
+        boxes: held.things,
         ...(held.failed.length ? { failed: held.failed } : {}),
       };
       const connectionsClean = ends === null ? true : ends.every((e) => e.mount === "cleared" && !e.error);
       const clean = connectionsClean && turn === null && (held === null || (held.things.every((t) => t.clean) && held.failed.length === 0));
+      // `retry`: whether a repeated DELETE can finish anything left. Never true when all that is left is a person's
+      // (`needs_operator_cleanup`, or a connection's `revoke_on_github`).
+      // A release that failed is retried too, unless what it failed on is only what no retry fixes (a stranded box).
+      const releaseRetry = held !== null && held.failed.some((f) => {
+        if (f.stage === "withdraw") return true;
+        const mine = held.things.filter((t) => f.alias === "*" || t.alias === f.alias);
+        return mine.length === 0 || mine.some((t) => t.clean || t.action === "retry_delete");
+      });
+      const retry = turn !== null || (ends ?? []).some((e) => e.action === "retry_delete")
+        || (held !== null && (releaseRetry || held.things.some((t) => t.action === "retry_delete")));
       if (ends === null && held === null && turn === null) return ok(agent);
-      return ok({ ...agent, ...(ends === null ? {} : { connections: ends, connectionsClean }), ...(turn ? { turn } : {}), ...(sandboxes ? { sandboxes } : {}), clean });
+      return ok({ ...agent, ...(ends === null ? {} : { connections: ends, connectionsClean }), ...(turn ? { turn } : {}), ...(sandboxes ? { sandboxes } : {}), clean, retry });
     };
     if (row.status === "deleted") {
       const ends = await unbind(deps.now());

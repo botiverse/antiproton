@@ -1141,10 +1141,10 @@ export class ToolGateway {
    * mount, for an exclusive plugin, as `releaseTask` is. A mount whose plugin has no `withdraw` registers nothing.
    */
   async withdrawTask(ctx: CallContext): Promise<{
-    things: Array<{ alias: string; id: string; clean: boolean; ownKey: boolean; why?: string; review?: string; projectResidue?: Array<{ secretId: string; name: string; reason: string }> }>;
+    things: Array<{ alias: string; id: string; clean: boolean; ownKey: boolean; code?: string; why?: string; review?: string; projectResidue?: Array<{ secretId: string; name: string; reason: string }> }>;
     failed: Array<{ alias: string; error: string }>;
   }> {
-    const things: Array<{ alias: string; id: string; clean: boolean; ownKey: boolean; why?: string; review?: string; projectResidue?: Array<{ secretId: string; name: string; reason: string }> }> = [];
+    const things: Array<{ alias: string; id: string; clean: boolean; ownKey: boolean; code?: string; why?: string; review?: string; projectResidue?: Array<{ secretId: string; name: string; reason: string }> }> = [];
     const failed: Array<{ alias: string; error: string }> = [];
     for (const mount of await this.#store.listMounts(ctx.tenantId, ctx.agentId)) {
       const plugin = this.#plugins.get(mount.plugin);
