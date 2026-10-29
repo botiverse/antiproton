@@ -1,20 +1,24 @@
 /**
- * Every provider route that names one agent refuses a platform token issued for another Raft origin.
+ * Every provider route that reaches an agent refuses a token issued for another Raft origin.
  *
  * A platform token derives the tenant from `?raftServerId=` alone (`tenantFor`), so a token minted for another Raft
- * deployment that names this server's id lands in the same tenant. What stops it is a check of the row's `raftOrigin`
- * against the token's, made route by route; the approval routes were the first to get it.
+ * deployment that names this server's id lands in the same tenant. What stops it on the routes under
+ * `/agents/<id>/…` is the check of the row's `raftOrigin` against the token's in `agentAt`
+ * (cf/src/provision/handlers.ts), the one way a route reaches the agent its path names. The routes that reach agents
+ * another way (a create's replay, a connector's agents) are cases of their own, at the end.
  *
  * The routes are not listed here by hand. `handleProvision` is an if-chain, not a table, so they are found by asking
  * it: every method, with every path the router's own words can spell (each lowercase literal in the handlers' and the
  * agent surface's source, one to three segments deep, a parameter where one may stand), is sent for an agent that does
  * not exist, and a request that looks the agent up is a route that takes an agent id. That the search reached every
- * route is checked against the source: each line of handlers.ts that looks an agent up by the path's id must have been
- * the one a found route called it from.
+ * route, and that each goes through `agentAt`, is checked against the source: every agent lookup in handlers.ts is
+ * either named as not the path's (NOT_THE_PATH, with why) or is `agentAt`'s one lookup, which every found route
+ * makes its lookup from.
  *
  * Then, for each route in both spellings (`/agents/<providerAgentId>/…`, `/agents/by-raft-agent/<raftAgentId>/…`):
  * the agent's own origin is served (a same-origin control), another origin is refused — a 404 or no route, with
- * nothing past the lookup touched.
+ * nothing past the lookup touched. A tenant-scoped token likewise: its own tenant at its origin is served, another
+ * origin or another tenant is refused.
  */
 import { readFileSync } from "node:fs";
 import { handleProvision, tenantFor, type ProvisionDeps } from "../cf/src/provision/handlers.ts";
@@ -82,9 +86,11 @@ function deps(row: ProvisionedAgent | null, extra: Record<string, unknown> = {},
   return { deps: d, lookups, touched };
 }
 
-async function send(d: ProvisionDeps, method: string, path: string, origin: string, body: unknown = {}) {
+/** A platform token of `who` when it is an origin; otherwise the token given. */
+type Who = Parameters<typeof handleProvision>[4];
+async function send(d: ProvisionDeps, method: string, path: string, who: string | Who, body: unknown = {}) {
   try {
-    const r = await handleProvision(method, path, { idempotencyKey: null, raftServerId: SERVER, credentialId: "cred-1" }, body, platform(origin), d);
+    const r = await handleProvision(method, path, { idempotencyKey: null, raftServerId: SERVER, credentialId: "cred-1" }, body, typeof who === "string" ? platform(who) : who, d);
     return r === null ? { status: null as number | null, text: "" } : { status: r.status, text: await r.text() };
   } catch (e) {
     // A stand-in answers null where a real dependency answers a value, and a handler may trip on it: that is a request
@@ -126,7 +132,7 @@ const NOT_THE_PATH: Array<{ call: string; why: string }> = [
   { call: "const row = await deps.registry.get(tenantId, raftAgentId);\n  if (!row || row.deletedAt !== null) return { ok: false", why: "repairPush: the id an operator names, no provider route" },
   { call: "let row = await deps.registry.get(tenantId, raftAgentId);", why: "POST /agents: the body's raftAgentId (a create or its replay; see the cases outside /agents/<id> below)" },
   { call: "const a = raftAgentId === row.raftAgentId ? row : await deps.registry.get(tenantId, raftAgentId);", why: "reconnect in place: the other agents bound to the connector" },
-  { call: "const row = await deps.registry.get(tenantId, raftAgentId);\n      if (row) await c.detachIfFrom", why: "DELETE /connectors/:id: the agents bound to the connector" },
+  { call: "for (const raftAgentId of bound) rows.set(raftAgentId, await deps.registry.get(tenantId, raftAgentId));", why: "DELETE /connectors/:id: the agents bound to the connector" },
   { call: "const got = await c.registry.get(tenantId, row.raftAgentId, p);", why: "the connection registry, keyed by an agent already found (two calls)" },
 ];
 const HANDLERS_TEXT = readFileSync(HANDLERS, "utf8");
@@ -145,19 +151,6 @@ const EXEMPT = NOT_THE_PATH.map((e) => {
 /** The lines that must look up the path's agent: every lookup call NOT_THE_PATH does not explain. */
 const LOOKUP_LINES = [...new Set(LOOKUP_CALLS.filter((n) => !EXEMPT.some((e) => e.at.includes(n))))];
 
-/**
- * Routes that serve another origin's token today: the gap #1116 names, found by this test, and left for its fix.
- * TODO(#1116): refuse another origin on these (as the approval routes do) and empty this list. An entry that refuses
- * already fails the test, so the list only shrinks.
- */
-const KNOWN_OPEN = new Set<string>([
-  "GET ", "PATCH ", "DELETE ", "PUT credential", "POST stop", "POST import",
-  "GET usage", "GET workspace-files", "GET workspace-files/read",
-  "GET model", "PUT model",
-  "GET connections/github", "POST connections/github", "PUT connections/github", "DELETE connections/github", "POST connections/github/confirm",
-  "PUT seed", "POST seed/seal", "GET seed/manifest", "POST fresh-context", "POST restart", "GET model-input", "GET tools", "GET transcript", "GET trace",
-]);
-
 const routes = await findRoutes();
 
 await check("the search finds routes that take an agent id, the approval routes among them", async () => {
@@ -167,13 +160,14 @@ await check("the search finds routes that take an agent id, the approval routes 
   }
 });
 
-await check("every agent lookup in handlers.ts is reached by a found route, or named with a reason as not the path's", async () => {
+await check("every agent lookup in handlers.ts is agentAt's, which every found route goes through, or named with a reason as not the path's", async () => {
   assert(LOOKUP_CALLS.length > LOOKUP_LINES.length && LOOKUP_LINES.length > 0, `lookups read from handlers.ts: ${LOOKUP_CALLS.length}, of the path's ${LOOKUP_LINES.length}`);
   const stale = EXEMPT.filter((e) => e.at.length !== (e.why.includes("two calls") ? 2 : 1));
   assert(stale.length === 0, `NOT_THE_PATH entries that match no call, or more than they say: ${stale.map((e) => `${e.call.split("\n")[0]} (${e.at.length})`).join("; ")}`);
-  const reached = new Set([...routes.values()].flatMap((r) => [...r.lines]));
-  const missed = LOOKUP_LINES.filter((n) => !reached.has(n));
-  assert(missed.length === 0, `handlers.ts lines ${missed.join(", ")} look an agent up, and no found route reached them`);
+  // The path's agent is looked up in one place, `agentAt`, and every found route made its lookup there.
+  assert(LOOKUP_LINES.length === 1, `handlers.ts looks the path's agent up on lines ${LOOKUP_LINES.join(", ")}: only agentAt may`);
+  const elsewhere = [...routes.entries()].filter(([, r]) => r.lines.size === 0 || [...r.lines].some((n) => n !== LOOKUP_LINES[0]));
+  assert(elsewhere.length === 0, `looked the path's agent up outside agentAt (handlers.ts:${LOOKUP_LINES[0]}): ${elsewhere.map(([k, r]) => `${k} at ${[...r.lines].join(",")}`).join("; ")}`);
 });
 
 const row: ProvisionedAgent = {
@@ -183,10 +177,8 @@ const row: ProvisionedAgent = {
 /** Refused: a 404 or no route at all, and nothing past the lookup reached. */
 const refused = (r: { status: number | null }, touched: string[]) => (r.status === null || r.status === 404) && touched.length === 0;
 
-/** The known gaps as they answered another origin's token: the finding, printed on each run. */
-const open = new Map<string, string>();
-const served: string[] = [];
-await check("each route serves its agent's own origin and refuses another origin's token, in both spellings, but for the known gaps", async () => {
+const served: Array<{ name: string; method: string; path: string }> = [];
+await check("each route serves its agent's own origin and refuses another origin's token, in both spellings", async () => {
   const problems: string[] = [];
   for (const [name, { method, tail }] of routes) {
     for (const spelling of [[AGENT], ["by-raft-agent", RAFT_AGENT]]) {
@@ -195,22 +187,31 @@ await check("each route serves its agent's own origin and refuses another origin
       const control = await send(ours.deps, method, path, OURS);
       // A method the route does not serve is refused to its own origin too; it has nothing to refuse to another.
       if (refused(control, ours.touched)) continue;
-      if (spelling[0] === AGENT) served.push(name);
+      served.push({ name, method, path });
       const theirs = deps(row);
       const other = await send(theirs.deps, method, path, THEIRS);
       if (refused(other, theirs.touched)) continue;
       const seen = `${method} ${path} → ${other.status}${theirs.touched.length ? `, reached ${[...new Set(theirs.touched)].join(" ")}` : ""}`;
-      if (KNOWN_OPEN.has(name)) { if (spelling[0] === AGENT) open.set(name, seen); }
-      else problems.push(seen);
+      problems.push(seen);
     }
   }
   assert(served.length > 0, "no route served its own origin: the control proves nothing");
   assert(problems.length === 0, `another origin's token was served:\n        ${problems.join("\n        ")}`);
 });
 
-await check("every known gap is a found route that still serves another origin: a fixed one leaves the list", async () => {
-  const stale = [...KNOWN_OPEN].filter((k) => !open.has(k));
-  assert(stale.length === 0, `no longer open (remove from KNOWN_OPEN): ${stale.join(", ")}`);
+await check("a tenant-scoped token: its tenant at its origin is served; another origin, or another tenant, is refused", async () => {
+  const tenantToken = (tenantId: string, raftOrigin: string) => ({ label: "raft-tenant", tenantId, raftOrigin, scope: "tenant" as const });
+  const problems: string[] = [];
+  for (const { method, path } of served) {
+    const own = deps(row);
+    if (refused(await send(own.deps, method, path, tenantToken(TENANT, OURS)), own.touched)) problems.push(`${method} ${path}: refused its own tenant token`);
+    for (const [why, who] of [["another origin", tenantToken(TENANT, THEIRS)], ["another tenant", tenantToken("t-other", OURS)]] as const) {
+      const d = deps(row);
+      const r = await send(d.deps, method, path, who);
+      if (!refused(r, d.touched)) problems.push(`${method} ${path}: served ${why}'s tenant token (${r.status})`);
+    }
+  }
+  assert(served.length > 0 && problems.length === 0, problems.join("\n        ") || "nothing served");
 });
 
 // ---- the cases outside /agents/<id>/…: a route that reaches an agent another way --------------------------------
@@ -265,30 +266,17 @@ const OUTSIDE: Record<string, () => Promise<{ served: boolean; open: boolean; se
     return { served: acted.includes(AGENT), open: acted.includes(THEIR_AGENT.agentId), seen: `${r.status}, reconnected ${acted.join(" ")}` };
   },
 };
-/**
- * TODO(#1116): close these with the per-agent origin check, and empty this list. As KNOWN_OPEN: an entry that is
- * closed already fails, so the list only shrinks.
- */
-const KNOWN_OPEN_OUTSIDE = new Set<string>([
-  "POST /agents replayed by another origin", "DELETE /connectors/:id from another origin", "confirm's reconnect in place reaches another origin's agent",
-]);
-
-const openOutside = new Map<string, string>();
-await check("outside /agents/<id>: each case serves its own origin, and another origin is refused but for the known gaps, which are still open", async () => {
+await check("outside /agents/<id>: each case serves its own origin, and refuses another origin", async () => {
   const problems: string[] = [];
   for (const [name, probe] of Object.entries(OUTSIDE)) {
     const r = await probe();
-    if (!r.served) { problems.push(`${name}: the control was not served (${r.seen})`); continue; }
-    if (r.open) openOutside.set(name, r.seen);
-    if (r.open !== KNOWN_OPEN_OUTSIDE.has(name)) problems.push(`${name}: ${r.open ? "open, and not a known gap" : "closed: remove it from KNOWN_OPEN_OUTSIDE"} (${r.seen})`);
+    if (!r.served) problems.push(`${name}: the control was not served (${r.seen})`);
+    else if (r.open) problems.push(`${name}: another origin was served (${r.seen})`);
   }
-  const unknown = [...KNOWN_OPEN_OUTSIDE].filter((k) => !(k in OUTSIDE));
-  assert(problems.length === 0 && unknown.length === 0, [...problems, ...unknown.map((k) => `${k}: no such case`)].join("\n        "));
+  assert(problems.length === 0, problems.join("\n        "));
 });
 
-console.log(`  ${routes.size} (method, path) pairs take an agent id; ${served.length} served for their own origin; ${open.size} still open to another origin:`);
-for (const seen of open.values()) console.log(`    ${seen}`);
-for (const [name, seen] of openOutside) console.log(`    ${name}: ${seen}`);
+console.log(`  ${routes.size} (method, path) pairs take an agent id; ${served.length} (both spellings) served for their own origin; ${Object.keys(OUTSIDE).length} cases outside /agents/<id>`);
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);
