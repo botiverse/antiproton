@@ -170,8 +170,12 @@ the pair another agent's renewal stored), `broken`, `unavailable` (GitHub did no
 marked), `interrupted-before` (a renewal in this object stopped part-way; the next one goes ahead) or
 `propagate-failed` (an agent on the connector was not told, below), `store-failed` and `kept-unstored` (above), with
 `tenantId`, `agentId`, `connectorId`, `why` (`expiring`, `rejected`, `adopt`) and GitHub's error as `reason`. Never a
-token. Each connect also writes `connect.exchange` with the **names** of the keys GitHub's answer carried: one with
-`expires_in` and `refresh_token` is an expiring token (`expiring: true`).
+token. A renewal reaching a mount whose reference names a key that is not its own (another mount's, or a name no
+mount can have) writes nothing and logs `github.refresh.skipped` instead: `mount` (the alias), `key`, `why` (`adopt`,
+`reconnect`, `rejected`) and `reason` `mount_key_foreign:shared` or `mount_key_foreign:not_a_mount_key`. It is a line
+only, not a trace row (cf/src/runtime.ts `#renewalSkipped`). Each connect also writes `connect.exchange` with the
+**names** of the keys GitHub's answer carried: one with `expires_in` and `refresh_token` is an expiring token
+(`expiring: true`).
 
 **In the trace.** The renewal runs in the agent's object, whose lines Workers Logs can drop (above, "Logs and what an
 object did"): on 2026-10-18 a connector rotated at 18:38:04Z with no `github.refresh` line, while the R2 trace export

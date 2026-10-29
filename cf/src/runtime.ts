@@ -1449,7 +1449,12 @@ export class AgentRuntime {
     this.#gateway = new ToolGateway(this.store, plugins, SEEDED_PLUGINS, this.#secrets,
       deps.hooks ? (tenantId, agentId, alias) => this.#inboundFor(tenantId, agentId, alias) : undefined,
       {
-        ...(deps.github ? { credentialRejected: (scope: { tenantId: string; agentId: string }, name: string, token: string) => this.#oauth.rejected(scope.tenantId, scope.agentId, name, token) } : {}),
+        ...(deps.github ? {
+          credentialRejected: async (scope: { tenantId: string; agentId: string }, name: string, token: string, alias: string) =>
+            // A renewal writes under `name`, which the mount the 401 came through may only be pointing at.
+            await this.#renewalSkipped(scope.tenantId, scope.agentId, { alias, secretRef: agentRef(name) }, "rejected")
+              ? null : this.#oauth.rejected(scope.tenantId, scope.agentId, name, token),
+        } : {}),
         heldPlace: async (ctx) => heldPlaceFor(agentKind((await this.store.loadAgent(ctx.tenantId, ctx.agentId))?.config),
           ctx.taskId, approvalsUrl(deps.consoleOrigin, ctx.agentId)),
         ...(deps.approvalTtlMs !== undefined ? { approvalTtlMs: deps.approvalTtlMs } : {}),
@@ -1890,6 +1895,22 @@ export class AgentRuntime {
   }
 
   /**
+   * Whether a renewal reaching `mount` (`why`: an adopt, a reconnect in place, a 401) must not write, because the key
+   * its reference names is not its own (`#foreignKey`): null to go ahead; otherwise the key, why, and the code
+   * (`mount_key_foreign:<reason>`), said on a `github.refresh.skipped` line. A line and not a `github.refresh` trace
+   * row: those rows are forwarded with a fixed outcome vocabulary (cf/src/trace-forward.ts, docs/runbook.md).
+   * Renewing a key from its own record before it is read (`GithubRefresher.beforeUse`) is not asked this.
+   */
+  async #renewalSkipped(tenantId: string, agentId: string, mount: { alias: string; secretRef: string | null },
+    why: "adopt" | "reconnect" | "rejected"): Promise<{ name: string; reason: ForeignKeyReason; code: string } | null> {
+    const foreign = await this.#foreignKey(tenantId, agentId, mount);
+    if (!foreign) return null;
+    const code = `mount_key_foreign:${foreign.reason}`;
+    logEvent("github.refresh.skipped", { tenantId, agentId, mount: mount.alias, key: foreign.name, why, reason: code });
+    return { ...foreign, code };
+  }
+
+  /**
    * Store a credential for one of this agent's mounts and point the mount at
    * it. `fields` is what the form posted, keyed by the plugin's declared field
    * names; a bare token comes as `{ token }`. The value is sealed before it
@@ -2178,9 +2199,10 @@ export class AgentRuntime {
    * the mount's own broken flag (the renewal record is written afresh). Only while the mount is still the connector's
    * — its renewal record names the connector, or it holds the connector's previous token (`was`) — as
    * `detachConnectionIfFrom` judges it: a key put on the mount since is not the connector's to replace.
+   * A mount whose reference names a key not its own is refused, as its attach would be, with `renewalSkipped`.
    */
   async reconnectConnection(tenantId: string, agentId: string, plugin: string, connectorId: string, was: Sealed, sealed: Sealed,
-    refresh: ConnectorRefresh | null): Promise<{ ok: true; updated: boolean } | { ok: false; error: string }> {
+    refresh: ConnectorRefresh | null): Promise<{ ok: true; updated: boolean } | { ok: false; error: string; renewalSkipped?: string }> {
     await this.ready();
     const kek = await this.#kek;
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
@@ -2190,6 +2212,10 @@ export class AgentRuntime {
     const renewedFrom = (await this.#oauth.read(tenantId, agentId, name))?.connectorId === connectorId;
     const held = await this.store.getSecret(tenantId, agentId, name);
     if (!held || (!renewedFrom && await open(kek, held) !== await open(kek, was))) return { ok: true, updated: false };
+    // A refusal, not a quiet `updated: false`: the reconnect lists it under `failed` (cf/src/provision/handlers.ts
+    // `reconnectInPlace`), which is how the person hears that this mount did not take the new pair.
+    const skipped = await this.#renewalSkipped(tenantId, agentId, mount, "reconnect");
+    if (skipped) return { ok: false, error: AgentRuntime.foreignKeyRefusal(mount.alias, skipped), renewalSkipped: skipped.code };
     const r = await this.attachSealedConnection(tenantId, agentId, plugin, sealed, refresh ? { ...refresh, connectorId } : null);
     return r.ok ? { ok: true, updated: true } : r;
   }
@@ -2236,15 +2262,19 @@ export class AgentRuntime {
   /**
    * Take the pair another agent's renewal stored on a connector this agent's mount was pointed at: GitHub spent the
    * access token this mount holds when it handed out the new one, and the sandbox's egress has no 401 to learn it
-   * from. False when the mount is not on that connector (any more).
+   * from. Not adopted when the mount is not on that connector (any more), and not when its reference names a key
+   * that is not its own (`renewalSkipped`, `#renewalSkipped`).
    */
-  async adoptConnection(tenantId: string, agentId: string, plugin: string, connectorId: string): Promise<boolean> {
+  async adoptConnection(tenantId: string, agentId: string, plugin: string, connectorId: string):
+    Promise<{ adopted: boolean; renewalSkipped?: string }> {
     await this.ready();
     const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
-    if (!mount || !isAgentRef(mount.secretRef)) return false;
+    if (!mount || !isAgentRef(mount.secretRef)) return { adopted: false };
     const name = agentKeyName(mount.secretRef)!;
-    if ((await this.#oauth.read(tenantId, agentId, name))?.connectorId !== connectorId) return false;
-    return (await this.#oauth.renew(tenantId, agentId, name, "adopt", null)).ok;
+    if ((await this.#oauth.read(tenantId, agentId, name))?.connectorId !== connectorId) return { adopted: false };
+    const skipped = await this.#renewalSkipped(tenantId, agentId, mount, "adopt");
+    if (skipped) return { adopted: false, renewalSkipped: skipped.code };
+    return { adopted: (await this.#oauth.renew(tenantId, agentId, name, "adopt", null)).ok };
   }
 
   /**
@@ -2261,7 +2291,7 @@ export class AgentRuntime {
     return r.ok ? { ok: true, cleared: true } : r;
   }
 
-  /** Remove the credential from this agent's mount of that plugin; false when there was none. */
+  /** Remove the credential from this agent's mount of that plugin; false when none went (`removeCredential`). */
   async detachConnection(tenantId: string, agentId: string, plugin: string): Promise<boolean> {
     await this.ready();
     const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
@@ -2301,9 +2331,14 @@ export class AgentRuntime {
    * Only an agent's own reference is removable, so this cannot be a way to
    * clear the shared account: on a mount already using it, there is nothing of
    * this agent's to take back and the answer is `false`.
+   *
+   * True only when the key itself went. A reference naming a key that is not this mount's (`#foreignKey`) is
+   * cleared and the key kept, which is `false` here: the caller asked for a key to be gone, and it is not.
+   * `removeCredentialOrWhy` tells that case apart.
    */
   async removeCredential(tenantId: string, agentId: string, alias: string): Promise<boolean> {
-    return (await this.removeCredentialOrWhy(tenantId, agentId, alias)).ok;
+    const r = await this.removeCredentialOrWhy(tenantId, agentId, alias);
+    return r.ok && r.removed;
   }
 
   /**

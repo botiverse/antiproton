@@ -115,10 +115,11 @@ export interface SecretResolver {
 
 /**
  * Renewing a mount's own credential after the far end refused it (`PluginContext.credentialRejected`): for the
- * secret the mount's `agent:` reference names, in the mount owner's store.
+ * secret the mount's `agent:` reference names, in the mount owner's store. `alias` is the mount the call went
+ * through, so the renewer can tell a key that is that mount's own from one its reference only points at.
  */
 export type CredentialRejected = (
-  scope: { tenantId: string; agentId: string }, secretName: string, credential: string,
+  scope: { tenantId: string; agentId: string }, secretName: string, credential: string, alias: string,
 ) => Promise<{ credential: string } | { reconnect: string } | null>;
 
 export const envSecrets: SecretResolver = {
@@ -1889,7 +1890,7 @@ export class ToolGateway {
       // Only for the mount's own key, and only where the deployment can renew one.
       ...(this.#credentialRejected && credential && isAgentRef(mount.secretRef) ? {
         credentialRejected: (token: string) => this.#credentialRejected!(
-          { tenantId: mount.tenantId, agentId: mount.agentId }, agentKeyName(mount.secretRef)!, token),
+          { tenantId: mount.tenantId, agentId: mount.agentId }, agentKeyName(mount.secretRef)!, token, mount.alias),
       } : {}),
       // What kind of credential the mount names, so a null `credential` can be read as "names none" or
       // "names one that did not arrive" rather than guessed. The KIND, never the reference: a reference

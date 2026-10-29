@@ -662,7 +662,7 @@ await check("a refusal that lost its lease to a renewal that landed does not mar
   must(!(await w.grants.markBroken(TENANT, id, "bad_refresh_token", Date.now(), "A", spent)), "a stale markBroken landed");
   must((await w.grants.grant(TENANT, id, a.agentId))!.brokenAt === null, "the connector was marked over a good pair");
   // Through the code: A's renewal is refused, and B's lands between A's last read and A's markBroken.
-  must(await a.rt.adoptConnection(TENANT, a.agentId, "github", id) && (await w.stored(a)).token === bToken, "A did not take B's first pair");
+  must((await a.rt.adoptConnection(TENANT, a.agentId, "github", id)).adopted && (await w.stored(a)).token === bToken, "A did not take B's first pair");
   await w.age(a, id);
   w.gh.live.delete((await w.stored(a)).token!);
   w.gh.s.refuse = true;
@@ -2221,6 +2221,84 @@ await check("a mount whose reference names an inbound hook's signing secret: an 
   const removed = await a.rt.removeCredentialOrWhy(TENANT, a.agentId, "gh");
   must(removed.ok && removed.removed === false && removed.foreign === hook && removed.reason === "not_a_mount_key", `the remove: ${JSON.stringify(removed)}`);
   must(rows() === before && (await ref()) === null, `after the remove: ${rows()} ${await ref()}`);
+  w.dispose();
+});
+
+/** The `github.refresh.skipped` lines logged for one agent (`AgentRuntime#renewalSkipped`). */
+const skipsOf = (agentId: string) => logged.filter((l) => l.includes('"evt":"github.refresh.skipped"'))
+  .map((l) => JSON.parse(l) as Record<string, string>).filter((l) => l.agentId === agentId);
+/** A second github mount (`gh-b` unless named), whose reference names the first mount's key, `gh`. */
+const addGhB = async (a: { rt: AgentRuntime; agentId: string }, alias = "gh-b") => a.rt.store.addMount({
+  tenantId: TENANT, agentId: a.agentId, alias, plugin: "github",
+  // The version `gh` was mounted at, so a call through this one is not refused for its pin.
+  installationId: `i-${alias}`, connectionId: null, toolVersion: (await a.rt.store.getMountByAlias(TENANT, a.agentId, "gh"))!.toolVersion,
+  publicConfig: {}, secretRef: "agent:gh", policy: null,
+});
+
+await check("a renewal reaching a mount whose reference names another mount's key (an adopt, a reconnect in place) writes nothing under that key and says why (mount_key_foreign:shared)", async () => {
+  const w = await world();
+  const { importKek, seal } = await import("../src/runtime/secrets.ts");
+  const kek = await importKek(KEK);
+  const a = await w.agent("FA"), b = await w.agent("FB");
+  const id = await w.connect(a);
+  await w.call("PUT", `/agents/by-raft-agent/FB/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
+  // b's key `gh` stays, with its renewal record naming the connector, but its mount is not a github one: `gh-b` is
+  // b's one github mount, which is what an adopt and a reconnect reach (`findMountsByPlugin`, first by alias).
+  const host = w.hostOf(b.agentId);
+  host.sql.exec("UPDATE mounts SET plugin = 'demo' WHERE alias = 'gh'");
+  await addGhB(b);
+  const rows = () => JSON.stringify(host.sql.exec("SELECT name, ciphertext, iv FROM secrets WHERE name IN ('gh', 'oauth:gh') ORDER BY name").toArray());
+  const before = rows();
+  must(JSON.stringify((await b.rt.store.findMountsByPlugin(TENANT, b.agentId, "github")).map((m) => m.alias)) === JSON.stringify(["gh-b"])
+    && (await w.stored(b)).rec?.connectorId === id, "the fixture: gh-b is not b's one github mount, or oauth:gh does not name the connector");
+  // a renews; the renewal is handed to b (propagate, then adoptConnection), which writes nothing.
+  const renewals = w.gh.s.refreshes;
+  await w.expireAt(a, Date.now() + 30_000, id);
+  await w.tool(a);
+  await w.settle();
+  must(w.gh.s.refreshes === renewals + 1 && w.propagated.includes(b.agentId), `control: a did not renew (${w.gh.s.refreshes - renewals}) or it did not reach b`);
+  must(rows() === before, "the adopt wrote b's gh or oauth:gh");
+  must(skipsOf(b.agentId).some((l) => l.why === "adopt" && l.mount === "gh-b" && l.key === "gh" && l.reason === "mount_key_foreign:shared"),
+    `the adopt's skip was not recorded: ${JSON.stringify(skipsOf(b.agentId))}`);
+  const adopted = await b.rt.adoptConnection(TENANT, b.agentId, "github", id);
+  must(adopted.adopted === false && adopted.renewalSkipped === "mount_key_foreign:shared", `the adopt's answer: ${JSON.stringify(adopted)}`);
+  // Another connector: nothing would be written, so nothing is said to be skipped.
+  const n = skipsOf(b.agentId).length;
+  const other = await b.rt.adoptConnection(TENANT, b.agentId, "github", "con_not_this_one");
+  must(other.adopted === false && other.renewalSkipped === undefined && skipsOf(b.agentId).length === n, `another connector's adopt: ${JSON.stringify(other)}`);
+  // A reconnect in place from a: b is listed as failed with why, and its rows are as they were.
+  const re = await w.reconnect(a, id);
+  await w.settle();
+  must(re.status === 200 && re.body.failed.some((f: any) => f.raftAgentId === "FB" && f.error.startsWith("mount_key_foreign:shared:")), `the reconnect: ${re.status} ${re.text}`);
+  must(rows() === before, "the reconnect wrote b's gh or oauth:gh");
+  must(skipsOf(b.agentId).some((l) => l.why === "reconnect" && l.mount === "gh-b" && l.key === "gh" && l.reason === "mount_key_foreign:shared"),
+    `the reconnect's skip was not recorded: ${JSON.stringify(skipsOf(b.agentId))}`);
+  const direct = await b.rt.reconnectConnection(TENANT, b.agentId, "github", id, await seal(kek, "ghu_" + "w".repeat(36)), await seal(kek, "ghu_" + "n".repeat(36)), null);
+  must(!direct.ok && direct.renewalSkipped === "mount_key_foreign:shared" && direct.error.startsWith("mount_key_foreign:shared:"), `the reconnect's answer: ${JSON.stringify(direct)}`);
+  must(rows() === before, "the direct reconnect wrote b's gh or oauth:gh");
+  w.dispose();
+});
+
+await check("a 401 through a mount whose reference names another mount's key renews nothing under that key and says why; through the key's own mount it renews", async () => {
+  const w = await world();
+  const a = await w.agent("FR");
+  const id = await w.connect(a);
+  // Named without the hyphen: a tool name is `<alias>.<tool>` in letters, digits and `_` (src/core/tools.ts `parseToolRef`).
+  await addGhB(a, "ghb");
+  const host = w.hostOf(a.agentId);
+  const rows = () => JSON.stringify(host.sql.exec("SELECT name, ciphertext, iv FROM secrets WHERE name IN ('gh', 'oauth:gh') ORDER BY name").toArray());
+  // As if renewed long ago, and GitHub no longer taking the key: a 401 renews (the control below).
+  await w.age(a, id);
+  w.gh.live.delete((await w.stored(a)).token!);
+  const before = rows(), renewals = w.gh.s.refreshes, refusals = w.gh.s.unauthorized;
+  const r = await a.rt.gateway().invoke({ tenantId: TENANT, agentId: a.agentId, taskId: "t1" }, "ghb.auth_status", {} as any);
+  must(w.gh.s.unauthorized > refusals, `control: GitHub did not answer 401: ${JSON.stringify(r).slice(0, 300)}`);
+  must(w.gh.s.refreshes === renewals && rows() === before, `the 401 through ghb renewed gh: ${w.gh.s.refreshes - renewals} ${rows() === before}`);
+  must(skipsOf(a.agentId).some((l) => l.why === "rejected" && l.mount === "ghb" && l.key === "gh" && l.reason === "mount_key_foreign:shared"),
+    `the 401's skip was not recorded: ${JSON.stringify(skipsOf(a.agentId))}`);
+  const n = skipsOf(a.agentId).length;
+  must(succeeded(await w.tool(a)) && w.gh.s.refreshes === renewals + 1 && rows() !== before && skipsOf(a.agentId).length === n,
+    `control: the 401 through gh did not renew its own key: ${w.gh.s.refreshes - renewals}`);
   w.dispose();
 });
 
