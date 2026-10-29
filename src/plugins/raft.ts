@@ -367,7 +367,7 @@ const SINCE_KEY = "since";
 
 /**
  * What push notices said is on its way, as `{ pairs: { [channelId]: latestSeq }, at: { [channelId]: ms }, attempt }`
- * (`at`: when a pull first waited for that conversation at its seq; absent until then): the next `receive_events`
+ * (`at`: when a pull first waited for that conversation; absent until then, and kept when a notice raises its seq): the next `receive_events`
  * pull sends them as `/events` `wait_for`, so a message Raft has committed but not yet made readable to `/events` (its
  * inbox chain trails the notice by seconds) is waited for instead of answered with an empty batch. Kept apart from
  * `SINCE_KEY` and never read into it: a notice says what exists, not what this agent was shown, and a `since` taken
@@ -387,7 +387,7 @@ const WAIT_FOR_MAX_PAIRS = 20;
 export const WAIT_FOR_MAX_MS = 30_000;
 /**
  * How long a pair is waited for at all, from the first pull that waited for it (not from its notice, so a pair noticed
- * while no one called `receive_events` is still waited for once). A message Raft never makes readable to this agent
+ * while no one called `receive_events` is still waited for once; a later notice raising its seq does not restart it). A message Raft never makes readable to this agent
  * (deleted, or in a conversation the agent has left) would otherwise cost every later `receive_events` the whole cap;
  * past this age the pair is dropped, said on a warn line, and the pull goes on without it.
  */
@@ -3957,14 +3957,19 @@ async function noteWaitFor(ctx: PluginContext, targets: readonly unknown[]): Pro
   if (!announced.length) return;
   await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
     const kept = waitForOf(tx.get(INBOX_STORE, WAIT_FOR_KEY));
-    let moved = false;
+    let moved = false, waited = false;
     for (const [channelId, seq] of announced) {
-      // A higher seq is a new message to wait for: its clock starts at its own first wait.
-      if ((kept.pairs[channelId] ?? 0) < seq) { kept.pairs[channelId] = seq; delete kept.at[channelId]; moved = true; }
+      if ((kept.pairs[channelId] ?? 0) >= seq) continue;
+      // A raised seq keeps the conversation's clock: a pair with a time was waited for and never seen readable (a
+      // readable pull removes it), and a conversation that keeps getting notices must not keep an old, never readable
+      // seq waited for forever. Raft's backoff (`attempt`) is kept with it.
+      kept.pairs[channelId] = seq;
+      moved = true;
+      if (kept.at[channelId] !== undefined) waited = true;
     }
     if (!moved) return;
     const pairs = Object.fromEntries(Object.entries(kept.pairs).sort(([, a], [, b]) => b - a).slice(0, WAIT_FOR_MAX_PAIRS));
-    keepWaitFor(tx, { pairs, at: kept.at, attempt: 0 });
+    keepWaitFor(tx, { pairs, at: kept.at, attempt: waited ? kept.attempt : 0 });
   });
 }
 

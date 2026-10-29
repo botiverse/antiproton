@@ -4903,6 +4903,36 @@ await check("wait_for age counts from the first wait: a pair noticed long ago bu
   must(!raft.pulls[before]!.has("wait_for") && await m.ctx.db.get(INBOX_STORE, "wait_for") === undefined, `kept past its age: ${raft.pulls[before]}`);
 });
 
+await check("wait_for age: a raised seq keeps the first wait's time, so a conversation noticed every minute is still dropped 5 min after its first wait", async () => {
+  const capped = createRaftPlugin({ waitForMaxMs: 30 });
+  const raft = waitingRaft(20); const m = pushOn();
+  raft.write(100);
+  await capped.invoke("receive_events", {}, m.ctx);
+  const real = Date.now;
+  const t0 = real() - 6 * 60_000;
+  // A clock that still runs from `t`, so the call's own cap is reached.
+  const at = async <T>(t: number, fn: () => Promise<T>) => { const off = t - real(); Date.now = () => real() + off; try { return await fn(); } finally { Date.now = real; } };
+  raft.write(101, Infinity);
+  await announce(capped, m, 101);
+  const first = await at(t0, () => capped.invoke("receive_events", {}, m.ctx)) as any;
+  must(first.status === "still_arriving", `control: waited at T0: ${JSON.stringify(first)}`);
+  const attempt = (await m.ctx.db.get(INBOX_STORE, "wait_for") as any).attempt;
+  // New messages in the same conversation every minute, none of them readable either.
+  for (let k = 1; k <= 5; k++) {
+    raft.write(101 + k, Infinity);
+    await at(t0 + k * 60_000, () => announce(capped, m, 101 + k));
+  }
+  const kept = await m.ctx.db.get(INBOX_STORE, "wait_for") as any;
+  must(kept.pairs[WAIT_CH] === 106 && Math.abs(kept.at[WAIT_CH] - t0) < 1_000 && kept.attempt === attempt, `the raise restarted the clock: ${JSON.stringify(kept)}`);
+  const warn = console.warn;
+  const warned: string[] = [];
+  console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+  const before = raft.pulls.length;
+  let out: any;
+  try { out = await capped.invoke("receive_events", {}, m.ctx); } finally { console.warn = warn; }
+  must(!raft.pulls[before]!.has("wait_for") && out.status === "no_new_messages" && warned.some((w) => /stopped waiting for 1/.test(w)), `kept alive by its notices: ${raft.pulls[before]} ${JSON.stringify(out)}`);
+});
+
 globalThis.fetch = originalFetch;
 console.log(`\n  raft plugin\n  ${"─".repeat(56)}`);
 for (const result of results) {
