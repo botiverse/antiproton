@@ -388,7 +388,7 @@ function d1(before?: string) {
   return { db, D1, rest: () => apply(files.slice(at)), agent, connector, bind, made };
 }
 
-await check("disconnect: each bound agent ends detached, cleared elsewhere, or failed; only the first is clean, and another origin's ids are not answered", async () => {
+await check("disconnect: each bound agent ends detached, kept, cleared elsewhere, or failed; only the first is clean, and another origin's ids are not answered", async () => {
   const MINE2: ProvisionedAgent = { ...row, raftAgentId: "01JMINE2", agentId: "raft_01JMINE2" };
   const MINE3: ProvisionedAgent = { ...row, raftAgentId: "01JMINE3", agentId: "raft_01JMINE3" };
   const THEIRS2: ProvisionedAgent = { ...THEIR_AGENT, raftAgentId: "01JTHEIRS2", agentId: "raft_01JTHEIRS2" };
@@ -398,10 +398,11 @@ await check("disconnect: each bound agent ends detached, cleared elsewhere, or f
     const r = await send(d.deps, "DELETE", "/connectors/k1", OURS, ACTING);
     return { ...r, body: JSON.parse(r.text || "null"), acted };
   };
-  // Clean: this origin's agents, one by the connector's credential, one by the agent when the match fails (an older copy).
+  // Clean: this origin's agent, by the connector's credential. Kept: this origin's agent whose mount holds another
+  // credential (a key put there since): left as it is, named apart, never as detached.
   const clean = await go([row, MINE2], { [MINE2.agentId]: { match: false, byAgent: true } });
-  assert(clean.status === 200 && JSON.stringify(clean.body.detached) === JSON.stringify([RAFT_AGENT, MINE2.raftAgentId]) && !("otherOrigins" in clean.body)
-    && clean.acted.includes(`${MINE2.agentId} by agent`) && clean.acted.includes("connector removed"), `clean: ${clean.status} ${clean.text}`);
+  assert(clean.status === 200 && JSON.stringify(clean.body.detached) === JSON.stringify([RAFT_AGENT]) && JSON.stringify(clean.body.kept) === JSON.stringify([MINE2.raftAgentId])
+    && !("otherOrigins" in clean.body) && !clean.acted.includes(`${MINE2.agentId} by agent`) && clean.acted.includes("connector removed"), `clean and kept: ${clean.status} ${clean.text}`);
   // Cleared elsewhere: another origin's agents, held an older copy (the match fails), removed by the agent. Not clean,
   // and their ids are not in the answer.
   const other = await go([row, THEIR_AGENT, THEIRS2], { [THEIR_AGENT.agentId]: { match: false, byAgent: true } });
@@ -409,10 +410,11 @@ await check("disconnect: each bound agent ends detached, cleared elsewhere, or f
     && other.body.otherOrigins.failed === 0 && /re-authorise or revoke it on GitHub/.test(other.body.otherOrigins.message)
     && !other.text.includes("THEIRS") && other.acted.includes(`${THEIR_AGENT.agentId} by agent`), `elsewhere: ${other.status} ${other.text}`);
   // Failed: neither the match nor the agent removes it. Never detached; the connector stays, for the same call again.
-  const mine = await go([row, MINE3], { [MINE3.agentId]: { match: false, byAgent: "throw" } });
+  const mine = await go([row, MINE3], { [MINE3.agentId]: { match: "throw", byAgent: true } });
   assert(mine.status === 502 && mine.body.error.code === "partially_disconnected" && JSON.stringify(mine.body.detached) === JSON.stringify([RAFT_AGENT])
     && mine.body.failed?.[0]?.raftAgentId === MINE3.raftAgentId && !mine.acted.includes("connector removed"), `failed: ${mine.status} ${mine.text}`);
-  const theirs = await go([row, THEIR_AGENT], { [THEIR_AGENT.agentId]: { match: "throw", byAgent: true } });
+  // Another origin's agent whose older copy the agent detach cannot remove either.
+  const theirs = await go([row, THEIR_AGENT], { [THEIR_AGENT.agentId]: { match: false, byAgent: "throw" } });
   assert(theirs.status === 502 && theirs.body.otherOrigins?.failed === 1 && (theirs.body.failed ?? []).length === 0 && !theirs.text.includes("THEIRS")
     && !theirs.acted.includes("connector removed"), `failed elsewhere: ${theirs.status} ${theirs.text}`);
 });
