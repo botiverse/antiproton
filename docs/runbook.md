@@ -562,6 +562,28 @@ curl -s -X POST -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: applic
   -d '{"tenantId":"<tenant>","agentId":"<agent>","needle":"<a marker placed in the material>"}' "$HOST/admin/storage-scan"
 ```
 
+## Listing which agents' mounts hold a connection credential
+
+`GET /admin/credential-inventory` (operator token, plus an `x-claimed-caller` header naming who is asking) lists the
+provisioned agents, deleted ones included, and for each its GitHub connection reconciled two ways: what the agent's
+object says its `github` mounts hold, and what D1 says (the `provisioned_connections` binding). The `state` is `both`,
+`mount_only` (a key on the mount with no binding: what a disconnect that did not clear the mount leaves), `binding_only`,
+`neither`, or `unknown` (the object did not answer: `object: "failed"`). A mount-only key also says whether a binding
+removal was recorded in `connector_events` (`removalRecorded`, `lastRemoval`). Each agent's recent events and its open
+`egress_residue` rows (`box_id`, `secret_id`, `title`, `reason_code`, …) come with it. Residue whose agent the registry
+does not list comes once, on the last page, as `residueOfUnlistedAgents`.
+
+A key is reported by its presence, the connector its renewal names, and `fingerprint`: the first 16 hex characters of
+its SHA-256, which tells two copies apart without recovering either. Reading changes nothing in the object.
+
+One page per call: `limit` agents (default 10, at most 25), each one's object asked. Pass `tenantId` for one tenant, or
+none to walk every tenant. A page with more after it carries `cursor`; pass it back to continue. Every call, refused ones
+included, is an `admin_audit` row (`route = '/admin/credential-inventory'`) with the page's counts.
+
+It cannot see run9's egress registrations themselves, only the residue already recorded in `egress_residue`. It does
+not list agents that were not provisioned (console agents). Its counts are a stock at the time read: they say what is
+there now, not when or by which build it got there.
+
 ## Moving a Raft server's agents to a new tenant
 
 A platform token acts in the tenant its request's server id derives (`derivedTenant`, cf/src/provision/handlers.ts).

@@ -111,6 +111,7 @@ import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens, reservedTenantProblem } from "./admin-provider-tokens.ts";
 import { cleanupResidue, d1EgressResidue, residueUnknownMessage, withResidue } from "./egress-residue.ts";
+import { adminCredentialInventory } from "./credential-inventory.ts";
 import { renewalAudience, d1ConnectorGrants, d1Connections, d1Connectors, type ConnectorRefresh, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
 import type { GithubGrant } from "./github-token.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps, type ReconnectTarget } from "./provision/connect.ts";
@@ -2343,6 +2344,16 @@ export class AgentDO extends DurableObject<Env> {
   async adminStorageScan(tenantId: string, agentId: string, needle: string) {
     if (!this.#isAgent(tenantId, agentId)) return null;
     return scanTables(this.sql as never, needle);
+  }
+
+  /**
+   * The credential inventory's half in this object (cf/src/credential-inventory.ts): what this agent's mounts of each
+   * plugin hold, by presence and fingerprint. Without claiming the object, so a look at one never made does not make
+   * it the agent's; null for an agent this object does not hold. Reads only.
+   */
+  async adminConnectionHoldings(tenantId: string, agentId: string, plugins: readonly string[]) {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return this.runtime().connectionHoldings(tenantId, agentId, plugins);
   }
 
   #isAgent(tenantId: string, agentId: string): boolean {
@@ -5214,6 +5225,13 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
           logTurnStop({ tenantId: t, agentId: a, trigger: "admin_cancel", side: "worker" }, r);
           return Response.json({ tenantId: t, agentId: a, ...r }, { status: r.result === "failed" ? 503 : 200 });
         }
+        case "/admin/credential-inventory":
+          // Read-only: what each provisioned agent's connection mounts hold, asked of its object, against its binding,
+          // connector events and open egress residue (cf/src/credential-inventory.ts). One bounded page per call.
+          return await adminCredentialInventory(request, url, {
+            token: env.AUTOMATION_TOKEN, db: env.CONTROL_DB, now: () => Date.now(),
+            holdings: (t, a, plugins) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).adminConnectionHoldings(t, a, plugins),
+          });
         case "/admin/withdraw-egress": {
           // A verification hook, preview only (EGRESS_VERIFY_ROUTE, set in cf/wrangler.preview.jsonc), to be removed
           // after the real-box observation (#1132). Without the flag this path is an unknown route like any other.

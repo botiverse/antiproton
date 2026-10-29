@@ -1924,6 +1924,26 @@ await check("residue records that cannot be read leave the delete not clean even
   w2.dispose();
 });
 
+await check("the credential inventory's read of a mount: the key's presence, its connector and a fingerprint, never the key; nothing changed by reading", async () => {
+  const w = await world();
+  const a = await w.agent("YQ");
+  const empty = await a.rt.connectionHoldings(TENANT, a.agentId, ["github"]);
+  must(empty.length === 1 && empty[0]!.key !== "agent" && empty[0]!.fingerprint === null, `before the connect: ${JSON.stringify(empty)}`);
+  const connectorId = await w.connect(a);
+  const { token } = await w.stored(a);
+  const rows = () => JSON.stringify(w.hostOf(a.agentId).sql.exec("SELECT * FROM secrets ORDER BY name").toArray());
+  const before = rows(), renewals = w.gh.s.refreshes;
+  const got = await a.rt.connectionHoldings(TENANT, a.agentId, ["github"]);
+  const { createHash } = await import("node:crypto");
+  must(got.length === 1 && got[0]!.alias === "gh" && got[0]!.plugin === "github" && got[0]!.key === "agent" && got[0]!.connectorId === connectorId
+    && got[0]!.fingerprint === `sha256:${createHash("sha256").update(token!).digest("hex").slice(0, 16)}`, `after the connect: ${JSON.stringify(got)}`);
+  must(!JSON.stringify(got).includes(token!), "the key itself in the answer");
+  must(rows() === before && w.gh.s.refreshes === renewals, "reading changed what the object holds, or renewed it");
+  // A plugin the agent has no mount of: nothing.
+  must((await a.rt.connectionHoldings(TENANT, a.agentId, ["nope"])).length === 0, "a mount of a plugin it does not have");
+  w.dispose();
+});
+
 await check("withdraw never deletes project-scope secrets (shared run9 project: would stop prod injection); withdraw runs while the box exists: after a delete there is nothing to withdraw", async () => {
   const run9 = run9Fake();
   const w = await world({ run9 });
