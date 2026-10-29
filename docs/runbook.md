@@ -569,7 +569,7 @@ provisioned agents, deleted ones included, and for each its GitHub connection re
 object says its `github` mounts hold, and what D1 says (the `provisioned_connections` binding). The `state` is `both`,
 `mount_only` (a key on the mount with no binding: what a disconnect that did not clear the mount leaves), `binding_only`,
 `neither`, `unknown` (the object did not answer, `object: "failed"`: ask again later), or `no_object` (the object holds
-no such agent, `object: "no_agent"`: asking again changes nothing). A `no_object` agent is not clean: the object cannot
+no such agent, `object: "no_agent"`: asking again gives the same answer). A `no_object` agent is not clean: the object cannot
 tell an agent whose provisioning never reached it from one whose storage was wiped (`objectNote` says so), so a person
 judges it. `layout_unknown` (`object: "layout_unknown"`, with `layoutMissing`): the object's storage lacks a table or
 column the read needs, so it is not read as "no key". Each connection also says whether a binding removal was recorded in `connector_events` (`removalRecorded`,
@@ -580,7 +580,9 @@ with no event saying so. Events carry `reasonCode`, codes only: a stored reason'
 does not list comes once, on the last page, as `residueOfUnlistedAgents`: page to the end to see it.
 
 A key is reported by its presence and the connector its renewal names, never by its value or anything derived from it (a
-hash would confirm a guessed or leaked key, and match it across systems). Reading changes nothing in the object.
+hash would confirm a guessed or leaked key, and match it across systems). The route writes no credential data to D1,
+only `admin_audit`. Opening an object that was never provisioned leaves its base tables and one pi `main` session row
+(the object's constructor, which predates this route); nothing else is written.
 
 One page per call: `limit` agents (default 10, at most 25), each one's object asked, five at a time, each waited for 10
 seconds at most (then `unknown`). A D1 failure is a fixed `503`, never D1's text. Pass `tenantId` for one tenant, or

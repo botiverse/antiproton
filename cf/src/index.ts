@@ -112,6 +112,7 @@ import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens, reservedTenantProblem } from "./admin-provider-tokens.ts";
 import { cleanupResidue, d1EgressResidue, residueUnknownMessage, withResidue } from "./egress-residue.ts";
 import { adminCredentialInventory, layoutMissing, readConnectionHoldings } from "./credential-inventory.ts";
+import { errorClassOf } from "./error-class.ts";
 import { renewalAudience, d1ConnectorGrants, d1Connections, d1Connectors, type ConnectorRefresh, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
 import type { GithubGrant } from "./github-token.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps, type ReconnectTarget } from "./provision/connect.ts";
@@ -5391,11 +5392,8 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
 /** The `/agent/*` routes that return what an agent was told or said, so are audited (cf/src/read-audit.ts). */
 const AUDITED_AGENT_READS = new Set(["/agent/events", "/agent/state", "/agent/activity"]);
 
-/** An error's class, for a log line that must not carry its message: a name made of letters, or `unknown`. */
-export function errorClassOf(e: unknown): string {
-  const name = (e as { name?: unknown } | null)?.name;
-  return typeof name === "string" && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(name) ? name : "unknown";
-}
+// Kept in its own module so a module index.ts imports can use it too (cf/src/credential-inventory.ts).
+export { errorClassOf };
 
 /** The first path segment, when it is one that chooses an object; matched whole, so `/agent-x` and `/Agent` are not `/agent`. */
 function objectPrefix(pathname: string): "conformance" | "bench" | "ui" | "agent" | null {

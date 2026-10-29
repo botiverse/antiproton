@@ -19,6 +19,7 @@
  * "no_agent"`, its connections `no_object`).
  */
 import { isOperator } from "./auth.ts";
+import { errorClassOf } from "./error-class.ts";
 import { CONNECTION_PLUGIN, type ConnectionProvider } from "./provision/connect.ts";
 import { logEvent } from "../../src/core/log.ts";
 import { agentRef, isAgentRef, open, type Sealed } from "../../src/runtime/secrets.ts";
@@ -177,7 +178,7 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
   // Past the token, every D1 failure is a fixed 503 and a log line with the error's class: D1's text never reaches a
   // response.
   try { return await inventory(); } catch (e) {
-    logEvent("admin.credential_inventory", { tenantId: tenantId || null, claimedCaller, outcome: "db_failed", errorName: (e as Error)?.name ?? "unknown" });
+    logEvent("admin.credential_inventory", { tenantId: tenantId || null, claimedCaller, outcome: "db_failed", errorName: errorClassOf(e) });
     return Response.json({ error: DB_FAILED }, { status: 503 });
   }
 
@@ -254,7 +255,7 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
       object = "failed";
       // Its class or shape only: an object's error message can quote what it was reading.
       logEvent("admin.credential_inventory", { tenantId: a.tenant_id, agentId: a.agent_id, outcome: "object_failed",
-        errorName: (e as Error)?.message === "timeout" ? "timeout" : (e as Error)?.name ?? typeof e });
+        errorName: e instanceof Error && e.message === "timeout" ? "timeout" : errorClassOf(e) });
     } finally { clearTimeout(timer); }
     const bindings = (await db.prepare(
       "SELECT provider, connector_id, account, connected_at, broken_at FROM provisioned_connections WHERE tenant_id = ? AND raft_agent_id = ?",
