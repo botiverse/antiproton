@@ -131,7 +131,7 @@ function taskEndedRefusal(address: string): { status: "rejected"; error: { code:
     error: { code: "task_ended", message: `${address} was not run: this task has ended and its machine has been handed back` },
   };
 }
-import { ToolGateway, type InvokeOpts } from "../../src/runtime/gateway.ts";
+import { ToolGateway, type HeldPlace, type InvokeOpts } from "../../src/runtime/gateway.ts";
 import { assertMountConfig, configFromForm, mergeMountSettings, repeatsMount, validateMount, type SettingValue } from "../../src/runtime/mount-config.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { OPERATOR_EXA_REF, OPERATOR_RUN9_REF, resolveOperatorRef } from "./operator-ref.ts";
@@ -298,6 +298,37 @@ export function agentKind(config: unknown): AgentKind {
   if (c?.provisionedBy === PROVISIONED_BY) return "raft";
   if (c?.openai !== undefined && c?.openai !== null) return "api";
   return "console";
+}
+
+/**
+ * The console page a held call is decided on: the agent's page, whose chat panel lists the held calls of its first
+ * conversation (cf/src/ui.ts `page`, polling /ui/chat?held=1). Only ids, never anything that decides: the page asks the
+ * viewer to sign in and checks the agent is theirs (cf/src/index.ts `requireViewer`, `uiOwnsAgent`), and approving is
+ * a signed-in POST to /ui/decide. The page reads no conversation or operation from its URL, so the link names neither.
+ */
+export function approvalsUrl(origin: string | undefined, agentId: string): string | null {
+  if (!origin) return null;
+  const u = new URL("/ui", origin);
+  u.searchParams.set("view", "agents");
+  u.searchParams.set("agentId", agentId);
+  return u.toString();
+}
+
+/**
+ * Where a held call can be decided, for the held result (src/runtime/gateway.ts `heldMessage`), and so what it may
+ * truthfully tell the agent. Nobody, for a Raft-made agent: the console accepts no Raft sign-in (cf/src/auth.ts
+ * `viewerOfToken`), and the agent is listed under the provider's home (cf/src/index.ts `agent.adopt`), so its owner's own
+ * sign-in gets a 404. Nobody, too, for a call held outside the agent's first conversation (`main`): the agent's page
+ * lists only that conversation's held calls (its chat panel polls /ui/chat?held=1, which names no conversation) and
+ * offers no other, so an API session's, a child's or a check's held call is on no page a person can decide it from.
+ * Otherwise the agent's page, by whoever may open it: an API agent is listed in its key owner's directory, a console
+ * agent in its maker's. No record names a person, so `decider` is null: a Raft-provisioned agent's row has no owner
+ * (cf/src/control-plane.ts `ProvisionedAgent`), and Raft's context names one only for a personal assistant.
+ */
+export function heldPlaceFor(kind: AgentKind, taskId: string, url: string | null): HeldPlace {
+  if (kind === "raft") return { nobody: "this agent was made through Raft, and the console accepts no Raft sign-in, so its owner cannot open it" };
+  if (taskId !== LEGACY_TASK) return { nobody: "the console's page for this agent shows only its first conversation's held calls, and this call was held in another one" };
+  return { decider: null, url };
 }
 
 /** How a message the harness writes into the conversation says whose it is (src/runtime/idle-lease.ts `warningText`). */
@@ -782,6 +813,11 @@ export interface RuntimeDeps {
    * are offered no `inbound` and cannot make hooks themselves.
    */
   hooks?: { origin: string; directory: Pick<HookDirectory, "create" | "lookup" | "revoke" | "list"> };
+  /**
+   * The console's origin (UI_ORIGIN), where a held call is decided: a held result links the agent's console page there
+   * (`approvalsUrl`). Absent: the result names the console without a link.
+   */
+  consoleOrigin?: string;
   /** How long `removeMount` waits on a plugin's `unmount`; {@link UNMOUNT_TIMEOUT_MS} when unset. A test's knob. */
   unmountTimeoutMs?: number;
   /**
@@ -1354,7 +1390,11 @@ export class AgentRuntime {
     // The operator's catalogue, told to the kernel rather than read by it.
     this.#gateway = new ToolGateway(this.store, plugins, SEEDED_PLUGINS, this.#secrets,
       deps.hooks ? (tenantId, agentId, alias) => this.#inboundFor(tenantId, agentId, alias) : undefined,
-      deps.github ? { credentialRejected: (scope, name, token) => this.#oauth.rejected(scope.tenantId, scope.agentId, name, token) } : {});
+      {
+        ...(deps.github ? { credentialRejected: (scope: { tenantId: string; agentId: string }, name: string, token: string) => this.#oauth.rejected(scope.tenantId, scope.agentId, name, token) } : {}),
+        heldPlace: async (ctx) => heldPlaceFor(agentKind((await this.store.loadAgent(ctx.tenantId, ctx.agentId))?.config),
+          ctx.taskId, approvalsUrl(deps.consoleOrigin, ctx.agentId)),
+      });
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
       makeToolBinding: deps.makeToolBinding,

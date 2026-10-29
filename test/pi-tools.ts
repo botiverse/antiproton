@@ -425,7 +425,8 @@ await check("run_js 里 confirm: true 的调用被挂起: 程序以 paused 结�
     "output('sent'); await tool`web__get ${{ again: true }}`;" });
   const body = JSON.parse(out.content[0].text);
   if (body.paused !== true || body.reason !== "awaiting_approval") throw new Error(`not paused on the hold: ${out.content[0].text}`);
-  if (JSON.stringify(body.data) !== '{"tool":"web__send","operationId":"op_wait"}') throw new Error(`data: ${JSON.stringify(body.data)}`);
+  // The gateway's own account of the hold rides along, so the model is told who decides and where.
+  if (JSON.stringify(body.data) !== '{"tool":"web__send","operationId":"op_wait","approval":"this call is held for approval"}') throw new Error(`data: ${JSON.stringify(body.data)}`);
   if (JSON.stringify(body.held) !== '[{"tool":"web__send","operationId":"op_wait","status":"pending"}]') {
     throw new Error(`held: ${JSON.stringify(body.held)}`);
   }
@@ -433,7 +434,7 @@ await check("run_js 里 confirm: true 的调用被挂起: 程序以 paused 结�
   if (seen.length !== 2 || seen[1].confirm !== true || "confirm" in seen[1].args) {
     throw new Error(`the held call did not go as a confirm, or a call after it was made: ${JSON.stringify(seen)}`);
   }
-  if (!/waiting for the person's approval/.test(body.note) || !/rest of your program did not run/.test(body.note)) {
+  if (!/data\.approval says who decides it/.test(body.note) || !/rest of your program did not run/.test(body.note)) {
     throw new Error(`the note: ${body.note}`);
   }
   if (!(out.details?.operations ?? []).includes("op_wait")) throw new Error(`details.operations: ${JSON.stringify(out.details)}`);

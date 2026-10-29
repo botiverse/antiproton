@@ -1065,6 +1065,17 @@ function resetCard(p: any, rel: string): string {
 }
 
 /**
+ * What deciding a held call does, written from its row and not from anything the agent said, since a person may open
+ * the page from the agent's message alone: approving runs the one recorded call with the agent's mount
+ * (src/runtime/gateway.ts `applyApproval`), denying runs nothing, and the decision is not put into the conversation.
+ */
+export function heldConsequence(a: Pick<ApprovalRecord, "agentId" | "mountAlias" | "tool" | "operationId">): string {
+  return `Agent <code>${esc(a.agentId)}</code> asked to run <code>${esc(a.mountAlias)}.${esc(a.tool)}</code> ` +
+    `(operation <code>${esc(a.operationId)}</code>). Approving runs this one call, exactly as shown, with the agent's ` +
+    `<code>${esc(a.mountAlias)}</code> mount; denying runs nothing. The agent is not told either way.`;
+}
+
+/**
  * The calls held in this conversation, waiting for a signature. Only those:
  * a decided call leaves the panel with the decision (task #7), since the
  * panel is for what needs the person now. The history of decisions is in
@@ -1085,7 +1096,7 @@ export function approvals(rows: ApprovalRecord[]): string {
           : `<pre>${esc(JSON.stringify(req?.args ?? {}, null, 2))}</pre>`;
         return `<div class="card">
   <div><span class="tool">${esc(a.mountAlias)}.${esc(a.tool)}</span>${req?.heldBy === "agent" ? ` <span class="badge warn">the agent asked you to confirm</span>` : ""}</div>
-  ${what}${typeof req?.policyKey === "string" ? `<div class="hint">decided under the mount's policy for <code>${esc(req.policyKey)}</code> as well as <code>${esc(a.tool)}</code></div>` : ""}
+  ${what}<div class="hint">${heldConsequence(a)}</div>${typeof req?.policyKey === "string" ? `<div class="hint">decided under the mount's policy for <code>${esc(req.policyKey)}</code> as well as <code>${esc(a.tool)}</code></div>` : ""}
   <div class="row">
     <button hx-post="/ui/decide" hx-target="#approvals" hx-swap="innerHTML"
       hx-vals='${esc(JSON.stringify({ operationId: a.operationId, decision: "approved" }))}'>approve</button>

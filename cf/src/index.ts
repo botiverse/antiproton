@@ -475,6 +475,8 @@ export class AgentDO extends DurableObject<Env> {
         layers: await d1ModelChoices(this.env.CONTROL_DB).layers(tenantId, agentId),
         pickerOff: modelPickerEnforced(this.env) && !(await d1TenantModelPicker(this.env.CONTROL_DB).enabled(tenantId)),
       }),
+      // Where a held call is decided, for the link the held result gives the agent.
+      ...(this.env.UI_ORIGIN ? { consoleOrigin: this.env.UI_ORIGIN } : {}),
       // Plugins may make their own mount's hooks (Raft push); the URL must be
       // one a service can reach, which the console's own origin may not be.
       hooks: this.env.HOOK_ORIGIN
@@ -4834,7 +4836,9 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? gate.agentId;
-          const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
+          // Every call the agent holds, in any conversation or session, unless one is named: the page's own panel
+          // (/ui/chat?held=1) shows only the first conversation's, and a call held elsewhere is on no other page.
+          const taskId = url.searchParams.get("taskId") ?? "";
           return conditional(request, approvals(await stub.uiApprovals(gate.tenantId, agentId, taskId)));
         }
         case "/ui/message": {

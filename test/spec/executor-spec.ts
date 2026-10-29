@@ -327,7 +327,7 @@ export async function executorSpec(exec: JsExecutor, only?: (row: string) => boo
     eq(r.status, "paused", "paused");
     eq(r.pause?.cause, "hold", "a hold, not the program's own pause");
     eq(r.pause?.reason, "awaiting_approval", "the gateway's code");
-    eq(JSON.stringify(r.pause?.data), '{"tool":"m.send","operationId":"op_held"}', "which call, which operation");
+    eq(JSON.stringify(r.pause?.data), '{"tool":"m.send","operationId":"op_held","approval":"held"}', "which call, which operation, and the gateway's account of the hold");
     eq(JSON.stringify(r.held), '[{"tool":"m.send","operationId":"op_held","status":"pending"}]', "held lists it");
     eq(calls.map((c) => c.tool).join(","), "m.read,m.send", "the call after the held one was never made");
     eq(JSON.stringify(r.outputs), '["read"]', "nothing after the hold was output, caught or not");

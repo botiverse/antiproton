@@ -700,6 +700,24 @@ export class DurableObjectStore implements StorageAdapter {
       j(a.request), this.#now());
   }
 
+  async holdApproval(a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt">, same: (held: ApprovalRecord) => boolean) {
+    // One synchronous transaction: no await between the lookup and the insert (StorageAdapter `holdApproval`).
+    return this.#tx(() => {
+      const existing = (this.#all(
+        "SELECT * FROM approvals WHERE tenant_id=? AND agent_id=? AND mount_alias=? AND tool=? AND state='pending' ORDER BY created_at ASC",
+        a.tenantId, a.agentId, a.mountAlias, a.tool) as any[]).map(mapApproval).find(same);
+      if (existing) return { created: false as const, existing };
+      this.#sql.exec(
+        `INSERT INTO approvals(tenant_id, operation_id, agent_id, task_id, mount_alias, tool,
+           request, state, approver, decided_at, created_at)
+         VALUES (?,?,?,?,?,?,?,'pending',NULL,NULL,?)
+         ON CONFLICT(tenant_id, operation_id) DO NOTHING`,
+        a.tenantId, a.operationId, a.agentId, a.taskId, a.mountAlias, a.tool,
+        j(a.request), this.#now());
+      return { created: true as const };
+    });
+  }
+
   async getApproval(tenantId: string, operationId: string): Promise<ApprovalRecord | null> {
     const r = this.#one("SELECT * FROM approvals WHERE tenant_id=? AND operation_id=?", tenantId, operationId);
     return r ? mapApproval(r) : null;

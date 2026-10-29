@@ -228,12 +228,17 @@ function answerFrom(text: string | null): { answer?: Json; answerError?: string 
   try { return { answer: JSON.parse(text) as Json }; } catch { return { answerError: "pause()'s third argument is not JSON; no answer check applies" }; }
 }
 
-/** A call held for approval stops the run the same way pause() does. */
-export function holdFrom(tool: string, res: { operationId: string; error?: { code?: string } }): Paused {
+/**
+ * A call held for approval stops the run the same way pause() does. `approval` is the gateway's own account of the
+ * hold (src/runtime/gateway.ts `heldMessage`: who decides, where, what happens next), so a program's hold tells the
+ * model what a direct call's does.
+ */
+export function holdFrom(tool: string, res: { operationId: string; error?: { code?: string; message?: string } }): Paused {
+  const approval = res.error?.message;
   return {
     cause: "hold",
     reason: res.error?.code ?? "awaiting_approval",
-    data: { tool, operationId: res.operationId },
+    data: { tool, operationId: res.operationId, ...(typeof approval === "string" && approval ? { approval } : {}) },
   };
 }
 

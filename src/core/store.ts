@@ -350,6 +350,16 @@ export interface StorageAdapter {
   requireApproval(
     a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt">,
   ): Promise<void>;
+  /**
+   * Hold a call unless the same call is already held: the agent's pending approvals for this mount and tool are
+   * matched with `same`, and the first match is returned instead of a second row. The lookup and the insert are one
+   * synchronous transaction, so two calls of one turn (pi runs them with `Promise.all`) cannot both miss and both
+   * insert. `same` must be synchronous: an await inside it would reopen that gap.
+   */
+  holdApproval(
+    a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt">,
+    same: (held: ApprovalRecord) => boolean,
+  ): Promise<{ created: true } | { created: false; existing: ApprovalRecord }>;
   getApproval(tenantId: string, operationId: string): Promise<ApprovalRecord | null>;
   /** Decide once. A second decision is refused rather than applied, so an
    *  approval cannot be replayed into a second execution. */

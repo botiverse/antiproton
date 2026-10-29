@@ -559,9 +559,9 @@ export const EXPIRED_NOTE =
 export function pausedNote(p: Paused, held: readonly HeldCall[], resumable = false): string {
   const rest = "Calls made before that point completed and are not undone.";
   if (p.cause === "hold") {
-    return "This call is waiting for the person's approval; if they approve it, it runs on its own exactly " +
-      "as written. The rest of your program did not run, and there is nothing to resume: a held call " +
-      "ends the program. " + rest + " Decide whether to continue without it, wait, or tell the person.";
+    return "This call is held for approval; data.approval says who decides it, where, and what happens next. " +
+      "The rest of your program did not run, and there is nothing to resume: a held call " +
+      "ends the program. " + rest + " Decide whether to continue without it, or tell a person.";
   }
   if (resumable) {
     return "The program is waiting at your pause(); nothing after that line has run yet. " + rest +
@@ -572,8 +572,8 @@ export function pausedNote(p: Paused, held: readonly HeldCall[], resumable = fal
       "new run_js program, carrying what you need from data and soFar.";
   }
   const also = held.length
-    ? ` ${held.length === 1 ? "A call is" : `${held.length} calls are`} also waiting for the person's approval ` +
-      "(see held); approved, each runs on its own exactly as written."
+    ? ` ${held.length === 1 ? "A call is" : `${held.length} calls are`} also held for approval ` +
+      "(see held); if approved, each runs on its own exactly as written, and you are not told the decision or the result."
     : "";
   return "The program stopped where you called pause(); nothing after that line ran. " + rest +
     " Think, then send a new run_js program to continue — carry what you need from data and outputs, " +
