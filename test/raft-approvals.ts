@@ -430,7 +430,8 @@ await check("notice: expired, the agent is told nobody decided and that it may a
   const now = Date.now();
   w.raw.sql.exec("UPDATE approvals SET created_at = ?, expires_at = ? WHERE operation_id = ?", now - 1 - DEFAULT_APPROVAL_TTL_MS, now - 1, op);
   const said = await noticeSent(w, op);
-  must(said.includes(`[approval ${op} — state.put — expired;`) && said.includes("Nobody decided within 24 hours") && said.includes("you may call it again"), said);
+  must(said.includes(`[approval ${op} — state.put — expired;`) && said.includes("Nobody decided within 24 hours") && said.includes("you may call it again") &&
+    said.includes(`You made this call at ${new Date(now - 1 - DEFAULT_APPROVAL_TTL_MS).toISOString()}.`), said);
 });
 
 // ---- publishing: the D1 copy and the hint -------------------------------------------------------------------

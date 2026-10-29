@@ -54,7 +54,10 @@ export function deniedNotice(a: ApprovalRecord): string {
 export function expiredNotice(a: Pick<ApprovalRecord, "operationId" | "mountAlias" | "tool" | "createdAt" | "expiresAt">): string {
   const ms = a.expiresAt === null ? null : a.expiresAt - a.createdAt;
   const within = ms === null ? "" : ms >= 3_600_000 ? ` within ${Math.round(ms / 3_600_000)} hours` : ` within ${Math.max(1, Math.round(ms / 60_000))} minutes`;
-  return `${head(a, "expired")}\nNobody decided${within}, so it was denied as expired and nothing was run. ` +
+  // The call may be hours old and long out of the agent's mind (holds already waiting when expiry arrived get their
+  // deadline then, and expire together), so the notice says when it was made.
+  return `${head(a, "expired")}\nYou made this call at ${new Date(a.createdAt).toISOString()}. ` +
+    `Nobody decided${within}, so it was denied as expired and nothing was run. ` +
     "If it still matters you may call it again, which asks for a new approval.";
 }
 
