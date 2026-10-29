@@ -1519,7 +1519,9 @@ await check("deleting an agent whose box run9 will not delete: its registrations
   // Still running, and still sending: the request leaves with the placeholder, not the token.
   const sent = req.send();
   must(sent !== null && sent.authorization === `token ${req.placeholder}` && !JSON.stringify(sent).includes(token), `the box's request after the delete: ${JSON.stringify(sent)}`);
-  // A command on the deleted agent's box (one racing the delete) wires nothing again.
+  // A command on the deleted agent's box, racing the delete while its GitHub mount still held the key (the delete
+  // clears that mount only after the withdrawal), wires nothing again.
+  must((await a.rt.attachCredential(TENANT, a.agentId, "gh", { token })).ok, "control: the key could not be put back on the mount");
   await w.sandbox(a);
   must(run9.boxes.get(boxId!)!.secrets.length === 0, `re-registered after the delete: ${JSON.stringify(run9.boxes.get(boxId!)!.secrets.map((x) => x.name))}`);
   // run9 answers again: the repeated delete lets the box go.
