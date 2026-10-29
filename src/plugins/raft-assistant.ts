@@ -2401,8 +2401,8 @@ export interface Filtered {
 /**
  * Where a conversation's unread stood when a check looked at it (`REVIEWED_KEY`): its count, its first unread message,
  * whether it held an @mention of the owner, and its latest seq when Raft sends one. `latestAt` orders the entries
- * (`REVIEWED_MAX`) and decides nothing, except for a row that carries no position at all (`newSince`). An entry kept
- * before positions were is a plain `latestAt` string.
+ * (`REVIEWED_MAX`), and decides only where the seq cannot (`newSince`). An entry kept before positions were is a plain
+ * `latestAt` string.
  */
 export interface Reviewed { latestAt: string; unread: number; firstUnreadMessageId: string | null; mention: boolean; latestSeq?: number }
 
@@ -2411,16 +2411,20 @@ export function reviewedEntry(i: InboxItem & { latestAt: string }): Reviewed {
 }
 
 /**
- * Whether a conversation is new since a check looked at it (`before`), by position, not time: its unread count grew, its
- * first unread message is another, an @mention appeared, or its latest seq rose. Time cannot say this: a message's
- * `created_at` is set when it is inserted, so one that becomes readable late is older than what a check already read,
- * and comparing times would call it seen. A first unread message that is another also covers the owner reading
- * everything and then one more arriving (the count falls); it also makes a partial read by the owner new, one more look,
- * since a partial read and a partial read with a late message are the same to every field the row has.
+ * Whether a conversation is new since a check looked at it (`before`), by position, not time: its unread count grew, an
+ * @mention appeared, its latest seq rose, or its first unread message is another while its count did not fall. Time
+ * cannot say this: a message's `created_at` is set when it is inserted, so one that becomes readable late is older than
+ * what a check already read, and comparing times would call it seen; a late message raises the count instead.
  *
- * Time decides only where no position can: an entry kept before positions were (a plain `latestAt`), judged as it was
- * written, and a row with neither a first unread message nor a seq on either side (an older Raft), where the owner
- * reading everything and one more arriving moves nothing else.
+ * A first unread message that moved while the count fell is the owner reading part of the conversation, and is not new:
+ * the told store is keyed by message, so a second look could tell the owner again about what they were told under the
+ * message they just read. The owner reading everything and then one more arriving also moves the first unread message
+ * and lowers the count from what was recorded (the row leaves the unread read in between, keeping its entry), but
+ * raises the latest seq. Where the seq cannot be compared (a row or entry without one), that new latest message is told
+ * from a partial read by `latestAt` moving forward, the one position the row has for it.
+ *
+ * Time decides alone only where no position can: an entry kept before positions were (a plain `latestAt`), judged as it
+ * was written, and a row with neither a first unread message nor a seq on either side (an older Raft).
  */
 export function newSince(i: InboxItem, before: Reviewed | string | undefined): boolean {
   if (before === undefined) return true;
@@ -2428,8 +2432,9 @@ export function newSince(i: InboxItem, before: Reviewed | string | undefined): b
   const later = (than: string) => { const t = Date.parse(than); return !(Number.isFinite(t) && Number.isFinite(at) && at <= t); };
   if (typeof before === "string") return later(before);
   const first = i.firstUnreadMessageId ?? null, seq = typeof i.latestSeq === "number" ? i.latestSeq : undefined;
-  if (i.unread > before.unread || first !== before.firstUnreadMessageId || (i.hasMention && !before.mention)) return true;
-  if (seq !== undefined && before.latestSeq !== undefined) return seq > before.latestSeq;
+  const seqs = seq !== undefined && before.latestSeq !== undefined;
+  if (i.unread > before.unread || (i.hasMention && !before.mention) || (seqs && seq > before.latestSeq!)) return true;
+  if (first !== before.firstUnreadMessageId) return i.unread === before.unread || (!seqs && later(before.latestAt));
   if (first === null && seq === undefined && before.latestSeq === undefined) return later(before.latestAt);
   return false;
 }

@@ -770,7 +770,7 @@ await check("a doorbell with new activity starts one short session of its own wi
   const again = await atTime(DAY, () => wake(a.ctx));
   must(again.turn === undefined && a.traced.at(-1)?.status === "skipped_filtered" && a.traced.at(-1)?.attrs.seen === 2, `again: ${show(again)} ${show(a.traced.at(-1))}`);
   // Newer activity in one of them is.
-  a.r.unread = [conv(1, { latestAt: "2026-10-20T09:58:00.000Z", firstUnreadMessageId: laterMsg(1, 1) }), conv(3, { unread: 2 })];
+  a.r.unread = [conv(1, { firstUnreadMessageId: laterMsg(1, 1) }), conv(3, { unread: 2 })];
   await atTime(DAY, () => noteDoorbell(a.ctx));
   const newer = await atTime(DAY, () => wake(a.ctx));
   must(newer.isolated === true && newer.turn.includes(conv(1).channelId) && !newer.turn.includes(conv(3).channelId), `newer: ${show(newer)}`);
@@ -1159,16 +1159,16 @@ await check("mute #random and always @ana, end to end: @ana's chat in #random ge
   const fromAna = await bell(a);
   must(fromAna.isolated === true && fromAna.turn.includes(conv(1).channelId) && /"why":"always"/.test(fromAna.turn), `ana: ${show(fromAna)}`);
   must(lastWake(a).attrs.always === 1 && !("person_rule_unenforced" in lastWake(a).attrs), show(lastWake(a)));
-  a.r.unread = [random({ firstUnreadMessageId: laterMsg(1, 1), latestAt: "2026-10-20T09:55:00.000Z" })];
+  a.r.unread = [random({ firstUnreadMessageId: laterMsg(1, 1) })];
   const fromBob = await bell(a);
   must(fromBob.turn === undefined && lastWake(a).attrs.muted_channel === 1, `bob: ${show(fromBob)} ${show(lastWake(a))}`);
-  a.r.unread = [random({ firstUnreadMessageId: laterMsg(1, 2), latestAt: "2026-10-20T09:56:00.000Z", hasMention: true })];
+  a.r.unread = [random({ firstUnreadMessageId: laterMsg(1, 2), hasMention: true })];
   const mention = await bell(a);
   must(mention.isolated === true && /"why":"mention"/.test(mention.turn), `bob's @mention in a muted channel: ${show(mention)}`);
   // Renamed: the same person under another name is still matched by id; someone new under her old name is not.
-  a.r.unread = [random({ firstUnreadMessageId: laterMsg(1, 3), latestAt: "2026-10-20T09:57:00.000Z", latestSenderName: "ana-renamed", latestSenderId: ANA })];
+  a.r.unread = [random({ firstUnreadMessageId: laterMsg(1, 3), latestSenderName: "ana-renamed", latestSenderId: ANA })];
   must((await bell(a)).isolated === true, "ana renamed was not let through");
-  a.r.unread = [random({ firstUnreadMessageId: laterMsg(1, 4), latestAt: "2026-10-20T09:58:00.000Z", latestSenderName: "ana", latestSenderId: "u-impostor" })];
+  a.r.unread = [random({ firstUnreadMessageId: laterMsg(1, 4), latestSenderName: "ana", latestSenderId: "u-impostor" })];
   must((await bell(a)).turn === undefined, "a new person named ana got ana's rule");
 });
 
@@ -1212,11 +1212,11 @@ await check("general chat: sent to the model while Raft gives no owner name (cou
   const on = await bell(b);
   must(on.isolated === true && on.turn.includes(conv(2).channelId) && /"why":"named"/.test(on.turn) && !on.turn.includes(conv(1).channelId) && !on.turn.includes(conv(3).channelId), `name known: ${show(on)}`);
   must(lastWake(b).attrs.default_chatter === 2, show(lastWake(b)));
-  b.r.unread = [conv(1, { latestPreview: "lunch at noon?", latestAt: "2026-10-20T09:59:00.000Z", firstUnreadMessageId: laterMsg(1, 1) })];
+  b.r.unread = [conv(1, { latestPreview: "lunch at noon?", firstUnreadMessageId: laterMsg(1, 1) })];
   must((await bell(b)).turn === undefined && lastWake(b).status === "skipped_filtered", "chatter alone made a model call");
   b.r.all = [conv(1)];
   await pref(b, { action: "add", effect: "always", channel: "#ch1" });
-  b.r.unread = [conv(1, { latestPreview: "lunch at noon?", latestAt: "2026-10-20T09:59:30.000Z", firstUnreadMessageId: laterMsg(1, 2) })];
+  b.r.unread = [conv(1, { latestPreview: "lunch at noon?", firstUnreadMessageId: laterMsg(1, 2) })];
   must((await bell(b)).isolated === true, "always #ch1 did not let its chat through");
 });
 
@@ -1362,7 +1362,7 @@ await check("each effect's confirm and list line is written from the stored rule
   await pref(a, { action: "add", effect: "mute", channel: "#ch1", until: "2026-10-20T11:00:00.000Z" });
   a.r.unread = [conv(1)];
   must((await bell(a)).turn === undefined && lastWake(a).attrs.muted === 1, "control: muted before it ends");
-  a.r.unread = [conv(1, { latestAt: "2026-10-20T11:30:00.000Z", firstUnreadMessageId: laterMsg(1, 1) })];
+  a.r.unread = [conv(1, { firstUnreadMessageId: laterMsg(1, 1) })];
   must((await bell(a, "2026-10-20T12:00:00Z")).isolated === true, "an expired mute still applied");
   must((await pref(a, { action: "list" }, "2026-10-20T12:00:00Z")).rules.length === 0, "an expired rule listed");
   await pref(a, { action: "add", effect: "mute", kind: "task" }, "2026-10-20T12:00:00Z");
@@ -2347,6 +2347,27 @@ await check("an unread count that grew is new with the same latestAt and first u
   const out = await bell(a);
   must(out.isolated === true && out.turn.includes(id(2)) && !out.turn.includes(id(1)) && lastWake(a).attrs.seen === 3, `one more unread: ${show(out)} ${show(lastWake(a))}`);
   must((await bell(a)).turn === undefined && lastWake(a).attrs.seen === 4, `the grown count once looked at is seen: ${show(lastWake(a))}`);
+});
+
+await check("the owner reading part of a conversation does not make it new; reading all of it and then one more arriving does", async () => {
+  // X, Y, Z unread in ch3; the owner reads X, so Y is the first unread and the count falls.
+  const X = laterMsg(3, 1), Y = laterMsg(3, 2), NEXT = laterMsg(3, 4);
+  for (const seqs of [true, false]) {
+    const a = await assistant(raft({ dm: "dm:@ada" }));
+    briefPosted(a, "2026-10-20");
+    const row = (o: Record<string, unknown>, seq: number) => conv(3, { ...o, ...(seqs ? { latestSeq: seq } : {}) });
+    a.r.unread = [row({ unread: 3, firstUnreadMessageId: X }, 9)];
+    must((await bell(a)).isolated === true, `control: ch3 looked at (seqs ${seqs})`);
+    a.r.unread = [row({ unread: 2, firstUnreadMessageId: Y }, 9)];
+    const partial = await bell(a);
+    must(partial.turn === undefined && lastWake(a).status === "skipped_filtered" && lastWake(a).attrs.seen === 1, `a partial read was new (seqs ${seqs}): ${show(partial)} ${show(lastWake(a))}`);
+    // Everything read: gone from the unread read, its entry kept. Then one more message.
+    a.r.unread = [];
+    must((await bell(a)).turn === undefined && lastWake(a).status === "skipped_empty", `control: nothing unread (seqs ${seqs})`);
+    a.r.unread = [row({ unread: 1, firstUnreadMessageId: NEXT, latestAt: "2026-10-20T09:59:00.000Z" }, 10)];
+    const more = await bell(a);
+    must(more.isolated === true && more.turn.includes(id(3)), `one more after reading all was not new (seqs ${seqs}): ${show(more)} ${show(lastWake(a))}`);
+  }
 });
 
 await check("a reviewed entry kept as a plain latestAt (before positions) is judged by time, then kept as a position", async () => {
