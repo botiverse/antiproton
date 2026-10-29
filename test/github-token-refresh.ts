@@ -1375,7 +1375,7 @@ await check("disconnecting a connector one of whose agents' objects holds no suc
   const r = await w.call("DELETE", `/connectors/${id}`, { actingRaftUserId: "u_owner", actingRole: "creator" });
   const msg = r.body?.revokeOnGithub?.message ?? "";
   must(r.status === 200 && JSON.stringify(r.body.revokeOnGithub?.agents) === JSON.stringify(["ZB"]) && r.body.revokeOnGithub.action === "revoke_on_github"
-    && msg.indexOf("#1128") < msg.indexOf("the last resort") && msg.indexOf("Until then") < msg.indexOf("the last resort") && /ALL of this GitHub account's tokens/.test(msg), `the answer: ${r.status} ${r.text}`);
+    && msg.indexOf("#1128") < msg.indexOf("the last resort") && msg.includes("Until then") && msg.indexOf("Until then") < msg.indexOf("the last resort") && /ALL of this GitHub account's tokens/.test(msg), `the answer: ${r.status} ${r.text}`);
   must(!w.db.raw.prepare("SELECT 1 FROM provisioned_connections WHERE raft_agent_id = 'ZB'").get(), "the wiped agent's binding was kept");
   w.dispose();
 });
