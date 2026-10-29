@@ -654,7 +654,10 @@ await check("deleted agent: its rows are kept as the record of who decided what,
   const w = await world();
   const op = await hold(w);
   must((await decide(w, op, "deny")).status === 200, "decide");
+  // Still pending when the agent is deleted: a late publish could still move it forward.
+  const open = await hold(w, "still pending");
   await w.D.alarm();
+  must(indexRow(w, open)?.status === "pending", "control: the pending hold was not copied");
   const before = indexRow(w, op);
   must(before?.status === "denied" && before.agent_deleted_at === null && typeof JSON.parse(before.item).args?.summary === "string", `control: ${show(before)}`);
   // Control: both lists show it while the agent lives.
@@ -681,8 +684,8 @@ await check("deleted agent: its rows are kept as the record of who decided what,
   const { d1ApprovalIndex } = await import("../cf/src/approvals.ts");
   const late = { tenantId: T, agentId: A, raftOrigin: ORIGIN, raftServerId: "srv-1", raftAgentId: RAFT_ID, createdAt: 1, expiresAt: null, updatedAt: Date.now() };
   await d1ApprovalIndex(w.DB).upsert({ ...late, operationId: "op_late", status: "pending", item: { operationId: "op_late" } as never });
-  await d1ApprovalIndex(w.DB).upsert({ ...late, operationId: op, status: "failed", item: { ...item, args: { summary: "back" } } as never });
-  must(!indexRow(w, "op_late") && indexRow(w, op).status === "denied" && !indexRow(w, op).item.includes("back"), `a late publish wrote: ${show(indexRow(w, op))}`);
+  await d1ApprovalIndex(w.DB).upsert({ ...late, operationId: open, status: "denied", item: { ...item, operationId: open, args: { summary: "back" } } as never });
+  must(!indexRow(w, "op_late") && indexRow(w, open).status === "pending" && !indexRow(w, open).item.includes("back"), `a late publish wrote: ${show(indexRow(w, open))}`);
 });
 
 await check("deleted agent: a delete whose marking failed is finished by the repeat, and its rows are not pruned as a live agent's meanwhile", async () => {
