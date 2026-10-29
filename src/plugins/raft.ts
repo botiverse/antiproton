@@ -367,7 +367,7 @@ const SINCE_KEY = "since";
 
 /**
  * What push notices said is on its way, as `{ pairs: { [channelId]: latestSeq }, at: { [channelId]: ms }, attempt }`
- * (`at`: when that conversation's seq was announced): the next `receive_events`
+ * (`at`: when a pull first waited for that conversation at its seq; absent until then): the next `receive_events`
  * pull sends them as `/events` `wait_for`, so a message Raft has committed but not yet made readable to `/events` (its
  * inbox chain trails the notice by seconds) is waited for instead of answered with an empty batch. Kept apart from
  * `SINCE_KEY` and never read into it: a notice says what exists, not what this agent was shown, and a `since` taken
@@ -386,9 +386,10 @@ const WAIT_FOR_MAX_PAIRS = 20;
  */
 export const WAIT_FOR_MAX_MS = 30_000;
 /**
- * How long a pair is waited for at all. A message Raft never makes readable to this agent (deleted, or in a
- * conversation the agent has left) would otherwise cost every later `receive_events` the whole cap; past this age the
- * pair is dropped, said on a warn line, and the pull goes on without it.
+ * How long a pair is waited for at all, from the first pull that waited for it (not from its notice, so a pair noticed
+ * while no one called `receive_events` is still waited for once). A message Raft never makes readable to this agent
+ * (deleted, or in a conversation the agent has left) would otherwise cost every later `receive_events` the whole cap;
+ * past this age the pair is dropped, said on a warn line, and the pull goes on without it.
  */
 export const WAIT_FOR_MAX_AGE_MS = 5 * 60_000;
 const CHANNEL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -3904,8 +3905,7 @@ function waitForOf(raw: unknown): WaitFor {
   for (const [channelId, seq] of Object.entries(object(o.pairs))) {
     if (!CHANNEL_ID.test(channelId) || typeof seq !== "number" || !Number.isSafeInteger(seq) || seq <= 0) continue;
     pairs[channelId] = seq;
-    // A pair with no time reads as announced long ago, so the age rule can still let it go.
-    at[channelId] = typeof when[channelId] === "number" ? when[channelId] as number : 0;
+    if (typeof when[channelId] === "number") at[channelId] = when[channelId] as number;
   }
   const attempt = typeof o.attempt === "number" && Number.isSafeInteger(o.attempt) && o.attempt >= 0 ? o.attempt : 0;
   return { pairs, at, attempt };
@@ -3913,22 +3913,23 @@ function waitForOf(raw: unknown): WaitFor {
 
 function keepWaitFor(tx: { put(store: string, value: Json, key?: string): void; delete(store: string, key: string): void }, w: WaitFor): void {
   if (!Object.keys(w.pairs).length) { tx.delete(INBOX_STORE, WAIT_FOR_KEY); return; }
-  const at = Object.fromEntries(Object.keys(w.pairs).map((c) => [c, w.at[c] ?? 0]));
+  const at = Object.fromEntries(Object.keys(w.pairs).flatMap((c) => (w.at[c] !== undefined ? [[c, w.at[c]!]] : [])));
   tx.put(INBOX_STORE, { pairs: w.pairs, at, attempt: w.attempt } as unknown as Json, WAIT_FOR_KEY);
 }
 
 /**
- * The kept pairs, less those older than `WAIT_FOR_MAX_AGE_MS`, which are dropped here with a warn line: Raft has had
- * minutes to make them readable, so waiting for them again would only make every call wait out the cap.
+ * The kept pairs, less those first waited for more than `WAIT_FOR_MAX_AGE_MS` ago, which are dropped here with a warn
+ * line: Raft has had minutes to make them readable, so waiting for them again would only make every call wait out the
+ * cap. A pair not waited for yet is timed from now, the pull this is for being its first wait.
  */
 async function freshWaitFor(ctx: PluginContext, now = Date.now()): Promise<WaitFor> {
   const { kept, dropped } = await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
     const kept = waitForOf(tx.get(INBOX_STORE, WAIT_FOR_KEY));
-    const dropped = Object.keys(kept.pairs).filter((c) => now - (kept.at[c] ?? 0) > WAIT_FOR_MAX_AGE_MS);
-    if (dropped.length) {
-      for (const c of dropped) { delete kept.pairs[c]; delete kept.at[c]; }
-      keepWaitFor(tx, kept);
-    }
+    const dropped = Object.keys(kept.pairs).filter((c) => kept.at[c] !== undefined && now - kept.at[c]! > WAIT_FOR_MAX_AGE_MS);
+    for (const c of dropped) { delete kept.pairs[c]; delete kept.at[c]; }
+    const first = Object.keys(kept.pairs).filter((c) => kept.at[c] === undefined);
+    for (const c of first) kept.at[c] = now;
+    if (dropped.length || first.length) keepWaitFor(tx, kept);
     return { kept, dropped };
   });
   if (dropped.length) {
@@ -3957,9 +3958,9 @@ async function noteWaitFor(ctx: PluginContext, targets: readonly unknown[]): Pro
   await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
     const kept = waitForOf(tx.get(INBOX_STORE, WAIT_FOR_KEY));
     let moved = false;
-    const now = Date.now();
     for (const [channelId, seq] of announced) {
-      if ((kept.pairs[channelId] ?? 0) < seq) { kept.pairs[channelId] = seq; kept.at[channelId] = now; moved = true; }
+      // A higher seq is a new message to wait for: its clock starts at its own first wait.
+      if ((kept.pairs[channelId] ?? 0) < seq) { kept.pairs[channelId] = seq; delete kept.at[channelId]; moved = true; }
     }
     if (!moved) return;
     const pairs = Object.fromEntries(Object.entries(kept.pairs).sort(([, a], [, b]) => b - a).slice(0, WAIT_FOR_MAX_PAIRS));

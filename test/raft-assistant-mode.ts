@@ -3854,6 +3854,24 @@ await check("delivered: an unreadable outcome with a short wake still due is not
   must(show(a.r.delivered) === show([[id]]), `after the retry's session: ${show(a.r.delivered)}`);
 });
 
+await check("delivered: a 401, 403 or 408 is the credential or the timing, not the ids: kept, and sent once Raft takes it", async () => {
+  for (const status of [401, 403, 408]) {
+    const a = await raftAssistant();
+    await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
+    const id = lastBellId(a);
+    const out = await atTime(DAY, () => wake(a.ctx));
+    a.r.deliveredAnswer = status;
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+    try { await afterTurn(a.ctx, checkEnd(out.turnKey, "completed")); } finally { console.warn = warn; }
+    must(warned.some((w) => /could not report 1 handled event\(s\) delivered; kept/.test(w)) && show(a.read(ASSISTANT_STORE, "event_delivery")?.unreported) === show([id]), `${status}: ${show(warned)}`);
+    a.r.deliveredAnswer = 200;
+    await atTime(DAY, () => wake(a.ctx));
+    must(show(a.r.delivered) === show([[id]]), `${status}: not sent again once accepted: ${show(a.r.delivered)}`);
+  }
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`  ${r.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${r.name}${r.ok ? "" : `\n      \x1b[31m${r.error}\x1b[0m`}`);
 console.log("  ────────────────────────────────────────────────────────");

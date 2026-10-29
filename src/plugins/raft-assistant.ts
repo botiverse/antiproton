@@ -2152,6 +2152,9 @@ export const DELIVERED_REPORT_MAX_IDS = 200;
 const DELIVERY_IDS_MAX = 1_000;
 const DELIVERY_TURNS_MAX = 20;
 
+/** The 4xx answers a report is sent again after: about the credential or the timing, not about the ids. */
+const RETRYABLE_4XX: ReadonlySet<number> = new Set([401, 403, 408, 429]);
+
 /** Raft's `POST /third-party-events/delivered` for these ids; throws when it did not answer 2xx. */
 export type DeliveredReport = (ctx: PluginContext, eventIds: readonly string[]) => Promise<void>;
 
@@ -2246,10 +2249,12 @@ export async function reportDelivered(ctx: PluginContext, report: DeliveredRepor
     try { await report(ctx, part); sent.push(...part); }
     catch (e) {
       const said = String((e as Error)?.message ?? e).slice(0, 160);
-      // A refusal (a 4xx other than 429) says the same however often it is asked: this part is dropped, said on the
-      // warn line, and the rest still goes. Anything else may clear: it and the rest are kept for the next report.
+      // A refusal of these ids (400, 404, 422, …) says the same however often it is asked: this part is dropped, said
+      // on the warn line, and the rest still goes. Anything else may clear and is kept for the next report with the
+      // rest: a 401 or 403 is the credential (rotated, expired) rather than the ids, a 408 or 429 is timing, a 5xx or
+      // no answer is Raft's.
       const status = (e as { httpStatus?: unknown })?.httpStatus;
-      if (typeof status === "number" && status >= 400 && status < 500 && status !== 429) {
+      if (typeof status === "number" && status >= 400 && status < 500 && !RETRYABLE_4XX.has(status)) {
         dropped.push(...part);
         console.warn(`raft mount ${ctx.alias}: Raft refused to record ${part.length} handled event(s) delivered (HTTP ${status}); dropped, not retried: ${said}`);
       } else error = said;

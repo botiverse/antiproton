@@ -4798,7 +4798,7 @@ await check("wait_for, case A: notices never move since; the next pull sends the
   // A cursor taken from a notice would be 102 here, past what the model was shown.
   must(await sinceKept(m) === 100, `a notice moved the kept since: ${await sinceKept(m)}`);
   const kept = await m.ctx.db.get(INBOX_STORE, "wait_for") as any;
-  must(JSON.stringify(kept.pairs) === JSON.stringify({ [WAIT_CH]: 102 }) && kept.attempt === 0 && typeof kept.at[WAIT_CH] === "number", `the notice pair: ${JSON.stringify(kept)}`);
+  must(JSON.stringify(kept.pairs) === JSON.stringify({ [WAIT_CH]: 102 }) && kept.attempt === 0 && !(WAIT_CH in (kept.at ?? {})), `the notice pair (not yet waited for): ${JSON.stringify(kept)}`);
   const second = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
   must(raft.pulls[1]!.get("since") === "100", `the second pull sent since=${raft.pulls[1]!.get("since")}`);
   must(raft.pulls[1]!.get("wait_for") === `${WAIT_CH}:102`, `wait_for: ${raft.pulls[1]!.get("wait_for")}`);
@@ -4878,6 +4878,29 @@ await check("wait_for age: a pair announced more than WAIT_FOR_MAX_AGE_MS ago is
   await m.ctx.db.put(INBOX_STORE, { ...young, at: { [WAIT_CH]: Date.now() - 4 * 60_000 } }, "wait_for");
   const next = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
   must(raft.pulls[2]!.get("wait_for") === `${WAIT_CH}:102` && JSON.stringify(shownSeqs(next)) === "[102]", `the young pair: ${JSON.stringify(next)}`);
+});
+
+await check("wait_for age counts from the first wait: a pair noticed long ago but never waited for is still tried once, then dropped once that wait is old", async () => {
+  const capped = createRaftPlugin({ waitForMaxMs: 30 });
+  const raft = waitingRaft(20); const m = pushOn();
+  raft.write(100);
+  await capped.invoke("receive_events", {}, m.ctx);
+  raft.write(101, Infinity);
+  // Noticed six minutes ago, while nothing called receive_events.
+  const real = Date.now;
+  Date.now = () => real() - 6 * 60_000;
+  try { await announce(capped, m, 101); } finally { Date.now = real; }
+  const out = await capped.invoke("receive_events", {}, m.ctx) as any;
+  must(raft.pulls[1]!.get("wait_for") === `${WAIT_CH}:101` && out.status === "still_arriving", `never waited for, yet not tried: ${JSON.stringify(out)} ${raft.pulls.map(String)}`);
+  const kept = await m.ctx.db.get(INBOX_STORE, "wait_for") as any;
+  must(typeof kept?.at?.[WAIT_CH] === "number" && real() - kept.at[WAIT_CH] < 5_000, `the first wait's time: ${JSON.stringify(kept)}`);
+  // That first wait six minutes old now: dropped.
+  await m.ctx.db.put(INBOX_STORE, { ...kept, at: { [WAIT_CH]: real() - 6 * 60_000 } }, "wait_for");
+  const warn = console.warn;
+  console.warn = () => {};
+  const before = raft.pulls.length;
+  try { await capped.invoke("receive_events", {}, m.ctx); } finally { console.warn = warn; }
+  must(!raft.pulls[before]!.has("wait_for") && await m.ctx.db.get(INBOX_STORE, "wait_for") === undefined, `kept past its age: ${raft.pulls[before]}`);
 });
 
 globalThis.fetch = originalFetch;
