@@ -321,7 +321,7 @@ await check("an AgentRuntime, Raft-made agent: nobody can decide, no link, tell 
 
 await check("current behaviour, until Raft approvals deliver decisions: after a decision the agent receives nothing", async () => {
   // What `heldMessage` tells the agent ("you are not told the decision or the result"). The Raft approvals work
-  // (docs/raft-approvals.md) is meant to change this; this case is then the one to rewrite.
+  // (botiverse/antiproton#1112 follow-up) is meant to change this; this case is then the one to rewrite.
   const { rt, host } = await runtimeFor({});
   const conversationRows = () => (host.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'pi_%entries'").toArray() as any[])
     .reduce((n, t) => n + Number((host.sql.exec(`SELECT COUNT(*) AS c FROM ${t.name}`).toArray()[0] as any).c), 0);
