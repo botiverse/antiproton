@@ -762,6 +762,17 @@ export async function connectorAudience(db: D1Database, tenantId: string, connec
   return (r.results ?? []).map((x: any) => String(x.agent_id));
 }
 
+/**
+ * `connectorAudience`, and how many of the agents bound to the connector it left out: bound to it in
+ * `provisioned_connections`, but of another origin, or of a connector with no origin.
+ */
+export async function renewalAudience(db: D1Database, tenantId: string, connectorId: string): Promise<{ to: string[]; filtered: number }> {
+  const to = await connectorAudience(db, tenantId, connectorId);
+  const bound = await db.prepare("SELECT COUNT(*) AS n FROM provisioned_connections WHERE tenant_id = ? AND connector_id = ?")
+    .bind(tenantId, connectorId).first<any>();
+  return { to, filtered: Math.max(0, Number(bound?.n ?? 0) - to.length) };
+}
+
 export function d1ConnectorGrants(db: D1Database): ConnectorGrants {
   return {
     async grant(tenantId, id, agentId) {

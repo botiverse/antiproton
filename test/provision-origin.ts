@@ -449,7 +449,7 @@ await check("renewal: a connector's pair reaches only its own origin's agents; a
   put("k1", OURS); put("k_null", null);
   // A binding of another origin's agent that the migration did not see (written around the new checks).
   f.bind("A", "k1"); f.bind("B", "k1"); f.bind("C", "k1"); f.bind("F", "k_null");
-  const { connectorAudience, d1ConnectorGrants } = await import("../cf/src/control-plane.ts");
+  const { connectorAudience, d1ConnectorGrants, renewalAudience } = await import("../cf/src/control-plane.ts");
   const g = d1ConnectorGrants(f.D1);
   assert((await g.grant(TENANT, "k1", "raft_A"))?.id === "k1", "control: its own origin's agent finds it");
   assert((await g.grant(TENANT, "k1", "raft_B")) === null, "another origin's agent found the connector");
@@ -458,6 +458,10 @@ await check("renewal: a connector's pair reaches only its own origin's agents; a
   const to = await connectorAudience(f.D1, TENANT, "k1");
   assert(JSON.stringify(to) === JSON.stringify(["raft_A", "raft_C"]), `handed to: ${JSON.stringify(to)}`);
   assert((await connectorAudience(f.D1, TENANT, "k_null")).length === 0, "a connector with no origin was handed to its agents");
+  // What the renewal push logs: the agents bound but left out, by origin or by the connector having none.
+  const k1 = await renewalAudience(f.D1, TENANT, "k1"), kNull = await renewalAudience(f.D1, TENANT, "k_null");
+  assert(JSON.stringify(k1) === JSON.stringify({ to: ["raft_A", "raft_C"], filtered: 1 }) && JSON.stringify(kNull) === JSON.stringify({ to: [], filtered: 1 }),
+    `filtered: ${JSON.stringify(k1)} ${JSON.stringify(kNull)}`);
 });
 
 console.log(`  ${routes.size} (method, path) pairs take an agent id; ${served.length} (both spellings) served for their own origin; ${Object.keys(OUTSIDE).length} cases outside /agents/<id>`);
