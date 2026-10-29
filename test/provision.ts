@@ -420,7 +420,7 @@ function connectionsFake() {
   f.deps.connections = {
     registry: {
       async get(t, r, p) { return conns.get(`${t}/${r}/${p}`) ?? null; },
-      async put(c) { conns.set(`${c.tenantId}/${c.raftAgentId}/${c.provider}`, c); },
+      async put(c) { conns.set(`${c.tenantId}/${c.raftAgentId}/${c.provider}`, c); return true; },
       async remove(t, r, p) { return conns.delete(`${t}/${r}/${p}`); },
       async boundTo(t, id) { return [...conns.values()].filter((c) => c.tenantId === t && c.connectorId === id).map((c) => c.raftAgentId).sort(); },
     },
@@ -442,6 +442,7 @@ function connectionsFake() {
     async attach(_t, agentId, _p, sealed) { attached.push({ agentId, sealed }); return { ok: true, account: "octocat" }; },
     async link(spec) { links.push(spec); return { url: "https://ap.example/connect/start?t=signed", expiresAt: "2026-09-29T07:00:00.000Z" }; },
     async detach(_t, agentId, provider) { detached.push(`${agentId}/${provider}`); return true; },
+    async clear(_t, agentId, provider) { detached.push(`${agentId}/${provider}/cleared`); return { ok: true, cleared: true }; },
     async detachIfFrom(_t, agentId, provider, sealed) {
       if (failDetach.has(agentId)) throw new Error("the agent's object did not answer");
       detached.push(`${agentId}/${provider}/${sealed.ciphertext}`); return true;

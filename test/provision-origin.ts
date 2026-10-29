@@ -135,6 +135,7 @@ const NOT_THE_PATH: Array<{ call: string; why: string }> = [
   { call: "const a = raftAgentId === row.raftAgentId ? row : await deps.registry.get(tenantId, raftAgentId);", why: "reconnect in place: the other agents bound to the connector" },
   { call: "const row = await deps.registry.get(tenantId, raftAgentId).catch(() => undefined);", why: "DELETE /connectors/:id: the agents bound to the connector" },
   { call: "const got = await c.registry.get(tenantId, row.raftAgentId, p);", why: "the connection registry, keyed by an agent already found (two calls)" },
+  { call: "const bound = await c.registry.get(tenantId, row.raftAgentId, p);", why: "an agent's DELETE: its connections, keyed by the agent already found" },
 ];
 const HANDLERS_TEXT = readFileSync(HANDLERS, "utf8");
 const lineOf = (offset: number) => HANDLERS_TEXT.slice(0, offset).split("\n").length;
@@ -459,13 +460,45 @@ await check("renewal: a connector's pair reaches only its own origin's agents; a
   assert(JSON.stringify(to) === JSON.stringify(["raft_A", "raft_C"]), `handed to: ${JSON.stringify(to)}`);
   assert((await connectorAudience(f.D1, TENANT, "k_null")).length === 0, "a connector with no origin was handed to its agents");
   // What the renewal push logs: the agents bound but left out, by origin or by the connector having none.
-  // A deleted agent of the connector's origin still bound is no origin's leak: in `to` as before, never `filtered`. A
-  // binding whose agent has no row is `skipped`.
+  // A deleted agent of the connector's origin still bound is no origin's leak: left out of `to` and counted `skipped`,
+  // never `filtered`; so is a binding whose agent has no row. In production `skipped` goes from 0 to 1 for the one
+  // deleted agent that was still bound until 0031 removes that binding, and that is expected.
   f.agent("H", OURS); f.db.prepare("UPDATE provisioned_agents SET status = 'deleted', deleted_at = 2 WHERE raft_agent_id = 'H'").run();
   f.bind("H", "k1"); f.bind("NOROW", "k1");
   const k1 = await renewalAudience(f.D1, TENANT, "k1"), kNull = await renewalAudience(f.D1, TENANT, "k_null");
-  assert(JSON.stringify(k1) === JSON.stringify({ to: ["raft_A", "raft_C", "raft_H"], filtered: 1, skipped: 1 })
+  assert(JSON.stringify(k1) === JSON.stringify({ to: ["raft_A", "raft_C"], filtered: 1, skipped: 2 })
     && JSON.stringify(kNull) === JSON.stringify({ to: [], filtered: 1, skipped: 0 }), `filtered: ${JSON.stringify(k1)} ${JSON.stringify(kNull)}`);
+});
+
+await check("credential paths take an allow list of statuses: an agent of a status not named there gets no grant, no renewed pair and no binding", async () => {
+  const f = d1();
+  f.agent("A", OURS); f.agent("S", OURS);
+  // A status added later, say a suspension: nothing hands it a credential until it is named.
+  f.db.prepare("UPDATE provisioned_agents SET status = 'suspended' WHERE raft_agent_id = 'S'").run();
+  f.db.prepare("INSERT INTO connectors(id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at, raft_origin) VALUES ('k1', ?, 'github', 'octo', 'u-1', 'c', 'i', 1, ?)").run(TENANT, OURS);
+  f.bind("A", "k1"); f.bind("S", "k1");
+  const { d1ConnectorGrants, d1Connections, renewalAudience, LIVE_AGENT_STATUSES } = await import("../cf/src/control-plane.ts");
+  assert(JSON.stringify(LIVE_AGENT_STATUSES) === JSON.stringify(["provisioning", "active"]), `live: ${JSON.stringify(LIVE_AGENT_STATUSES)}`);
+  assert((await d1ConnectorGrants(f.D1).grant(TENANT, "k1", "raft_A")) !== null, "control: the active agent was refused");
+  assert((await d1ConnectorGrants(f.D1).grant(TENANT, "k1", "raft_S")) === null, "a suspended agent found the connector");
+  const aud = await renewalAudience(f.D1, TENANT, "k1");
+  assert(JSON.stringify(aud) === JSON.stringify({ to: ["raft_A"], filtered: 0, skipped: 1 }), `audience: ${JSON.stringify(aud)}`);
+  const put = (agent: string) => d1Connections(f.D1).put({ tenantId: TENANT, raftAgentId: agent, provider: "linear", account: null, connectedBy: "u-1", connectedAt: 1, connectorId: null } as any);
+  assert((await put("A")) === true && (await put("S")) === false, "the binding write took a suspended agent");
+});
+
+await check("migration 0031: a deleted agent still bound to a connector is unbound, each recorded first; live agents keep theirs", async () => {
+  const f = d1("0031_");
+  f.agent("A", OURS); f.agent("Z", OURS);
+  f.db.prepare("UPDATE provisioned_agents SET status = 'deleted', deleted_at = 5000 WHERE raft_agent_id = 'Z'").run();
+  f.db.prepare("INSERT INTO connectors(id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at, raft_origin) VALUES ('k1', ?, 'github', 'octo', 'u-1', 'c', 'i', 1, ?)").run(TENANT, OURS);
+  f.bind("A", "k1"); f.bind("Z", "k1");
+  f.rest();
+  const left = (f.db.prepare("SELECT raft_agent_id AS a FROM provisioned_connections ORDER BY a").all() as any[]).map((r) => r.a);
+  assert(JSON.stringify(left) === JSON.stringify(["A"]), `bindings left: ${JSON.stringify(left)}`);
+  const ev = f.db.prepare("SELECT * FROM connector_events WHERE action = 'deleted_agent_unbound'").all() as any[];
+  assert(ev.length === 1 && ev[0].connector_id === "k1" && ev[0].raft_agent_id === "Z" && ev[0].acting_role === "system" && ev[0].at > 1_700_000_000_000
+    && JSON.stringify(JSON.parse(ev[0].reason)) === JSON.stringify({ provider: "github", mountCleared: false, deletedAt: 5000 }), `the record: ${JSON.stringify(ev)}`);
 });
 
 console.log(`  ${routes.size} (method, path) pairs take an agent id; ${served.length} (both spellings) served for their own origin; ${Object.keys(OUTSIDE).length} cases outside /agents/<id>`);

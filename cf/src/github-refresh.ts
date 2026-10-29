@@ -466,6 +466,11 @@ export class GithubRefresher {
       if (r.ok) {
         // Also when only the mount's own broken flag is stale: the connector says it is healthy.
         if (r.accessToken !== current || r.expiresAt !== rec.expiresAt || rec.brokenAt) {
+          // The agent may have been deleted, and its mount cleared, while the renewal ran: asked again just before the
+          // write, so a pair is not put back on a mount its delete took it off. A delete landing between this read and
+          // the write still loses to it; that window is one D1 read wide.
+          // Nothing is written then, not even the broken mark: that record carries the refresh token, and the clear took it.
+          if (!(await this.#d.grants.grant(tenantId, rec.connectorId, agentId))) return { ok: false, broken: true, reason: "the connection was removed" };
           await this.#write(tenantId, agentId, name, current, { ...rec, refreshToken: r.refreshToken, expiresAt: r.expiresAt, refreshExpiresAt: r.refreshExpiresAt }, r.accessToken);
           this.#report({ tenantId, agentId, mount: name, connectorId: rec.connectorId, why, outcome: r.rotated ? "rotated" : "adopted" });
         }

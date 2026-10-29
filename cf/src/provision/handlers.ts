@@ -27,7 +27,7 @@ import {
   MAIN_SESSION_ID, redactCredentials, TRACE_LIMIT_DEFAULT, TRACE_LIMIT_MAX, TRACE_WINDOW_MAX_MS, TRANSCRIPT_LIMIT_DEFAULT, TRANSCRIPT_LIMIT_MAX,
   type EvalTranscript, type TraceQuery, type TraceWindow,
 } from "../eval-read.ts";
-import { AGENT_BUDGETS, type AgentBudget, type ConnectionRegistry, type ConnectorRefresh, type ConnectorStore, type ProviderTokenIdentity, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
+import { AGENT_BUDGETS, LIVE_AGENT_STATUSES, SYSTEM_ACTOR, type AgentBudget, type ConnectionRegistry, type ConnectorRefresh, type ConnectorStore, type ProviderTokenIdentity, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
 import { MAX_BUDGET_CENTS, PLANS, type BudgetWrite, type Plan, type TenantPlanStore } from "../spend-limit.ts";
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider, type ReconnectTarget } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
@@ -189,6 +189,8 @@ export interface ProvisionDeps {
     detachIfFrom(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string }, connectorId?: string | null): Promise<boolean>;
     /** Remove the provider's credential from the agent's mount. */
     detach(tenantId: string, agentId: string, provider: ConnectionProvider): Promise<boolean>;
+    /** The same, for an agent's delete, telling nothing to clear from a refusal (`AgentRuntime.clearConnection`). */
+    clear(tenantId: string, agentId: string, provider: ConnectionProvider): Promise<{ ok: true; cleared: boolean } | { ok: false; error: string; gone?: true }>;
     /** Make a held connection the mount's credential, for the Raft user it was held for (connect.ts), as connector `connectorId`. */
     confirm(tenantId: string, agentId: string, provider: ConnectionProvider, pending: string, raftUserId: string, connectorId?: string):
       Promise<{ ok: true; account: string | null; accountId?: string | null; sealed: { ciphertext: string; iv: string }; refresh?: ConnectorRefresh | null;
@@ -1026,7 +1028,74 @@ export async function handleProvision(
       try { await deps.approvals.index.markAgentDeleted(tenantId, row.agentId, at); }
       catch (e) { console.warn(`keeping the approval copies of ${tenantId}/${row.agentId} failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`); }
     };
-    if (row.status === "deleted") { await keepHolds(row.deletedAt ?? row.updatedAt); return ok(view(row)); }
+    // Its connections go: the credential copy on the agent's mount, then each binding to a connector, recorded as the
+    // connector's event with whether the mount was cleared. What became of each is in the answer (`connections`,
+    // `connectionsClean`): still a 200, since the agent is deleted either way, but never a plain success when a copy
+    // may be left, and each such entry names what to do next:
+    //  - the clear was refused (something the key made is still held) or the object did not answer (usually
+    //    passing): the binding is kept, so the next DELETE of the agent, or the connector's disconnect, still finds
+    //    it, and `action: "retry_delete"`. Meanwhile the copy is not renewed: a deleted agent is never handed a pair,
+    //    nor finds a connector to renew through (`d1ConnectorGrants`).
+    //  - the object holds no such agent (wiped): nothing here can reach what it was handed, a retry cannot either, so
+    //    the binding goes, and `action: "revoke_on_github"` (botiverse/antiproton#1128).
+    type ConnectionEnd = { provider: ConnectionProvider; connectorId: string | null; binding: "removed" | "kept" | "none";
+      mount: "cleared" | "not_cleared"; action?: "retry_delete" | "revoke_on_github"; message?: string; error?: string };
+    const REVOKE = "this agent's object holds nothing to clear, so a copy it was handed cannot be removed here; revoke the connection on GitHub " +
+      "to end it, which also makes every other agent on this connector re-authorise, since they share the token (botiverse/antiproton#1128)";
+    const unbind = async (at: number): Promise<ConnectionEnd[] | null> => {
+      const c = deps.connections;
+      if (!c) return null;
+      const ends: ConnectionEnd[] = [];
+      for (const p of CONNECTION_PROVIDERS) {
+        let error: string | null = null;
+        let gone = false;
+        let took = false;
+        try {
+          const r = await c.clear(tenantId, row.agentId, p);
+          if (r.ok) took = r.cleared;
+          else { error = r.error; gone = r.gone === true; }
+        } catch (e) { error = `the agent's object did not answer: ${String((e as Error)?.message ?? e).slice(0, 160)}`; }
+        const mountCleared = error === null;
+        const action = mountCleared ? undefined : gone ? "revoke_on_github" as const : "retry_delete" as const;
+        if (!mountCleared) logEvent("connect.agent_delete", { tenantId, agentId: row.agentId, provider: p, outcome: "mount-not-cleared", action: action!, reason: error!.slice(0, 200) });
+        let connectorId: string | null = null;
+        let binding: ConnectionEnd["binding"] = "none";
+        try {
+          const bound = await c.registry.get(tenantId, row.raftAgentId, p);
+          if (bound) {
+            connectorId = bound.connectorId ?? null;
+            binding = "kept";
+            if (action !== "retry_delete") {
+              // Whether the mount copy went is recorded with the unbinding, so a later check reads it from data.
+              if (connectorId) {
+                await c.connectors.record({ tenantId, connectorId, raftAgentId: row.raftAgentId, action: "deleted_agent_unbound",
+                  actingRaftUserId: SYSTEM_ACTOR, actingRole: "system", at, reason: JSON.stringify({ provider: p, mountCleared, ...(error ? { error } : {}) }) });
+              }
+              await c.registry.remove(tenantId, row.raftAgentId, p);
+              binding = "removed";
+            }
+            logEvent("connect.agent_delete", { tenantId, agentId: row.agentId, provider: p, connectorId, outcome: binding === "removed" ? "unbound" : "binding-kept", mountCleared });
+          }
+        } catch (e) {
+          error ??= String((e as Error)?.message ?? e).slice(0, 200);
+          logEvent("connect.agent_delete", { tenantId, agentId: row.agentId, provider: p, outcome: "unbind-failed", reason: String((e as Error)?.message ?? e).slice(0, 200) });
+        }
+        // A provider the agent was never connected to, with nothing on its mount, is not worth an entry.
+        if (binding !== "none" || took || error !== null) {
+          ends.push({ provider: p, connectorId, binding, mount: mountCleared ? "cleared" : "not_cleared",
+            ...(action ? { action, message: action === "revoke_on_github" ? REVOKE : "the mount still holds a copy; DELETE this agent again to clear it" } : {}),
+            ...(error ? { error } : {}) });
+        }
+      }
+      return ends;
+    };
+    const answer = (agent: ReturnType<typeof view>, ends: ConnectionEnd[] | null) => ends === null ? ok(agent)
+      : ok({ ...agent, connections: ends, connectionsClean: ends.every((e) => e.mount === "cleared" && !e.error) });
+    if (row.status === "deleted") {
+      const ends = await unbind(deps.now());
+      await keepHolds(row.deletedAt ?? row.updatedAt);
+      return answer(view(row), ends);
+    }
     // Raft revokes the credential itself, so pushes stop even if this fails half-way; what is
     // reported is what could not be undone here. The object and its transcript stay: data is
     // never destroyed by a delete, here as for every agent.
@@ -1036,8 +1105,9 @@ export async function handleProvision(
     const patch = { status: "deleted" as const, pushRegistered: false, pushError: off.ok ? null : off.error, deletedAt: t };
     // After the registry says deleted, so a publish racing this adds nothing the mark misses (`d1ApprovalIndex.upsert`).
     await deps.registry.update(tenantId, row.raftAgentId, patch);
+    const ends = await unbind(t);
     await keepHolds(t);
-    return ok(view({ ...row, ...patch, updatedAt: t }));
+    return answer(view({ ...row, ...patch, updatedAt: t }), ends);
   }
 
   return null;
@@ -1298,6 +1368,18 @@ function importView(rec: ImportRecord, row: ProvisionedAgent) {
  * here in the clear: the flow in connect.ts seals it, and the handlers carry it only sealed.
  */
 /**
+ * A connection route read the agent live, then the agent was deleted before its binding was written (the guarded
+ * `put` wrote nothing): the credential just put on its mount is taken off again, and the route answers as for an agent
+ * that is not there. A clear that fails is logged; the agent's delete clears its mounts again when repeated.
+ */
+async function deletedMeanwhile(c: NonNullable<ProvisionDeps["connections"]>, tenantId: string, row: ProvisionedAgent, p: ConnectionProvider,
+  byRaft: boolean, id: string): Promise<Response> {
+  const cleared = await c.clear(tenantId, row.agentId, p).catch((e: unknown) => ({ ok: false as const, error: String((e as Error)?.message ?? e).slice(0, 200) }));
+  logEvent("connect.deleted_meanwhile", { tenantId, agentId: row.agentId, provider: p, mountCleared: cleared.ok, ...(cleared.ok ? {} : { reason: cleared.error }) });
+  return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${id}` });
+}
+
+/**
  * A connector of the tenant as a token of `raftOrigin` may see it: one that origin made, else null, which every route
  * answers exactly as a connector that does not exist. The only way a provider route reads a connector
  * (test/provision-origin.ts checks it).
@@ -1354,7 +1436,11 @@ async function connection(
     const connectedAt = deps.now();
     await c.connectors.create({ id: connectorId, tenantId, provider: p, account: r.account, accountId: r.accountId ?? null, creatorRaftUserId: b.raftUserId,
       raftOrigin: row.raftOrigin, sealed: r.sealed, refresh: r.refresh ?? null, createdAt: connectedAt });
-    await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: b.raftUserId, connectedAt, connectorId });
+    if (!(await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: b.raftUserId, connectedAt, connectorId }))) {
+      // Deleted while its connection was confirmed: the connector made for it alone goes with the copy on its mount.
+      await c.connectors.remove(tenantId, connectorId);
+      return deletedMeanwhile(c, tenantId, row, p, byRaft, rest[0]!);
+    }
     await c.connectors.record({ tenantId, connectorId, raftAgentId: row.raftAgentId, action: "create", actingRaftUserId: b.raftUserId, actingRole: "creator", at: connectedAt });
     return ok({ connected: true, connectorId, account: r.account, connectedAt: new Date(connectedAt).toISOString(), connectedBy: b.raftUserId });
   }
@@ -1433,7 +1519,9 @@ async function connection(
     const at = deps.now();
     // The attach checked the credential with GitHub and it was taken.
     await c.connectors.checked?.(tenantId, k.id, at);
-    await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: k.account, connectedBy: acting.actingRaftUserId, connectedAt: at, connectorId: k.id });
+    if (!(await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: k.account, connectedBy: acting.actingRaftUserId, connectedAt: at, connectorId: k.id }))) {
+      return deletedMeanwhile(c, tenantId, row, p, byRaft, rest[0]!);
+    }
     await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, action: "bind", ...acting, at });
     return ok({ connected: true, connectorId: k.id, account: k.account, connectedAt: new Date(at).toISOString(), connectedBy: acting.actingRaftUserId });
   }
@@ -1492,8 +1580,9 @@ async function reconnectInPlace(
   for (const raftAgentId of bound) {
     try {
       const a = raftAgentId === row.raftAgentId ? row : await deps.registry.get(tenantId, raftAgentId);
-      // Another Raft origin's agent on the same connector is not this origin's to change.
-      if (!a || a.raftOrigin !== row.raftOrigin) continue;
+      // Another Raft origin's agent on the same connector is not this origin's to change, and an agent no longer live
+      // (deleted, its binding kept for a retried delete to find) is handed no new credential.
+      if (!a || a.raftOrigin !== row.raftOrigin || !(LIVE_AGENT_STATUSES as readonly string[]).includes(a.status)) continue;
       const got = await c.reconnect(tenantId, a.agentId, p, k.id, k.sealed, r.sealed, r.refresh);
       if (!got.ok) { failed.push({ raftAgentId, error: got.error }); continue; }
       if (got.updated) updated.push(raftAgentId);
@@ -1511,9 +1600,15 @@ async function reconnectInPlace(
     else failed.push({ raftAgentId: row.raftAgentId, error: got.error });
   }
   if (connected) {
-    // Written afresh, which clears a broken state kept on this agent's own row.
-    await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: raftUserId, connectedAt: at, connectorId: k.id });
-    if (!bound.includes(row.raftAgentId)) await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, action: "bind", ...acting, at });
+    // Written afresh, which clears a broken state kept on this agent's own row. Deleted meanwhile: the pair just put on
+    // its mount is taken off again, and it is not connected.
+    if (!(await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: raftUserId, connectedAt: at, connectorId: k.id }))) {
+      const cleared = await c.clear(tenantId, row.agentId, p).catch((e: unknown) => ({ ok: false as const, error: String((e as Error)?.message ?? e).slice(0, 200) }));
+      logEvent("connect.deleted_meanwhile", { tenantId, agentId: row.agentId, provider: p, mountCleared: cleared.ok });
+      connected = false;
+      if (updated.includes(row.raftAgentId)) updated.splice(updated.indexOf(row.raftAgentId), 1);
+      failed.push({ raftAgentId: row.raftAgentId, error: "the agent was deleted while it was being connected" });
+    } else if (!bound.includes(row.raftAgentId)) await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, action: "bind", ...acting, at });
   }
   logEvent("connect.reconnect", { tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, actingRole: acting.actingRole, updated: updated.length, failed: failed.length });
   return ok({

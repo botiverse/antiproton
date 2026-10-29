@@ -2042,6 +2042,11 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("connectionAdopt", () => this.runtime().adoptConnection(tenantId, agentId, plugin, connectorId));
   }
 
+  async connectionClear(tenantId: string, agentId: string, plugin: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("connectionClear", () => this.runtime().clearConnection(tenantId, agentId, plugin));
+  }
+
   async connectionDetach(tenantId: string, agentId: string, plugin: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("connectionDetach", () => this.runtime().detachConnection(tenantId, agentId, plugin));
@@ -3855,6 +3860,7 @@ function provisionDeps(env: Env): ProvisionDeps {
         registry: d1Connections(env.CONTROL_DB),
         link: (spec) => connectLink(env.UI_ORIGIN!, env.SESSION_SECRET!, spec, Date.now()),
         detach: (tenantId, agentId, provider) => stub(tenantId, agentId).connectionDetach(tenantId, agentId, CONNECTION_PLUGIN[provider]),
+        clear: (tenantId, agentId, provider) => stub(tenantId, agentId).connectionClear(tenantId, agentId, CONNECTION_PLUGIN[provider]),
         confirm: (tenantId, agentId, provider, pending, raftUserId, connectorId) =>
           stub(tenantId, agentId).connectionConfirm(tenantId, agentId, CONNECTION_PLUGIN[provider], pending, raftUserId, connectorId),
         detachIfFrom: (tenantId, agentId, provider, sealed, connectorId) =>
