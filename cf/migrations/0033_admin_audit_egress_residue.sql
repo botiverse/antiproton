@@ -10,7 +10,7 @@
 -- A row whose outcome is still 'started' was written and never finished: the Worker died mid-call, or the object
 -- threw before the update landed. It is unconfirmed, never "nothing happened": anything that counts or summarises
 -- these rows treats it as possibly done.
-CREATE TABLE admin_audit (
+CREATE TABLE IF NOT EXISTS admin_audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   at INTEGER NOT NULL,
   route TEXT NOT NULL,
@@ -21,7 +21,7 @@ CREATE TABLE admin_audit (
   counts TEXT,
   finished_at INTEGER
 );
-CREATE INDEX admin_audit_agent ON admin_audit(tenant_id, agent_id, at);
+CREATE INDEX IF NOT EXISTS admin_audit_agent ON admin_audit(tenant_id, agent_id, at);
 
 -- Project-scope registrations found carrying a box's placeholder after an agent's delete or the egress hook (#1130):
 -- a token run9 still injects into the boxes a label matches, which antiproton never removes (the run9 project is shared
@@ -33,11 +33,14 @@ CREATE INDEX admin_audit_agent ON admin_audit(tenant_id, agent_id, at);
 -- is listed all the same. No environment column: preview and production have separate D1 databases
 -- (antiproton-preview-control, antiproton-control), so rows of the two never mix.
 --
+-- IF NOT EXISTS throughout: a migration's file name is its only identity, so one renamed would run again where it was
+-- already applied; this makes that harmless.
+--
 -- A row is resolved only with evidence: `resolved_by` says how (listing_absent: a complete, readable project listing
 -- no longer had it; operator_excluded and provider_reclaimed are reserved for #1128), `resolved_ref` by what (the
 -- call that saw it gone). Resolved rows are kept, and dropped 180 days after resolution by the daily cron, each run
 -- recorded in admin_audit; unresolved rows are never dropped. Ids and names only: never a value, never run9's text.
-CREATE TABLE egress_residue (
+CREATE TABLE IF NOT EXISTS egress_residue (
   tenant_id TEXT NOT NULL,
   agent_id TEXT NOT NULL,
   alias TEXT NOT NULL,
@@ -50,7 +53,11 @@ CREATE TABLE egress_residue (
   resolved_at INTEGER,
   resolved_by TEXT,
   resolved_ref TEXT,
+  -- How often a resolved row was seen again and reopened, and what overturned it last: a row that keeps reopening says
+  -- run9's "absent from a complete listing" is not to be trusted, not that this code is wrong.
+  reopened_count INTEGER NOT NULL DEFAULT 0,
+  last_overturned_ref TEXT,
   PRIMARY KEY (tenant_id, agent_id, secret_id)
 );
-CREATE INDEX egress_residue_open ON egress_residue(tenant_id, agent_id, resolved_at);
-CREATE INDEX egress_residue_resolved ON egress_residue(resolved_at) WHERE resolved_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS egress_residue_open ON egress_residue(tenant_id, agent_id, resolved_at);
+CREATE INDEX IF NOT EXISTS egress_residue_resolved ON egress_residue(resolved_at) WHERE resolved_at IS NOT NULL;

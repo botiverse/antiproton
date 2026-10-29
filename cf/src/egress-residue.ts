@@ -13,12 +13,13 @@ import type { Withdrawal } from "../../src/plugins/types.ts";
 /**
  * Why a held thing is not clean after an agent's delete. `not_withdrawn`, `listing_failed` (registrations left, or run9
  * refusing, unreachable or answering what cannot be read) and `project_listing_failed` (the project-scope listing
- * failed, so residue was never checked) are what the next delete retries. The rest no retry fixes: `project_residue`
+ * failed, so residue was never checked) and `residue_store_failed` (the residue record could not be written or read)
+ * are what the next delete retries. The rest no retry fixes: `project_residue`
  * (a project-scope registration still acts for the box), `stranded` (made under a key since replaced),
  * `no_credential` (no key to reach it), `deletion_unconfirmed` (let go, but not made under this kind of key, so a
  * "deleted" cannot be believed).
  */
-export type UncleanCode = "not_withdrawn" | "listing_failed" | "project_listing_failed" | "project_residue" | "stranded" | "no_credential" | "deletion_unconfirmed";
+export type UncleanCode = "not_withdrawn" | "listing_failed" | "project_listing_failed" | "residue_store_failed" | "project_residue" | "stranded" | "no_credential" | "deletion_unconfirmed";
 /**
  * What to do about each: `retry_delete` (the next delete can finish it); `needs_operator_cleanup` (a known object an
  * operator can reach, #1128: project-scope residue, or a box whose deletion cannot be believed); `await_provider_reclaim`
@@ -27,15 +28,15 @@ export type UncleanCode = "not_withdrawn" | "listing_failed" | "project_listing_
  */
 export type UncleanAction = "retry_delete" | "needs_operator_cleanup" | "await_provider_reclaim";
 export const ACTION_OF: Record<UncleanCode, UncleanAction> = {
-  not_withdrawn: "retry_delete", listing_failed: "retry_delete", project_listing_failed: "retry_delete",
+  not_withdrawn: "retry_delete", listing_failed: "retry_delete", project_listing_failed: "retry_delete", residue_store_failed: "retry_delete",
   project_residue: "needs_operator_cleanup", deletion_unconfirmed: "needs_operator_cleanup",
   stranded: "await_provider_reclaim", no_credential: "await_provider_reclaim",
 };
 export const MESSAGE_OF: Partial<Record<UncleanAction, string>> = {
   needs_operator_cleanup: "retrying the delete cannot clear this; it needs an operator (botiverse/antiproton#1128, planned)",
   // Nothing here says waiting fixes it: reclaim needs the box idle, and the token itself does not expire.
-  await_provider_reclaim: "Cannot be located or deleted with current keys. The credential stops working only after the provider reclaims this box, " +
-    "and reclaim requires that nothing uses the box any more; a running background job keeps it alive. OAuth App tokens do not expire on their own.",
+  await_provider_reclaim: "Restore a run9 key to the mount and delete again to clear it; otherwise it lasts until the provider reclaims the box, " +
+    "which requires that nothing uses the box any more. OAuth App tokens don't expire on their own.",
 };
 
 export const RESIDUE_REASON = "a project-scope registration carrying this box's placeholder: run9 injects it into the boxes its label matches, " +
@@ -48,11 +49,19 @@ export const RESOLVED_RESIDUE_KEEP_MS = 180 * 24 * 60 * 60 * 1000;
 export interface ResidueRow {
   tenantId: string; agentId: string; alias: string; boxId: string; secretId: string; title: string; reasonCode: string;
   firstSeen: number; lastSeen: number; resolvedAt: number | null; resolvedBy: string | null; resolvedRef: string | null;
+  reopenedCount: number; lastOverturnedRef: string | null;
 }
 
 export interface ResidueStore {
-  /** Findings of one withdrawal, kept: a new one with `first_seen` now, one seen before with `last_seen` moved on. */
-  record(tenantId: string, agentId: string, alias: string, findings: Withdrawal["project"]["findings"], at: number): Promise<void>;
+  /**
+   * Findings of one withdrawal, kept: a new one with `first_seen` now; one seen before with `last_seen` moved on and
+   * its box, title, mount and reason as seen now (a secret seen later on another box, under another name, or through
+   * another mount is reported where it is now). `secret_id` and `first_seen` stay. One resolved before and seen again
+   * is reopened: the listing that called it absent was wrong. Each reopening is counted (`reopened_count`) with what
+   * overturned it (`last_overturned_ref`, the call that saw it again), to judge how far "absent from a complete
+   * listing" can be trusted.
+   */
+  record(tenantId: string, agentId: string, alias: string, findings: Withdrawal["project"]["findings"], at: number, ref: string): Promise<void>;
   /**
    * The open rows of this agent's mount that a complete listing (`ids`, every secret it had) no longer has: resolved,
    * `listing_absent`, by `ref`. Never called with a listing that failed or could not be read.
@@ -69,20 +78,27 @@ const rowOf = (r: any): ResidueRow => ({
   title: String(r.title), reasonCode: String(r.reason_code), firstSeen: Number(r.first_seen), lastSeen: Number(r.last_seen),
   resolvedAt: r.resolved_at == null ? null : Number(r.resolved_at), resolvedBy: r.resolved_by == null ? null : String(r.resolved_by),
   resolvedRef: r.resolved_ref == null ? null : String(r.resolved_ref),
+  reopenedCount: Number(r.reopened_count ?? 0), lastOverturnedRef: r.last_overturned_ref == null ? null : String(r.last_overturned_ref),
 });
 
 export function d1EgressResidue(db: D1Database): ResidueStore {
   return {
-    async record(tenantId, agentId, alias, findings, at) {
+    async record(tenantId, agentId, alias, findings, at, ref) {
       for (const f of findings) {
         await db.prepare(
           `INSERT INTO egress_residue (tenant_id, agent_id, alias, box_id, secret_id, title, reason_code, first_seen, last_seen)
            VALUES (?, ?, ?, ?, ?, ?, 'project_residue', ?, ?)
-           ON CONFLICT (tenant_id, agent_id, secret_id) DO UPDATE SET last_seen = excluded.last_seen WHERE egress_residue.resolved_at IS NULL`,
-        ).bind(tenantId, agentId, alias, f.boxId, f.secretId, f.name.slice(0, 120), at, at).run();
+           ON CONFLICT (tenant_id, agent_id, secret_id) DO UPDATE SET last_seen = excluded.last_seen, alias = excluded.alias,
+             box_id = excluded.box_id, title = excluded.title, reason_code = excluded.reason_code,
+             reopened_count = egress_residue.reopened_count + (CASE WHEN egress_residue.resolved_at IS NULL THEN 0 ELSE 1 END),
+             last_overturned_ref = CASE WHEN egress_residue.resolved_at IS NULL THEN egress_residue.last_overturned_ref ELSE ? END,
+             resolved_at = NULL, resolved_by = NULL, resolved_ref = NULL`,
+        ).bind(tenantId, agentId, alias, f.boxId, f.secretId, f.name.slice(0, 120), at, at, ref.slice(0, 120)).run();
       }
     },
     async resolveAbsent(tenantId, agentId, alias, ids, at, ref) {
+      // A null among `ids` would make NOT IN answer NULL for every row and resolve nothing, silently; run9's secret_id
+      // is never null today (`secretViews` refuses an entry without one), and they are strings here besides.
       const r = await db.prepare(
         `UPDATE egress_residue SET resolved_at = ?, resolved_by = 'listing_absent', resolved_ref = ?
           WHERE tenant_id = ? AND agent_id = ? AND alias = ? AND resolved_at IS NULL AND secret_id NOT IN (SELECT value FROM json_each(?))`,
@@ -125,24 +141,43 @@ export async function withResidue(
   store: ResidueStore, tenantId: string, agentId: string,
   boxes: BoxEnd[], projects: Array<{ alias: string } & Withdrawal["project"]>, at: number, ref: string,
 ): Promise<BoxEnd[]> {
-  for (const p of projects) {
-    if (p.findings.length) await store.record(tenantId, agentId, p.alias, p.findings, at);
-    if (p.state === "complete") await store.resolveAbsent(tenantId, agentId, p.alias, p.ids, at, ref);
+  // This call's own findings hold their box back directly, whatever the table says or whether it could be written.
+  const fresh = projects.flatMap((p) => p.findings.map((f) => ({ ...f, alias: p.alias })));
+  // A failure to observe or record must not change the course of the action: a residue store that cannot be written
+  // or read leaves every box not clean and retryable (`residue_store_failed`), and the delete goes on.
+  let open: ResidueRow[] | null = null;
+  try {
+    for (const p of projects) {
+      if (p.findings.length) await store.record(tenantId, agentId, p.alias, p.findings, at, ref);
+      if (p.state === "complete") await store.resolveAbsent(tenantId, agentId, p.alias, p.ids, at, ref);
+    }
+    open = await store.open(tenantId, agentId);
+  } catch (e) {
+    console.warn(`egress residue for ${tenantId}/${agentId} could not be kept: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
   }
-  const open = await store.open(tenantId, agentId);
-  const residueOf = (boxId: string) => open.filter((r) => r.boxId === boxId).map((r) => ({
-    secretId: r.secretId, title: r.title, reasonCode: r.reasonCode, reason: RESIDUE_REASON, firstSeen: new Date(r.firstSeen).toISOString(),
-  }));
+  const rows = open ?? [];
+  const residueOf = (boxId: string) => {
+    const seen = new Map<string, NonNullable<BoxEnd["projectResidue"]>[number]>();
+    for (const r of rows.filter((x) => x.boxId === boxId)) {
+      seen.set(r.secretId, { secretId: r.secretId, title: r.title, reasonCode: r.reasonCode, reason: RESIDUE_REASON, firstSeen: new Date(r.firstSeen).toISOString() });
+    }
+    for (const f of fresh.filter((x) => x.boxId === boxId)) {
+      if (!seen.has(f.secretId)) seen.set(f.secretId, { secretId: f.secretId, title: f.name, reasonCode: "project_residue", reason: RESIDUE_REASON, firstSeen: new Date(at).toISOString() });
+    }
+    return [...seen.values()];
+  };
   const out = boxes.map((b) => {
     const residue = residueOf(b.id);
+    const end = residue.length ? { ...b, projectResidue: residue } : b;
+    if (open === null) return unclean({ ...end, why: "the record of project-scope residue could not be kept or read, so it was not checked" }, "residue_store_failed");
     if (!residue.length) return b;
     // The box's own reason stands when it has one; a box otherwise clear is held back by its residue.
-    return b.clean ? unclean({ ...b, projectResidue: residue }, "project_residue") : { ...b, projectResidue: residue };
+    return b.clean ? unclean(end, "project_residue") : end;
   });
   const held = new Set(boxes.map((b) => b.id));
-  for (const boxId of new Set(open.map((r) => r.boxId))) {
+  for (const boxId of new Set([...rows.map((r) => r.boxId), ...fresh.map((f) => f.boxId)])) {
     if (held.has(boxId)) continue;
-    const alias = open.find((r) => r.boxId === boxId)!.alias;
+    const alias = rows.find((r) => r.boxId === boxId)?.alias ?? fresh.find((f) => f.boxId === boxId)!.alias;
     const state = projects.find((p) => p.alias === alias)?.state;
     const code: UncleanCode = state === "failed" ? "project_listing_failed" : state === "no_credential" ? "no_credential" : "project_residue";
     const why = state === "failed" ? "the project-scope listing failed, so this box's residue could not be checked"
@@ -157,8 +192,16 @@ export async function withResidue(
  * The daily cleanup (cf/src/index.ts `scheduled`): resolved rows past RESOLVED_RESIDUE_KEEP_MS dropped, never an open
  * one, and each run recorded in admin_audit, whatever it dropped.
  */
-export async function cleanupResidue(db: D1Database, now: number): Promise<number> {
-  const dropped = await d1EgressResidue(db).dropResolved(now - RESOLVED_RESIDUE_KEEP_MS);
+export async function cleanupResidue(db: D1Database, now: number): Promise<number | null> {
+  let dropped: number;
+  try { dropped = await d1EgressResidue(db).dropResolved(now - RESOLVED_RESIDUE_KEEP_MS); }
+  catch (e) {
+    // Its own failure, kept apart from the usage retention it runs beside: a row saying it failed, and a log line.
+    console.warn(`egress residue cleanup failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+    await db.prepare("INSERT INTO admin_audit (at, route, outcome, finished_at) VALUES (?, 'cron:egress-residue-cleanup', 'failed', ?)")
+      .bind(now, now).run().catch(() => console.warn("egress residue cleanup: its failure could not be recorded"));
+    return null;
+  }
   await db.prepare("INSERT INTO admin_audit (at, route, outcome, counts, finished_at) VALUES (?, 'cron:egress-residue-cleanup', 'cleaned', ?, ?)")
     .bind(now, JSON.stringify({ dropped }), now).run();
   return dropped;

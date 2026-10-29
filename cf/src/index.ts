@@ -4164,6 +4164,7 @@ export default {
     await dailyCron(
       async () => {
         await retainUsage(env.CONTROL_DB, controller.scheduledTime);
+        // Its own failure, not the retention's: recorded in admin_audit as failed (`cleanupResidue`), never thrown.
         await cleanupResidue(env.CONTROL_DB, controller.scheduledTime);
       },
       () => frictionDaily(env, { bucket: env.ARTIFACTS as unknown as FrictionBucket, window: frictionWindowOf(env) }, controller.scheduledTime),

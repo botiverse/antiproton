@@ -1715,8 +1715,8 @@ await check("every unclean box has a reason code, and the action follows it: ret
     run9.f.deleteNotFound = true;
     const r = await w.call("DELETE", "/agents/by-raft-agent/YF");
     const box = (r.body?.sandboxes?.boxes ?? []).find((b: any) => b.id === machine.boxId);
-    must(box?.code === "stranded" && box.action === "await_provider_reclaim" && /stops working only after the provider reclaims/.test(box.message)
-      && /a running background job keeps it alive/.test(box.message) && /do not expire on their own/.test(box.message) && r.body.clean === false && r.body.retry === false,
+    must(box?.code === "stranded" && box.action === "await_provider_reclaim" && /^Restore a run9 key to the mount and delete again to clear it/.test(box.message)
+      && /requires that nothing uses the box any more/.test(box.message) && /don't expire on their own/.test(box.message) && r.body.clean === false && r.body.retry === false,
       `stranded: ${r.text}`);
     w.dispose();
   }
@@ -1810,8 +1810,8 @@ await check("residue is read by its own columns: a deleted agent whose registry 
   const w = await world({ run9 });
   const store = d1EgressResidue(w.db);
   const now = Date.now(), DAY = 24 * 60 * 60 * 1000;
-  await store.record("t-x", "raft_GONE", "sandbox", [{ boxId: "b1", secretId: "s-open", name: "GH_TOKEN" }], now - 400 * DAY);
-  await store.record("t-x", "raft_GONE", "sandbox", [{ boxId: "b1", secretId: "s-old", name: "GH_TOKEN" }, { boxId: "b1", secretId: "s-new", name: "GH_TOKEN" }], now - 400 * DAY);
+  await store.record("t-x", "raft_GONE", "sandbox", [{ boxId: "b1", secretId: "s-open", name: "GH_TOKEN" }], now - 400 * DAY, "t");
+  await store.record("t-x", "raft_GONE", "sandbox", [{ boxId: "b1", secretId: "s-old", name: "GH_TOKEN" }, { boxId: "b1", secretId: "s-new", name: "GH_TOKEN" }], now - 400 * DAY, "t");
   must(!w.db.raw.prepare("SELECT 1 FROM provisioned_agents WHERE agent_id = 'raft_GONE'").get(), "control: the agent has a registry row");
   must((await store.open("t-x", "raft_GONE")).length === 3, "a deleted agent's residue is not listed");
   // Resolved only by a complete listing without them: s-old long ago, s-new lately; s-open stays open.
@@ -1823,6 +1823,67 @@ await check("residue is read by its own columns: a deleted agent whose registry 
     `after the cleanup: ${dropped} ${JSON.stringify(left)}`);
   const audit = w.db.raw.prepare("SELECT * FROM admin_audit WHERE route = 'cron:egress-residue-cleanup'").all() as any[];
   must(audit.length === 1 && JSON.parse(audit[0].counts).dropped === 1, `the cleanup's audit row: ${JSON.stringify(audit)}`);
+  w.dispose();
+});
+
+await check("a residue row follows where its secret is seen now (box, title, mount), so a later mount's complete listing resolves it; a failed cleanup is its own audit row", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const store = d1EgressResidue(w.db);
+  const now = Date.now();
+  await store.record("t-y", "raft_Y", "sandbox-a", [{ boxId: "box-a", secretId: "s1", name: "OLD" }], now - 1000, "t");
+  await store.record("t-y", "raft_Y", "sandbox-b", [{ boxId: "box-b", secretId: "s1", name: "NEW" }], now, "t");
+  const [row] = await store.open("t-y", "raft_Y");
+  must(row?.boxId === "box-b" && row.title === "NEW" && row.alias === "sandbox-b" && row.firstSeen === now - 1000 && row.lastSeen === now, `after mount B saw it: ${JSON.stringify(row)}`);
+  // Mount B's complete listing without it resolves it.
+  must((await store.resolveAbsent("t-y", "raft_Y", "sandbox-b", [], now, "delete:9")) === 1 && (await store.open("t-y", "raft_Y")).length === 0, "mount B could not resolve it");
+  // A cleanup whose drop fails: no throw, and a failed row of its own.
+  const broken = { prepare: (q: string) => q.startsWith("DELETE") ? { bind: () => ({ run: async () => { throw new Error("D1 is away"); } }) } : (w.db as any).prepare(q) } as unknown as D1Database;
+  must((await cleanupResidue(broken, now)) === null, "the failed cleanup did not say so");
+  const audit = w.db.raw.prepare("SELECT outcome FROM admin_audit WHERE route = 'cron:egress-residue-cleanup'").all() as any[];
+  must(audit.length === 1 && audit[0].outcome === "failed", `the failed cleanup's row: ${JSON.stringify(audit)}`);
+  w.dispose();
+});
+
+await check("residue resolved by one listing and seen again by a later one is reopened, counted, and holds its box back", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("YK");
+  await w.connect(a);
+  await w.sandbox(a);
+  const [boxId] = [...run9.boxes.keys()];
+  const p = { secret_id: "p5", name: "X", value: "x", placeholder: run9.boxes.get(boxId!)!.secrets[0]!.placeholder, inject_header_name: "authorization", allowed_hosts: ["api.github.com"] };
+  run9.project.push(p);
+  run9.f.failDelete = true;
+  must(boxOf((await w.call("DELETE", "/agents/by-raft-agent/YK")).body)?.code === "project_residue", "control: no residue");
+  // A listing that misses it: resolved, the box clear.
+  run9.project.splice(0);
+  must(boxOf((await w.call("DELETE", "/agents/by-raft-agent/YK")).body)?.clean === true, "control: not resolved");
+  // Seen again: reopened, and the box is held back again, never reported clean while run9 still injects it.
+  run9.project.push(p);
+  const again = await w.call("DELETE", "/agents/by-raft-agent/YK");
+  must(boxOf(again.body)?.clean === false && boxOf(again.body).code === "project_residue" && boxOf(again.body).projectResidue?.[0]?.secretId === "p5", `seen again: ${again.text}`);
+  const row = w.db.raw.prepare("SELECT * FROM egress_residue WHERE secret_id = 'p5'").get() as any;
+  must(row.resolved_at === null && row.resolved_by === null && row.reopened_count === 1 && /^delete:\d+$/.test(row.last_overturned_ref), `the reopened row: ${JSON.stringify(row)}`);
+  w.dispose();
+});
+
+await check("a residue store that fails does not change the delete's course: every box not clean and retryable, and the delete finishes", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("YL");
+  const id = await w.connect(a);
+  await w.sandbox(a);
+  const [boxId] = [...run9.boxes.keys()];
+  run9.project.push({ secret_id: "p6", name: "X", value: "x", placeholder: run9.boxes.get(boxId!)!.secrets[0]!.placeholder, inject_header_name: "authorization", allowed_hosts: ["api.github.com"] });
+  w.db.raw.exec("DROP TABLE egress_residue");
+  const r = await w.call("DELETE", "/agents/by-raft-agent/YL");
+  must(r.status === 200 && r.body.status === "deleted" && boxOf(r.body)?.code === "residue_store_failed" && boxOf(r.body).action === "retry_delete"
+    && boxOf(r.body).projectResidue?.[0]?.secretId === "p6" && r.body.retry === true, `the answer: ${r.status} ${r.text}`);
+  // The rest of the delete ran: the registry says deleted, the GitHub binding is gone.
+  must((w.db.raw.prepare("SELECT status FROM provisioned_agents WHERE raft_agent_id = 'YL'").get() as any)?.status === "deleted"
+    && !w.db.raw.prepare("SELECT 1 FROM provisioned_connections WHERE raft_agent_id = 'YL'").get(), "the delete did not finish");
+  void id;
   w.dispose();
 });
 
