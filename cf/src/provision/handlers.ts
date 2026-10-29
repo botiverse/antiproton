@@ -1379,6 +1379,8 @@ async function connection(
     let reconnect: ReconnectTarget | undefined;
     if (b.connectorId !== undefined) {
       if (typeof b.connectorId !== "string" || !b.connectorId) return fail({ status: 422, code: "invalid", message: "connectorId is the connector to reconnect in place", param: "connectorId" });
+      // Raft's claim, unverified: `admin` is taken as said, relying on the caller being Raft (`creatorRefused`,
+      // botiverse/antiproton#1122). The connector read below is origin-checked; the role never stands in for that.
       if (b.actingRole !== "creator" && b.actingRole !== "admin") {
         return fail({ status: 422, code: "invalid", message: "actingRole is creator or admin: the capacity Raft checked the initiator reconnects this connector in", param: "actingRole" });
       }
@@ -1554,6 +1556,11 @@ function actingField(body: unknown, also: string[]): Acting | Fail {
  * Pointing an agent at a connector hands it that account's identity, so only its creator or a server
  * admin may. Raft checks both before calling, and only Raft knows who is an admin; a claim to be the
  * creator can be checked here as well, and is.
+ *
+ * `actingRole` is the capacity Raft claims for its session's user, and is not verified here: `admin` passes
+ * unchecked, relying on the caller being Raft, the same trust as `decidedBy.role` on an approval, with the provider
+ * token as the anchor. It is never what keeps another Raft origin out; that is the origin check (`agentAt`,
+ * `ownConnector`). What rests on one platform token per deployment: botiverse/antiproton#1122.
  */
 function creatorRefused(k: { creatorRaftUserId: string }, acting: Acting): Fail | null {
   if (acting.actingRole === "creator" && acting.actingRaftUserId !== k.creatorRaftUserId) {
