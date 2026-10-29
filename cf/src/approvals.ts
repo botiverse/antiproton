@@ -196,13 +196,13 @@ const STATE_RANK = (col: string) => `(CASE ${col} WHEN 'pending' THEN 0 WHEN 'ap
 export function d1ApprovalIndex(db: D1Database): ApprovalIndex {
   return {
     async upsert(r) {
-      // A publish that read the registry before the delete and writes after it adds no row and changes no marked one,
-      // so a kept record never gets its summaries back and every row of a deleted agent is one the audit prune drops.
+      // A publish that read the registry before the delete and writes after it writes nothing: with no row selected there
+      // is no conflict either, so a kept record never gets its summaries back and every row of a deleted agent is marked.
       await db.prepare(
         "INSERT INTO provider_approvals(tenant_id, agent_id, operation_id, raft_origin, raft_server_id, raft_agent_id, status, item, created_at, expires_at, updated_at) " +
         "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM provisioned_agents p WHERE p.tenant_id = ? AND p.agent_id = ? AND p.status = 'deleted') " +
         "ON CONFLICT(tenant_id, agent_id, operation_id) DO UPDATE SET status = excluded.status, item = excluded.item, expires_at = excluded.expires_at, updated_at = excluded.updated_at " +
-        `WHERE ${STATE_RANK("excluded.status")} > ${STATE_RANK("provider_approvals.status")} AND provider_approvals.agent_deleted_at IS NULL`,
+        `WHERE ${STATE_RANK("excluded.status")} > ${STATE_RANK("provider_approvals.status")}`,
       ).bind(r.tenantId, r.agentId, r.operationId, r.raftOrigin, r.raftServerId, r.raftAgentId, r.status, JSON.stringify(r.item),
         r.createdAt, r.expiresAt, r.updatedAt, r.tenantId, r.agentId).run();
     },
