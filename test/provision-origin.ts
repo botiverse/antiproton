@@ -487,6 +487,22 @@ await check("credential paths take an allow list of statuses: an agent of a stat
   assert((await put("A")) === true && (await put("S")) === false, "the binding write took a suspended agent");
 });
 
+await check("migration 0032: connector_events keeps every row, and takes an event with no connector, named by provider", async () => {
+  const f = d1("0032_");
+  f.db.prepare("INSERT INTO connector_events(tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at, reason) VALUES (?, 'k1', 'A', 'bind', 'u-1', 'creator', 5, 'r')").run(TENANT);
+  let refused = false;
+  try { f.db.prepare("INSERT INTO connector_events(tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at) VALUES (?, NULL, 'A', 'unbind', 'u-1', 'creator', 6)").run(TENANT); }
+  catch { refused = true; }
+  assert(refused, "control: the table before 0032 took a null connector");
+  f.rest();
+  const kept = f.db.prepare("SELECT tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at, reason, provider FROM connector_events").all() as any[];
+  assert(kept.length === 1 && kept[0].connector_id === "k1" && kept[0].reason === "r" && kept[0].at === 5 && kept[0].provider === null, `kept: ${JSON.stringify(kept)}`);
+  const { d1Connectors } = await import("../cf/src/control-plane.ts");
+  await d1Connectors(f.D1).record({ tenantId: TENANT, connectorId: null, raftAgentId: "A", provider: "github", action: "unbind", actingRaftUserId: "u-1", actingRole: "creator", at: 7 });
+  const added = f.db.prepare("SELECT connector_id, provider FROM connector_events WHERE at = 7").get() as any;
+  assert(added?.connector_id === null && added.provider === "github", `added: ${JSON.stringify(added)}`);
+});
+
 await check("migration 0031: a deleted agent still bound to a connector is unbound, each recorded first; live agents keep theirs", async () => {
   const f = d1("0031_");
   f.agent("A", OURS); f.agent("Z", OURS);

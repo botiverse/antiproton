@@ -1308,6 +1308,20 @@ await check("removing an agent's GitHub connection whose object holds no such ag
   w.dispose();
 });
 
+await check("removing an agent's GitHub connection that has no connector (from before connectors) is recorded too, keyed by agent and provider", async () => {
+  const w = await world();
+  const a = await w.agent("Z6");
+  await w.connect(a);
+  // As a connection made before connectors: its row names none.
+  w.db.raw.prepare("UPDATE provisioned_connections SET connector_id = NULL WHERE raft_agent_id = 'Z6'").run();
+  const r = await w.call("DELETE", "/agents/by-raft-agent/Z6/connections/github", { actingRaftUserId: "u_owner", actingRole: "creator" });
+  must(r.status === 204 && (await w.stored(a)).token === null, `${r.status} ${r.text}`);
+  const ev = w.db.raw.prepare("SELECT * FROM connector_events WHERE action = 'unbind' AND raft_agent_id = 'Z6'").all() as any[];
+  must(ev.length === 1 && ev[0].connector_id === null && ev[0].provider === "github" && JSON.parse(ev[0].reason).outcome === "cleared"
+    && JSON.parse(ev[0].reason).bound === true, `the record: ${JSON.stringify(ev)}`);
+  w.dispose();
+});
+
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);

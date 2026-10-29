@@ -1541,14 +1541,13 @@ async function connection(
     const keep = error !== null && !gone;
     if (!keep) await c.registry.remove(tenantId, row.raftAgentId, p);
     // Who asked is optional here: removing a connection from an agent gives nobody an identity. The event is recorded
-    // all the same (with the deployment as the actor when none was named), with what became of the mount.
+    // all the same (with the deployment as the actor when none was named), with what became of the mount, and for a
+    // connection with no connector too (0032), named by its provider.
     const acting = body === undefined || body === null ? null : actingField(body, []);
     const named = acting && !isFail(acting) ? acting : null;
-    if (got?.connectorId) {
-      await c.connectors.record({ tenantId, connectorId: got.connectorId, raftAgentId: row.raftAgentId, action: "unbind",
-        ...(named ?? { actingRaftUserId: SYSTEM_ACTOR, actingRole: "system" as const }), at: deps.now(),
-        reason: JSON.stringify({ outcome, bindingKept: keep, actorNamed: named !== null, ...(error ? { error } : {}) }) });
-    }
+    await c.connectors.record({ tenantId, connectorId: got?.connectorId ?? null, raftAgentId: row.raftAgentId, provider: p, action: "unbind",
+      ...(named ?? { actingRaftUserId: SYSTEM_ACTOR, actingRole: "system" as const }), at: deps.now(),
+      reason: JSON.stringify({ outcome, bindingKept: keep, bound: got !== null, actorNamed: named !== null, ...(error ? { error } : {}) }) });
     logEvent("connect.disconnect_agent", { tenantId, agentId: row.agentId, provider: p, outcome, bindingKept: keep });
     if (keep) {
       return Response.json({ error: { code: "mount_not_cleared", message: `the agent's mount still holds the connection's credential (${error}); the connection was kept, DELETE it again` },

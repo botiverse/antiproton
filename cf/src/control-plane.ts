@@ -619,7 +619,8 @@ export interface ConnectorRefresh {
 }
 
 export interface ConnectorEvent {
-  tenantId: string; connectorId: string; raftAgentId: string | null;
+  /** Null: a connection made before connectors (0012), whose removal is still recorded (0032), named by `provider`. */
+  tenantId: string; connectorId: string | null; raftAgentId: string | null; provider?: string | null;
   action: "create" | "bind" | "unbind" | "disconnect" | "broken" | "reconnect" | "origin_mismatch_removed" | "deleted_agent_unbound";
   /** `system` for what the deployment records itself (`broken`), with SYSTEM_ACTOR as the user. */
   actingRaftUserId: string; actingRole: "creator" | "admin" | "system"; at: number;
@@ -703,8 +704,8 @@ export function d1Connectors(db: D1Database): ConnectorStore {
     },
     async record(e) {
       await db.prepare(
-        "INSERT INTO connector_events (tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      ).bind(e.tenantId, e.connectorId, e.raftAgentId, e.action, e.actingRaftUserId, e.actingRole, e.at, e.reason ?? null).run();
+        "INSERT INTO connector_events (tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at, reason, provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).bind(e.tenantId, e.connectorId, e.raftAgentId, e.action, e.actingRaftUserId, e.actingRole, e.at, e.reason ?? null, e.provider ?? null).run();
     },
   };
 }
