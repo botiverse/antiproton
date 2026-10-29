@@ -14,7 +14,7 @@ import { assistantSystemPrompt } from "../src/runtime/pi-prompt.ts";
 import { PUSH_KEY, PUSH_STORE, raftPlugin, wakeInstruction } from "../src/plugins/raft.ts";
 import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import {
-  ASSISTANT_STORE, CHAT_TOOLS, CHECK_KEY, CHECK_TOOLS, SEND_AS_OWNER_TOOL, SEND_LIMITED_HOLD_MS, COUNTS_KEY, DEFERRED_KEY, DM_ITEMS_MAX, INBOX_LAG_RETRY_MS, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, SUMMARY_MAX, UNREADABLE_KEY,
+  ASSISTANT_STORE, CHAT_TOOLS, CHECK_KEY, CHECK_TOOLS, SEND_AS_OWNER_TOOL, SEND_LIMITED_HOLD_MS, COUNTS_KEY, DEFERRED_KEY, DM_ITEMS_MAX, INBOX_LAG_RETRY_MS, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, SETTLE_MS, SUMMARY_MAX, UNREADABLE_KEY,
   assistantCheckPrompt, assistantPrecedence, assistantMountOf, assistantPrompt, assistantWake, assistantWakeInstruction, compose, confirmRef, FAILED_TURN_LINE, isQuietHours, itemOf, localDay, nextBriefAt, noteDoorbell, sendAsOwner, zoneOf,
 } from "../src/plugins/raft-assistant.ts";
 import { confirmLine, matches, ruleLine, rulesOf, winningRule, type ContactRule } from "../src/plugins/raft-assistant-rules.ts";
@@ -137,6 +137,12 @@ const conv = (n: number, o: Record<string, unknown> = {}) => ({
   parentChannelId: null, parentMessageId: null, unread: 1, hasMention: false, latestAt: "2026-10-20T09:50:00.000Z",
   latestSenderName: "bob", latestPreview: "can you pick a date?", firstUnreadMessageId: `aaaaaaa${n}-1111-4222-8333-444455556666`, ...o,
 });
+
+/**
+ * The id of conversation n's kth message after `conv(n)`'s, as its first unread one: the owner read the one before and
+ * this arrived, so the row's unread position moved. Its first 8 characters differ from `conv(n)`'s, which a told key uses.
+ */
+const laterMsg = (n: number, k: number) => `fe${String(k).padStart(5, "0")}${n}-1111-4222-8333-444455556666`;
 
 /** The Reminder app, as Raft lists it to an assistant (slock#10764), and the app itself (reminder-app's manifest, cut down). */
 const REMINDER_APP = "https://reminder.example.com";
@@ -764,7 +770,7 @@ await check("a doorbell with new activity starts one short session of its own wi
   const again = await atTime(DAY, () => wake(a.ctx));
   must(again.turn === undefined && a.traced.at(-1)?.status === "skipped_filtered" && a.traced.at(-1)?.attrs.seen === 2, `again: ${show(again)} ${show(a.traced.at(-1))}`);
   // Newer activity in one of them is.
-  a.r.unread = [conv(1, { latestAt: "2026-10-20T09:58:00.000Z" }), conv(3, { unread: 2 })];
+  a.r.unread = [conv(1, { firstUnreadMessageId: laterMsg(1, 1) }), conv(3, { unread: 2 })];
   await atTime(DAY, () => noteDoorbell(a.ctx));
   const newer = await atTime(DAY, () => wake(a.ctx));
   must(newer.isolated === true && newer.turn.includes(conv(1).channelId) && !newer.turn.includes(conv(3).channelId), `newer: ${show(newer)}`);
@@ -1153,16 +1159,16 @@ await check("mute #random and always @ana, end to end: @ana's chat in #random ge
   const fromAna = await bell(a);
   must(fromAna.isolated === true && fromAna.turn.includes(conv(1).channelId) && /"why":"always"/.test(fromAna.turn), `ana: ${show(fromAna)}`);
   must(lastWake(a).attrs.always === 1 && !("person_rule_unenforced" in lastWake(a).attrs), show(lastWake(a)));
-  a.r.unread = [random({ latestAt: "2026-10-20T09:55:00.000Z" })];
+  a.r.unread = [random({ firstUnreadMessageId: laterMsg(1, 1) })];
   const fromBob = await bell(a);
   must(fromBob.turn === undefined && lastWake(a).attrs.muted_channel === 1, `bob: ${show(fromBob)} ${show(lastWake(a))}`);
-  a.r.unread = [random({ latestAt: "2026-10-20T09:56:00.000Z", hasMention: true })];
+  a.r.unread = [random({ firstUnreadMessageId: laterMsg(1, 2), hasMention: true })];
   const mention = await bell(a);
   must(mention.isolated === true && /"why":"mention"/.test(mention.turn), `bob's @mention in a muted channel: ${show(mention)}`);
   // Renamed: the same person under another name is still matched by id; someone new under her old name is not.
-  a.r.unread = [random({ latestAt: "2026-10-20T09:57:00.000Z", latestSenderName: "ana-renamed", latestSenderId: ANA })];
+  a.r.unread = [random({ firstUnreadMessageId: laterMsg(1, 3), latestSenderName: "ana-renamed", latestSenderId: ANA })];
   must((await bell(a)).isolated === true, "ana renamed was not let through");
-  a.r.unread = [random({ latestAt: "2026-10-20T09:58:00.000Z", latestSenderName: "ana", latestSenderId: "u-impostor" })];
+  a.r.unread = [random({ firstUnreadMessageId: laterMsg(1, 4), latestSenderName: "ana", latestSenderId: "u-impostor" })];
   must((await bell(a)).turn === undefined, "a new person named ana got ana's rule");
 });
 
@@ -1206,11 +1212,11 @@ await check("general chat: sent to the model while Raft gives no owner name (cou
   const on = await bell(b);
   must(on.isolated === true && on.turn.includes(conv(2).channelId) && /"why":"named"/.test(on.turn) && !on.turn.includes(conv(1).channelId) && !on.turn.includes(conv(3).channelId), `name known: ${show(on)}`);
   must(lastWake(b).attrs.default_chatter === 2, show(lastWake(b)));
-  b.r.unread = [conv(1, { latestPreview: "lunch at noon?", latestAt: "2026-10-20T09:59:00.000Z" })];
+  b.r.unread = [conv(1, { latestPreview: "lunch at noon?", firstUnreadMessageId: laterMsg(1, 1) })];
   must((await bell(b)).turn === undefined && lastWake(b).status === "skipped_filtered", "chatter alone made a model call");
   b.r.all = [conv(1)];
   await pref(b, { action: "add", effect: "always", channel: "#ch1" });
-  b.r.unread = [conv(1, { latestPreview: "lunch at noon?", latestAt: "2026-10-20T09:59:30.000Z" })];
+  b.r.unread = [conv(1, { latestPreview: "lunch at noon?", firstUnreadMessageId: laterMsg(1, 2) })];
   must((await bell(b)).isolated === true, "always #ch1 did not let its chat through");
 });
 
@@ -1356,7 +1362,7 @@ await check("each effect's confirm and list line is written from the stored rule
   await pref(a, { action: "add", effect: "mute", channel: "#ch1", until: "2026-10-20T11:00:00.000Z" });
   a.r.unread = [conv(1)];
   must((await bell(a)).turn === undefined && lastWake(a).attrs.muted === 1, "control: muted before it ends");
-  a.r.unread = [conv(1, { latestAt: "2026-10-20T11:30:00.000Z" })];
+  a.r.unread = [conv(1, { firstUnreadMessageId: laterMsg(1, 1) })];
   must((await bell(a, "2026-10-20T12:00:00Z")).isolated === true, "an expired mute still applied");
   must((await pref(a, { action: "list" }, "2026-10-20T12:00:00Z")).rules.length === 0, "an expired rule listed");
   await pref(a, { action: "add", effect: "mute", kind: "task" }, "2026-10-20T12:00:00Z");
@@ -2297,6 +2303,116 @@ await check("pending doorbells' sources are united at the highest seq of each; m
   await atTime("2026-10-20T10:00:40Z", () => ring(a, { first_change_at: "2026-10-20T10:00:30.000Z", last_change_at: "2026-10-20T10:00:40.000Z", sources: [src(2, 10), src(3, "9"), src(4, 2)] }));
   const owner = a.read(ASSISTANT_STORE, OWNER_KEY);
   must(show(owner.changeSources) === show({ [id(2)]: 12, [id(3)]: 9, [id(4)]: 2 }) && owner.changeAt === MENTION_AT, show(owner));
+});
+
+// ---- a message that becomes readable after a later one: newness by position, and the settle read -----------------------
+
+// A (T1, seq 12, an @mention of the owner) and B (T2 > T1, seq 13) in ch2. Raft assigns a seq and a time when a message
+// is inserted, not when it commits: B can become readable before A.
+const LATE_A = "a1a1a1a1-1111-4222-8333-444455556666", LATE_B = "b2b2b2b2-1111-4222-8333-444455556666";
+const LATE_T1 = "2026-10-20T10:00:00.000Z", LATE_T2 = "2026-10-20T10:00:10.000Z";
+const onlyB = () => conv(2, { latestAt: LATE_T2, latestSeq: 13, unread: 1, hasMention: false, firstUnreadMessageId: LATE_B, latestPreview: "lunch?" });
+const bothAB = () => conv(2, { latestAt: LATE_T2, latestSeq: 13, unread: 2, hasMention: true, firstUnreadMessageId: LATE_A, latestPreview: "lunch?" });
+const withCh2 = (a: { r: ReturnType<typeof raft> }, row: ReturnType<typeof conv>) => {
+  a.r.unread = [conv(1, { latestSeq: 30 }), row, conv(3, { latestSeq: 5 }), conv(4, { latestSeq: 8 })];
+  a.r.all = a.r.unread;
+};
+/** Four looked at, then a check at 10:00:12 that reads B alone in ch2. */
+async function readBFirst() {
+  const a = await lookedAtFour();
+  withCh2(a, onlyB());
+  await atTime("2026-10-20T10:00:12Z", () => ring(a, { first_change_at: LATE_T2, last_change_at: "2026-10-20T10:00:12Z", sources: [src(2, 13)] }));
+  const first = await atTime("2026-10-20T10:00:12Z", () => wake(a.ctx));
+  must(first.isolated === true && first.turn.includes(id(2)), `control: B is checked: ${show(first)} ${show(wakeRows(a).at(-1))}`);
+  must(a.read(ASSISTANT_STORE, REVIEWED_KEY)[id(2)]?.latestAt === LATE_T2, `control: ch2 recorded at B: ${show(a.read(ASSISTANT_STORE, REVIEWED_KEY))}`);
+  return { a, first };
+}
+
+await check("a message that becomes readable after a later one a check read (earlier time and seq) is new to the next doorbell's check", async () => {
+  const { a } = await readBFirst();
+  // A becomes readable 20 s later: two unread now, A first, with a mention; the row's latest is still B.
+  withCh2(a, bothAB());
+  await atTime("2026-10-20T10:00:32Z", () => ring(a, { first_change_at: LATE_T1, last_change_at: "2026-10-20T10:00:32Z", sources: [src(2, 12)] }));
+  const second = await atTime("2026-10-20T10:00:32Z", () => wake(a.ctx));
+  const row = wakeRows(a).at(-1);
+  must(second.isolated === true && typeof second.turn === "string" && second.turn.includes(id(2)), `A's @mention never reaches a check: ${show(second)} row=${show(row)} reviewed=${show(a.read(ASSISTANT_STORE, REVIEWED_KEY))}`);
+  must(row?.status === "invoked" && row.attrs.candidates === 1 && row.attrs.seen === 3, show(row));
+});
+
+await check("an unread count that grew is new with the same latestAt and first unread message; the same row again is not", async () => {
+  const a = await lookedAtFour();
+  a.r.unread = [conv(1), conv(2), conv(3), conv(4)];
+  must((await bell(a)).turn === undefined && lastWake(a).attrs.seen === 4, `control: unchanged is seen: ${show(lastWake(a))}`);
+  a.r.unread = [conv(1), conv(2, { unread: 2 }), conv(3), conv(4)];
+  const out = await bell(a);
+  must(out.isolated === true && out.turn.includes(id(2)) && !out.turn.includes(id(1)) && lastWake(a).attrs.seen === 3, `one more unread: ${show(out)} ${show(lastWake(a))}`);
+  must((await bell(a)).turn === undefined && lastWake(a).attrs.seen === 4, `the grown count once looked at is seen: ${show(lastWake(a))}`);
+});
+
+await check("the owner reading part of a conversation does not make it new; reading all of it and then one more arriving does", async () => {
+  // X, Y, Z unread in ch3; the owner reads X, so Y is the first unread and the count falls.
+  const X = laterMsg(3, 1), Y = laterMsg(3, 2), NEXT = laterMsg(3, 4);
+  for (const seqs of [true, false]) {
+    const a = await assistant(raft({ dm: "dm:@ada" }));
+    briefPosted(a, "2026-10-20");
+    const row = (o: Record<string, unknown>, seq: number) => conv(3, { ...o, ...(seqs ? { latestSeq: seq } : {}) });
+    a.r.unread = [row({ unread: 3, firstUnreadMessageId: X }, 9)];
+    must((await bell(a)).isolated === true, `control: ch3 looked at (seqs ${seqs})`);
+    a.r.unread = [row({ unread: 2, firstUnreadMessageId: Y }, 9)];
+    const partial = await bell(a);
+    must(partial.turn === undefined && lastWake(a).status === "skipped_filtered" && lastWake(a).attrs.seen === 1, `a partial read was new (seqs ${seqs}): ${show(partial)} ${show(lastWake(a))}`);
+    // Everything read: gone from the unread read, its entry kept. Then one more message.
+    a.r.unread = [];
+    must((await bell(a)).turn === undefined && lastWake(a).status === "skipped_empty", `control: nothing unread (seqs ${seqs})`);
+    a.r.unread = [row({ unread: 1, firstUnreadMessageId: NEXT, latestAt: "2026-10-20T09:59:00.000Z" }, 10)];
+    const more = await bell(a);
+    must(more.isolated === true && more.turn.includes(id(3)), `one more after reading all was not new (seqs ${seqs}): ${show(more)} ${show(lastWake(a))}`);
+  }
+});
+
+await check("a reviewed entry kept as a plain latestAt (before positions) is judged by time, then kept as a position", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  briefPosted(a, "2026-10-20");
+  const T = "2026-10-20T09:50:00.000Z";
+  a.write(ASSISTANT_STORE, REVIEWED_KEY, { [id(1)]: T, [id(2)]: T, [id(3)]: T });
+  // ch1 as it was; ch2 newer; ch3 with more unread at the same time, which a time alone cannot see, as before.
+  a.r.unread = [conv(1), conv(2, { latestAt: "2026-10-20T09:51:00.000Z" }), conv(3, { unread: 4 })];
+  const out = await bell(a);
+  must(out.isolated === true && out.turn.includes(id(2)) && !out.turn.includes(id(1)) && !out.turn.includes(id(3)), `old entries: ${show(out)}`);
+  must(lastWake(a).attrs.seen === 2 && lastWake(a).attrs.candidates === 1, show(lastWake(a)));
+  const kept = a.read(ASSISTANT_STORE, REVIEWED_KEY);
+  must(kept[id(3)]?.unread === 4 && kept[id(3)]?.firstUnreadMessageId === conv(3).firstUnreadMessageId && kept[id(2)]?.latestAt === "2026-10-20T09:51:00.000Z", `rewritten: ${show(kept)}`);
+});
+
+await check("a check that records a recent change reads once more at its latestAt + SETTLE_MS; a doorbell in between keeps it; the read finds what the doorbell's read could not", async () => {
+  const { a, first } = await readBFirst();
+  const settle = at(LATE_T2) + SETTLE_MS;
+  must(SETTLE_MS === 60_000 && first.wakeAt === settle && a.read(ASSISTANT_STORE, OWNER_KEY).settleAt === settle && typeof a.read(ASSISTANT_STORE, OWNER_KEY).doorbellAt === "number", `scheduled: ${show(first)} ${show(a.read(ASSISTANT_STORE, OWNER_KEY))}`);
+  // Raft rings for A before A is readable: B's seq 13 is at least A's 12, so the seq rule calls the read caught up, and
+  // ch2 is as it was looked at. The settle read stays due, once.
+  await atTime("2026-10-20T10:00:20Z", () => ring(a, { first_change_at: LATE_T1, last_change_at: "2026-10-20T10:00:20Z", sources: [src(2, 12)] }));
+  const early = await atTime("2026-10-20T10:00:20Z", () => wake(a.ctx));
+  must(early.turn === undefined && wakeRows(a).at(-1)?.status === "skipped_filtered" && wakeRows(a).at(-1)?.attrs.caught_up === true, `control: the early ring's read shows nothing new: ${show(early)} ${show(wakeRows(a).at(-1))}`);
+  must(early.wakeAt === settle && a.read(ASSISTANT_STORE, OWNER_KEY).settleAt === settle, `the doorbell in between dropped the settle read: ${show(early)} ${show(a.read(ASSISTANT_STORE, OWNER_KEY))}`);
+  // A is readable now; no doorbell comes for it. The settle read is a doorbell's check.
+  withCh2(a, bothAB());
+  const read = await atTime(new Date(settle).toISOString(), () => wake(a.ctx));
+  const row = wakeRows(a).at(-1);
+  must(read.isolated === true && read.turn.includes(id(2)) && row?.status === "invoked" && row.attrs.settle_read === true, `the settle read: ${show(read)} ${show(row)}`);
+  must(read.wakeAt === at("2026-10-21T06:00:00Z") && a.read(ASSISTANT_STORE, OWNER_KEY).settleAt === null, `a second settle read: ${show(read)} ${show(a.read(ASSISTANT_STORE, OWNER_KEY))}`);
+});
+
+await check("a settle read that finds nothing new says nothing, asks no model and schedules nothing more", async () => {
+  const { a, first } = await readBFirst();
+  const sends = a.r.sends.length, probes = a.r.messageReads.length;
+  const read = await atTime(new Date(first.wakeAt).toISOString(), () => wake(a.ctx));
+  const row = wakeRows(a).at(-1);
+  must(read.turn === undefined && row?.status === "skipped_filtered" && row.attrs.settle_read === true && row.attrs.seen === 4, `${show(read)} ${show(row)}`);
+  must(a.r.sends.length === sends && a.r.messageReads.length === probes, `the quiet read sent or read: ${show(a.r.sends.slice(sends))}`);
+  must(read.wakeAt === at("2026-10-21T06:00:00Z") && a.read(ASSISTANT_STORE, OWNER_KEY).settleAt === null && a.read(ASSISTANT_STORE, OWNER_KEY).doorbellAt === null, `it schedules another: ${show(read)} ${show(a.read(ASSISTANT_STORE, OWNER_KEY))}`);
+  const reads = a.r.inboxReads.length;
+  const idle = await atTime("2026-10-20T10:05:00Z", () => wake(a.ctx));
+  must(idle.turn === undefined && a.r.inboxReads.length === reads, `a wake after it read again: ${show(idle)}`);
 });
 
 // ---- the runtime: the chat, the short sessions, and what each is offered and told --------------------------------------
