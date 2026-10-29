@@ -218,7 +218,16 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
 
   add("a connection is kept per agent and provider, replaced by a reconnect, and removed; a connect link is spent once", async () => {
     const c = d1Connections(db);
-    await c.put({ tenantId: "t", raftAgentId: "a1", provider: "github", account: "octocat", connectedBy: "u1", connectedAt: 1000, connectorId: null });
+    // A binding is written only for a live agent (LIVE_AGENT_STATUSES): none for one with no row, or a deleted one.
+    const agent = { tenantId: "t", agentId: "raft_a1", raftServerId: "srv", raftOrigin: "https://api.raft.build", name: "n", instructions: "",
+      credentialHash: null, pushRegistered: false, pushError: null };
+    await registry.create({ ...agent, raftAgentId: "a1", status: "active" as const });
+    await registry.create({ ...agent, raftAgentId: "a9", agentId: "raft_a9", status: "active" as const });
+    await registry.update("t", "a9", { status: "deleted", deletedAt: 1 });
+    const one = { provider: "github", account: "octocat", connectedBy: "u1", connectedAt: 1000, connectorId: null };
+    assert((await c.put({ tenantId: "t", raftAgentId: "a0", ...one })) === false && (await c.put({ tenantId: "t", raftAgentId: "a9", ...one })) === false
+      && (await c.get("t", "a9", "github")) === null, "a binding was written for an agent with no row, or a deleted one");
+    assert((await c.put({ tenantId: "t", raftAgentId: "a1", ...one })) === true, "a live agent's binding was refused");
     await c.put({ tenantId: "t", raftAgentId: "a1", provider: "github", account: "hubot", connectedBy: "u2", connectedAt: 2000, connectorId: "con_1" });
     const got = await c.get("t", "a1", "github");
     assert(got?.account === "hubot" && got.connectedBy === "u2" && got.connectedAt === 2000 && got.connectorId === "con_1", `reconnect: ${JSON.stringify(got)}`);
