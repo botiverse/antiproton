@@ -2414,6 +2414,8 @@ export class ToolGateway {
         : null,
       // The sibling's null is ambiguous in exactly the same three ways as this mount's.
       credentialRefKind: secretRefKind(other.secretRef),
+      // A credential the mount has but this asker may not read is said so, for an error that names the gate.
+      ...(!reads && other.secretRef ? { withheld: true as const } : {}),
       db: db(other),
       plugin: other.plugin,
       policy: other.policy ?? null,

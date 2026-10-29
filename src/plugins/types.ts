@@ -528,6 +528,12 @@ export interface PluginContext {
     /** As on this mount: what kind of credential that mount names, so a null
      *  one can be reported as unreadable rather than absent. */
     credentialRefKind?: CredentialRefKind;
+    /**
+     * Present, and true, when that mount has a credential but this plugin may not read it
+     * (`Plugin.siblingReaders`): `credential` is null by the gateway's rule, not for want of one. A plugin that
+     * needs it fails loudly with that, rather than act without it.
+     */
+    withheld?: true;
     /** That mount's database, opened under that mount's plugin. */
     db: PluginDatabase;
     /**

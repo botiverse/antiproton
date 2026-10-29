@@ -144,9 +144,10 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * client id no list in the isolate had named yet), and the handler refused once Raft resolved it: the tool, the
  * service and the action as the agent sent them, clipped, never a token (src/plugins/raft-agent-login.ts
  * `unresolvedRefusal`). It counts how often that window opens. `appworld.sibling_unset` is a second account's token an AppWorld
- * call left unset, the call going ahead without it: `not_callable` (`ctx.sibling` answered null for that mount; when
- * it does is PluginContext.sibling's) or `no_credential`, with the parameter and the other mount's alias, never a
- * token or a credential (src/plugins/appworld.ts `invoke`). `raftbench.run_done` is one RaftBench run's end: its id
+ * call could not get, the call refused before any request: `not_callable` (`ctx.sibling` answered null for that mount;
+ * when it does is PluginContext.sibling's), `no_credential`, or `withheld` (the other app does not list this one in
+ * `siblingReaders`), with the parameter and the other mount's alias, never a token or a credential
+ * (src/plugins/appworld.ts `invoke`). `raftbench.run_done` is one RaftBench run's end: its id
  * and revision, the outcome's fixed head (`accepted`, `refused`, `gave_up`, `stopped`), whose result was sent (`from`),
  * a plugin failure's fixed code (`failure`), the receipt's id, counts of fix-ups, model calls, reads and retries, and
  * how the result's shape was held to (`output`, `prompt_only`); never the result, a finding, the model's text or a

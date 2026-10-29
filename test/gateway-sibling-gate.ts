@@ -15,6 +15,7 @@
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { createRaftPlugin } from "../src/plugins/raft.ts";
+import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -266,6 +267,59 @@ await check("an id names one plugin: a second plugin registered under an existin
   threw = "";
   try { new ToolGateway(store, [raft, createRaftPlugin()], new Set()); } catch (e) { threw = String((e as Error).message); }
   assert(/"raft"/.test(threw), `a second "raft" was accepted: ${threw || "no error"}`);
+});
+
+// A plugin family whose members read each other's accounts: AppWorld builds one plugin per app, and an action
+// spanning two accounts (venmo's `phone_access_token`) takes the second app's token from that app's mount. The gate
+// must leave that working, offline: a fake AppWorld server answers the logins and records what the action was sent.
+await check("an AppWorld app reads its family's other app's account: venmo's action is sent with phone's token", async () => {
+  const p = (name: string) => ({ name, type: "string", required: true, description: "", default: null, constraints: [] });
+  const catalogue: Catalogue = {
+    venmo: { description: "payments", apis: [{ app_name: "venmo", api_name: "send_money", path: "/send_money", method: "POST",
+      description: "pay a contact", parameters: [p("access_token"), p("phone_access_token"), p("amount")] }] },
+    phone: { description: "contacts", apis: [{ app_name: "phone", api_name: "contacts", path: "/contacts", method: "GET",
+      description: "list contacts", parameters: [p("access_token")] }] },
+  };
+  const family = appworldPlugins(catalogue, { apiBaseUrl: "http://appworld.test" });
+  // Derived from the family, not typed: each lists the others.
+  for (const plugin of family) {
+    assert(JSON.stringify(plugin.siblingReaders) === JSON.stringify(family.map((x) => x.id).filter((id) => id !== plugin.id)), `${plugin.id}: ${JSON.stringify(plugin.siblingReaders)}`);
+  }
+  const sent: Array<{ url: string; body: any; authorization: string | null }> = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: any, init: any = {}) => {
+    const url = String(input);
+    const m = /^http:\/\/appworld\.test\/(\w+)\/auth\/token$/.exec(url);
+    if (m) return new Response(JSON.stringify({ access_token: `token-of-${m[1]}` }), { status: 200, headers: { "content-type": "application/json" } });
+    sent.push({ url, body: init.body ? JSON.parse(init.body) : null, authorization: new Headers(init.headers).get("authorization") });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as any;
+  const family2 = async (plugins: Plugin[]) => {
+    const store = new SqliteStore(":memory:");
+    await store.init();
+    await store.createAgent("t", "a");
+    for (const app of ["venmo", "phone"]) {
+      await store.addMount({ tenantId: "t", agentId: "a", alias: app, plugin: app, installationId: `i-${app}`, connectionId: null,
+        toolVersion: "1.0.0", publicConfig: {}, secretRef: `secret:${app}`, policy: null });
+    }
+    return new ToolGateway(store, plugins, new Set(plugins.map((x) => x.id)),
+      { async resolve(ref: string) { return JSON.stringify({ username: ref, password: "pw" }); } });
+  };
+  try {
+    const r = await (await family2(family)).invoke(ctx, "venmo.send_money", { amount: "5" }) as any;
+    assert(r.status === "succeeded", `send_money: ${JSON.stringify(r)}`);
+    // What actually left: venmo's own token in the header, phone's in the parameter the action names.
+    const call = sent.find((x) => x.url.endsWith("/venmo/send_money"));
+    assert(call?.authorization === "Bearer token-of-venmo", `venmo's own token was not sent: ${call?.authorization}`);
+    assert(call?.body?.phone_access_token === "token-of-phone", `the action was sent without phone's token: ${JSON.stringify(call?.body)}`);
+    // And a phone that does not let venmo read it: refused loudly, naming the sibling and the gate, before any request.
+    sent.length = 0;
+    const closed = family.map((x) => (x.id === "phone" ? { ...x, siblingReaders: [] } : x));
+    const refused = await (await family2(closed)).invoke(ctx, "venmo.send_money", { amount: "5" }) as any;
+    assert(refused.status === "failed" && /phone mount's account/.test(refused.error?.message ?? "") && /siblingReaders/.test(refused.error.message),
+      `a withheld sibling: ${JSON.stringify(refused)}`);
+    assert(!sent.some((x) => x.url.endsWith("/venmo/send_money")), "the action was sent without phone's token");
+  } finally { globalThis.fetch = realFetch; }
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
