@@ -2410,10 +2410,11 @@ export class AgentRuntime {
       const idle = Math.round(safety.live.idleMs / 60_000);
       return { ok: false, error: `${safety.reason} (${safety.live.id}, idle ${idle}m)` };
     }
-    // Only a credential this agent supplied moves. `operator:` references name
-    // something the deployment owns, under a name that has nothing to do with
-    // this mount's alias.
-    const own = isAgentRef(mount.secretRef);
+    // Only a key named after this alias moves, with its renewal record and the reference. `operator:` references
+    // name something the deployment owns, and a key the reference names under another name is not filed under this
+    // alias: moving the row named `from` would take a key that is not this mount's, and rewriting the reference
+    // would leave this mount's own key behind.
+    const own = agentKeyName(mount.secretRef) === from;
     if (this.#gateway.isRemoving(tenantId, agentId, from)) return { ok: false, error: removing };
     const r = await this.store.renameMount(tenantId, agentId, from, to, own ? { newRef: agentRef(to) } : null);
     // The last snapshot error is keyed by the alias too, and is about the same mount under its new name.

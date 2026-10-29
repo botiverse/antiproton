@@ -2100,6 +2100,65 @@ await check("a box that takes a key named apart from its alias records the use u
   w.dispose();
 });
 
+// A rename moves a mount's key, its renewal record and its reference only when the key is filed under the alias
+// being renamed: the row named after the old alias is the one the store moves.
+async function renameWorld(KEY: string | null) {
+  const w = await world();
+  const a = await w.agent(KEY === null ? "RN" : "RK");
+  await w.connect(a);
+  const alias = (await a.rt.store.findMountsByPlugin(TENANT, a.agentId, "github"))[0]!.alias;
+  const host = w.hostOf(a.agentId);
+  if (KEY !== null) {
+    host.sql.exec("UPDATE secrets SET name = ? WHERE name = ?", KEY, alias);
+    host.sql.exec("UPDATE secrets SET name = ? WHERE name = ?", OAUTH_PREFIX + KEY, OAUTH_PREFIX + alias);
+    await a.rt.store.setMountSecretRef(TENANT, a.agentId, alias, `agent:${KEY}`);
+  }
+  const names = () => (host.sql.exec("SELECT name FROM secrets ORDER BY name").toArray() as any[]).map((r) => String(r.name));
+  const ref = async (at: string) => (await a.rt.store.getMountByAlias(TENANT, a.agentId, at))?.secretRef;
+  return { w, a, alias, host, names, ref };
+}
+
+await check("renaming a mount whose reference names a key other than its alias moves neither the key, its renewal record nor the reference", async () => {
+  const { w, a, alias, names, ref } = await renameWorld("gh_key");
+  must(alias === "gh" && JSON.stringify(names()) === JSON.stringify(["gh_key", "oauth:gh_key"]), `the fixture: ${alias} ${JSON.stringify(names())}`);
+  const r = await a.rt.renameMount(TENANT, a.agentId, "gh", "gh2");
+  must(r.ok, `the rename was refused: ${JSON.stringify(r)}`);
+  must((await ref("gh2")) === "agent:gh_key", `the reference: ${await ref("gh2")}`);
+  must(JSON.stringify(names()) === JSON.stringify(["gh_key", "oauth:gh_key"]), `the rows: ${JSON.stringify(names())}`);
+  w.dispose();
+});
+
+await check("renaming such a mount leaves a key filed under its old alias, and another mount's reference to it, as they were", async () => {
+  const { w, a, host, names, ref } = await renameWorld("gh_key");
+  // Another mount, whose key is the row named `gh` (the alias being renamed away), with its renewal record.
+  await a.rt.store.addMount({
+    tenantId: TENANT, agentId: a.agentId, alias: "other", plugin: "demo",
+    installationId: "i-other", connectionId: null, toolVersion: "1.0.0",
+    publicConfig: {}, secretRef: "agent:gh", policy: null,
+  });
+  await a.rt.store.putSecret(TENANT, a.agentId, "gh", { ciphertext: "others-key", iv: "iv" });
+  await a.rt.store.putSecret(TENANT, a.agentId, OAUTH_PREFIX + "gh", { ciphertext: "others-record", iv: "iv" });
+  const rows = () => JSON.stringify(host.sql.exec("SELECT name, ciphertext FROM secrets WHERE name IN ('gh', 'oauth:gh') ORDER BY name").toArray());
+  const before = rows();
+  must(JSON.stringify(names()) === JSON.stringify(["gh", "gh_key", "oauth:gh", "oauth:gh_key"]), `the fixture: ${JSON.stringify(names())}`);
+  const r = await a.rt.renameMount(TENANT, a.agentId, "gh", "gh2");
+  must(r.ok, `the rename was refused: ${JSON.stringify(r)}`);
+  must(rows() === before, `the other mount's key or record moved: ${rows()}`);
+  must(JSON.stringify(names()) === JSON.stringify(["gh", "gh_key", "oauth:gh", "oauth:gh_key"]), `the rows: ${JSON.stringify(names())}`);
+  must((await ref("other")) === "agent:gh" && (await ref("gh2")) === "agent:gh_key", `the references: other ${await ref("other")}, gh2 ${await ref("gh2")}`);
+  w.dispose();
+});
+
+await check("renaming a mount whose key is filed under its alias moves the key, its renewal record and the reference", async () => {
+  const { w, a, names, ref } = await renameWorld(null);
+  must((await ref("gh")) === "agent:gh" && JSON.stringify(names()) === JSON.stringify(["gh", "oauth:gh"]), `the fixture: ${await ref("gh")} ${JSON.stringify(names())}`);
+  const r = await a.rt.renameMount(TENANT, a.agentId, "gh", "gh2");
+  must(r.ok, `the rename was refused: ${JSON.stringify(r)}`);
+  must((await ref("gh2")) === "agent:gh2", `the reference: ${await ref("gh2")}`);
+  must(JSON.stringify(names()) === JSON.stringify(["gh2", "oauth:gh2"]), `the rows: ${JSON.stringify(names())}`);
+  w.dispose();
+});
+
 await check("withdraw never deletes project-scope secrets (shared run9 project: would stop prod injection); withdraw runs while the box exists: after a delete there is nothing to withdraw", async () => {
   const run9 = run9Fake();
   const w = await world({ run9 });
