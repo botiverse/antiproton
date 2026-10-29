@@ -764,7 +764,8 @@ export { OPERATOR_RUN9_REF, OPERATOR_INSTABOX_REF, OPERATOR_EXA_REF } from "./op
  * that can be believed), or why not; the mounts let go; and every step that failed.
  */
 export interface ReleaseForDelete {
-  things: Array<{ alias: string; id: string; clean: boolean; via?: "withdrawn" | "deleted"; why?: string; review?: string }>;
+  things: Array<{ alias: string; id: string; clean: boolean; via?: "withdrawn" | "deleted"; why?: string; review?: string;
+    projectResidue?: Array<{ secretId: string; name: string; reason: string }> }>;
   released: string[];
   failed: Array<{ alias: string; stage: "withdraw" | "release"; error: string }>;
 }
@@ -4856,8 +4857,12 @@ export class AgentRuntime {
     const releaseFailed = new Set(r.failed.map((f) => f.alias));
     return {
       things: w.things.map((t) => {
-        const via = t.clean ? "withdrawn" as const : t.ownKey && !releaseFailed.has(t.alias) ? "deleted" as const : null;
-        return { alias: t.alias, id: t.id, clean: via !== null, ...(via ? { via } : {}), ...(via || !t.why ? {} : { why: t.why }), ...(t.review ? { review: t.review } : {}) };
+        // A project-scope registration carrying the box's placeholder outlives the box: run9 injects it into whatever
+        // its label matches. Never clean while one is there, deleted box or not, and always named.
+        const residue = t.projectResidue?.length ? t.projectResidue : null;
+        const via = residue ? null : t.clean ? "withdrawn" as const : t.ownKey && !releaseFailed.has(t.alias) ? "deleted" as const : null;
+        return { alias: t.alias, id: t.id, clean: via !== null, ...(via ? { via } : {}), ...(via || !t.why ? {} : { why: t.why }),
+          ...(t.review ? { review: t.review } : {}), ...(residue ? { projectResidue: residue } : {}) };
       }),
       released: r.released,
       failed: [...w.failed.map((f) => ({ ...f, stage: "withdraw" as const })), ...r.failed.map((f) => ({ ...f, stage: "release" as const }))],

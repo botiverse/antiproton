@@ -111,12 +111,23 @@ function caller(settings: ProviderSettings, auth: string) {
   return { send, api };
 }
 
+/**
+ * What a value looks like, never what it says: its type, whether it is an array, and an object's key names. For
+ * errors about run9's answers, which flow back to Raft in a DELETE's answer: a malformed list may hold a token.
+ */
+export function shapeOf(v: unknown): string {
+  if (v === null) return "null";
+  if (Array.isArray(v)) return `array of ${v.length}`;
+  if (typeof v === "object") return `object with keys ${Object.keys(v as object).slice(0, 8).join(", ") || "(none)"}`;
+  return typeof v;
+}
+
 /** A secrets listing as run9 answers it: a bare array of views, each with its `secret_id`. Throws on anything else. */
 export function secretViews(listed: unknown, path: string): any[] {
-  if (!Array.isArray(listed)) throw new Error(`run9 GET ${path}: not a list of secrets (${typeof listed === "string" ? "text" : JSON.stringify(listed)?.slice(0, 80)})`);
+  if (!Array.isArray(listed)) throw new Error(`run9 GET ${path}: not a list of secrets (${shapeOf(listed)})`);
   for (const s of listed) {
     if (!s || typeof s !== "object" || typeof (s as any).secret_id !== "string") {
-      throw new Error(`run9 GET ${path}: an entry without its secret_id (${JSON.stringify(s)?.slice(0, 80)})`);
+      throw new Error(`run9 GET ${path}: an entry without its secret_id (${shapeOf(s)})`);
     }
   }
   return listed;

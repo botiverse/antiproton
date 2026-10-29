@@ -67,6 +67,9 @@
     // Same container lease as production (cf/wrangler.jsonc says why).
     "RUN9_WARN_MINUTES": "5",
     "RUN9_MAX_IDLE_MINUTES": "30",
+    // The egress verification hook, POST /admin/withdraw-egress (#1130), for observing the withdrawal against a real
+    // run9 box; preview only, never in cf/wrangler.jsonc, and removed after the observation (#1132).
+    "EGRESS_VERIFY_ROUTE": "1",
     // Which deployment this is: what a forwarded trace row says in its `env` field
     // (cf/src/trace-forward.ts).
     "DEPLOYMENT_ENV": "preview",

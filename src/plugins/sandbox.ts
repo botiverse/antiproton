@@ -2388,7 +2388,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       const mount = await readMount(ctx);
       const cfg = cfgOf(ctx);
       const backend = backendFor(cfg);
-      const out: Array<{ id: string; clean: boolean; ownKey: boolean; why?: string; review?: string }> = [];
+      const out: Array<{ id: string; clean: boolean; ownKey: boolean; why?: string; review?: string;
+        projectResidue?: Array<{ secretId: string; name: string; reason: string }> }> = [];
       for (const machine of boxedMachines(mount)) {
         const state = await readView(ctx, machine);
         if (!state.boxId) continue;
@@ -2404,14 +2405,21 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
           const names = new Set([...before.map((x) => String(x.name ?? "")), ...(state.wired ?? []).flatMap((w) => w.names ?? [])].filter(Boolean));
           for (const sec of before) await provider.removeSecret(state.boxId, sec.id);
           const left = await provider.listSecrets(state.boxId);
-          let injected = 0, named = 0;
+          // Project scope is listed, never written: one run9 project is shared with production, and a project-scope
+          // secret removed here could stop another deployment's boxes from working. One carrying this box's
+          // placeholder is residue run9 will inject: named, every time, whatever else is clean.
+          const projectResidue: Array<{ secretId: string; name: string; reason: string }> = [];
+          let named = 0;
           if (provider.listProjectSecrets) {
             for (const p of await provider.listProjectSecrets()) {
               const ph = String(p.placeholder ?? "");
-              if (ph && ([...placeholders].some((x) => ph === x || ph.includes(x)) || carriesBoxPlaceholder(ph, state.boxId))) injected++;
-              else if (names.has(String(p.name ?? ""))) named++;
+              if (ph && ([...placeholders].some((x) => ph === x || ph.includes(x)) || carriesBoxPlaceholder(ph, state.boxId))) {
+                projectResidue.push({ secretId: String(p.id), name: String(p.name ?? ""),
+                  reason: "a project-scope registration carrying this box's placeholder: run9 injects it into the boxes its label matches, and antiproton never removes project-scope secrets (the run9 project is shared with production), so a person must" });
+              } else if (names.has(String(p.name ?? ""))) named++;
             }
           }
+          const injected = projectResidue.length;
           const now = await readView(ctx, machine);
           if (now.boxId === state.boxId && (now.wired || now.leftOut)) {
             const next = { ...now };
@@ -2421,9 +2429,12 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
           const why = left.length ? `${left.length} registration(s) still on the box after removal`
             : injected ? `${injected} project-scope registration(s) carry this box's placeholder, so run9 still injects them` : undefined;
           out.push({ id: state.boxId, clean: !left.length && !injected, ownKey, ...(why ? { why } : {}),
-            ...(named ? { review: `${named} project-scope registration(s) share a name with this box's accounts; a person should look` } : {}) });
+            ...(named ? { review: `${named} project-scope registration(s) share a name with this box's accounts; a person should look` } : {}),
+            ...(injected ? { projectResidue } : {}) });
         } catch (e) {
-          out.push({ id: state.boxId, clean: false, ownKey, why: String((e as Error)?.message ?? e).slice(0, 200) });
+          // What run9 answered is never repeated here, only its status: this text reaches Raft in a DELETE's answer.
+          const why = e instanceof ProviderError ? `run9 refused (${e.status ? `HTTP ${e.status}` : e.code})` : String((e as Error)?.message ?? e).slice(0, 200);
+          out.push({ id: state.boxId, clean: false, ownKey, why });
         }
       }
       for (const id of Object.keys(mount?.stranded ?? {})) {

@@ -135,16 +135,21 @@ function run9Fake() {
   // `ignoreWithdraw`: it answers a removal 200 and keeps the registration (a removal taken but not applied).
   // `deleteNotFound`: it answers the box's delete 404 (as for a key of another account) and the box runs on.
   // `listShape`: the box's secrets listing comes back in another shape (wrapped, or a proxy's page).
-  const f = { failDelete: false, failWithdraw: false, ignoreWithdraw: false, deleteNotFound: false, listShape: null as null | "wrapped" | "html" };
+  // `listShape: "leaky"`: a wrapped list whose entries carry a token; `listFail`: the listing answers 503 with a body
+  // that holds one. Neither may come back in any answer.
+  const f = { failDelete: false, failWithdraw: false, ignoreWithdraw: false, deleteNotFound: false, listShape: null as null | "wrapped" | "html" | "leaky", listFail: false };
   /** Project-scope registrations: injected into the boxes they label, never listed on the box. */
   const project: Secret[] = [];
   const calls: string[] = [];
+  /** Every request's method, path and body, as sent. */
+  const sent: Array<{ method: string; path: string; body: any }> = [];
   const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json" } });
   async function handle(url: string, init?: RequestInit): Promise<Response> {
     const method = init?.method ?? "GET";
     const path = url.startsWith(ws) ? url.slice(ws.length).split("?")[0]! : url;
     const body = typeof init?.body === "string" ? JSON.parse(init.body) : null;
     calls.push(`${method} ${url.replace("https://api.run.sys9.ai", "")}`);
+    sent.push({ method, path: url.replace("https://api.run.sys9.ai", ""), body });
     let m: RegExpMatchArray | null;
     if (url === "https://api.run.sys9.ai/projects/default/secrets") {
       return json(project.map((x) => ({ secret_id: x.secret_id, name: x.name, placeholder: x.placeholder, scope: "project", box_label: { k: "v" } })));
@@ -164,6 +169,8 @@ function run9Fake() {
         b.secrets.push({ secret_id: `s${++n}`, name: body.name, value: body.value, placeholder: body.placeholder, inject_header_name: body.inject_header_name, allowed_hosts: body.allowed_hosts });
         return json({});
       }
+      if (f.listFail) return new Response("upstream error: ghu_LEAKFROMBODY0000000000000000000000000", { status: 503 });
+      if (f.listShape === "leaky") return json({ items: b.secrets.map((x) => ({ secret_id: x.secret_id, value: "ghu_LEAKFROMLIST000000000000000000000000" })) });
       if (f.listShape === "wrapped") return json({ items: b.secrets.map((x) => ({ name: x.name, secret_id: x.secret_id })) });
       if (f.listShape === "html") return new Response("<html>gateway</html>", { status: 200, headers: { "content-type": "text/html" } });
       return json(b.secrets.map((x) => ({ name: x.name, secret_id: x.secret_id, placeholder: x.placeholder })));
@@ -197,7 +204,7 @@ function run9Fake() {
     }
     return out;
   }
-  return { boxes, handle, egress, f, project, calls };
+  return { boxes, handle, egress, f, project, calls, sent };
 }
 
 async function world(opts: { expiring?: boolean; github?: boolean; run9?: ReturnType<typeof run9Fake> } = {}) {
@@ -1480,15 +1487,30 @@ function fromBox(run9: ReturnType<typeof run9Fake>, boxId: string) {
 
 const boxOf = (body: any) => body?.sandboxes?.boxes?.[0];
 
+await check("registration is box-scoped (a project-scope secret with box_label would inject into matching prod boxes)", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("Y0");
+  await w.connect(a);
+  must((await w.sandbox(a) as any).status === "succeeded", "control: the command did not run");
+  const [boxId] = [...run9.boxes.keys()];
+  const posts = run9.sent.filter((x) => x.method === "POST" && x.path.includes("secrets"));
+  must(posts.length === 2 && posts.every((x) => x.path === `/projects/default/workspace/boxes/${boxId}/secrets`), `registered at another path: ${JSON.stringify(posts.map((x) => x.path))}`);
+  // The body too: a box secret names itself and its placeholder, and carries no label or scope that would widen it.
+  for (const { body } of posts) {
+    must(typeof body.name === "string" && /^GH_TOKEN/.test(body.name) && typeof body.placeholder === "string" && body.placeholder.length > 0
+      && !("box_label" in body) && !("scope" in body) && Array.isArray(body.allowed_hosts) && body.inject_header_name === "authorization",
+      `a registration body: ${JSON.stringify({ ...body, value: "(withheld)" })}`);
+  }
+  w.dispose();
+});
+
 await check("deleting an agent with a live sandbox: the box is deleted, and a request it makes carries no GitHub token", async () => {
   const run9 = run9Fake();
   const w = await world({ run9 });
   const a = await w.agent("Y1");
   await w.connect(a);
   must((await w.sandbox(a) as any).status === "succeeded", "control: the command did not run");
-  // Registered for the box alone, never for the project: a project-scope registration would not be on the box's list.
-  must(run9.calls.some((c) => /^POST \/projects\/default\/workspace\/boxes\/[^/]+\/secrets$/.test(c)) && !run9.calls.some((c) => /^POST \/projects\/default\/secrets/.test(c)),
-    `registered at another scope: ${run9.calls.filter((c) => c.includes("secrets")).join(", ")}`);
   const [boxId] = [...run9.boxes.keys()];
   const req = fromBox(run9, boxId!);
   const token = (await w.stored(a)).token!;
@@ -1616,7 +1638,7 @@ await check("run9's secrets listing is read strictly: a bare array of views with
   }
 });
 
-await check("a project-scope registration carrying the box's placeholder is not clean; one sharing only a name is for a person to look at", async () => {
+await check("a project-scope registration carrying the box's placeholder is named in the answer and never clean, even once the box is deleted; one sharing only a name is for a person to look at", async () => {
   const run9 = run9Fake();
   const w = await world({ run9 });
   const a = await w.agent("Y8");
@@ -1627,11 +1649,51 @@ await check("a project-scope registration carrying the box's placeholder is not 
   run9.project.push({ secret_id: "p1", name: "GH_TOKEN", value: "x", placeholder: "__AP_OTHER__", inject_header_name: "authorization", allowed_hosts: ["api.github.com"] });
   run9.f.failDelete = true;
   const named = await w.call("DELETE", "/agents/by-raft-agent/Y8");
-  must(boxOf(named.body)?.clean === true && /a person should look/.test(boxOf(named.body).review ?? ""), `a name only: ${named.text}`);
+  must(boxOf(named.body)?.clean === true && /a person should look/.test(boxOf(named.body).review ?? "") && !boxOf(named.body).projectResidue, `a name only: ${named.text}`);
   run9.project.push({ secret_id: "p2", name: "OTHER", value: "x", placeholder, inject_header_name: "authorization", allowed_hosts: ["api.github.com"] });
   const injected = await w.call("DELETE", "/agents/by-raft-agent/Y8");
-  must(boxOf(injected.body)?.clean === false && /project-scope/.test(boxOf(injected.body).why ?? ""), `a placeholder match: ${injected.text}`);
+  must(boxOf(injected.body)?.clean === false && boxOf(injected.body).projectResidue?.[0]?.secretId === "p2" && /never removes project-scope/.test(boxOf(injected.body).projectResidue[0].reason),
+    `a placeholder match: ${injected.text}`);
+  // The box goes; the project registration does not, and is still named.
+  run9.f.failDelete = false;
+  const gone = await w.call("DELETE", "/agents/by-raft-agent/Y8");
+  must(!run9.boxes.has(boxId!) && gone.body.clean === false && boxOf(gone.body)?.projectResidue?.[0]?.secretId === "p2", `after the box went: ${gone.text}`);
   w.dispose();
+});
+
+await check("withdraw never deletes project-scope secrets (shared run9 project: would stop prod injection)", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("YA");
+  await w.connect(a);
+  await w.sandbox(a);
+  const [boxId] = [...run9.boxes.keys()];
+  const placeholder = run9.boxes.get(boxId!)!.secrets[0]!.placeholder;
+  run9.project.push({ secret_id: "p3", name: "GH_TOKEN", value: "x", placeholder, inject_header_name: "authorization", allowed_hosts: ["api.github.com"] });
+  await w.call("DELETE", "/agents/by-raft-agent/YA");
+  // The operator's withdrawal (the route's answer) names it too.
+  const op = await a.rt.withdrawEgress(TENANT, a.agentId);
+  must(op.things[0]?.projectResidue?.[0]?.secretId === "p3", `the operator's answer: ${JSON.stringify(op)}`);
+  const writes = run9.sent.filter((x) => x.method !== "GET" && /^\/projects\/default\/secrets/.test(x.path));
+  must(writes.length === 0 && run9.sent.some((x) => x.method === "GET" && x.path === "/projects/default/secrets"), `project-scope writes: ${JSON.stringify(writes.map((x) => `${x.method} ${x.path}`))}`);
+  must(run9.project.length === 1, "a project secret went");
+  w.dispose();
+});
+
+await check("what run9 answered never comes back in a DELETE's answer: a malformed list, or a refusal's body, is reported by its shape or status only", async () => {
+  for (const mode of ["leaky", "fail"] as const) {
+    const run9 = run9Fake();
+    const w = await world({ run9 });
+    const a = await w.agent(mode === "leaky" ? "YB" : "YC");
+    await w.connect(a);
+    await w.sandbox(a);
+    if (mode === "leaky") run9.f.listShape = "leaky"; else run9.f.listFail = true;
+    run9.f.failDelete = true;
+    const del = await w.call("DELETE", `/agents/by-raft-agent/${a.raftAgentId}`);
+    must(boxOf(del.body)?.clean === false && !del.text.includes("ghu_LEAK") && !del.text.includes("upstream error"), `${mode}: ${del.text}`);
+    must(mode === "leaky" ? /object with keys items/.test(boxOf(del.body).why) : /HTTP 503/.test(boxOf(del.body).why), `${mode}: the shape or status is not said: ${boxOf(del.body).why}`);
+    w.dispose();
+  }
 });
 
 await check("the operator's withdrawal alone (/admin/withdraw-egress): a live box's registrations go, the box runs on, and its request carries the placeholder", async () => {

@@ -85,7 +85,8 @@ export interface ProvisionAgentOps {
    * its held things let go (`AgentRuntime.releaseForDelete`).
    */
   releaseForDelete?(tenantId: string, agentId: string): Promise<{
-    things: Array<{ alias: string; id: string; clean: boolean; via?: "withdrawn" | "deleted"; why?: string; review?: string }>;
+    things: Array<{ alias: string; id: string; clean: boolean; via?: "withdrawn" | "deleted"; why?: string; review?: string;
+      projectResidue?: Array<{ secretId: string; name: string; reason: string }> }>;
     released: string[];
     failed: Array<{ alias: string; stage: "withdraw" | "release"; error: string }>;
   }>;

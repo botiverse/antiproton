@@ -1891,7 +1891,9 @@ export interface Holding {
    * showing none), and `ownKey` when the thing records being made under the mount's current kind of key, so a
    * deletion of it by this mount's release can be believed.
    */
-  withdraw?(ctx: PluginContext): Promise<Array<{ id: string; clean: boolean; ownKey: boolean; why?: string; review?: string }>>;
+  withdraw?(ctx: PluginContext): Promise<Array<{ id: string; clean: boolean; ownKey: boolean; why?: string; review?: string;
+    /** Registrations made outside the thing (run9's project scope) that still act for it, which this never removes. */
+    projectResidue?: Array<{ secretId: string; name: string; reason: string }> }>>;
   /**
    * Let go of it. Scoped to the AGENT rather than to one task, safe to call
    * again, and it must throw rather than return if something billed could not

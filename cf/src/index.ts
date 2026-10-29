@@ -315,6 +315,12 @@ export interface Env {
   /** Lets automation reach the endpoints that spend money, since a script
    *  cannot sign in through a browser. */
   AUTOMATION_TOKEN?: string;
+  /**
+   * "1" turns on `POST /admin/withdraw-egress`, a verification hook for observing an agent's egress withdrawal
+   * against a real run9 box (#1130), to be removed after that observation (#1132). Set in cf/wrangler.preview.jsonc
+   * only, never for production: absent, the path is an unknown route like any other.
+   */
+  EGRESS_VERIFY_ROUTE?: string;
   LOADER: {
     load(code: WorkerCode): WorkerStub;
     get(id: string, cb: () => Promise<WorkerCode> | WorkerCode): WorkerStub;
@@ -5203,20 +5209,34 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
           return Response.json({ tenantId: t, agentId: a, ...r }, { status: r.result === "failed" ? 503 : 200 });
         }
         case "/admin/withdraw-egress": {
+          // A verification hook, preview only (EGRESS_VERIFY_ROUTE, set in cf/wrangler.preview.jsonc), to be removed
+          // after the real-box observation (#1132). Without the flag this path is an unknown route like any other.
+          if (env.EGRESS_VERIFY_ROUTE !== "1") return unrouted();
           // The withdrawal an agent's delete starts with, alone: every egress registration on every box the agent's
-          // mounts hold is removed, nothing is let go, nothing is deleted, and the answer is what each box showed
-          // (`Holding.withdraw`). For an operator observing it against a real box; the agent's next command wires its
-          // accounts again. Operator only, and never on its own a substitute for the delete.
+          // mounts hold is removed, nothing is let go or deleted, and the answer is what each box showed
+          // (`Holding.withdraw`). The agent's next command wires its accounts again.
           if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
             return Response.json({ error: "unauthorized" }, { status: 401 });
           }
           if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
+          // Who says they are calling: free text, self-declared, not authentication (the token is the operator's,
+          // shared), written into the audit line so a use leaves a name.
+          const claimedCaller = (request.headers.get("x-claimed-caller") ?? "").trim().slice(0, 64);
+          if (!claimedCaller) return Response.json({ error: "x-claimed-caller is required: who is calling, as free text" }, { status: 400 });
           const t = url.searchParams.get("tenantId") ?? "";
           const a = url.searchParams.get("agentId") ?? "";
           if (!t || !a) return Response.json({ error: "tenantId and agentId are required" }, { status: 400 });
+          // Only an agent this deployment provisioned, read from its own D1 before its object is touched: an id that
+          // was never an agent is a 404, and no object is opened (opening one records it as the agent's).
+          if (!(await d1ProvisionedAgents(env.CONTROL_DB).getByAgentId(t, a))) {
+            logEvent("admin.withdraw_egress", { tenantId: t, agentId: a, claimedCaller, outcome: "no_such_agent", at: new Date().toISOString() });
+            return Response.json({ error: "not_found" }, { status: 404 });
+          }
+          const at = new Date().toISOString();
           const r = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).withdrawEgress(t, a);
-          logEvent("admin.withdraw_egress", { tenantId: t, agentId: a, things: r.things.length, clean: r.things.filter((x) => x.clean).length, failed: r.failed.length });
-          return Response.json({ tenantId: t, agentId: a, at: new Date().toISOString(), ...r });
+          logEvent("admin.withdraw_egress", { tenantId: t, agentId: a, claimedCaller, outcome: "withdrawn", at,
+            things: r.things.length, clean: r.things.filter((x) => x.clean).length, residue: r.things.reduce((n, x) => n + (x.projectResidue?.length ?? 0), 0), failed: r.failed.length });
+          return Response.json({ tenantId: t, agentId: a, at, ...r });
         }
         case "/admin/migrate-engine":
           return await adminMigrateEngine(request, env.AUTOMATION_TOKEN,
