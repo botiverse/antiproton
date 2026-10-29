@@ -548,7 +548,7 @@ export function heldMessage(operationId: string, place: HeldPlace, merged = fals
   const ids = `giving the operation id (${operationId}) and the tool (${call.tool})`;
   const twice = merged ? " If you need it done twice, call again after that one is decided." : "";
   if ("raft" in place) {
-    return `${opening}${twice} An approval card for it goes to your owner in Raft, and they approve or deny it there; if approved, it runs on its own ` +
+    return `${opening}${twice} An approval card for it goes to your owner in Raft (or a server admin if your owner has left), and they approve or deny it there; if approved, it runs on its own ` +
       `exactly as written. ${expiry} ${told} If you tell your owner about it, give the operation id (${operationId}) and the tool (${call.tool}). Do not retry it. ${again}`;
   }
   if ("nobody" in place) {

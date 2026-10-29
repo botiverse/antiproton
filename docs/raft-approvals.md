@@ -268,8 +268,10 @@ This is the reconcile. Rows come oldest change first.
 - The copy only moves forward: pending, then approved, then a final state.
 - It can lag the agent by one alarm pass, normally seconds, and by longer while D1 is unreachable. The per-agent
   route is always current.
-- When an agent is deleted, its rows are removed.
-- A row in a final state is dropped 30 days after its last change.
+- When an agent is deleted, its rows are no longer listed, but they are kept as the record of who decided what for
+  it: ids, status, tool, `decidedBy` and timestamps, without the argument and outcome summaries (those stay in the
+  agent's own object). They are dropped a year after the delete.
+- A live agent's row in a final state is dropped 30 days after its last change.
 
 ## How Raft learns of changes: a signed hint, then a pull
 
@@ -393,13 +395,13 @@ In every case also show who decided (from `decidedBy`) and when (`decidedAt`).
 
 **When the call is held**, the pending answer says the following, with the deadline given as an ISO time:
 
-> This call is held for approval (operation op_…). An approval card for it goes to your owner in Raft, and they
-> approve or deny it there; if approved, it runs on its own exactly as written. If nobody decides by … (24 hours
-> after it was held), it expires and is not run. You will be woken with the outcome in a notice: executed (with its
-> result), failed, denied, expired, or policy_denied (approved, but the mount's policy now refuses it); your turn
-> does not wait for it. If you tell your owner about it, give the operation id (op_…) and the tool
-> (gh.create_pull_request). Do not retry it. Calling this tool again with the same arguments while it waits
-> returns this same pending approval; it does not create another.
+> This call is held for approval (operation op_…). An approval card for it goes to your owner in Raft (or a server
+> admin if your owner has left), and they approve or deny it there; if approved, it runs on its own exactly as
+> written. If nobody decides by … (24 hours after it was held), it expires and is not run. You will be woken with
+> the outcome in a notice: executed (with its result), failed, denied, expired, or policy_denied (approved, but the
+> mount's policy now refuses it); your turn does not wait for it. If you tell your owner about it, give the
+> operation id (op_…) and the tool (gh.create_pull_request). Do not retry it. Calling this tool again with the same
+> arguments while it waits returns this same pending approval; it does not create another.
 
 The hours are the deployment's TTL. A call identical to one already pending is told it was merged into that hold,
 and gets that hold's deadline.
@@ -461,7 +463,7 @@ agent.
 | The owner switches the mount to `deny` after the hold | The approved call is not run. The hold ends `failed` with `policy_denied` in `outcome`, and the agent is told. |
 | The object stops while an approved call runs | The run is never started again. 15 minutes after it was claimed, the hold ends `failed` with outcome "not known", and the agent is told to check before calling it again. |
 | The agent's sealed values cannot be opened | `args.withheld: true` with an empty summary, and likewise for `outcome`. The hold can still be decided. |
-| The agent is deleted | Its holds are no longer listed (`404`, and gone from the provider-wide copy). No more hints are sent for it. Raft retires its cards with the agent. |
+| The agent is deleted | Its holds are no longer listed (`404`, and left out of the provider-wide list; the copy keeps them as a record for a year). No more hints are sent for it. Raft retires its cards with the agent. |
 | A hold from before this change, on an idle object | It expires at the object's next wake rather than exactly at the deadline. |
 
 ## Follow-ups (not in this version)
@@ -490,4 +492,5 @@ agent.
 - `src/runtime/approval-notice.ts`: the notice text and the run's outcome.
 - `src/store/approvals-schema.ts`: the columns and their migration.
 - `cf/migrations/0028_provider_approvals.sql`: the provider-wide copy.
+- `cf/migrations/0029_provider_approvals_audit.sql`: a deleted agent's rows kept as a record, and the prunes' indexes.
 - `test/raft-approvals.ts`, `test/held-result.ts`: the tests.

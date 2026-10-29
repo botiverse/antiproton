@@ -161,14 +161,31 @@ export interface ApprovalIndex {
   upsert(row: IndexRow): Promise<void>;
   list(scope: IndexScope, q: { status: ApprovalState | null; updatedSince: number | null; after: Cursor | null; limit: number }):
     Promise<{ rows: IndexRow[]; next: Cursor | null }>;
-  /** Every copy of one agent's holds, when the agent is deleted. */
-  removeAgent(tenantId: string, agentId: string): Promise<void>;
-  /** Ended holds whose last change is older than `before`. */
-  prune(before: number): Promise<void>;
+  /**
+   * The agent was deleted at `at`: its copies are kept as the record of who decided what (migration 0029), no longer
+   * listed, without the argument and outcome summaries. Repeating it keeps the first `at`.
+   */
+  markAgentDeleted(tenantId: string, agentId: string, at: number): Promise<void>;
+  /** A live agent's ended holds whose last change is before `ended`; a deleted agent's holds whose delete is before `deleted`. */
+  prune(before: { ended: number; deleted: number }): Promise<void>;
 }
 
-/** How long the provider-wide copy keeps a hold after it ended (denied, expired, executed, failed): 30 days. */
+/**
+ * How long the provider-wide copy keeps a live agent's hold after it ended (denied, expired, executed, failed): 30
+ * days. The copy is what Raft reconciles its cards against; the agent's own object keeps every hold it made.
+ */
 export const APPROVAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+/**
+ * How long a deleted agent's holds are kept after its delete: a year. Once deleted, no provider route reads its object,
+ * so these rows are where who decided what for it is read; nothing is added to them after the delete, so they are
+ * bounded by the deletes of a year.
+ */
+export const AUDIT_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
+
+/** The item's fields a deleted agent's copy drops: what was asked and what came of it, the agent's to keep. */
+const AUDIT_DROPS = "'$.args', '$.outcome', '$.route', '$.description'";
+/** The row's agent is deleted in the registry. */
+const AGENT_DELETED = "EXISTS (SELECT 1 FROM provisioned_agents p WHERE p.tenant_id = provider_approvals.tenant_id AND p.agent_id = provider_approvals.agent_id AND p.status = 'deleted')";
 
 /**
  * How far along a state is: a copy only moves forward (pending, then approved, then an end), so a write that arrives
@@ -179,17 +196,19 @@ const STATE_RANK = (col: string) => `(CASE ${col} WHEN 'pending' THEN 0 WHEN 'ap
 export function d1ApprovalIndex(db: D1Database): ApprovalIndex {
   return {
     async upsert(r) {
+      // A publish that read the registry before the delete and writes after it adds no row and changes no marked one,
+      // so a kept record never gets its summaries back and every row of a deleted agent is one the audit prune drops.
       await db.prepare(
         "INSERT INTO provider_approvals(tenant_id, agent_id, operation_id, raft_origin, raft_server_id, raft_agent_id, status, item, created_at, expires_at, updated_at) " +
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+        "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM provisioned_agents p WHERE p.tenant_id = ? AND p.agent_id = ? AND p.status = 'deleted') " +
         "ON CONFLICT(tenant_id, agent_id, operation_id) DO UPDATE SET status = excluded.status, item = excluded.item, expires_at = excluded.expires_at, updated_at = excluded.updated_at " +
-        `WHERE ${STATE_RANK("excluded.status")} > ${STATE_RANK("provider_approvals.status")}`,
+        `WHERE ${STATE_RANK("excluded.status")} > ${STATE_RANK("provider_approvals.status")} AND provider_approvals.agent_deleted_at IS NULL`,
       ).bind(r.tenantId, r.agentId, r.operationId, r.raftOrigin, r.raftServerId, r.raftAgentId, r.status, JSON.stringify(r.item),
-        r.createdAt, r.expiresAt, r.updatedAt).run();
+        r.createdAt, r.expiresAt, r.updatedAt, r.tenantId, r.agentId).run();
     },
     async list(scope, q) {
-      // A deleted agent's rows are left out even before its delete removes them (`removeAgent`).
-      const where = ["raft_origin = ?", "NOT EXISTS (SELECT 1 FROM provisioned_agents p WHERE p.tenant_id = provider_approvals.tenant_id AND p.agent_id = provider_approvals.agent_id AND p.status = 'deleted')"];
+      // A deleted agent's rows are left out, marked (`markAgentDeleted`) or not yet: the registry says it is deleted first.
+      const where = ["raft_origin = ?", `NOT ${AGENT_DELETED}`];
       const binds: unknown[] = [scope.raftOrigin];
       if (scope.tenantId !== null) { where.push("tenant_id = ?"); binds.push(scope.tenantId); }
       if (q.status !== null) { where.push("status = ?"); binds.push(q.status); }
@@ -212,11 +231,19 @@ export function d1ApprovalIndex(db: D1Database): ApprovalIndex {
       const last = page.at(-1);
       return { rows: page, next: more && last ? { u: last.updatedAt, t: last.tenantId, a: last.agentId, o: last.operationId } : null };
     },
-    async removeAgent(tenantId, agentId) {
-      await db.prepare("DELETE FROM provider_approvals WHERE tenant_id = ? AND agent_id = ?").bind(tenantId, agentId).run();
+    async markAgentDeleted(tenantId, agentId, at) {
+      await db.prepare(
+        `UPDATE provider_approvals SET agent_deleted_at = COALESCE(agent_deleted_at, ?), item = json_remove(item, ${AUDIT_DROPS}) WHERE tenant_id = ? AND agent_id = ?`,
+      ).bind(at, tenantId, agentId).run();
     },
     async prune(before) {
-      await db.prepare("DELETE FROM provider_approvals WHERE status IN ('denied', 'expired', 'executed', 'failed') AND updated_at < ?").bind(before).run();
+      // Each spelled as its partial index (migration 0029). A deleted agent's row its delete failed to mark is not a
+      // live agent's: it stays for the delete's repeat to mark, not dropped at 30 days.
+      await db.batch([
+        db.prepare("DELETE FROM provider_approvals WHERE agent_deleted_at IS NULL AND status IN ('denied', 'expired', 'executed', 'failed') AND updated_at < ? " +
+          `AND NOT ${AGENT_DELETED}`).bind(before.ended),
+        db.prepare("DELETE FROM provider_approvals WHERE agent_deleted_at IS NOT NULL AND agent_deleted_at < ?").bind(before.deleted),
+      ]);
     },
   };
 }

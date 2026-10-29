@@ -20,7 +20,7 @@
 import { auditRead, auditRefused, type ReadAudit } from "../read-audit.ts";
 import { RECONNECT_REASON, type OAuthStatus } from "../github-refresh.ts";
 import type { ApprovalState, DecidedBy, Json } from "../../../src/core/types.ts";
-import { APPROVAL_RETENTION_MS, decodeCursor, encodeCursor, type ApprovalIndex, type ApprovalItem, type ProvisionDecideResult } from "../approvals.ts";
+import { APPROVAL_RETENTION_MS, AUDIT_RETENTION_MS, decodeCursor, encodeCursor, type ApprovalIndex, type ApprovalItem, type ProvisionDecideResult } from "../approvals.ts";
 import { originProblem } from "../../../src/plugins/types.ts";
 import { secretShape } from "../secret-shape.ts";
 import {
@@ -631,8 +631,10 @@ async function providerApprovals(who: ProviderTokenIdentity, raftServerId: strin
   const cursorRaw = query.get("cursor");
   const after = cursorRaw ? decodeCursor(cursorRaw) : null;
   if (cursorRaw && !after) return fail({ status: 400, code: "invalid", param: "cursor", message: "cursor is one a previous page answered, as it was answered" });
-  // Ended holds are kept for APPROVAL_RETENTION_MS after their last change, then dropped here, before the read.
-  await index.prune(Date.now() - APPROVAL_RETENTION_MS);
+  // Dropped here, before the read: a live agent's ended holds APPROVAL_RETENTION_MS after their last change, a deleted
+  // agent's kept holds AUDIT_RETENTION_MS after its delete.
+  const now = Date.now();
+  await index.prune({ ended: now - APPROVAL_RETENTION_MS, deleted: now - AUDIT_RETENTION_MS });
   const page = await index.list({ raftOrigin: who.raftOrigin, tenantId }, { status, updatedSince, after, limit });
   return ok({
     approvals: page.rows.map((r) => ({ ...r.item, status: r.status, updatedAt: new Date(r.updatedAt).toISOString() })),
@@ -998,7 +1000,16 @@ export async function handleProvision(
     // model with nobody able to see it (Raft stops taking a deleted agent's activity), which is what happened on
     // preview before deletes did this. A stop that fails does not fail the delete; it is logged (`turn.stop`).
     if (deps.agent.stopTurn) await stopTurnOf(deps.agent.stopTurn, tenantId, row.agentId, "delete");
-    if (row.status === "deleted") return ok(view(row));
+    // Its holds' copies are kept as the record of who decided what for it, no longer listed, without the arguments'
+    // summaries, which are the agent's to keep (`markAgentDeleted`). Again on a repeated delete, so one whose marking
+    // failed is finished by the next. A failure is logged, not a failed delete: the list leaves a deleted agent's rows
+    // out by the registry anyway (`d1ApprovalIndex`).
+    const keepHolds = async (at: number) => {
+      if (!deps.approvals) return;
+      try { await deps.approvals.index.markAgentDeleted(tenantId, row.agentId, at); }
+      catch (e) { console.warn(`keeping the approval copies of ${tenantId}/${row.agentId} failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`); }
+    };
+    if (row.status === "deleted") { await keepHolds(row.deletedAt ?? row.updatedAt); return ok(view(row)); }
     // Raft revokes the credential itself, so pushes stop even if this fails half-way; what is
     // reported is what could not be undone here. The object and its transcript stay: data is
     // never destroyed by a delete, here as for every agent.
@@ -1006,13 +1017,9 @@ export async function handleProvision(
     await deps.agent.removeCredential(tenantId, row.agentId);
     const t = deps.now();
     const patch = { status: "deleted" as const, pushRegistered: false, pushError: off.ok ? null : off.error, deletedAt: t };
+    // After the registry says deleted, so a publish racing this adds nothing the mark misses (`d1ApprovalIndex.upsert`).
     await deps.registry.update(tenantId, row.raftAgentId, patch);
-    // The provider-wide copy of its holds goes with it: their arguments' summaries are the agent's to keep, not D1's.
-    // A failure is logged, not a failed delete: the list leaves a deleted agent's rows out anyway (`d1ApprovalIndex`).
-    if (deps.approvals) {
-      try { await deps.approvals.index.removeAgent(tenantId, row.agentId); }
-      catch (e) { console.warn(`removing the approval copies of ${tenantId}/${row.agentId} failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`); }
-    }
+    await keepHolds(t);
     return ok(view({ ...row, ...patch, updatedAt: t }));
   }
 
