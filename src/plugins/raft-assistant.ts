@@ -49,7 +49,7 @@
  *
  * Compiled by both typecheck programs.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { logEvent } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
 import type { RaftAssistantOf } from "@botiverse/raft-sdk";
@@ -1256,8 +1256,22 @@ export async function noteChatNotice(ctx: PluginContext, noticeId: string): Prom
 /** What the owner is told when their chat's turn failed before answering them: the code's words, never the model's. */
 export const FAILED_TURN_LINE = "Something went wrong on my side and I couldn't finish that. Ask me again in a bit.";
 
-/** The turns the assistant's own code asks for, each in a short session: never the owner's chat. */
-const OWN_TURN_KEYS: ReadonlySet<string> = new Set(["assistant.check", "assistant.brief"]);
+/**
+ * The turns the assistant's own code asks for, each in a short session: never the owner's chat. Each session has a key
+ * of its own, its kind and a nonce (`ownTurnKey`), since what a session read is settled by that session's end alone
+ * (`turnDelivered`), and two of a kind can run at once. A bare kind is a session asked for before keys had a nonce.
+ */
+const OWN_TURN_KINDS: readonly string[] = ["assistant.check", "assistant.brief"];
+
+/** A new key for one short session of this kind. */
+function ownTurnKey(kind: "assistant.check" | "assistant.brief"): string {
+  return `${kind}:${randomUUID().slice(0, 8)}`;
+}
+
+/** Whether a turn key is one of the assistant's own sessions (`ownTurnKey`), with or without its nonce. */
+export function isOwnTurnKey(key: string | null): boolean {
+  return key !== null && OWN_TURN_KINDS.some((k) => key === k || key.startsWith(`${k}:`));
+}
 
 /**
  * The end of a turn of the owner's chat (`Plugin.afterTurn`, which the runtime calls for the main conversation only,
@@ -1294,7 +1308,7 @@ export async function replyFallback(
   const done = () => ctx.db.put(ASSISTANT_STORE, { sent: false, handled: end.turnId, dms: [], asOwner: false } as unknown as Json, REPLY_KEY);
   const failedTurn = end.outcome === "failed";
   const text = failedTurn ? FAILED_TURN_LINE : end.outcome === "completed" ? end.finalText ?? "" : "";
-  if (answered(kept, dm) || !text.trim() || (end.turnKey !== null && OWN_TURN_KEYS.has(end.turnKey))) {
+  if (answered(kept, dm) || !text.trim() || isOwnTurnKey(end.turnKey)) {
     await done();
     return "skipped";
   }
@@ -2166,15 +2180,21 @@ function deliveryOf(raw: unknown): Delivery {
   return { rung: ids(o.rung), turns, unreported: ids(o.unreported) };
 }
 
-async function updateDelivery(ctx: PluginContext, change: (d: Delivery) => void): Promise<Delivery> {
-  const d = deliveryOf(await ctx.db.get(ASSISTANT_STORE, DELIVERY_KEY));
-  change(d);
-  d.rung = d.rung.slice(-DELIVERY_IDS_MAX);
-  d.unreported = d.unreported.slice(-DELIVERY_IDS_MAX);
-  const keys = Object.keys(d.turns);
-  for (const k of keys.slice(0, Math.max(0, keys.length - DELIVERY_TURNS_MAX))) delete d.turns[k];
-  await ctx.db.put(ASSISTANT_STORE, d as unknown as Json, DELIVERY_KEY);
-  return d;
+/**
+ * One change to the record, read and written in one transaction: a doorbell rings while a wake settles and a session
+ * ends, each awaiting in between, and a read-then-write across those awaits would drop the other's ids.
+ */
+async function updateDelivery<T>(ctx: PluginContext, change: (d: Delivery) => T): Promise<T> {
+  return ctx.db.transaction(ASSISTANT_STORE, "readwrite", (tx) => {
+    const d = deliveryOf(tx.get(ASSISTANT_STORE, DELIVERY_KEY));
+    const out = change(d);
+    d.rung = d.rung.slice(-DELIVERY_IDS_MAX);
+    d.unreported = d.unreported.slice(-DELIVERY_IDS_MAX);
+    const keys = Object.keys(d.turns);
+    for (const k of keys.slice(0, Math.max(0, keys.length - DELIVERY_TURNS_MAX))) delete d.turns[k];
+    tx.put(ASSISTANT_STORE, d as unknown as Json, DELIVERY_KEY);
+    return out;
+  });
 }
 
 async function noteRung(ctx: PluginContext, ids: readonly string[]): Promise<void> {
@@ -2214,24 +2234,36 @@ async function awaitTurn(ctx: PluginContext, turnKey: string, ids: readonly stri
  */
 export async function reportDelivered(ctx: PluginContext, report: DeliveredReport | undefined, ids: readonly string[]): Promise<boolean> {
   if (!report) return false;
-  const d = deliveryOf(await ctx.db.get(ASSISTANT_STORE, DELIVERY_KEY));
-  const all = uniqueIds([...d.unreported, ...ids]);
+  // Written down as unreported before they are sent, and struck off once settled, so an end between the two (an
+  // eviction mid-request) leaves them to the next report. Two reports at once may send an id twice: Raft's update is
+  // idempotent, so that costs a request, never a wrong row.
+  const all = await updateDelivery(ctx, (d) => { d.unreported = uniqueIds([...d.unreported, ...ids]); return [...d.unreported]; });
   if (!all.length) return true;
-  const sent: string[] = [];
+  const sent: string[] = [], dropped: string[] = [];
   let error: string | null = null;
   for (let i = 0; i < all.length && error === null; i += DELIVERED_REPORT_MAX_IDS) {
     const part = all.slice(i, i + DELIVERED_REPORT_MAX_IDS);
     try { await report(ctx, part); sent.push(...part); }
-    catch (e) { error = String((e as Error)?.message ?? e).slice(0, 160); }
+    catch (e) {
+      const said = String((e as Error)?.message ?? e).slice(0, 160);
+      // A refusal (a 4xx other than 429) says the same however often it is asked: this part is dropped, said on the
+      // warn line, and the rest still goes. Anything else may clear: it and the rest are kept for the next report.
+      const status = (e as { httpStatus?: unknown })?.httpStatus;
+      if (typeof status === "number" && status >= 400 && status < 500 && status !== 429) {
+        dropped.push(...part);
+        console.warn(`raft mount ${ctx.alias}: Raft refused to record ${part.length} handled event(s) delivered (HTTP ${status}); dropped, not retried: ${said}`);
+      } else error = said;
+    }
   }
-  const done = new Set(sent);
-  await updateDelivery(ctx, (now) => { now.unreported = uniqueIds([...now.unreported, ...all]).filter((id) => !done.has(id)); });
-  const attrs = { reported: sent.length, unreported: all.length - sent.length, ...(error ? { error } : {}) };
+  const settled = new Set([...sent, ...dropped]);
+  const kept = all.filter((id) => !settled.has(id));
+  if (settled.size) await updateDelivery(ctx, (now) => { now.unreported = now.unreported.filter((id) => !settled.has(id)); });
+  const attrs = { reported: sent.length, unreported: kept.length, ...(dropped.length ? { dropped: dropped.length } : {}), ...(error ? { error } : {}) };
   logEvent("raft.event_delivered", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, ...attrs });
   if (error !== null) {
-    console.warn(`raft mount ${ctx.alias}: could not report ${all.length - sent.length} handled event(s) delivered; kept to report again: ${error}`);
+    console.warn(`raft mount ${ctx.alias}: could not report ${kept.length} handled event(s) delivered; kept to report again: ${error}`);
   }
-  return error === null;
+  return error === null && !dropped.length;
 }
 
 /** The reports an earlier failure left, sent again; nothing when none is left. */
@@ -2248,9 +2280,9 @@ export async function retryDelivered(ctx: PluginContext, report: DeliveredReport
 export async function turnDelivered(ctx: PluginContext, end: Pick<TurnEnd, "turnKey" | "outcome" | "isolated">, report: DeliveredReport | undefined): Promise<void> {
   if (!end.isolated || !end.turnKey) return;
   const key = end.turnKey;
-  const ids = deliveryOf(await ctx.db.get(ASSISTANT_STORE, DELIVERY_KEY)).turns[key];
-  if (!ids?.length) return;
-  await updateDelivery(ctx, (d) => { delete d.turns[key]; });
+  if (!deliveryOf(await ctx.db.get(ASSISTANT_STORE, DELIVERY_KEY)).turns[key]?.length) return;
+  const ids = await updateDelivery(ctx, (d) => { const taken = d.turns[key] ?? []; delete d.turns[key]; return taken; });
+  if (!ids.length) return;
   if (end.outcome === "completed") { await reportDelivered(ctx, report, ids); return; }
   logEvent("raft.event_delivered", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, reported: 0, left_delivering: ids.length, outcome: end.outcome });
 }
@@ -2734,7 +2766,7 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
   if (trigger === null) return { wakeAt: nextBriefAt(now, zone0) };
   // The doorbells this wake handles, if it reaches an outcome that handles them: a final one in code reports them
   // delivered, a model call hands them to its session (`settleRung`). A wake that stops short (quiet hours, a pause, a
-  // lagging inbox, a failure) leaves them waiting for the next.
+  // lagging inbox, a failure, an unreadable conversation with a retry still due) leaves them waiting for the next.
   const rung = await rungNow(ctx);
   const handled = () => settleRung(ctx, rung, { report: deps.delivered });
   // The brief's timer reads Raft's flag before it briefs: switched on since the last listing, Raft briefs, not this.
@@ -2893,7 +2925,8 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
       if (!candidates.length) {
         if (failed.length) {
           await record(ctx, day, trigger, "unreadable", { ...counts, said: await sayUnreadable(failed, kept) });
-          await handled();
+          // Not final while a short wake is due to read again (`again`): that wake's outcome settles the doorbell.
+          if (wakeAt >= next) await handled();
           return { wakeAt };
         }
         await record(ctx, day, trigger, items.length ? "skipped_filtered" : "skipped_empty", counts);
@@ -2901,8 +2934,9 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
         return { wakeAt };
       }
       await record(ctx, day, trigger, "invoked", counts);
-      await settleRung(ctx, rung, { turnKey: "assistant.check" });
-      return { turn: checkInstruction(ctx.alias, candidates, { why: f.why, rulesLine: modelRulesLine(rules, rowsCarryIds(items), now), language: owner.language }), isolated: true, turnKey: "assistant.check", wakeAt };
+      const turnKey = ownTurnKey("assistant.check");
+      await settleRung(ctx, rung, { turnKey });
+      return { turn: checkInstruction(ctx.alias, candidates, { why: f.why, rulesLine: modelRulesLine(rules, rowsCarryIds(items), now), language: owner.language }), isolated: true, turnKey, wakeAt };
     }
     const unread = await read("unread");
     const all = await read("all");
@@ -2926,7 +2960,7 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
       await saveOwner(ctx, { ...owner, briefSent: day });
       if (failed.length) {
         await record(ctx, day, trigger, "unreadable", { ...counts, said: await sayUnreadable(failed, kept) });
-        await handled();
+        if (wakeAt >= next) await handled();
         return { wakeAt };
       }
       await record(ctx, day, trigger, unread.length || recent.length ? "skipped_filtered" : "skipped_empty", counts);
@@ -2934,8 +2968,9 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
       return { wakeAt };
     }
     await record(ctx, day, trigger, "invoked", counts);
-    await settleRung(ctx, rung, { turnKey: "assistant.brief" });
-    return { turn: briefInstruction(ctx.alias, { zone, held, waiting, active, rulesLine: modelRulesLine(rules, rowsCarryIds(all), now), language: owner.language }), isolated: true, turnKey: "assistant.brief", wakeAt };
+    const turnKey = ownTurnKey("assistant.brief");
+    await settleRung(ctx, rung, { turnKey });
+    return { turn: briefInstruction(ctx.alias, { zone, held, waiting, active, rulesLine: modelRulesLine(rules, rowsCarryIds(all), now), language: owner.language }), isolated: true, turnKey, wakeAt };
   } catch (e) {
     const paused = (await loadOwner(ctx))?.pausedAt !== null;
     await record(ctx, day, trigger, paused ? "paused" : "failed", wakeFailureAttrs(e));

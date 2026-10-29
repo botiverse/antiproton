@@ -366,7 +366,8 @@ const STATE_KEY = "state";
 const SINCE_KEY = "since";
 
 /**
- * What push notices said is on its way, as `{ pairs: { [channelId]: latestSeq }, attempt }`: the next `receive_events`
+ * What push notices said is on its way, as `{ pairs: { [channelId]: latestSeq }, at: { [channelId]: ms }, attempt }`
+ * (`at`: when that conversation's seq was announced): the next `receive_events`
  * pull sends them as `/events` `wait_for`, so a message Raft has committed but not yet made readable to `/events` (its
  * inbox chain trails the notice by seconds) is waited for instead of answered with an empty batch. Kept apart from
  * `SINCE_KEY` and never read into it: a notice says what exists, not what this agent was shown, and a `since` taken
@@ -379,9 +380,17 @@ const WAIT_FOR_MAX_PAIRS = 20;
 /**
  * The longest one `receive_events` spends re-pulling while Raft says a noticed message is not readable yet
  * (`retry_after_ms`); past it the call returns with `status: "still_arriving"`, and the pairs stay for the next call.
- * Raft itself waits up to its own cap (6 s by default) inside each pull, so this is a few of its pulls at most.
+ * It bounds when the last pull may START: no sleep is taken that would end past it. That pull may then spend Raft's own
+ * wait inside it (6 s by default, at most 30 s), and the request is cut at the mount's timeout, so a call takes at most
+ * this plus one pull: about 36 s with Raft's defaults.
  */
 export const WAIT_FOR_MAX_MS = 30_000;
+/**
+ * How long a pair is waited for at all. A message Raft never makes readable to this agent (deleted, or in a
+ * conversation the agent has left) would otherwise cost every later `receive_events` the whole cap; past this age the
+ * pair is dropped, said on a warn line, and the pull goes on without it.
+ */
+export const WAIT_FOR_MAX_AGE_MS = 5 * 60_000;
 const CHANNEL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
@@ -3505,7 +3514,7 @@ export function createRaftPlugin(deps: {
         refreshFeatures(ctx);
         const keep = (b: RaftInboxBatch) => withoutDoorbells(ctx, withoutRunAssignments(ctx, b));
         // What notices announced goes as `wait_for` (`WAIT_FOR_KEY`); with nothing announced, the SDK's own pull.
-        const waiting = waitForOf(await ctx.db.get(INBOX_STORE, WAIT_FOR_KEY));
+        const waiting = await freshWaitFor(ctx);
         let batch: RaftInboxBatch, arriving = false;
         if (Object.keys(waiting.pairs).length) {
           const pulled = await pullWaitingFor(ctx, { since, limit, waiting, maxMs: waitForMaxMs }, keep);
@@ -3887,14 +3896,46 @@ async function recheckOwner(ctx: PluginContext): Promise<AssistantOwner | null> 
 export const raftPlugin: Plugin = createRaftPlugin();
 
 /** The kept `wait_for` record (`WAIT_FOR_KEY`), with anything malformed left out. */
-function waitForOf(raw: unknown): { pairs: Record<string, number>; attempt: number } {
+type WaitFor = { pairs: Record<string, number>; at: Record<string, number>; attempt: number };
+function waitForOf(raw: unknown): WaitFor {
   const o = object(raw);
-  const pairs: Record<string, number> = {};
+  const pairs: Record<string, number> = {}, at: Record<string, number> = {};
+  const when = object(o.at);
   for (const [channelId, seq] of Object.entries(object(o.pairs))) {
-    if (CHANNEL_ID.test(channelId) && typeof seq === "number" && Number.isSafeInteger(seq) && seq > 0) pairs[channelId] = seq;
+    if (!CHANNEL_ID.test(channelId) || typeof seq !== "number" || !Number.isSafeInteger(seq) || seq <= 0) continue;
+    pairs[channelId] = seq;
+    // A pair with no time reads as announced long ago, so the age rule can still let it go.
+    at[channelId] = typeof when[channelId] === "number" ? when[channelId] as number : 0;
   }
   const attempt = typeof o.attempt === "number" && Number.isSafeInteger(o.attempt) && o.attempt >= 0 ? o.attempt : 0;
-  return { pairs, attempt };
+  return { pairs, at, attempt };
+}
+
+function keepWaitFor(tx: { put(store: string, value: Json, key?: string): void; delete(store: string, key: string): void }, w: WaitFor): void {
+  if (!Object.keys(w.pairs).length) { tx.delete(INBOX_STORE, WAIT_FOR_KEY); return; }
+  const at = Object.fromEntries(Object.keys(w.pairs).map((c) => [c, w.at[c] ?? 0]));
+  tx.put(INBOX_STORE, { pairs: w.pairs, at, attempt: w.attempt } as unknown as Json, WAIT_FOR_KEY);
+}
+
+/**
+ * The kept pairs, less those older than `WAIT_FOR_MAX_AGE_MS`, which are dropped here with a warn line: Raft has had
+ * minutes to make them readable, so waiting for them again would only make every call wait out the cap.
+ */
+async function freshWaitFor(ctx: PluginContext, now = Date.now()): Promise<WaitFor> {
+  const { kept, dropped } = await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
+    const kept = waitForOf(tx.get(INBOX_STORE, WAIT_FOR_KEY));
+    const dropped = Object.keys(kept.pairs).filter((c) => now - (kept.at[c] ?? 0) > WAIT_FOR_MAX_AGE_MS);
+    if (dropped.length) {
+      for (const c of dropped) { delete kept.pairs[c]; delete kept.at[c]; }
+      keepWaitFor(tx, kept);
+    }
+    return { kept, dropped };
+  });
+  if (dropped.length) {
+    console.warn(`raft mount ${ctx.alias}: stopped waiting for ${dropped.length} announced conversation(s) Raft did not make readable within ${WAIT_FOR_MAX_AGE_MS / 60_000} min`);
+    logEvent("raft.wait_for_dropped", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, count: dropped.length });
+  }
+  return kept;
 }
 
 /**
@@ -3916,12 +3957,13 @@ async function noteWaitFor(ctx: PluginContext, targets: readonly unknown[]): Pro
   await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
     const kept = waitForOf(tx.get(INBOX_STORE, WAIT_FOR_KEY));
     let moved = false;
+    const now = Date.now();
     for (const [channelId, seq] of announced) {
-      if ((kept.pairs[channelId] ?? 0) < seq) { kept.pairs[channelId] = seq; moved = true; }
+      if ((kept.pairs[channelId] ?? 0) < seq) { kept.pairs[channelId] = seq; kept.at[channelId] = now; moved = true; }
     }
     if (!moved) return;
     const pairs = Object.fromEntries(Object.entries(kept.pairs).sort(([, a], [, b]) => b - a).slice(0, WAIT_FOR_MAX_PAIRS));
-    tx.put(INBOX_STORE, { pairs, attempt: 0 } as unknown as Json, WAIT_FOR_KEY);
+    keepWaitFor(tx, { pairs, at: kept.at, attempt: 0 });
   });
 }
 
@@ -3931,12 +3973,15 @@ async function noteWaitFor(ctx: PluginContext, targets: readonly unknown[]): Pro
  * (`retry_after_ms`) and the batch shows nothing, the pull is made again after that delay, until the batch shows
  * something, Raft stops saying "not yet", or the next wait would pass `maxMs`.
  *
- * Only the first pull sends `since`. Every later one sends none, which acknowledges nothing, so the rows a pull
+ * Only the first pull sends the kept `since`. Every later one sends `since=latest`, which acknowledges nothing, so the rows a pull
  * returned unacknowledged come back in the next one, and the last pull's batch is the one handed over and whose cursor
  * is kept. A seq-less event is acknowledged as it is handed out, so a pull that showed one is never repeated.
+ *
+ * `has_more` alone is never re-pulled: it means the batch was cut, and its messages are handed over now, the rest
+ * coming on the model's next call; re-pulling here would hold back messages this pull already returned.
  */
 async function pullWaitingFor(
-  ctx: PluginContext, o: { since: number | null; limit: number; waiting: { pairs: Record<string, number>; attempt: number }; maxMs: number },
+  ctx: PluginContext, o: { since: number | null; limit: number; waiting: WaitFor; maxMs: number },
   keep: (b: RaftInboxBatch) => RaftInboxBatch,
 ): Promise<{ batch: RaftInboxBatch; arriving: boolean; attempt: number; sent: Record<string, number> }> {
   const started = Date.now();
@@ -3963,7 +4008,7 @@ async function pullWaitingFor(
       ackMode: data.ack_mode ?? "immediate", hasMore: data.has_more === true,
       stillUnreadConversations: data.inbox_hint?.unread_conversations ?? null, replyTarget: data.reply_target ?? null,
     });
-    const behind = typeof data.retry_after_ms === "number" && Number.isFinite(data.retry_after_ms) && data.retry_after_ms >= 0;
+    const behind = typeof data.retry_after_ms === "number" && Number.isFinite(data.retry_after_ms) && data.retry_after_ms > 0;
     if (!behind || batch.messages.length > 0) return { batch, arriving: behind, attempt, sent };
     const delay = data.retry_after_ms!;
     if (Date.now() - started + delay >= o.maxMs) {
@@ -3983,12 +4028,11 @@ async function settleWaitFor(ctx: PluginContext, pulled: { arriving: boolean; at
   await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
     const kept = waitForOf(tx.get(INBOX_STORE, WAIT_FOR_KEY));
     if (pulled.arriving) {
-      tx.put(INBOX_STORE, { pairs: kept.pairs, attempt: Math.max(kept.attempt, pulled.attempt + 1) } as unknown as Json, WAIT_FOR_KEY);
+      keepWaitFor(tx, { ...kept, attempt: Math.max(kept.attempt, pulled.attempt + 1) });
       return;
     }
     const left = Object.fromEntries(Object.entries(kept.pairs).filter(([channelId, seq]) => seq > (pulled.sent[channelId] ?? 0)));
-    if (Object.keys(left).length) tx.put(INBOX_STORE, { pairs: left, attempt: 0 } as unknown as Json, WAIT_FOR_KEY);
-    else tx.delete(INBOX_STORE, WAIT_FOR_KEY);
+    keepWaitFor(tx, { pairs: left, at: kept.at, attempt: 0 });
   });
 }
 

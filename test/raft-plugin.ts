@@ -4798,7 +4798,7 @@ await check("wait_for, case A: notices never move since; the next pull sends the
   // A cursor taken from a notice would be 102 here, past what the model was shown.
   must(await sinceKept(m) === 100, `a notice moved the kept since: ${await sinceKept(m)}`);
   const kept = await m.ctx.db.get(INBOX_STORE, "wait_for") as any;
-  must(JSON.stringify(kept) === JSON.stringify({ pairs: { [WAIT_CH]: 102 }, attempt: 0 }), `the notice pair: ${JSON.stringify(kept)}`);
+  must(JSON.stringify(kept.pairs) === JSON.stringify({ [WAIT_CH]: 102 }) && kept.attempt === 0 && typeof kept.at[WAIT_CH] === "number", `the notice pair: ${JSON.stringify(kept)}`);
   const second = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
   must(raft.pulls[1]!.get("since") === "100", `the second pull sent since=${raft.pulls[1]!.get("since")}`);
   must(raft.pulls[1]!.get("wait_for") === `${WAIT_CH}:102`, `wait_for: ${raft.pulls[1]!.get("wait_for")}`);
@@ -4852,6 +4852,32 @@ await check("wait_for cap: a message still not readable at the cap ends the call
   const idle = waitingRaft(); const n = pushOn();
   const none = await capped.invoke("receive_events", {}, n.ctx) as any;
   must(none.status === "no_new_messages" && none.status !== out.status && !("note" in none), `nothing new: ${JSON.stringify(none)} ${idle.pulls.length}`);
+});
+
+await check("wait_for age: a pair announced more than WAIT_FOR_MAX_AGE_MS ago is dropped with a warn line and not waited for; a younger one still is", async () => {
+  const raft = waitingRaft(); const m = pushOn();
+  raft.write(100);
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  raft.write(101, Infinity);
+  await announce(raftPlugin, m, 101);
+  // Announced six minutes ago, and never made readable: deleted, or in a conversation the agent has left.
+  const kept = await m.ctx.db.get(INBOX_STORE, "wait_for") as any;
+  await m.ctx.db.put(INBOX_STORE, { ...kept, at: { [WAIT_CH]: Date.now() - 6 * 60_000 } }, "wait_for");
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+  let out: any;
+  const started = Date.now();
+  try { out = await raftPlugin.invoke("receive_events", {}, m.ctx); } finally { console.warn = warn; }
+  must(raft.pulls.length === 2 && !raft.pulls[1]!.has("wait_for") && out.status === "no_new_messages" && Date.now() - started < 1_000, `waited for an old pair: ${JSON.stringify(out)} ${raft.pulls.map(String)}`);
+  must(warned.some((w) => /stopped waiting for 1 announced conversation/.test(w)) && await m.ctx.db.get(INBOX_STORE, "wait_for") === undefined, `warned: ${JSON.stringify(warned)}`);
+  // Control: four minutes old is still waited for.
+  await announce(raftPlugin, m, 102);
+  raft.write(102, raft.pulls.length + 2);
+  const young = await m.ctx.db.get(INBOX_STORE, "wait_for") as any;
+  await m.ctx.db.put(INBOX_STORE, { ...young, at: { [WAIT_CH]: Date.now() - 4 * 60_000 } }, "wait_for");
+  const next = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
+  must(raft.pulls[2]!.get("wait_for") === `${WAIT_CH}:102` && JSON.stringify(shownSeqs(next)) === "[102]", `the young pair: ${JSON.stringify(next)}`);
 });
 
 globalThis.fetch = originalFetch;
