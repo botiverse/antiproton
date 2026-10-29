@@ -2080,6 +2080,26 @@ await check("another agent's renewal and a reconnect in place reach a mount whos
   w.dispose();
 });
 
+await check("a box that takes a key named apart from its alias records the use under the reference's name", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("ZU");
+  await w.connect(a);
+  const alias = (await a.rt.store.findMountsByPlugin(TENANT, a.agentId, "github"))[0]!.alias;
+  const KEY = "gh_key";
+  const host = w.hostOf(a.agentId);
+  host.sql.exec("UPDATE secrets SET name = ? WHERE name = ?", KEY, alias);
+  host.sql.exec("UPDATE secrets SET name = ? WHERE name = ?", OAUTH_PREFIX + KEY, OAUTH_PREFIX + alias);
+  await a.rt.store.setMountSecretRef(TENANT, a.agentId, alias, `agent:${KEY}`);
+  host.sql.exec("UPDATE secrets SET last_used_at = NULL WHERE name = ?", KEY);
+  await w.sandbox(a);
+  must(run9.boxes.size === 1, "control: no box was made");
+  const meta = await a.rt.store.secretMeta(TENANT, a.agentId, KEY);
+  must(typeof meta?.lastUsedAt === "number", `the key's use was not recorded under its name: ${JSON.stringify(meta)}`);
+  must(!(await a.rt.store.getSecret(TENANT, a.agentId, alias)), "a row appeared under the alias");
+  w.dispose();
+});
+
 await check("withdraw never deletes project-scope secrets (shared run9 project: would stop prod injection); withdraw runs while the box exists: after a delete there is nothing to withdraw", async () => {
   const run9 = run9Fake();
   const w = await world({ run9 });
