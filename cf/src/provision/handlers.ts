@@ -1033,31 +1033,54 @@ export async function handleProvision(
     // deleted agent is never handed a renewed pair, and finds no connector to renew through (`d1ConnectorGrants`), so
     // a copy left behind expires and is not renewed. A mount that could not be cleared is logged, and the next delete
     // of the same agent tries again: its mounts are cleared whether or not a binding is left.
-    const unbind = async (at: number) => {
+    // What became of each connection, in the answer (`connections`, `connectionsClean`) as well as the log: still a 200,
+    // since the agent is deleted either way, but a mount left holding the copy is never reported as a plain success.
+    type ConnectionEnd = { provider: ConnectionProvider; connectorId: string | null; unbound: boolean; mountCleared: boolean; error?: string };
+    const unbind = async (at: number): Promise<ConnectionEnd[] | null> => {
       const c = deps.connections;
-      if (!c) return;
+      if (!c) return null;
+      const ends: ConnectionEnd[] = [];
       for (const p of CONNECTION_PROVIDERS) {
+        // Cleared, or nothing there to clear: the mount holds no copy either way. Refused, or the object did not answer: it may.
         let error: string | null = null;
+        let took = false;
         try {
           const r = await c.clear(tenantId, row.agentId, p);
-          if (!r.ok) error = r.error;
+          if (r.ok) took = r.cleared; else error = r.error;
         } catch (e) { error = String((e as Error)?.message ?? e).slice(0, 200); }
-        if (error !== null) logEvent("connect.agent_delete", { tenantId, agentId: row.agentId, provider: p, outcome: "mount-not-cleared", reason: error.slice(0, 200) });
+        const mountCleared = error === null;
+        if (!mountCleared) logEvent("connect.agent_delete", { tenantId, agentId: row.agentId, provider: p, outcome: "mount-not-cleared", reason: error!.slice(0, 200) });
+        let connectorId: string | null = null;
+        let unbound = false;
         try {
           const bound = await c.registry.get(tenantId, row.raftAgentId, p);
-          if (!bound) continue;
-          if (bound.connectorId) {
-            await c.connectors.record({ tenantId, connectorId: bound.connectorId, raftAgentId: row.raftAgentId, action: "deleted_agent_unbound",
-              actingRaftUserId: SYSTEM_ACTOR, actingRole: "system", at, reason: error === null ? null : "the mount could not be cleared" });
+          if (bound) {
+            connectorId = bound.connectorId ?? null;
+            // Whether the mount copy went is recorded with the unbinding, so a later check reads it from data.
+            if (connectorId) {
+              await c.connectors.record({ tenantId, connectorId, raftAgentId: row.raftAgentId, action: "deleted_agent_unbound",
+                actingRaftUserId: SYSTEM_ACTOR, actingRole: "system", at, reason: JSON.stringify({ provider: p, mountCleared, ...(error ? { error } : {}) }) });
+            }
+            await c.registry.remove(tenantId, row.raftAgentId, p);
+            unbound = true;
+            logEvent("connect.agent_delete", { tenantId, agentId: row.agentId, provider: p, connectorId, outcome: "unbound", mountCleared });
           }
-          await c.registry.remove(tenantId, row.raftAgentId, p);
-          logEvent("connect.agent_delete", { tenantId, agentId: row.agentId, provider: p, connectorId: bound.connectorId ?? null, outcome: "unbound", mountCleared: error === null });
         } catch (e) {
+          error ??= String((e as Error)?.message ?? e).slice(0, 200);
           logEvent("connect.agent_delete", { tenantId, agentId: row.agentId, provider: p, outcome: "unbind-failed", reason: String((e as Error)?.message ?? e).slice(0, 200) });
         }
+        // A provider the agent was never connected to, with nothing on its mount, is not worth an entry.
+        if (unbound || took || error !== null) ends.push({ provider: p, connectorId, unbound, mountCleared, ...(error ? { error } : {}) });
       }
+      return ends;
     };
-    if (row.status === "deleted") { await unbind(deps.now()); await keepHolds(row.deletedAt ?? row.updatedAt); return ok(view(row)); }
+    const answer = (agent: ReturnType<typeof view>, ends: ConnectionEnd[] | null) => ends === null ? ok(agent)
+      : ok({ ...agent, connections: ends, connectionsClean: ends.every((e) => e.mountCleared && !e.error) });
+    if (row.status === "deleted") {
+      const ends = await unbind(deps.now());
+      await keepHolds(row.deletedAt ?? row.updatedAt);
+      return answer(view(row), ends);
+    }
     // Raft revokes the credential itself, so pushes stop even if this fails half-way; what is
     // reported is what could not be undone here. The object and its transcript stay: data is
     // never destroyed by a delete, here as for every agent.
@@ -1067,9 +1090,9 @@ export async function handleProvision(
     const patch = { status: "deleted" as const, pushRegistered: false, pushError: off.ok ? null : off.error, deletedAt: t };
     // After the registry says deleted, so a publish racing this adds nothing the mark misses (`d1ApprovalIndex.upsert`).
     await deps.registry.update(tenantId, row.raftAgentId, patch);
-    await unbind(t);
+    const ends = await unbind(t);
     await keepHolds(t);
-    return ok(view({ ...row, ...patch, updatedAt: t }));
+    return answer(view({ ...row, ...patch, updatedAt: t }), ends);
   }
 
   return null;

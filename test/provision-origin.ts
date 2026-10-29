@@ -481,7 +481,7 @@ await check("migration 0031: a deleted agent still bound to a connector is unbou
   assert(JSON.stringify(left) === JSON.stringify(["A"]), `bindings left: ${JSON.stringify(left)}`);
   const ev = f.db.prepare("SELECT * FROM connector_events WHERE action = 'deleted_agent_unbound'").all() as any[];
   assert(ev.length === 1 && ev[0].connector_id === "k1" && ev[0].raft_agent_id === "Z" && ev[0].acting_role === "system" && ev[0].at > 1_700_000_000_000
-    && JSON.stringify(JSON.parse(ev[0].reason)) === JSON.stringify({ provider: "github", deletedAt: 5000 }), `the record: ${JSON.stringify(ev)}`);
+    && JSON.stringify(JSON.parse(ev[0].reason)) === JSON.stringify({ provider: "github", mountCleared: false, deletedAt: 5000 }), `the record: ${JSON.stringify(ev)}`);
 });
 
 console.log(`  ${routes.size} (method, path) pairs take an agent id; ${served.length} (both spellings) served for their own origin; ${Object.keys(OUTSIDE).length} cases outside /agents/<id>`);

@@ -1105,12 +1105,16 @@ await check("deleting an agent bound to a connector: it leaves the renewal audie
     && (await w.stored(b)).token !== null, "control");
   const del = await w.call("DELETE", "/agents/by-raft-agent/X2");
   must(del.status === 200 && del.body.status === "deleted", `delete: ${del.status} ${del.text}`);
+  // Clean, and said so: the binding removed and the mount copy cleared.
+  must(del.body.connectionsClean === true && JSON.stringify(del.body.connections) === JSON.stringify([{ provider: "github", connectorId: id, unbound: true, mountCleared: true }]),
+    `the answer: ${del.text}`);
   const after = await renewalAudience(w.db, TENANT, id);
   must(JSON.stringify(after) === JSON.stringify({ to: [a.agentId], filtered: 0, skipped: 0 }), `audience after the delete: ${JSON.stringify(after)}`);
   must(!bindingOf("X2") && bindingOf("X1")?.connector_id === id, "the deleted agent's binding is still there, or the other's went");
   must((await w.stored(b)).token === null && (await w.stored(b)).rec === null, "the credential copy is still on the deleted agent's mount");
   const ev = w.db.raw.prepare("SELECT * FROM connector_events WHERE action = 'deleted_agent_unbound'").all() as any[];
-  must(ev.length === 1 && ev[0].connector_id === id && ev[0].raft_agent_id === "X2" && ev[0].acting_role === "system", `the record: ${JSON.stringify(ev)}`);
+  must(ev.length === 1 && ev[0].connector_id === id && ev[0].raft_agent_id === "X2" && ev[0].acting_role === "system"
+    && JSON.parse(ev[0].reason).mountCleared === true, `the record: ${JSON.stringify(ev)}`);
   // And a deleted agent whose object still runs finds no connector to renew through.
   must((await w.grants.grant(TENANT, id, b.agentId)) === null && (await w.grants.grant(TENANT, id, a.agentId)) !== null, "a deleted agent can still renew");
   w.dispose();
@@ -1125,14 +1129,19 @@ await check("deleting an agent whose object does not answer: the binding goes an
   const from = logged.length;
   const del = await w.call("DELETE", "/agents/by-raft-agent/X3");
   must(del.status === 200 && !bindingOf() && (await renewalAudience(w.db, TENANT, id)).to.length === 0, `delete: ${del.status} ${del.text}`);
+  // Never a plain success: the binding went, the mount copy did not, and the answer says which.
+  const end = del.body.connections?.[0];
+  must(del.body.connectionsClean === false && end?.unbound === true && end.mountCleared === false && /did not answer/.test(end.error ?? ""), `the answer: ${del.text}`);
   must((await w.stored(a)).token !== null, "control: the mount was cleared though its object did not answer");
   must(logged.slice(from).some((l) => /"evt":"connect.agent_delete"/.test(l) && /"outcome":"mount-not-cleared"/.test(l)), "the failed clear was not logged");
   const ev = w.db.raw.prepare("SELECT reason FROM connector_events WHERE action = 'deleted_agent_unbound'").get() as any;
-  must(ev?.reason === "the mount could not be cleared", `the record: ${JSON.stringify(ev)}`);
+  must(JSON.parse(ev?.reason ?? "{}").mountCleared === false, `the record: ${JSON.stringify(ev)}`);
   // The object answers again: the same delete, repeated, clears the mount, with no binding left to go.
   w.clearFails.clear();
   const again = await w.call("DELETE", "/agents/by-raft-agent/X3");
-  must(again.status === 200 && (await w.stored(a)).token === null, `repeat: ${again.status} ${(await w.stored(a)).token}`);
+  must(again.status === 200 && (await w.stored(a)).token === null && again.body.connectionsClean === true
+    && JSON.stringify(again.body.connections) === JSON.stringify([{ provider: "github", connectorId: null, unbound: false, mountCleared: true }]),
+    `repeat: ${again.status} ${again.text} ${(await w.stored(a)).token}`);
   w.dispose();
 });
 
