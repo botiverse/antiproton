@@ -13,7 +13,7 @@ CREATE TABLE connector_events_0032 (
   acting_role TEXT NOT NULL,
   at INTEGER NOT NULL,
   reason TEXT,
-  provider TEXT
+  provider TEXT  -- NULL = recorded before 0032
 );
 INSERT INTO connector_events_0032 (tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at, reason)
   SELECT tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at, reason FROM connector_events;

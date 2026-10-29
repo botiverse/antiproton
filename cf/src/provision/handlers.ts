@@ -1373,7 +1373,8 @@ function importView(rec: ImportRecord, row: ProvisionedAgent) {
  * the last resort, and its reach is said in full: it is the GitHub account's authorization of this App that goes.
  */
 export const REVOKE_ON_GITHUB = "a copy of this connection's credential was handed to an agent whose object holds nothing to clear, so it cannot be " +
-  "removed here. First: the operator cleanup of such copies (botiverse/antiproton#1128, planned). Last resort: revoking this App's " +
+  "removed here. First choice, once it exists: the operator cleanup of such copies (botiverse/antiproton#1128, planned). Until then, " +
+  "the last resort: revoking this App's " +
   "authorization on GitHub invalidates ALL of this GitHub account's tokens for this App, possibly including other connectors and agents, " +
   "which will all need to re-authorise.";
 
@@ -1785,7 +1786,10 @@ async function disconnect(tenantId: string, connectorId: string, body: unknown, 
   const otherOrigins = elsewhere.length || elsewhereFailed.length || elsewhereRevoke.length ? {
     otherOrigins: {
       cleared: elsewhere.length, failed: elsewhereFailed.length, ...(elsewhereRevoke.length ? { revoke: elsewhereRevoke.length } : {}),
-      message: "agents of another Raft origin held this connector's credential: their copies are removed here, but that origin has had a working token. " + REVOKE_ON_GITHUB,
+      // The revoke hint only when something needs a person: another origin's object was wiped, so its copy could not be
+      // reached. A copy removed here (the common case) needs nobody.
+      message: "agents of another Raft origin held this connector's credential: their copies are removed here, but that origin has had a working token" +
+        (elsewhereRevoke.length ? `. ${REVOKE_ON_GITHUB}` : ""),
     },
   } : {};
   const revokeOnGithub = revoke.length ? { revokeOnGithub: { agents: revoke, action: "revoke_on_github" as const, message: REVOKE_ON_GITHUB } } : {};

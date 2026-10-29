@@ -226,7 +226,7 @@ const CONNECTOR = { id: "k1", tenantId: TENANT, provider: "github", account: "oc
  * `store` is the tenant's connectors, every origin's, as D1 holds them.
  */
 /** How an agent's mount answers a detach: by the connector's credential (`match`), then by the agent (`byAgent`). */
-type DetachMode = { match: boolean | "throw"; byAgent: boolean | "throw" };
+type DetachMode = { match: boolean | "throw" | "gone"; byAgent: boolean | "throw" };
 function connections(acted: string[], bound: string[], store: Array<typeof CONNECTOR> = [CONNECTOR], modes: Record<string, DetachMode> = {}) {
   const answer = (v: boolean | "throw", what: string) => { if (v === "throw") throw new Error(`${what} failed`); return v; };
   return {
@@ -244,7 +244,8 @@ function connections(acted: string[], bound: string[], store: Array<typeof CONNE
     reconnect: async (_t: string, agentId: string) => { acted.push(agentId); return { ok: true, updated: true }; },
     // As the runtime answers: removed, or the mount holds another credential; a throw is an object that did not answer.
     detachIfFrom: async (_t: string, agentId: string) => {
-      const m = answer(modes[agentId]?.match ?? true, "the match");
+      if (modes[agentId]?.match === "gone") return { ok: false, gone: true, error: "the agent's object holds no such agent" };
+      const m = answer((modes[agentId]?.match ?? true) as boolean | "throw", "the match");
       if (m) acted.push(agentId);
       return m ? { ok: true, removed: true } : { ok: true, removed: false, other: true };
     },
@@ -414,13 +415,19 @@ await check("disconnect: each bound agent ends detached, kept, cleared elsewhere
   // and their ids are not in the answer.
   const other = await go([row, THEIR_AGENT, THEIRS2], { [THEIR_AGENT.agentId]: { match: false, byAgent: true } });
   assert(other.status === 200 && JSON.stringify(other.body.detached) === JSON.stringify([RAFT_AGENT]) && other.body.otherOrigins?.cleared === 2
-    && other.body.otherOrigins.failed === 0 && /#1128/.test(other.body.otherOrigins.message) && /ALL of this GitHub account/.test(other.body.otherOrigins.message)
+    // This assertion was written for "always append the revoke hint", which was wrong; it now expects the hint only
+    // when the other origin's object was wiped. Here every copy was removed, so there is none.
+    && other.body.otherOrigins.failed === 0 && !/#1128/.test(other.body.otherOrigins.message) && !/revoking/.test(other.body.otherOrigins.message)
     && !other.text.includes("THEIRS") && other.acted.includes(`${THEIR_AGENT.agentId} by agent`), `elsewhere: ${other.status} ${other.text}`);
   // Failed: neither the match nor the agent removes it. Never detached; the connector stays, for the same call again.
   const mine = await go([row, MINE3], { [MINE3.agentId]: { match: "throw", byAgent: true } });
   assert(mine.status === 409 && mine.body.outcome === "not_cleared" && mine.body.retry === true && JSON.stringify(mine.body.agents) === JSON.stringify([MINE3.raftAgentId])
     && mine.body.error.code === "partially_disconnected" && JSON.stringify(mine.body.detached) === JSON.stringify([RAFT_AGENT])
     && mine.body.failed?.[0]?.raftAgentId === MINE3.raftAgentId && !mine.acted.includes("connector removed"), `failed: ${mine.status} ${mine.text}`);
+  // Another origin's agent whose object was wiped: nothing here can reach its copy, so a person is told what to do.
+  const wiped = await go([row, THEIR_AGENT], { [THEIR_AGENT.agentId]: { match: "gone", byAgent: true } });
+  assert(wiped.status === 200 && wiped.body.otherOrigins?.revoke === 1 && /#1128/.test(wiped.body.otherOrigins.message) && !wiped.text.includes("THEIRS"),
+    `wiped elsewhere: ${wiped.status} ${wiped.text}`);
   // Another origin's agent whose older copy the agent detach cannot remove either.
   const theirs = await go([row, THEIR_AGENT], { [THEIR_AGENT.agentId]: { match: false, byAgent: "throw" } });
   assert(theirs.status === 409 && theirs.body.retry === true && theirs.body.agents.length === 0 && theirs.body.otherOrigins?.failed === 1 && (theirs.body.failed ?? []).length === 0 && !theirs.text.includes("THEIRS")
