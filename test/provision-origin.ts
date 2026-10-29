@@ -133,7 +133,7 @@ const NOT_THE_PATH: Array<{ call: string; why: string }> = [
   { call: "const row = await deps.registry.get(tenantId, raftAgentId);\n  if (!row || row.deletedAt !== null) return { ok: false", why: "repairPush: the id an operator names, no provider route" },
   { call: "let row = await deps.registry.get(tenantId, raftAgentId);", why: "POST /agents: the body's raftAgentId (a create or its replay; see the cases outside /agents/<id> below)" },
   { call: "const a = raftAgentId === row.raftAgentId ? row : await deps.registry.get(tenantId, raftAgentId);", why: "reconnect in place: the other agents bound to the connector" },
-  { call: "for (const raftAgentId of bound) rows.set(raftAgentId, await deps.registry.get(tenantId, raftAgentId));", why: "DELETE /connectors/:id: the agents bound to the connector" },
+  { call: "const row = await deps.registry.get(tenantId, raftAgentId);\n      if (row) await c.detachIfFrom", why: "DELETE /connectors/:id: the agents bound to the connector" },
   { call: "const got = await c.registry.get(tenantId, row.raftAgentId, p);", why: "the connection registry, keyed by an agent already found (two calls)" },
 ];
 const HANDLERS_TEXT = readFileSync(HANDLERS, "utf8");
@@ -349,6 +349,14 @@ await check("another origin's own agent cannot list, attach, reconnect or discon
     }
   }
   assert(problems.length === 0, problems.join("\n        "));
+});
+
+await check("disconnecting this origin's connector takes its credential off every agent bound to it, another origin's too", async () => {
+  const acted: string[] = [];
+  const d = deps(row, { connections: connections(acted, [RAFT_AGENT, THEIR_AGENT.raftAgentId]) }, [THEIR_AGENT]);
+  const r = await send(d.deps, "DELETE", "/connectors/k1", OURS, ACTING);
+  assert(r.status === 200 && acted.includes(AGENT) && acted.includes(THEIR_AGENT.agentId) && acted.includes("connector removed"),
+    `${r.status} ${r.text}; changed ${acted.join(", ")}`);
 });
 
 await check("migration 0030: each existing connector gets the origin of the agent it was made for, else its bound agents' one origin, else none", async () => {

@@ -1576,23 +1576,17 @@ async function disconnect(tenantId: string, connectorId: string, body: unknown, 
   if (!k) return fail({ status: 404, code: "not_found", message: `no connector ${connectorId} in this tenant` });
   const refused = creatorRefused(k, acting);
   if (refused) return fail(refused);
-  // A connector has no origin of its own; its agents do. One bound to another Raft origin's agent is not this token's
-  // to remove (a platform token derives the tenant from the server id alone), and is answered as if absent, before
-  // anything is detached.
-  const bound = await c.registry.boundTo(tenantId, k.id);
-  const rows = new Map<string, ProvisionedAgent | null>();
-  for (const raftAgentId of bound) rows.set(raftAgentId, await deps.registry.get(tenantId, raftAgentId));
-  if ([...rows.values()].some((r) => r && r.raftOrigin !== who.raftOrigin)) {
-    return fail({ status: 404, code: "not_found", message: `no connector ${connectorId} in this tenant` });
-  }
   const provider = k.provider as ConnectionProvider;
   // Not atomic with a PUT that lands between `boundTo` and the delete below: that agent keeps a copy of
   // the credential and a connectorId that no longer exists, until it is pointed elsewhere or disconnected.
   const detached: string[] = [];
   const failed: Array<{ raftAgentId: string; error: string }> = [];
-  for (const raftAgentId of bound) {
+  // Every agent holding this connector's credential gives it up, another origin's too: one bound before connectors had
+  // an origin (0030) holds this origin's credential, which is this origin's to take back. The detach takes only this
+  // connector's own credential off a mount (`detachIfFrom`), never a key put there since.
+  for (const raftAgentId of await c.registry.boundTo(tenantId, k.id)) {
     try {
-      const row = rows.get(raftAgentId);
+      const row = await deps.registry.get(tenantId, raftAgentId);
       if (row) await c.detachIfFrom(tenantId, row.agentId, provider, k.sealed, k.id);
       await c.registry.remove(tenantId, raftAgentId, provider);
       detached.push(raftAgentId);
