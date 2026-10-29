@@ -157,6 +157,9 @@ leaves the call to the policy as before — and fails closed: a throw, or an
 answer that is not a non-empty string, refuses the call with a fixed message,
 and so does a reason past 300 characters (`String.length`): never a cut copy
 of it. The bound is on this hook's answer only, not on a route table's texts.
+The operation ends `rejected`, and its `tool.call` trace row carries the
+refusal's code and sentence (bounded and redacted, as a failure's are), never
+the arguments, so a refused attempt leaves a record of what refused it.
 Keep the same refusal in the tool's handler too, for an `invoke` that does not
 come through the gateway. `test/plugin-refuse.ts` holds the core's half.
 
@@ -942,6 +945,34 @@ the app answers 401 is sent once more after a fresh login. Only v0 manifests
 (`raft-agent-manifest.v0`) with `http_api` actions that answer JSON or text are
 run, and a manifest whose `base_url` has a path is refused rather than joined; `test/raft-agent-login.ts` holds all of it against a fake Raft and a fake
 app.
+
+**A plugin can own a service's Agent Login.** A plugin that declares
+`agentLogin: { services, tool }` (`Plugin.agentLogin` in
+`src/plugins/types.ts`) gets `ctx.agentLogin(service, codeChallenge)`: the
+gateway has the agent's raft mount run the app's `agent-login` action for it
+(`grantAgentLogin`), the plugin exchanges the one-time grant itself, and the
+session it gets stays sealed in that plugin's mount. stamp declares
+`{ services: ["stamp"], tool: "stamp_login" }`, and is the only plugin that
+declares one. For a declared service the raft plugin refuses the agent's own
+`integrations_login`, and `integrations_invoke` of its `agent-login` action
+(or of any action the manifest points at the same endpoint): otherwise the
+agent could pass a code challenge of its own, get the grant back, exchange it
+at the app (Stamp's `POST /api/auth/agent/exchange` takes no credential) and
+hold the session in its conversation, without the person the plugin's login
+tool asks. The refusal is `Plugin.refuse`, so it comes before any approval
+card, and its sentence names the declared `tool` as the way in. The service
+is compared folded (NFKC, invisible characters dropped, trimmed, lower-cased)
+and the action with case and separators ignored; a client id or name is also
+refused once Raft's list has said which service it is, and the handlers check
+again against the service Raft resolved, before a login or a handoff. The
+declarations are read from the runtime's plugins (`createRaftPlugin({ registry
+})` in `cf/src/runtime.ts`), never from a list in the raft plugin. **Adding a
+service to a plugin's `agentLogin.services` is a security decision**: it hands
+that plugin the agent's Agent Login for the service and takes the raw one
+away from the agent. `test/raft-agent-login.ts` pins the refusal, its variants
+and that an undeclared service is unchanged; `test/stamp-plugin.ts` and
+`test/stamp-bridge.ts` pin that no stamp tool and no `sdk:stamp` request
+reaches `/api/auth/*`.
 
 Two more are a personal assistant's reads of its owner's Raft:
 `assistant_owner_inbox` (the owner's channels and threads with unread counts,

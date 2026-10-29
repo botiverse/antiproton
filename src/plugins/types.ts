@@ -2219,8 +2219,13 @@ export interface Plugin {
   /**
    * The services this plugin may obtain an Agent Login grant for (`PluginContext.agentLogin`). Absent: none, and
    * its contexts have no such method. stamp declares `["stamp"]` and nothing else.
+   *
+   * A declared service's Agent Login belongs to this plugin alone: the raft plugin refuses the agent's own
+   * `integrations_login` for it and `integrations_invoke` of its `agent-login` action, before any approval card, so
+   * the grant (and the session it is exchanged for) never reaches the model. `tool` is this plugin's own login tool,
+   * which that refusal names as the way in. Adding a service here is therefore a security decision, not a formality.
    */
-  agentLogin?: { services: readonly string[] };
+  agentLogin?: { services: readonly string[]; tool?: string };
   /**
    * Issue the grant `PluginContext.agentLogin` asks for, from this plugin's own credential (the raft plugin). Called
    * by the gateway only, on the raft mount's own context, with a service the requesting plugin declared. The request

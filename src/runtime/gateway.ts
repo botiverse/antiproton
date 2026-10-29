@@ -1420,7 +1420,10 @@ export class ToolGateway {
     // A call refused before any verdict, a bridged request on its route or a call its plugin refuses
     // (`Plugin.refuse`): ended as a refusal ends, nothing ran, and answered in one shape whichever it was.
     const refusedHere = async (error: ToolError): Promise<ToolResult> => {
-      await this.#store.completeOperation(ctx.tenantId, operationId, "rejected", null, undefined, facts());
+      // The refusal's code and sentence go on the operation's `tool.call` row (bounded and redacted, `failureAttrs`),
+      // so a refused attempt says which rule refused it and what it named; never the arguments.
+      await this.#store.completeOperation(ctx.tenantId, operationId, "rejected", null, undefined,
+        { ...facts(), failure: { code: error.code, message: error.message } });
       return { status: "rejected", error };
     };
     // A bridged request is classified on its route before any verdict: a refused route ends here, approved or not,
