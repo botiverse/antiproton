@@ -272,8 +272,13 @@ export async function converse(e: Engine, user: string, script: Turn[]): Promise
   throw new Error(`${e.name}: the conversation did not settle`);
 }
 
+/** Each distinct id in one text becomes `<op1>`, `<op2>`, … in order of first appearance, so repeats must still agree. */
+const ordinal = (kind: string) => {
+  const seen = new Map<string, number>();
+  return (id: string) => `<${kind}${seen.get(id) ?? (seen.set(id, seen.size + 1), seen.size)}>`;
+};
 /** What differs between two runs and is not behaviour: a token, an expiry time (also in a held call's text), a held call's operation id. */
-export const norm = (s: string) => s.replace(/rjc_[0-9a-f]+/g, "<token>").replace(/\bop_[0-9a-f]+/g, "<op>").replace(/\\?"expiresAt\\?":\\?"[^"\\]*\\?"/g, "<expiresAt>").replace(/If nobody decides by \d{4}-\d\d-\d\dT[\d:.]+Z/g, "If nobody decides by <deadline>");
+export const norm = (s: string) => s.replace(/rjc_[0-9a-f]+/g, "<token>").replace(/\bop_[0-9a-f]+/g, ordinal("op")).replace(/\\?"expiresAt\\?":\\?"[^"\\]*\\?"/g, "<expiresAt>").replace(/If nobody decides by \d{4}-\d\d-\d\dT[\d:.]+Z/g, "If nobody decides by <deadline>");
 /** A request as the model reads it, system prompt aside (the prompt's own parity is the runtime's case). */
 export const seen = (r: Request) => ({ tools: r.tools ?? [], messages: r.messages.filter((m) => m.role !== "system").map((m) => norm(show(m))) });
 
