@@ -131,7 +131,7 @@ function taskEndedRefusal(address: string): { status: "rejected"; error: { code:
     error: { code: "task_ended", message: `${address} was not run: this task has ended and its machine has been handed back` },
   };
 }
-import { ToolGateway, type InvokeOpts } from "../../src/runtime/gateway.ts";
+import { ToolGateway, type HeldPlace, type InvokeOpts } from "../../src/runtime/gateway.ts";
 import { assertMountConfig, configFromForm, mergeMountSettings, repeatsMount, validateMount, type SettingValue } from "../../src/runtime/mount-config.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { OPERATOR_EXA_REF, OPERATOR_RUN9_REF, resolveOperatorRef } from "./operator-ref.ts";
@@ -312,6 +312,23 @@ export function approvalsUrl(origin: string | undefined, agentId: string): strin
   u.searchParams.set("view", "agents");
   u.searchParams.set("agentId", agentId);
   return u.toString();
+}
+
+/**
+ * Where a held call can be decided, for the held result (src/runtime/gateway.ts `heldMessage`), and so what it may
+ * truthfully tell the agent. Nobody, for a Raft-made agent: the console accepts no Raft sign-in (cf/src/auth.ts
+ * `viewerOfToken`), and the agent is listed under the provider's home (cf/src/index.ts `agent.adopt`), so its owner's own
+ * sign-in gets a 404. Nobody, too, for a call held outside the agent's first conversation (`main`): the agent's page
+ * lists only that conversation's held calls (its chat panel polls /ui/chat?held=1, which names no conversation) and
+ * offers no other, so an API session's, a child's or a check's held call is on no page a person can decide it from.
+ * Otherwise the agent's page, by whoever may open it: an API agent is listed in its key owner's directory, a console
+ * agent in its maker's. No record names a person, so `decider` is null: a Raft-provisioned agent's row has no owner
+ * (cf/src/control-plane.ts `ProvisionedAgent`), and Raft's context names one only for a personal assistant.
+ */
+export function heldPlaceFor(kind: AgentKind, taskId: string, url: string | null): HeldPlace {
+  if (kind === "raft") return { nobody: "this agent was made through Raft, and the console accepts no Raft sign-in, so its owner cannot open it" };
+  if (taskId !== LEGACY_TASK) return { nobody: "the console's page for this agent shows only its first conversation's held calls, and this call was held in another one" };
+  return { decider: null, url };
 }
 
 /** How a message the harness writes into the conversation says whose it is (src/runtime/idle-lease.ts `warningText`). */
@@ -1375,9 +1392,8 @@ export class AgentRuntime {
       deps.hooks ? (tenantId, agentId, alias) => this.#inboundFor(tenantId, agentId, alias) : undefined,
       {
         ...(deps.github ? { credentialRejected: (scope: { tenantId: string; agentId: string }, name: string, token: string) => this.#oauth.rejected(scope.tenantId, scope.agentId, name, token) } : {}),
-        // No decider: no record names a person who may decide. A Raft-provisioned agent's row has no owner
-        // (cf/src/control-plane.ts `ProvisionedAgent`), and Raft's context names one only for a personal assistant.
-        heldPlace: (ctx) => ({ decider: null, url: approvalsUrl(deps.consoleOrigin, ctx.agentId) }),
+        heldPlace: async (ctx) => heldPlaceFor(agentKind((await this.store.loadAgent(ctx.tenantId, ctx.agentId))?.config),
+          ctx.taskId, approvalsUrl(deps.consoleOrigin, ctx.agentId)),
       });
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,

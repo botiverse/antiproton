@@ -491,10 +491,24 @@ function routeCard(decl: BridgeDecl, req: { method: string; path: string; body: 
 }
 
 /**
- * Who decides a held call and where, as far as the deployment knows. `decider` is a person's name, null when no record
- * names one; `url` is the page the decision is made on, null when the deployment has no console origin.
+ * Who decides a held call and where, as far as the deployment knows. Either a place a person can decide it on:
+ * `decider` is a person's name, null when no record names one; `url` is the page the decision is made on, null when
+ * the deployment has no console origin. Or `nobody`: no person with access to the agent can open a page that decides
+ * it today, and why, in words for the model (a Raft-made agent; a call held where the console's page does not look).
  */
-export interface HeldPlace { decider: string | null; url: string | null }
+export type HeldPlace = { decider: string | null; url: string | null } | { nobody: string };
+
+/** Canonical JSON: object keys sorted at every depth, so two calls with the same arguments compare equal as text. */
+export function canonicalJson(v: unknown): string {
+  return JSON.stringify(v, (_k, x) => x && typeof x === "object" && !Array.isArray(x)
+    ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, (x as Record<string, unknown>)[k]])) : x) ?? "null";
+}
+
+/** What a held call is merged by: the same agent, mount, tool, arguments as kept and bridged route (`#invoke`). */
+function heldKey(agentId: string, mountAlias: string, tool: string, request: unknown): string {
+  const req = (request ?? {}) as { args?: unknown; route?: unknown };
+  return canonicalJson([agentId, mountAlias, tool, req.args ?? null, req.route ?? null]);
+}
 
 /**
  * What the model reads when a call is held: who decides, where, what happens next, what to do meanwhile.
@@ -502,19 +516,30 @@ export interface HeldPlace { decider: string | null; url: string | null }
  * Each sentence states what the code does, because the model acts on it. Nothing is sent anywhere when a call is held:
  * the approval is a row the console's panel reads (cf/src/ui.ts `approvals`), so a person learns of it only from the
  * agent or by opening the console. The row has no expiry (src/store/sqlite.ts `requireApproval`). The decision runs the
- * call (`applyApproval`) but is not put into the conversation, so the agent is not told it. A direct call has no
- * idempotency key, so calling again records a new operation and a second approval (`#invoke`).
+ * call (`applyApproval`) but is not put into the conversation, so the agent is not told it. An identical call made
+ * while one is pending is merged into it (`#invoke`), so `merged` says that this call added nothing.
  */
-export function heldMessage(operationId: string, place: HeldPlace): string {
+export function heldMessage(operationId: string, place: HeldPlace, merged = false): string {
+  const opening = merged
+    ? `An identical call is already waiting for approval (operation ${operationId}); this call was not added as a second one. ` +
+      "If you need it done twice, call again after that one is decided."
+    : `This call is held for approval (operation ${operationId}).`;
+  const again = "Calling this tool again with the same arguments while it waits returns this same pending approval; it does not create another.";
+  if ("nobody" in place) {
+    return `${opening} Nobody with access to this agent can approve it on the antiproton console today: ${place.nobody}. ` +
+      "It does not expire. Antiproton notifies nobody of it. " +
+      "Tell your owner in a message that this action is blocked pending an approval nobody can currently give, and do not retry it. " +
+      again;
+  }
   const page = place.url ? `the antiproton console at ${place.url}` : "this agent's approvals panel on the antiproton console";
   const who = place.decider
     ? `${place.decider} decides it on ${page}.`
     : `No decider is known: it is decided on ${page}, by a person signed in there with access to this agent.`;
-  return `This call is held for approval (operation ${operationId}). ${who} ` +
+  return `${opening} ${who} ` +
     `It does not expire: it waits until someone decides. If approved, it runs on its own exactly as written; ` +
     `you are not told the decision or the result, and your turn does not wait for it. ` +
     `Antiproton notifies nobody of it: if it matters, send ${place.decider ?? "a person"} ${place.url ? "that link" : "the operation id"} in a message. ` +
-    "Do not call this tool again for it: each call is held as a new, separate approval.";
+    again;
 }
 
 /** Moved beside `Plugin.defaultPolicy` (src/plugins/types.ts), where a plugin can read it too; kept importable from here. */
@@ -691,8 +716,9 @@ export class ToolGateway {
    * Deciding is atomic and happens once, so one approval can never authorise
    * two executions. On approval the recorded request is executed exactly as it
    * was recorded — an approver approved that request, not whatever the agent
-   * might ask for next — and the result rides the completion event back to the
-   * task, which the store wakes.
+   * might ask for next. The result, or the denial, ends the operation and is on
+   * its completion event, which only the console reads: nothing puts it into the
+   * conversation, so the agent is not told (`heldMessage` says so).
    */
   async applyApproval(
     tenantId: string,
@@ -1318,29 +1344,42 @@ export class ToolGateway {
     }
     if (verdict === "approval") {
       // Recorded, not executed, and not blocking a thread: the approver may
-      // take hours and nothing should hold a process for them. The task parks
-      // on the operation and is woken by the decision.
-      await this.#store.requireApproval({
-        tenantId: ctx.tenantId, operationId, agentId: ctx.agentId, taskId: ctx.taskId,
-        mountAlias: r.mount.alias, tool: r.tool,
-        // `heldBy` tells the card who asked for it: a policy, or the agent. `policyKey` is the second name the call was
-        // decided under, so an owner who allowed the tool sees which setting is still missing; `route` is what a person
-        // signs for a bridged request, since its arguments are an SDK's, not a sentence.
-        request: {
-          tool: raw, args: kept, heldBy: confirm ? "agent" : "policy",
-          ...(typeof key === "string" && key !== r.tool ? { policyKey: key } : {}),
-          ...(bridge && route ? { route: routeCard(bridge, route) } : {}),
-        },
-      });
+      // take hours and nothing should hold a process for them. Nothing parks
+      // or wakes the task on the decision: `applyApproval` runs the call and
+      // ends the operation, and the conversation is not told.
+      // `heldBy` tells the card who asked for it: a policy, or the agent. `policyKey` is the second name the call was
+      // decided under, so an owner who allowed the tool sees which setting is still missing; `route` is what a person
+      // signs for a bridged request, since its arguments are an SDK's, not a sentence.
+      const request = {
+        tool: raw, args: kept, heldBy: confirm ? "agent" : "policy",
+        ...(typeof key === "string" && key !== r.tool ? { policyKey: key } : {}),
+        ...(bridge && route ? { route: routeCard(bridge, route) } : {}),
+      };
+      // An identical call already pending is that call, not a second card: two cards for one intent could each be
+      // approved, and the side effect would run twice. Only a pending one: once it is decided, the same call again is
+      // a new intent (the same payment twice) and gets its own approval. This attempt's own operation, recorded above,
+      // is ended as cancelled with the operation it was merged into, since nothing will ever run it.
+      const same = heldKey(ctx.agentId, r.mount.alias, r.tool, request);
+      const pending = (await this.#store.listApprovals(ctx.tenantId, "pending"))
+        .find((a) => heldKey(a.agentId, a.mountAlias, a.tool, a.request) === same);
+      if (pending) {
+        await this.#store.completeOperation(ctx.tenantId, operationId, "cancelled", null, { mergedInto: pending.operationId }, facts());
+      } else {
+        await this.#store.requireApproval({
+          tenantId: ctx.tenantId, operationId, agentId: ctx.agentId, taskId: ctx.taskId,
+          mountAlias: r.mount.alias, tool: r.tool, request,
+        });
+      }
+      const held = pending?.operationId ?? operationId;
       // A place that cannot be read must not lose the hold, which is already recorded: the text then names neither.
       const place: HeldPlace = await (async () => this.#heldPlace?.(ctx))().catch(() => undefined) ?? { decider: null, url: null };
       return {
         status: "pending",
-        operationId,
-        decider: place.decider,
+        operationId: held,
+        decider: "nobody" in place ? null : place.decider,
         expires: null,
-        ...(place.url ? { url: place.url } : {}),
-        error: { code: "awaiting_approval", message: heldMessage(operationId, place) },
+        url: "nobody" in place ? null : place.url,
+        error: { code: "awaiting_approval", message: heldMessage(held, place, pending !== undefined) },
       };
     }
 

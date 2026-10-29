@@ -11,9 +11,10 @@ export type ToolResult =
   | { status: "succeeded"; operationId: string; result: Json }
   /**
    * `pending`: held for a person (src/runtime/gateway.ts `heldMessage`). `decider` is who decides, null when no record
-   * names one; `expires` is when the hold lapses, null because it never does; `url` is where it is decided.
+   * names one; `expires` is when the hold lapses, null because it never does; `url` is where it is decided, null when no
+   * page can be named or nobody can decide it there.
    */
-  | { status: "pending"; operationId: string; decider?: string | null; expires?: number | null; url?: string; error?: ToolError }
+  | { status: "pending"; operationId: string; decider?: string | null; expires?: number | null; url?: string | null; error?: ToolError }
   /** `background`: the work has started and outlives the call (see Backgrounded). */
   | { status: "running"; operationId: string; background?: { alias: string; tool: string; handle: Json; note?: string } }
   | { status: "failed" | "cancelled" | "unknown"; operationId: string; error?: ToolError }
