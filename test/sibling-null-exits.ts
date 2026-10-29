@@ -1,7 +1,7 @@
 /**
  * `ctx.sibling` answers null alike for a missing mount and for one the agent cannot call (PluginContext.sibling).
- * Two of its callers turn that null into something a person reads: raftbench's wake error, and the trace row
- * appworld writes for a second account's token it left unset. And that row is only written because its kind is
+ * Two of its callers turn that null into something a person reads: raftbench's wake error, and appworld's refusal
+ * of a call whose second account's token it could not get (an error naming the sibling, and a trace row saying why). And that row is only written because its kind is
  * listed (`PLUGIN_TRACE_KINDS`): the gateway drops any other kind without a word, so the last case counts rows, not
  * "it did not throw". The appworld cases use a hand-built `ctx.trace`, so they cannot show the list; only the last
  * case can.
@@ -61,7 +61,7 @@ await check("raftbench: a mount that is there but not raft says so, apart from a
   assert(error === "the raft mount is not a raft mount", `the error reads: ${error}`);
 });
 
-// appworld: the second account's token, left unset.
+// appworld: the second account's token, missing — the call is refused before any request, never sent without it.
 
 const catalogue: Catalogue = {
   shop: {
@@ -86,22 +86,28 @@ async function share(sibling: PluginContext["sibling"]) {
   }) as any;
   const rows: any[] = [];
   try {
-    const result = await shop!.invoke("share", { item: "x" }, context(sibling, { trace: (r) => rows.push(r) }));
-    return { result, sent, rows };
+    let error = "";
+    const result = await shop!.invoke("share", { item: "x" }, context(sibling, { trace: (r) => rows.push(r) }))
+      .catch((e) => { error = String((e as Error)?.message ?? e); return null; });
+    return { result, sent, rows, error };
   } finally { globalThis.fetch = original; }
 }
 
-await check("appworld: a null sibling leaves the token unset, the result the API's own, and one row saying why", async () => {
-  const { result, sent, rows } = await share(async () => null);
-  assert(JSON.stringify(result) === JSON.stringify({ shared: true }), `the result was changed: ${JSON.stringify(result)}`);
-  assert(sent.length === 1 && !("drive_access_token" in sent[0]), `the request: ${JSON.stringify(sent)}`);
+await check("appworld: a null sibling refuses the call before any request, naming it, with one row saying why", async () => {
+  const { sent, rows, error } = await share(async () => null);
+  assert(/needs the drive mount's account for drive_access_token/.test(error) && /no callable mount named drive/.test(error), `the error: ${error}`);
+  assert(sent.length === 0, `a request was sent: ${JSON.stringify(sent)}`);
   assert(rows.length === 1 && rows[0].kind === "appworld.sibling_unset" && rows[0].status === "not_callable"
     && rows[0].attrs.param === "drive_access_token" && rows[0].attrs.sibling === "drive", `rows: ${JSON.stringify(rows)}`);
 });
 
-await check("appworld: a sibling with no credential is told apart from a null one", async () => {
-  const { rows } = await share(async () => ({ credential: null, db: memoryDb(), plugin: "drive", policy: null }));
-  assert(rows.length === 1 && rows[0].status === "no_credential", `rows: ${JSON.stringify(rows)}`);
+await check("appworld: a sibling with no credential is told apart from a null one, and from one the gate withheld", async () => {
+  const none = await share(async () => ({ credential: null, db: memoryDb(), plugin: "drive", policy: null }));
+  assert(none.rows.length === 1 && none.rows[0].status === "no_credential" && /no account attached/.test(none.error) && none.sent.length === 0,
+    `no credential: ${JSON.stringify(none)}`);
+  const withheld = await share(async () => ({ credential: null, withheld: true, db: memoryDb(), plugin: "drive", policy: null }));
+  assert(withheld.rows.length === 1 && withheld.rows[0].status === "withheld" && /siblingReaders/.test(withheld.error) && withheld.sent.length === 0,
+    `withheld: ${JSON.stringify(withheld)}`);
 });
 
 await check("appworld: a callable sibling sets the token and writes no row (control)", async () => {

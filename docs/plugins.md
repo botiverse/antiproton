@@ -987,8 +987,12 @@ asker is the plugin id the platform recorded on its mount, never the mount's
 alias, and the gateway refuses two plugins registered under one id, so no
 plugin can take a listed one's place. `raft` lists `["stamp", "raftbench"]`:
 its credential reaches Raft's Agent Login directly, past everything above, so
-a plugin listed there can mint any app's grant. **Editing a `siblingReaders`
-list is a security change.** It is a rule the gateway enforces, not a scan:
+a plugin listed there can mint any app's grant. AppWorld builds one plugin
+per app, and each lists the other apps of the same build (derived from the one
+app list `appworldPlugins` is built from), since an action spanning two
+accounts takes the second app's token from that app's mount; when it cannot
+get it, the call is refused before any request, naming the sibling and why.
+**Editing a `siblingReaders` list is a security change.** It is a rule the gateway enforces, not a scan:
 `test/gateway-sibling-gate.ts` holds it, and `test/raft-agent-login.ts` keeps
 a scan naming every reader of `sibling` as a backstop.
 
