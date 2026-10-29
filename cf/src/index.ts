@@ -475,6 +475,8 @@ export class AgentDO extends DurableObject<Env> {
         layers: await d1ModelChoices(this.env.CONTROL_DB).layers(tenantId, agentId),
         pickerOff: modelPickerEnforced(this.env) && !(await d1TenantModelPicker(this.env.CONTROL_DB).enabled(tenantId)),
       }),
+      // Where a held call is decided, for the link the held result gives the agent.
+      ...(this.env.UI_ORIGIN ? { consoleOrigin: this.env.UI_ORIGIN } : {}),
       // Plugins may make their own mount's hooks (Raft push); the URL must be
       // one a service can reach, which the console's own origin may not be.
       hooks: this.env.HOOK_ORIGIN

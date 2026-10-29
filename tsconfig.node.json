@@ -149,6 +149,7 @@
     "test/pd-migrate-object.ts",
     "test/hook-fast-ack.ts",
     "test/console-mounts.ts",
+    "test/held-result.ts",
     "test/pd-writes.ts",
     "test/pd-object-reads.ts",
     "test/spec/pd-writes-spec.ts",

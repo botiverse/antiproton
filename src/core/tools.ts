@@ -9,7 +9,11 @@ import type { Json } from "./types.ts";
  */
 export type ToolResult =
   | { status: "succeeded"; operationId: string; result: Json }
-  | { status: "pending"; operationId: string }
+  /**
+   * `pending`: held for a person (src/runtime/gateway.ts `heldMessage`). `decider` is who decides, null when no record
+   * names one; `expires` is when the hold lapses, null because it never does; `url` is where it is decided.
+   */
+  | { status: "pending"; operationId: string; decider?: string | null; expires?: number | null; url?: string; error?: ToolError }
   /** `background`: the work has started and outlives the call (see Backgrounded). */
   | { status: "running"; operationId: string; background?: { alias: string; tool: string; handle: Json; note?: string } }
   | { status: "failed" | "cancelled" | "unknown"; operationId: string; error?: ToolError }

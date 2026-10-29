@@ -272,8 +272,8 @@ export async function converse(e: Engine, user: string, script: Turn[]): Promise
   throw new Error(`${e.name}: the conversation did not settle`);
 }
 
-/** What differs between two runs and is not behaviour: a token, an expiry time. */
-export const norm = (s: string) => s.replace(/rjc_[0-9a-f]+/g, "<token>").replace(/\\?"expiresAt\\?":\\?"[^"\\]*\\?"/g, "<expiresAt>");
+/** What differs between two runs and is not behaviour: a token, an expiry time, a held call's operation id. */
+export const norm = (s: string) => s.replace(/rjc_[0-9a-f]+/g, "<token>").replace(/\(operation op_[0-9a-f]+\)/g, "(operation <op>)").replace(/\\?"expiresAt\\?":\\?"[^"\\]*\\?"/g, "<expiresAt>");
 /** A request as the model reads it, system prompt aside (the prompt's own parity is the runtime's case). */
 export const seen = (r: Request) => ({ tools: r.tools ?? [], messages: r.messages.filter((m) => m.role !== "system").map((m) => norm(show(m))) });
 
@@ -384,7 +384,7 @@ export function pdToolsCases(withHost: WithDriveHost): DriveCase[] {
     same(r);
     const results = toolMessages(r.pd.requests[1]!);
     check(results[0] === show({ title: "page u1" }), `the read's result: ${results[0]}`);
-    check(results[1] === "web__send: this call is held for approval", `the held call: ${results[1]}`);
+    check(/^web__send: This call is held for approval \(operation op_[0-9a-f]+\)\. /.test(results[1] ?? ""), `the held call: ${results[1]}`);
     for (const run of [r.pi, r.pd]) {
       check(show(run.world.invoked) === show(["web.read_page"]), `${run.engine.name}: the plugin ran ${show(run.world.invoked)} (a held call must not run)`);
       const held = run.approvals;

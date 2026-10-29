@@ -490,6 +490,33 @@ function routeCard(decl: BridgeDecl, req: { method: string; path: string; body: 
   };
 }
 
+/**
+ * Who decides a held call and where, as far as the deployment knows. `decider` is a person's name, null when no record
+ * names one; `url` is the page the decision is made on, null when the deployment has no console origin.
+ */
+export interface HeldPlace { decider: string | null; url: string | null }
+
+/**
+ * What the model reads when a call is held: who decides, where, what happens next, what to do meanwhile.
+ *
+ * Each sentence states what the code does, because the model acts on it. Nothing is sent anywhere when a call is held:
+ * the approval is a row the console's panel reads (cf/src/ui.ts `approvals`), so a person learns of it only from the
+ * agent or by opening the console. The row has no expiry (src/store/sqlite.ts `requireApproval`). The decision runs the
+ * call (`applyApproval`) but is not put into the conversation, so the agent is not told it. A direct call has no
+ * idempotency key, so calling again records a new operation and a second approval (`#invoke`).
+ */
+export function heldMessage(operationId: string, place: HeldPlace): string {
+  const page = place.url ? `the antiproton console at ${place.url}` : "this agent's approvals panel on the antiproton console";
+  const who = place.decider
+    ? `${place.decider} decides it on ${page}.`
+    : `No decider is known: it is decided on ${page}, by a person signed in there with access to this agent.`;
+  return `This call is held for approval (operation ${operationId}). ${who} ` +
+    `It does not expire: it waits until someone decides. If approved, it runs on its own exactly as written; ` +
+    `you are not told the decision or the result, and your turn does not wait for it. ` +
+    `Antiproton notifies nobody of it: if it matters, send ${place.decider ?? "a person"} ${place.url ? "that link" : "the operation id"} in a message. ` +
+    "Do not call this tool again for it: each call is held as a new, separate approval.";
+}
+
 /** Moved beside `Plugin.defaultPolicy` (src/plugins/types.ts), where a plugin can read it too; kept importable from here. */
 export { policyFor } from "../plugins/types.ts";
 import { policyFor } from "../plugins/types.ts";
@@ -568,7 +595,7 @@ export class ToolGateway {
     store: StorageAdapter, plugins: Plugin[], seeded: ReadonlySet<string>,
     secrets: SecretResolver = envSecrets,
     inbound?: (tenantId: string, agentId: string, alias: string) => InboundHooks,
-    opts: { credentialRejected?: CredentialRejected } = {},
+    opts: { credentialRejected?: CredentialRejected; heldPlace?: (ctx: CallContext) => HeldPlace | Promise<HeldPlace> } = {},
   ) {
     for (const p of plugins) checkBridge(p);
     this.#store = store;
@@ -577,9 +604,13 @@ export class ToolGateway {
     this.#inbound = inbound;
     this.#seeded = seeded;
     this.#credentialRejected = opts.credentialRejected;
+    this.#heldPlace = opts.heldPlace;
   }
 
   #credentialRejected?: CredentialRejected;
+
+  /** Who decides a held call and where; without it the held result names neither (`heldMessage`). */
+  #heldPlace?: (ctx: CallContext) => HeldPlace | Promise<HeldPlace>;
 
   readonly #seeded: ReadonlySet<string>;
 
@@ -1301,14 +1332,16 @@ export class ToolGateway {
           ...(bridge && route ? { route: routeCard(bridge, route) } : {}),
         },
       });
+      // A place that cannot be read must not lose the hold, which is already recorded: the text then names neither.
+      const place: HeldPlace = await (async () => this.#heldPlace?.(ctx))().catch(() => undefined) ?? { decider: null, url: null };
       return {
         status: "pending",
         operationId,
-        error: {
-          code: "awaiting_approval",
-          message: `this call is held for approval`,
-        },
-      } as ToolResult;
+        decider: place.decider,
+        expires: null,
+        ...(place.url ? { url: place.url } : {}),
+        error: { code: "awaiting_approval", message: heldMessage(operationId, place) },
+      };
     }
 
     if (bridge && route) {

@@ -300,6 +300,20 @@ export function agentKind(config: unknown): AgentKind {
   return "console";
 }
 
+/**
+ * The console page a held call is decided on: the agent's page, whose chat panel lists the held calls of its first
+ * conversation (cf/src/ui.ts `page`, polling /ui/chat?held=1). Only ids, never anything that decides: the page asks the
+ * viewer to sign in and checks the agent is theirs (cf/src/index.ts `requireViewer`, `uiOwnsAgent`), and approving is
+ * a signed-in POST to /ui/decide. The page reads no conversation or operation from its URL, so the link names neither.
+ */
+export function approvalsUrl(origin: string | undefined, agentId: string): string | null {
+  if (!origin) return null;
+  const u = new URL("/ui", origin);
+  u.searchParams.set("view", "agents");
+  u.searchParams.set("agentId", agentId);
+  return u.toString();
+}
+
 /** How a message the harness writes into the conversation says whose it is (src/runtime/idle-lease.ts `warningText`). */
 export const HARNESS_NOTICE = "[a notice from the harness, not a message from the user] ";
 
@@ -782,6 +796,11 @@ export interface RuntimeDeps {
    * are offered no `inbound` and cannot make hooks themselves.
    */
   hooks?: { origin: string; directory: Pick<HookDirectory, "create" | "lookup" | "revoke" | "list"> };
+  /**
+   * The console's origin (UI_ORIGIN), where a held call is decided: a held result links the agent's console page there
+   * (`approvalsUrl`). Absent: the result names the console without a link.
+   */
+  consoleOrigin?: string;
   /** How long `removeMount` waits on a plugin's `unmount`; {@link UNMOUNT_TIMEOUT_MS} when unset. A test's knob. */
   unmountTimeoutMs?: number;
   /**
@@ -1354,7 +1373,12 @@ export class AgentRuntime {
     // The operator's catalogue, told to the kernel rather than read by it.
     this.#gateway = new ToolGateway(this.store, plugins, SEEDED_PLUGINS, this.#secrets,
       deps.hooks ? (tenantId, agentId, alias) => this.#inboundFor(tenantId, agentId, alias) : undefined,
-      deps.github ? { credentialRejected: (scope, name, token) => this.#oauth.rejected(scope.tenantId, scope.agentId, name, token) } : {});
+      {
+        ...(deps.github ? { credentialRejected: (scope: { tenantId: string; agentId: string }, name: string, token: string) => this.#oauth.rejected(scope.tenantId, scope.agentId, name, token) } : {}),
+        // No decider: no record names a person who may decide. A Raft-provisioned agent's row has no owner
+        // (cf/src/control-plane.ts `ProvisionedAgent`), and Raft's context names one only for a personal assistant.
+        heldPlace: (ctx) => ({ decider: null, url: approvalsUrl(deps.consoleOrigin, ctx.agentId) }),
+      });
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
       makeToolBinding: deps.makeToolBinding,
