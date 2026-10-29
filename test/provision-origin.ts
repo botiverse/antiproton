@@ -470,6 +470,20 @@ await check("renewal: a connector's pair reaches only its own origin's agents; a
     && JSON.stringify(kNull) === JSON.stringify({ to: [], filtered: 1, skipped: 0 }), `filtered: ${JSON.stringify(k1)} ${JSON.stringify(kNull)}`);
 });
 
+await check("migration 0031: a deleted agent still bound to a connector is unbound, each recorded first; live agents keep theirs", async () => {
+  const f = d1("0031_");
+  f.agent("A", OURS); f.agent("Z", OURS);
+  f.db.prepare("UPDATE provisioned_agents SET status = 'deleted', deleted_at = 5000 WHERE raft_agent_id = 'Z'").run();
+  f.db.prepare("INSERT INTO connectors(id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at, raft_origin) VALUES ('k1', ?, 'github', 'octo', 'u-1', 'c', 'i', 1, ?)").run(TENANT, OURS);
+  f.bind("A", "k1"); f.bind("Z", "k1");
+  f.rest();
+  const left = (f.db.prepare("SELECT raft_agent_id AS a FROM provisioned_connections ORDER BY a").all() as any[]).map((r) => r.a);
+  assert(JSON.stringify(left) === JSON.stringify(["A"]), `bindings left: ${JSON.stringify(left)}`);
+  const ev = f.db.prepare("SELECT * FROM connector_events WHERE action = 'deleted_agent_unbound'").all() as any[];
+  assert(ev.length === 1 && ev[0].connector_id === "k1" && ev[0].raft_agent_id === "Z" && ev[0].acting_role === "system" && ev[0].at > 1_700_000_000_000
+    && JSON.stringify(JSON.parse(ev[0].reason)) === JSON.stringify({ provider: "github", deletedAt: 5000 }), `the record: ${JSON.stringify(ev)}`);
+});
+
 console.log(`  ${routes.size} (method, path) pairs take an agent id; ${served.length} (both spellings) served for their own origin; ${Object.keys(OUTSIDE).length} cases outside /agents/<id>`);
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
