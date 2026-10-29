@@ -2032,6 +2032,15 @@ await check("a mount whose reference names a key other than its alias: read, sho
   // A reconnect puts the new key and its renewal record under the reference's name, and leaves the reference as it was.
   await w.reconnect(a, connectorId);
   must((await mount()).secretRef === `agent:${KEY}` && JSON.stringify(names()) === JSON.stringify([KEY, OAUTH_PREFIX + KEY].sort()), `after a reconnect: ${(await mount()).secretRef} ${JSON.stringify(names())}`);
+  // A 401 for a live-looking key renews it under that name (the gateway's credentialRejected).
+  const rec2 = JSON.parse(await open(kek, (await a.rt.store.getSecret(TENANT, a.agentId, OAUTH_PREFIX + KEY))!));
+  await a.rt.store.putSecret(TENANT, a.agentId, OAUTH_PREFIX + KEY, await seal(kek, JSON.stringify({ ...rec2, rotatedAt: Date.now() - 2 * H })));
+  w.db.raw.prepare("UPDATE connectors SET refreshed_at = ? WHERE id = ?").run(Date.now() - 2 * H, connectorId);
+  const live = await open(kek, (await a.rt.store.getSecret(TENANT, a.agentId, KEY))!);
+  w.gh.live.delete(live);
+  const renewed = w.gh.s.refreshes;
+  must(succeeded(await w.tool(a)) && w.gh.s.refreshes === renewed + 1 && (await open(kek, (await a.rt.store.getSecret(TENANT, a.agentId, KEY))!)) !== live
+    && JSON.stringify(names()) === JSON.stringify([KEY, OAUTH_PREFIX + KEY].sort()), `the 401: ${w.gh.s.refreshes - renewed}, ${JSON.stringify(names())}`);
   // A disconnect's guard reads the key under that name too: another credential on the mount, not "nothing there".
   const { seal: seal2 } = await import("../src/runtime/secrets.ts");
   const guard = await a.rt.detachConnectionIfFrom(TENANT, a.agentId, "github", await seal2(kek, "ghu_" + "o".repeat(36)), "k-not-this-one");
