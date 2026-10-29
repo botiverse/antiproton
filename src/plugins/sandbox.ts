@@ -1525,6 +1525,30 @@ const UNKNOWN_WIRING: Wired = { alias: "", plugin: "", placeholder: "", digest: 
  * 2026-09-15: re-registered after a policy change, GitHub answered 401).
  */
 /**
+ * Project-scope registrations found carrying a box's placeholder (`Holding.withdraw`), kept under the mount's box
+ * store until a complete project listing no longer has them: ids, names and times only, never a value or anything
+ * run9 said.
+ */
+export const RESIDUE_KEY = "egress-residue";
+type ResidueRow = { boxId: string; secretId: string; name: string; firstSeen: number };
+function asResidue(v: unknown): Record<string, ResidueRow> {
+  const out: Record<string, ResidueRow> = {};
+  if (!v || typeof v !== "object" || Array.isArray(v)) return out;
+  for (const [id, r] of Object.entries(v as Record<string, any>)) {
+    if (r && typeof r.boxId === "string" && typeof r.secretId === "string" && typeof r.firstSeen === "number") {
+      out[id] = { boxId: r.boxId, secretId: r.secretId, name: typeof r.name === "string" ? r.name : "", firstSeen: r.firstSeen };
+    }
+  }
+  return out;
+}
+const RESIDUE_REASON = "a project-scope registration carrying this box's placeholder: run9 injects it into the boxes its label matches, " +
+  "and antiproton never removes project-scope secrets (the run9 project is shared with production), so a person must";
+function residueOf(stored: Record<string, ResidueRow>, boxId: string) {
+  return Object.values(stored).filter((r) => r.boxId === boxId)
+    .map((r) => ({ secretId: r.secretId, name: r.name, reason: RESIDUE_REASON, firstSeen: new Date(r.firstSeen).toISOString() }));
+}
+
+/**
  * Whether `value` carries a placeholder made for this box (`placeholderFor`), as itself or in the base64 form a git
  * registration wraps it in: the mark is the box id's tail, which every placeholder for the box carries.
  */
@@ -2388,8 +2412,31 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       const mount = await readMount(ctx);
       const cfg = cfgOf(ctx);
       const backend = backendFor(cfg);
-      const out: Array<{ id: string; clean: boolean; ownKey: boolean; code?: "no_credential" | "stranded" | "listing_failed" | "not_withdrawn"; why?: string; review?: string;
+      type Code = "no_credential" | "stranded" | "listing_failed" | "not_withdrawn" | "project_residue" | "project_listing_failed";
+      const out: Array<{ id: string; clean: boolean; ownKey: boolean; code?: Code; why?: string; review?: string;
         projectResidue?: Array<{ secretId: string; name: string; reason: string }> }> = [];
+      // What run9 answered is never repeated, only its status or shape: this text reaches Raft in a DELETE's answer.
+      const failure = (e: unknown) => e instanceof ProviderError ? `run9 refused (${e.status ? `HTTP ${e.status}` : e.code})` : String((e as Error)?.message ?? e).slice(0, 200);
+      const provider = ctx.credential && backend.caps.boxSecrets ? backend.open(cfg, ctx.credential) : null;
+      // Residue found before, kept in this mount's own storage: a box it came from may be gone, so it cannot be found
+      // again from the box, and must be reported until a listing shows it gone (`RESIDUE_KEY`).
+      const stored = asResidue(await ctx.db.get(BOX_STORE, RESIDUE_KEY));
+      const boxes = boxedMachines(mount);
+      // Project scope, listed once per withdrawal and never written: one run9 project is shared with production, and
+      // a project-scope secret removed here could stop another deployment's boxes from working.
+      let project: Array<{ name: unknown; id: unknown; placeholder: unknown }> | null = null;
+      let projectFailed: string | null = null;
+      if (boxes.length || Object.keys(stored).length) {
+        if (!provider?.listProjectSecrets) projectFailed = provider ? null : "no credential to list project-scope registrations with";
+        else {
+          try { project = await provider.listProjectSecrets(); }
+          catch (e) { projectFailed = `the project-scope listing failed: ${failure(e)}`; }
+        }
+      }
+      // Resolved only on a complete, readable listing that no longer has it: a failure, a wrong shape or a timeout
+      // leaves every residue as it was.
+      if (project) for (const id of Object.keys(stored)) if (!project.some((p) => String(p.id) === id)) delete stored[id];
+      const now = Date.now();
       for (const machine of boxedMachines(mount)) {
         const state = await readView(ctx, machine);
         if (!state.boxId) continue;
@@ -2397,47 +2444,50 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         if (!backend.caps.boxSecrets) { out.push({ id: state.boxId, clean: true, ownKey: false, why: `${backend.name} wires no account into a box` }); continue; }
         // A deletion by this mount's release is believed only for a box recorded as made under this kind of key.
         const ownKey = !!ctx.credential && state.credentialRef !== undefined && state.credentialRef === ctx.credentialRefKind;
-        if (!ctx.credential) { out.push({ id: state.boxId, clean: false, ownKey: false, code: "no_credential", why: "no credential to reach the box with" }); continue; }
+        if (!provider) { out.push({ id: state.boxId, clean: false, ownKey: false, code: "no_credential", why: "no credential to reach the box with" }); continue; }
         try {
-          const provider = backend.open(cfg, ctx.credential);
           const before = await provider.listSecrets(state.boxId);
           const placeholders = new Set([...before.map((x) => String(x.placeholder ?? "")), ...(state.wired ?? []).map((w) => w.placeholder)].filter(Boolean));
           const names = new Set([...before.map((x) => String(x.name ?? "")), ...(state.wired ?? []).flatMap((w) => w.names ?? [])].filter(Boolean));
           for (const sec of before) await provider.removeSecret(state.boxId, sec.id);
           const left = await provider.listSecrets(state.boxId);
-          // Project scope is listed, never written: one run9 project is shared with production, and a project-scope
-          // secret removed here could stop another deployment's boxes from working. One carrying this box's
-          // placeholder is residue run9 will inject: named, every time, whatever else is clean.
-          const projectResidue: Array<{ secretId: string; name: string; reason: string }> = [];
+          // One carrying this box's placeholder is residue run9 will inject: kept and named, every time.
           let named = 0;
-          if (provider.listProjectSecrets) {
-            for (const p of await provider.listProjectSecrets()) {
-              const ph = String(p.placeholder ?? "");
-              if (ph && ([...placeholders].some((x) => ph === x || ph.includes(x)) || carriesBoxPlaceholder(ph, state.boxId))) {
-                projectResidue.push({ secretId: String(p.id), name: String(p.name ?? ""),
-                  reason: "a project-scope registration carrying this box's placeholder: run9 injects it into the boxes its label matches, and antiproton never removes project-scope secrets (the run9 project is shared with production), so a person must" });
-              } else if (names.has(String(p.name ?? ""))) named++;
-            }
+          for (const p of project ?? []) {
+            const ph = String(p.placeholder ?? "");
+            if (ph && ([...placeholders].some((x) => ph === x || ph.includes(x)) || carriesBoxPlaceholder(ph, state.boxId))) {
+              const id = String(p.id);
+              stored[id] = { boxId: state.boxId, secretId: id, name: String(p.name ?? "").slice(0, 120), firstSeen: stored[id]?.firstSeen ?? now };
+            } else if (names.has(String(p.name ?? ""))) named++;
           }
-          const injected = projectResidue.length;
-          const now = await readView(ctx, machine);
-          if (now.boxId === state.boxId && (now.wired || now.leftOut)) {
-            const next = { ...now };
+          const view = await readView(ctx, machine);
+          if (view.boxId === state.boxId && (view.wired || view.leftOut)) {
+            const next = { ...view };
             delete next.wired; delete next.leftOut;
             await writeView(ctx, machine, next);
           }
-          // `clean` is the box's own registrations; project-scope residue is named beside it, for the caller to weigh.
-          const why = left.length ? `${left.length} registration(s) still on the box after removal`
-            : injected ? `${injected} project-scope registration(s) carry this box's placeholder, so run9 still injects them` : undefined;
-          out.push({ id: state.boxId, clean: !left.length, ownKey, ...(left.length ? { code: "not_withdrawn" as const } : {}), ...(why ? { why } : {}),
+          const residue = residueOf(stored, state.boxId);
+          // `clean` is the box's own registrations; project-scope residue is named beside it, for the caller to weigh. A
+          // project listing that failed is not clean: residue was never checked.
+          const code: Code | undefined = left.length ? "not_withdrawn" : projectFailed ? "project_listing_failed" : undefined;
+          const why = left.length ? `${left.length} registration(s) still on the box after removal` : projectFailed ?? (residue.length
+            ? `${residue.length} project-scope registration(s) carry this box's placeholder, so run9 still injects them` : undefined);
+          out.push({ id: state.boxId, clean: !left.length && !projectFailed, ownKey, ...(code ? { code } : {}), ...(why ? { why } : {}),
             ...(named ? { review: `${named} project-scope registration(s) share a name with this box's accounts; a person should look` } : {}),
-            ...(injected ? { projectResidue } : {}) });
+            ...(residue.length ? { projectResidue: residue } : {}) });
         } catch (e) {
-          // What run9 answered is never repeated here, only its status: this text reaches Raft in a DELETE's answer.
-          const why = e instanceof ProviderError ? `run9 refused (${e.status ? `HTTP ${e.status}` : e.code})` : String((e as Error)?.message ?? e).slice(0, 200);
-          out.push({ id: state.boxId, clean: false, ownKey, code: "listing_failed", why });
+          out.push({ id: state.boxId, clean: false, ownKey, code: "listing_failed", why: failure(e) });
         }
       }
+      // Residue whose box this mount no longer holds (deleted since): reported on its own, until a listing clears it.
+      const held = new Set(out.map((t) => t.id));
+      for (const boxId of new Set(Object.values(stored).map((r) => r.boxId))) {
+        if (held.has(boxId)) continue;
+        out.push({ id: boxId, clean: false, ownKey: false, code: projectFailed ? "project_listing_failed" : "project_residue",
+          why: projectFailed ?? "the box is gone; project-scope registration(s) carrying its placeholder are still there", projectResidue: residueOf(stored, boxId) });
+      }
+      if (Object.keys(stored).length) await ctx.db.put(BOX_STORE, stored as unknown as Json, RESIDUE_KEY);
+      else await ctx.db.delete(BOX_STORE, RESIDUE_KEY);
       for (const id of Object.keys(mount?.stranded ?? {})) {
         out.push({ id, clean: false, ownKey: false, code: "stranded", why: "stranded: made under a key since replaced, so with this one its registrations can be neither listed nor removed, nor the box deleted" });
       }

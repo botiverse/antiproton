@@ -758,14 +758,21 @@ export class BoundArtifacts {
 export const isOperatorModelRef = (ref: string) => providerOfRef(ref) !== null;
 export { OPERATOR_RUN9_REF, OPERATOR_INSTABOX_REF, OPERATOR_EXA_REF } from "./operator-ref.ts";
 
+/** What a failure's text says without what any provider answered: the HTTP statuses it names, or that it failed. */
+export function statusesOnly(text: string): string {
+  const statuses = [...text.matchAll(/(?:returned|->|HTTP)\s*(\d{3})\b/g)].map((m) => m[1]);
+  return statuses.length ? `failed (HTTP ${[...new Set(statuses)].join(", ")})` : "failed";
+}
+
 /**
- * Why a held thing is not clean after an agent's delete. `not_withdrawn` and `listing_failed` (registrations left,
- * or run9 refusing, unreachable or answering what cannot be read) are what the next delete retries. The rest no retry
+ * Why a held thing is not clean after an agent's delete. `not_withdrawn`, `listing_failed` (registrations left,
+ * or run9 refusing, unreachable or answering what cannot be read) and `project_listing_failed` (the project-scope
+ * listing failed, so residue was never checked) are what the next delete retries. The rest no retry
  * fixes: `project_residue` (the box is clear, a project-scope registration still acts for it), `stranded` (made under
  * a key since replaced), `no_credential` (no key to reach it), `deletion_unconfirmed` (let go, but not made under this
  * kind of key, so a "deleted" cannot be believed).
  */
-export type UncleanCode = "not_withdrawn" | "listing_failed" | "project_residue" | "stranded" | "no_credential" | "deletion_unconfirmed";
+export type UncleanCode = "not_withdrawn" | "listing_failed" | "project_listing_failed" | "project_residue" | "stranded" | "no_credential" | "deletion_unconfirmed";
 /**
  * What to do about each: `retry_delete` (the next delete can finish it); `needs_operator_cleanup` (a known object an
  * operator can reach, #1128); `await_provider_reclaim` (nothing reachable with any current key: a stranded box, which
@@ -773,7 +780,7 @@ export type UncleanCode = "not_withdrawn" | "listing_failed" | "project_residue"
  */
 export type UncleanAction = "retry_delete" | "needs_operator_cleanup" | "await_provider_reclaim";
 const ACTION_OF: Record<UncleanCode, UncleanAction> = {
-  not_withdrawn: "retry_delete", listing_failed: "retry_delete",
+  not_withdrawn: "retry_delete", listing_failed: "retry_delete", project_listing_failed: "retry_delete",
   project_residue: "needs_operator_cleanup", no_credential: "needs_operator_cleanup", deletion_unconfirmed: "needs_operator_cleanup",
   stranded: "await_provider_reclaim",
 };
@@ -789,7 +796,7 @@ const MESSAGE_OF: Partial<Record<UncleanAction, string>> = {
  */
 export interface ReleaseForDelete {
   things: Array<{ alias: string; id: string; clean: boolean; via?: "withdrawn" | "deleted"; why?: string; review?: string;
-    projectResidue?: Array<{ secretId: string; name: string; reason: string }>;
+    projectResidue?: Array<{ secretId: string; name: string; reason: string; firstSeen?: string }>;
     /** Why not clean, and what to do: retried by the next delete, or a person's (#1128). */
     code?: UncleanCode; action?: UncleanAction; message?: string }>;
   released: string[];
@@ -4869,7 +4876,9 @@ export class AgentRuntime {
    */
   async withdrawEgress(tenantId: string, agentId: string) {
     await this.ready();
-    return this.#gateway.withdrawTask({ tenantId, agentId, taskId: LEGACY_TASK });
+    const w = await this.#gateway.withdrawTask({ tenantId, agentId, taskId: LEGACY_TASK });
+    // As the delete's answer does it: a failure's statuses, never its text (`statusesOnly`).
+    return { things: w.things, failed: w.failed.map((f) => ({ alias: f.alias, error: statusesOnly(f.error) })) };
   }
 
   async releaseForDelete(tenantId: string, agentId: string): Promise<ReleaseForDelete> {
@@ -4886,11 +4895,14 @@ export class AgentRuntime {
         // A project-scope registration carrying the box's placeholder outlives the box: run9 injects it into whatever
         // its label matches. Never clean while one is there, deleted box or not, and always named.
         const residue = t.projectResidue?.length ? t.projectResidue : null;
-        const via = t.clean ? "withdrawn" as const : t.ownKey && !releaseFailed.has(t.alias) ? "deleted" as const : null;
+        // A project-scope listing that failed means residue was never checked: not clean whatever became of the box.
+        const listingFailed = t.code === "project_listing_failed";
+        const via = listingFailed ? null : t.clean ? "withdrawn" as const : t.ownKey && !releaseFailed.has(t.alias) ? "deleted" as const : null;
         const common = { alias: t.alias, id: t.id, ...(t.review ? { review: t.review } : {}), ...(residue ? { projectResidue: residue } : {}) };
         if (via && !residue) return { ...common, clean: true, via };
         // The action follows the reason (`ACTION_OF`): only what the next delete can do is `retry_delete`.
-        const code: UncleanCode = via ? "project_residue"
+        const code: UncleanCode = listingFailed ? "project_listing_failed"
+          : via || t.code === "project_residue" ? "project_residue"
           : t.code === "stranded" || t.code === "no_credential" ? t.code
           : !releaseFailed.has(t.alias) ? "deletion_unconfirmed"
           : t.code === "listing_failed" ? "listing_failed" : "not_withdrawn";
@@ -4899,7 +4911,10 @@ export class AgentRuntime {
           ...(MESSAGE_OF[action] ? { message: MESSAGE_OF[action] } : {}) };
       }),
       released: r.released,
-      failed: [...w.failed.map((f) => ({ ...f, stage: "withdraw" as const })), ...r.failed.map((f) => ({ ...f, stage: "release" as const }))],
+      // A failure's text is the plugin's, and may carry what run9 answered (a delete's or a stop's body): only the
+      // HTTP statuses in it go into the answer, which reaches Raft. The whole text stays in the logs and the lease.
+      failed: [...w.failed.map((f) => ({ alias: f.alias, stage: "withdraw" as const, error: statusesOnly(f.error) })),
+        ...r.failed.map((f) => ({ alias: f.alias, stage: "release" as const, error: statusesOnly(f.error) }))],
     };
   }
 

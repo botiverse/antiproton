@@ -5215,28 +5215,55 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
           // The withdrawal an agent's delete starts with, alone: every egress registration on every box the agent's
           // mounts hold is removed, nothing is let go or deleted, and the answer is what each box showed
           // (`Holding.withdraw`). The agent's next command wires its accounts again.
-          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
-            return Response.json({ error: "unauthorized" }, { status: 401 });
-          }
-          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
-          // Who says they are calling: free text, self-declared, not authentication (the token is the operator's,
-          // shared), written into the audit line so a use leaves a name.
-          const claimedCaller = (request.headers.get("x-claimed-caller") ?? "").trim().slice(0, 64);
-          if (!claimedCaller) return Response.json({ error: "x-claimed-caller is required: who is calling, as free text" }, { status: 400 });
+          //
+          // Every attempt is a row in D1's admin_audit (migration 0033), refusals included, written before the agent's
+          // object is called and updated after: never the token, nor anything run9 answered. `x-claimed-caller` is
+          // who the caller says it is, free text, not authentication: the token is the operator's, shared with
+          // /admin and the bench scripts.
+          const claimedCaller = (request.headers.get("x-claimed-caller") ?? "").trim().slice(0, 64) || null;
           const t = url.searchParams.get("tenantId") ?? "";
           const a = url.searchParams.get("agentId") ?? "";
-          if (!t || !a) return Response.json({ error: "tenantId and agentId are required" }, { status: 400 });
+          const audit = async (outcome: string, counts?: Record<string, number>, id?: number): Promise<number | null> => {
+            const at = Date.now();
+            logEvent("admin.withdraw_egress", { tenantId: t || null, agentId: a || null, claimedCaller, outcome, at: new Date(at).toISOString(), ...(counts ?? {}) });
+            if (id !== undefined) {
+              await env.CONTROL_DB.prepare("UPDATE admin_audit SET outcome = ?, counts = ?, finished_at = ? WHERE id = ?")
+                .bind(outcome, counts ? JSON.stringify(counts) : null, at, id).run();
+              return id;
+            }
+            const row = await env.CONTROL_DB.prepare(
+              "INSERT INTO admin_audit (at, route, tenant_id, agent_id, claimed_caller, outcome, counts) VALUES (?, '/admin/withdraw-egress', ?, ?, ?, ?, ?) RETURNING id",
+            ).bind(at, t || null, a || null, claimedCaller, outcome, counts ? JSON.stringify(counts) : null).first<{ id: number }>();
+            return row ? Number(row.id) : null;
+          };
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            await audit("unauthorized");
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (request.method !== "POST") { await audit("wrong_method"); return Response.json({ error: "POST" }, { status: 405 }); }
+          if (!claimedCaller) {
+            await audit("no_claimed_caller");
+            return Response.json({ error: "x-claimed-caller is required: who is calling, as free text" }, { status: 400 });
+          }
+          if (!t || !a) { await audit("no_agent_named"); return Response.json({ error: "tenantId and agentId are required" }, { status: 400 }); }
           // Only an agent this deployment provisioned, read from its own D1 before its object is touched: an id that
           // was never an agent is a 404, and no object is opened (opening one records it as the agent's).
           if (!(await d1ProvisionedAgents(env.CONTROL_DB).getByAgentId(t, a))) {
-            logEvent("admin.withdraw_egress", { tenantId: t, agentId: a, claimedCaller, outcome: "no_such_agent", at: new Date().toISOString() });
+            await audit("no_such_agent");
             return Response.json({ error: "not_found" }, { status: 404 });
           }
-          const at = new Date().toISOString();
-          const r = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).withdrawEgress(t, a);
-          logEvent("admin.withdraw_egress", { tenantId: t, agentId: a, claimedCaller, outcome: "withdrawn", at,
-            things: r.things.length, clean: r.things.filter((x) => x.clean).length, residue: r.things.reduce((n, x) => n + (x.projectResidue?.length ?? 0), 0), failed: r.failed.length });
-          return Response.json({ tenantId: t, agentId: a, at, ...r });
+          // Written before the call: a call the Worker does not live to finish stays 'started', unconfirmed.
+          const id = await audit("started");
+          if (id === null) return Response.json({ error: "the audit row could not be written, so nothing was done" }, { status: 503 });
+          let r: Awaited<ReturnType<AgentDO["withdrawEgress"]>>;
+          try { r = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).withdrawEgress(t, a); }
+          catch {
+            await audit("object_threw", undefined, id);
+            return Response.json({ error: "the agent's object did not answer" }, { status: 503 });
+          }
+          await audit("withdrawn", { things: r.things.length, clean: r.things.filter((x) => x.clean).length,
+            residue: r.things.reduce((n, x) => n + (x.projectResidue?.length ?? 0), 0), failed: r.failed.length }, id);
+          return Response.json({ tenantId: t, agentId: a, at: new Date().toISOString(), ...r });
         }
         case "/admin/migrate-engine":
           return await adminMigrateEngine(request, env.AUTOMATION_TOKEN,

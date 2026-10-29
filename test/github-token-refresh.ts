@@ -137,7 +137,8 @@ function run9Fake() {
   // `listShape`: the box's secrets listing comes back in another shape (wrapped, or a proxy's page).
   // `listShape: "leaky"`: a wrapped list whose entries carry a token; `listFail`: the listing answers 503 with a body
   // that holds one. Neither may come back in any answer.
-  const f = { failDelete: false, failWithdraw: false, ignoreWithdraw: false, deleteNotFound: false, listShape: null as null | "wrapped" | "html" | "leaky", listFail: false };
+  // `projectListFail`: the project-scope listing answers 503 with a body holding a token.
+  const f = { failDelete: false, failWithdraw: false, ignoreWithdraw: false, deleteNotFound: false, listShape: null as null | "wrapped" | "html" | "leaky", listFail: false, projectListFail: false };
   /** Project-scope registrations: injected into the boxes they label, never listed on the box. */
   const project: Secret[] = [];
   const calls: string[] = [];
@@ -151,6 +152,7 @@ function run9Fake() {
     calls.push(`${method} ${url.replace("https://api.run.sys9.ai", "")}`);
     sent.push({ method, path: url.replace("https://api.run.sys9.ai", ""), body });
     let m: RegExpMatchArray | null;
+    if (url === "https://api.run.sys9.ai/projects/default/secrets" && f.projectListFail) return new Response("down: ghu_LEAKFROMPROJECT000000000000000000", { status: 503 });
     if (url === "https://api.run.sys9.ai/projects/default/secrets") {
       return json(project.map((x) => ({ secret_id: x.secret_id, name: x.name, placeholder: x.placeholder, scope: "project", box_label: { k: "v" } })));
     }
@@ -184,7 +186,7 @@ function run9Fake() {
     }
     if ((m = path.match(/^\/boxes\/([^/]+)\/stop$/))) { const b = boxes.get(m[1]!); if (b) b.state = "stopped"; return json({}); }
     if ((m = path.match(/^\/boxes\/([^/]+)$/)) && method === "DELETE") {
-      if (f.failDelete) return json({ message: "run9 is unavailable" }, 503);
+      if (f.failDelete) return json({ message: "run9 is unavailable", detail: "ghu_LEAKFROMDELETE0000000000000000000000" }, 503);
       if (f.deleteNotFound) return json({ message: "box not found" }, 404);
       boxes.delete(m[1]!);
       return json({});
@@ -1712,6 +1714,62 @@ await check("every unclean box has a reason code, and the action follows it: ret
       `stranded: ${r.text}`);
     w.dispose();
   }
+});
+
+await check("project-scope residue outlives its box and every retry, until a complete listing shows it gone; a failed listing clears nothing and is retryable; nothing run9 said is stored", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("YG");
+  await w.connect(a);
+  await w.sandbox(a);
+  const [boxId] = [...run9.boxes.keys()];
+  run9.project.push({ secret_id: "p7", name: "X", value: "x", placeholder: run9.boxes.get(boxId!)!.secrets[0]!.placeholder, inject_header_name: "authorization", allowed_hosts: ["api.github.com"] });
+  const residueOf = (body: any) => (body?.sandboxes?.boxes ?? []).flatMap((b: any) => (b.projectResidue ?? []).map((r: any) => ({ box: b.id, code: b.code, action: b.action, id: r.secretId })));
+  // The box goes, the residue is reported.
+  const first = await w.call("DELETE", "/agents/by-raft-agent/YG");
+  must(!run9.boxes.has(boxId!) && JSON.stringify(residueOf(first.body)) === JSON.stringify([{ box: boxId, code: "project_residue", action: "needs_operator_cleanup", id: "p7" }]), `first: ${first.text}`);
+  // A retry finds no box, and still reports it, from what was stored.
+  const again = await w.call("DELETE", "/agents/by-raft-agent/YG");
+  must(again.body.clean === false && again.body.retry === false && residueOf(again.body)[0]?.id === "p7", `retry: ${again.text}`);
+  // A listing that fails clears nothing: retryable, the residue still named, and nothing run9 said kept or answered.
+  run9.f.projectListFail = true;
+  const failed = await w.call("DELETE", "/agents/by-raft-agent/YG");
+  must(residueOf(failed.body)[0]?.id === "p7" && residueOf(failed.body)[0]?.code === "project_listing_failed" && failed.body.retry === true
+    && !failed.text.includes("ghu_LEAK"), `a failed listing: ${failed.text}`);
+  const stored = String((w.hostOf(a.agentId).sql.exec("SELECT value FROM plugin_db WHERE agent_id = ? AND alias = 'sandbox' AND key LIKE '%egress-residue%'", a.agentId).toArray()[0] as any)?.value ?? "");
+  must(stored.includes("p7") && !stored.includes("ghu_") && !stored.includes("down:"), `the stored residue: ${stored}`);
+  // A person removes it; a complete listing then shows it gone, and the delete is clean.
+  run9.f.projectListFail = false;
+  run9.project.splice(0);
+  const done = await w.call("DELETE", "/agents/by-raft-agent/YG");
+  must(done.body.clean === true && residueOf(done.body).length === 0, `after it went: ${done.text}`);
+  w.dispose();
+});
+
+await check("a box deleted under its own key is not clean when the project-scope listing failed: residue was never checked, and a retry is due", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("YH");
+  await w.connect(a);
+  await w.sandbox(a);
+  run9.f.projectListFail = true;
+  const r = await w.call("DELETE", "/agents/by-raft-agent/YH");
+  must(boxOf(r.body)?.clean === false && boxOf(r.body).code === "project_listing_failed" && boxOf(r.body).action === "retry_delete"
+    && r.body.retry === true && !r.text.includes("ghu_LEAK"), `${r.text}`);
+  w.dispose();
+});
+
+await check("a release run9 refuses with a body holding a token comes back as its status only", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("YI");
+  await w.connect(a);
+  await w.sandbox(a);
+  run9.f.failDelete = true;
+  const r = await w.call("DELETE", "/agents/by-raft-agent/YI");
+  const f = r.body?.sandboxes?.failed?.[0];
+  must(f?.stage === "release" && f.error === "failed (HTTP 503)" && !r.text.includes("ghu_LEAK") && !r.text.includes("unavailable"), `${r.text}`);
+  w.dispose();
 });
 
 await check("withdraw never deletes project-scope secrets (shared run9 project: would stop prod injection)", async () => {

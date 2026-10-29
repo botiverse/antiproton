@@ -1892,10 +1892,13 @@ export interface Holding {
    * deletion of it by this mount's release can be believed.
    */
   withdraw?(ctx: PluginContext): Promise<Array<{ id: string; clean: boolean; ownKey: boolean; why?: string; review?: string;
-    /** Why not clean: no key to reach it, made under a key since replaced, a listing that failed, or registrations left. */
-    code?: "no_credential" | "stranded" | "listing_failed" | "not_withdrawn";
+    /**
+     * Why not clean: no key to reach it, made under a key since replaced, a listing that failed, registrations left,
+     * a project-scope listing that failed (residue never checked), or residue kept from a thing no longer held.
+     */
+    code?: "no_credential" | "stranded" | "listing_failed" | "not_withdrawn" | "project_listing_failed" | "project_residue";
     /** Registrations made outside the thing (run9's project scope) that still act for it, which this never removes. */
-    projectResidue?: Array<{ secretId: string; name: string; reason: string }> }>>;
+    projectResidue?: Array<{ secretId: string; name: string; reason: string; firstSeen?: string }> }>>;
   /**
    * Let go of it. Scoped to the AGENT rather than to one task, safe to call
    * again, and it must throw rather than return if something billed could not
