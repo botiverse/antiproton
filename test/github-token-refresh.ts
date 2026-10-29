@@ -16,6 +16,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
 import { d1ConnectorGrants, d1Connections, d1Connectors, d1ProvisionedAgents, renewalAudience } from "../cf/src/control-plane.ts";
 import { cleanupResidue, d1EgressResidue } from "../cf/src/egress-residue.ts";
+import { adminCredentialInventory, readConnectionHoldings } from "../cf/src/credential-inventory.ts";
 import { handleProvision, type ProvisionDeps } from "../cf/src/provision/handlers.ts";
 import { githubExchangeCode, GITHUB_TOKEN } from "../cf/src/auth.ts";
 import { OAUTH_PREFIX, RECONNECT_REASON, reasonCode } from "../cf/src/github-refresh.ts";
@@ -1922,6 +1923,75 @@ await check("residue records that cannot be read leave the delete not clean even
   const never = await w2.call("DELETE", "/agents/by-raft-agent/YN");
   must(never.status === 200 && never.body.status === "deleted" && never.body.clean === false && never.body.retry === true && never.body.residueUnknown === true, `never had a box: ${never.text}`);
   w2.dispose();
+});
+
+await check("the credential inventory's read of a mount: the key's presence and its renewal connector, nothing else and nothing derived from the key; nothing changed by reading", async () => {
+  const w = await world();
+  const a = await w.agent("YQ");
+  const { importKek } = await import("../src/runtime/secrets.ts");
+  const kek = await importKek(KEK);
+  const empty = await readConnectionHoldings(a.rt.store, kek, TENANT, a.agentId, ["github"]);
+  must(JSON.stringify(empty) === JSON.stringify([{ alias: "gh", plugin: "github", key: empty[0]?.key === "shared" ? "shared" : "none", connectorId: null }]), `before the connect: ${JSON.stringify(empty)}`);
+  const connectorId = await w.connect(a);
+  // Expired, so a read that went through the renewal path would renew it.
+  await w.expireAt(a, Date.now() - 1000, connectorId);
+  const rows = () => JSON.stringify(w.hostOf(a.agentId).sql.exec("SELECT * FROM secrets ORDER BY name").toArray());
+  const before = rows(), renewals = w.gh.s.refreshes;
+  const got = await readConnectionHoldings(a.rt.store, kek, TENANT, a.agentId, ["github"]);
+  // Exactly these fields and values: a field derived from the key (a hash, a prefix, a length) is a difference here.
+  must(JSON.stringify(got) === JSON.stringify([{ alias: "gh", plugin: "github", key: "agent", connectorId }]), `after the connect: ${JSON.stringify(got)}`);
+  // Without the key to open the renewal record: still present, its connector unknown.
+  must(JSON.stringify(await readConnectionHoldings(a.rt.store, null, TENANT, a.agentId, ["github"])) === JSON.stringify([{ alias: "gh", plugin: "github", key: "agent", connectorId: null }]), "without a kek");
+  must(rows() === before && w.gh.s.refreshes === renewals, "reading changed what the object holds, or renewed it");
+  must((await readConnectionHoldings(a.rt.store, kek, TENANT, a.agentId, ["nope"])).length === 0, "a mount of a plugin it does not have");
+  w.dispose();
+});
+
+// Guards agreement between two read paths until #1135 unifies them; at that point keep the outcome assertions and drop
+// the agreement check.
+await check("the inventory's read of a mount agrees with the runtime's (key present, none, dangling; the renewal record's connector), and lists the right state for each", async () => {
+  const w = await world();
+  const { importKek, seal } = await import("../src/runtime/secrets.ts");
+  const kek = await importKek(KEK);
+  const present = await w.agent("ZP"), none = await w.agent("ZN"), dangling = await w.agent("ZD");
+  const connectorId = await w.connect(present);
+  await w.connect(dangling);
+  // A key the mount still names but that is not stored.
+  w.hostOf(dangling.agentId).sql.exec("DELETE FROM secrets WHERE name = 'gh'");
+  const other = await seal(kek, "ghu_" + "o".repeat(36));
+  const read = (a: typeof present) => readConnectionHoldings(a.rt.store, kek, TENANT, a.agentId, ["github"]);
+  // The runtime's own reading, read-only for a connector the mount does not name: `other` when a key of the agent's is
+  // on it, nothing when there is none.
+  const runtimeHeld = async (a: typeof present) => {
+    const r = await a.rt.detachConnectionIfFrom(TENANT, a.agentId, "github", other, "k-not-this-one");
+    must(r.ok && r.removed === false, `the read-only probe removed something: ${JSON.stringify(r)}`);
+    return (r as { other?: true }).other === true;
+  };
+  const view = { present: await read(present), none: await read(none), dangling: await read(dangling) };
+  const held = { present: await runtimeHeld(present), none: await runtimeHeld(none), dangling: await runtimeHeld(dangling) };
+  // Agreement.
+  for (const k of ["present", "none", "dangling"] as const) {
+    must(view[k].some((m) => m.key === "agent") === held[k], `${k}: the inventory says ${JSON.stringify(view[k])}, the runtime ${held[k]}`);
+  }
+  // Outcomes.
+  must(held.present && view.present[0]?.key === "agent" && view.present[0].connectorId === connectorId, `present: ${JSON.stringify(view.present)}`);
+  must(!held.none && view.none[0]?.key !== "agent" && view.none[0]?.connectorId === null, `none: ${JSON.stringify(view.none)}`);
+  must(!held.dangling && view.dangling[0]?.key === "dangling", `dangling: ${JSON.stringify(view.dangling)}`);
+  // The renewal record names the connector the runtime renews from: a detach that names it does take the key (last:
+  // it changes the mount).
+  const inventory = async () => {
+    const res = await adminCredentialInventory(new Request("https://x/admin/credential-inventory?tenantId=" + TENANT + "&limit=25", { headers: { "x-harness-token": "tok", "x-claimed-caller": "test" } }),
+      new URL("https://x/admin/credential-inventory?tenantId=" + TENANT + "&limit=25"),
+      { token: "tok", db: w.db, now: () => Date.now(), holdings: async (_t, a, p) => readConnectionHoldings(({ raft_ZP: present, raft_ZN: none, raft_ZD: dangling } as any)[a].rt.store, kek, TENANT, a, p) });
+    const body: any = await res.json();
+    return Object.fromEntries(body.agents.map((x: any) => [x.raft_agent_id, x.connections[0].state]));
+  };
+  must(JSON.stringify(await inventory()) === JSON.stringify({ ZD: "binding_only", ZN: "neither", ZP: "both" }), `with bindings: ${JSON.stringify(await inventory())}`);
+  w.db.raw.prepare("DELETE FROM provisioned_connections WHERE raft_agent_id = 'ZP'").run();
+  must((await inventory()).ZP === "mount_only", "a key with no binding");
+  const taken = await present.rt.detachConnectionIfFrom(TENANT, present.agentId, "github", other, view.present[0]!.connectorId);
+  must(taken.ok && taken.removed === true, `the runtime does not renew from the connector the inventory read: ${JSON.stringify(taken)}`);
+  w.dispose();
 });
 
 await check("withdraw never deletes project-scope secrets (shared run9 project: would stop prod injection); withdraw runs while the box exists: after a delete there is nothing to withdraw", async () => {

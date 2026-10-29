@@ -100,6 +100,8 @@ const ROUTES: Route[] = [
   { path: "/admin/transcript", method: "GET", refused: 401, passed: (s) => s === 400 },
   // The storage scan (cf/src/storage-scan.ts): with no body it names no agent, a 400 before the object or R2 is read.
   { path: "/admin/storage-scan", method: "POST", refused: 401, passed: (s, c) => s === 400 && !c.some((x) => /^(object|r2)\./.test(x)) },
+  // The credential inventory (cf/src/credential-inventory.ts): with no x-claimed-caller it is a 400, before any object is asked.
+  { path: "/admin/credential-inventory", method: "GET", refused: 401, passed: (s, c) => s === 400 && !c.some((x) => /^(object|agent)\./.test(x)) },
   // The friction scan on demand (cf/src/friction-scan.ts): without a day it is a 400, before anything is read.
   { path: "/admin/friction-scan", method: "POST", refused: 401, passed: (s, c) => s === 400 && !c.some((x) => /^(object|r2)\./.test(x)) },
   // A signed-in admin or the operator's token (auth.ts isAdmin); its refusal is "no such route".

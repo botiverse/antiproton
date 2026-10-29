@@ -170,6 +170,7 @@
     "test/provision-model.ts",
     "test/raft-approvals.ts",
     "test/egress-verify-route.ts",
+    "test/credential-inventory.ts",
     "test/provision-origin.ts",
     "test/provision-usage.ts",
     "test/admin-fail-closed.ts",

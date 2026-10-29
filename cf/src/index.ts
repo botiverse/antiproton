@@ -40,7 +40,7 @@ import { maskRawRefs } from "../../src/store/refs.ts";
 import { chatPanel } from "./chat.ts";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
-import { secretRefKind } from "../../src/runtime/secrets.ts";
+import { importKek, secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend, type SuspendRequest } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
@@ -111,6 +111,8 @@ import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens, reservedTenantProblem } from "./admin-provider-tokens.ts";
 import { cleanupResidue, d1EgressResidue, residueUnknownMessage, withResidue } from "./egress-residue.ts";
+import { adminCredentialInventory, layoutMissing, readConnectionHoldings } from "./credential-inventory.ts";
+import { errorClassOf } from "./error-class.ts";
 import { renewalAudience, d1ConnectorGrants, d1Connections, d1Connectors, type ConnectorRefresh, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
 import type { GithubGrant } from "./github-token.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps, type ReconnectTarget } from "./provision/connect.ts";
@@ -2343,6 +2345,25 @@ export class AgentDO extends DurableObject<Env> {
   async adminStorageScan(tenantId: string, agentId: string, needle: string) {
     if (!this.#isAgent(tenantId, agentId)) return null;
     return scanTables(this.sql as never, needle);
+  }
+
+  /**
+   * The credential inventory's half in this object (cf/src/credential-inventory.ts): what this agent's mounts of each
+   * plugin hold, by presence and renewal connector. Without claiming the object, so a look at one never made does not
+   * make it the agent's; null for an agent this object does not hold. As `diagnose` reads: the store is read directly
+   * and never readied, no runtime is built, no alarm is set, nothing is written.
+   *
+   * Reads with direct SELECTs and never builds the runtime: building it runs migrations and creates tables, with
+   * possible side effects. Tests cannot prove this (the object's constructor already creates tables); only review keeps
+   * it so.
+   */
+  async adminConnectionHoldings(tenantId: string, agentId: string, plugins: readonly string[]) {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    // A layout without what the read needs is said, not read as "no key".
+    const missing = layoutMissing(this.sql as never);
+    if (missing.length) return { layoutMissing: missing };
+    const kek = this.env.SECRET_KEK ? await importKek(this.env.SECRET_KEK) : null;
+    return readConnectionHoldings(new DurableObjectStore(this.ctx as any), kek, tenantId, agentId, plugins);
   }
 
   #isAgent(tenantId: string, agentId: string): boolean {
@@ -5214,6 +5235,13 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
           logTurnStop({ tenantId: t, agentId: a, trigger: "admin_cancel", side: "worker" }, r);
           return Response.json({ tenantId: t, agentId: a, ...r }, { status: r.result === "failed" ? 503 : 200 });
         }
+        case "/admin/credential-inventory":
+          // Read-only: what each provisioned agent's connection mounts hold, asked of its object, against its binding,
+          // connector events and open egress residue (cf/src/credential-inventory.ts). One bounded page per call.
+          return await adminCredentialInventory(request, url, {
+            token: env.AUTOMATION_TOKEN, db: env.CONTROL_DB, now: () => Date.now(),
+            holdings: (t, a, plugins) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).adminConnectionHoldings(t, a, plugins),
+          });
         case "/admin/withdraw-egress": {
           // A verification hook, preview only (EGRESS_VERIFY_ROUTE, set in cf/wrangler.preview.jsonc), to be removed
           // after the real-box observation (#1132). Without the flag this path is an unknown route like any other.
@@ -5364,11 +5392,8 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
 /** The `/agent/*` routes that return what an agent was told or said, so are audited (cf/src/read-audit.ts). */
 const AUDITED_AGENT_READS = new Set(["/agent/events", "/agent/state", "/agent/activity"]);
 
-/** An error's class, for a log line that must not carry its message: a name made of letters, or `unknown`. */
-export function errorClassOf(e: unknown): string {
-  const name = (e as { name?: unknown } | null)?.name;
-  return typeof name === "string" && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(name) ? name : "unknown";
-}
+// Kept in its own module so a module index.ts imports can use it too (cf/src/credential-inventory.ts).
+export { errorClassOf };
 
 /** The first path segment, when it is one that chooses an object; matched whole, so `/agent-x` and `/Agent` are not `/agent`. */
 function objectPrefix(pathname: string): "conformance" | "bench" | "ui" | "agent" | null {
