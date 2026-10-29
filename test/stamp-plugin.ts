@@ -14,7 +14,7 @@ import { stampPlugin, STAMP_WITHHELD, SESSION_STORE, parseSession, loadSession, 
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { keepRaftIdentity } from "../src/plugins/raft-identity.ts";
-import { createRaftPlugin } from "../src/plugins/raft.ts";
+import { createRaftPlugin, raftPlugin } from "../src/plugins/raft.ts";
 import { sealText } from "./../src/plugins/raft-agent-login.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -641,7 +641,8 @@ await check("issue_comment needs an issue number", async () => {
 // policy allowed everything, so approve, merge and `api` ran with nobody there.
 
 /** The raft plugin as a sibling sees it: its id, its version pin and its context store; nothing it calls. */
-const RAFT_STUB = { id: "raft", version: "1.0.0", tools: [], async invoke() { return {}; },
+// Who may read its credential is the real raft plugin's list (`Plugin.siblingReaders`), stamp among them.
+const RAFT_STUB = { id: "raft", version: "1.0.0", tools: [], async invoke() { return {}; }, siblingReaders: raftPlugin.siblingReaders,
   database: { version: 8, stores: { context: {} } } } as any;
 
 /** A store with this agent's Raft mount, its identity kept as the raft plugin keeps it. */

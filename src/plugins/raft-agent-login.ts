@@ -166,12 +166,20 @@ export function isAgentLoginAction(action: string): boolean {
   return action.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "") === "agentlogin";
 }
 
-/** The sentence a raw Agent Login for a declared service is refused with: who logs in instead, and why. */
-export function sealedLoginMessage(tool: string, written: string, s: SealedLogin): string {
-  const what = tool === INVOKE_TOOL ? "run agent-login for" : "sign in to";
-  const instead = s.tool ? `call ${s.tool} on your ${s.plugin} mount instead` : `use the ${s.plugin} plugin's own login tool instead`;
-  return `${tool} may not ${what} ${JSON.stringify(clip(written, 60))}: its Agent Login belongs to the ${s.plugin} plugin. ` +
-    `${instead}, which a person approves and which keeps the ${s.service} session sealed in that mount, never in this conversation. Nothing was sent.`;
+/**
+ * The sentence a raw Agent Login for a declared service is refused with: the service and the action as the agent sent
+ * them first (the trace row keeps the first 200 characters, `TOOL_ERROR_MAX`), then who logs in instead, and why.
+ */
+export function sealedLoginMessage(tool: string, written: string, s: SealedLogin, action?: string): string {
+  const what = tool === INVOKE_TOOL ? `agent-login (action ${JSON.stringify(clip(action ?? "", 32))})` : "a login";
+  const instead = s.tool ? `call ${s.tool}` : `use the ${s.plugin} plugin's own login tool`;
+  return `${tool}: ${what} for service ${JSON.stringify(clip(written, 40))} refused: that login is the ${s.plugin} plugin's. ` +
+    `Instead ${instead}: a person approves it, and the session stays sealed in that mount, out of this conversation.`;
+}
+
+/** The declaration a resolved service falls under: by its id, its client id or its name, whichever is declared. */
+export function sealedRecord(sealed: NonNullable<AgentLoginDeps["sealed"]>, s: ServiceRecord): SealedLogin | null {
+  return sealed(s.id) ?? sealed(s.clientId) ?? sealed(s.name);
 }
 
 /**
@@ -185,7 +193,7 @@ export function sealedLoginRefusal(tool: string, args: unknown, sealed: AgentLog
   if (typeof a.service !== "string") return null;
   if (tool === INVOKE_TOOL && (typeof a.action !== "string" || !isAgentLoginAction(a.action))) return null;
   const s = sealed(a.service);
-  return s ? sealedLoginMessage(tool, a.service, s) : null;
+  return s ? sealedLoginMessage(tool, a.service, s, typeof a.action === "string" ? a.action : undefined) : null;
 }
 
 /** A Raft service record as the login and list routes answer it (the fields this module reads). */
@@ -687,7 +695,7 @@ export async function integrationsLogin(args: unknown, ctx: PluginContext, deps:
     const early = sealedLoginRefusal(LOGIN_TOOL, a, sealed);
     if (early) throw fail(early);
     guard = (s) => {
-      const owner = sealed(s.id);
+      const owner = sealedRecord(sealed, s);
       if (owner) throw fail(sealedLoginMessage(LOGIN_TOOL, service, owner));
     };
     const found = await matchService(deps, service);
@@ -906,13 +914,16 @@ async function listed(deps: AgentLoginDeps): Promise<Obj> {
   }
   // The SDK checks the answer against Raft's shared contract before it is handed back, so a list is there.
   const data = obj(out.data);
-  return { services: Array.isArray(data.services) ? data.services : [], activeLogins: Array.isArray(data.activeLogins) ? data.activeLogins : [] };
+  const services = Array.isArray(data.services) ? data.services : [];
+  // Every list teaches the refusal the spellings of a declared service, `integrations_list` included: the list is
+  // where the agent reads an app's id.
+  deps.learn?.(services.map(serviceOf).filter((s): s is ServiceRecord => s !== null));
+  return { services, activeLogins: Array.isArray(data.activeLogins) ? data.activeLogins : [] };
 }
 
 /** The installed app `query` names in Raft's list, by the rule every Agent Login tool uses, or undefined. */
 async function matchService(deps: AgentLoginDeps, query: string): Promise<ServiceRecord | undefined> {
   const services = (obj(await listed(deps)).services as unknown[]).map(serviceOf).filter((s): s is ServiceRecord => s !== null);
-  deps.learn?.(services);
   const q = query.trim().toLowerCase();
   // An exact service id first: another app named like it must not stand in for it.
   return services.find((s) => s.id === query) ?? services.find((s) => s.clientId.toLowerCase() === q || s.name.toLowerCase() === q);
@@ -1098,7 +1109,7 @@ export async function integrationsInvoke(args: unknown, ctx: PluginContext, deps
   const early = sealedLoginRefusal(INVOKE_TOOL, a, deps.sealed);
   if (early) throw fail(early);
   const service = await findService(deps, query);
-  const owner = deps.sealed?.(service.id) ?? null;
+  const owner = deps.sealed ? sealedRecord(deps.sealed, service) : null;
   const manifest = await fetchManifest(ctx, deps, service, cache);
   if (manifest.mode !== "http_api") throw fail(`${service.name}'s actions run as a local command line, which this mount cannot run`);
   const action = manifest.actions.find((x) => x.name === name);
@@ -1107,7 +1118,7 @@ export async function integrationsInvoke(args: unknown, ctx: PluginContext, deps
     // endpoint is the same request, so it is refused too.
     const login = manifest.actions.filter((x) => isAgentLoginAction(x.name)).map((x) => `${x.endpoint.method} ${x.endpoint.path}`);
     if (isAgentLoginAction(name) || (action && login.includes(`${action.endpoint.method} ${action.endpoint.path}`))) {
-      throw fail(sealedLoginMessage(INVOKE_TOOL, query, owner));
+      throw fail(sealedLoginMessage(INVOKE_TOOL, query, owner, name));
     }
   }
   if (!action) {

@@ -2274,7 +2274,8 @@ await check("the gateway's sibling names the plugin of the mount it found", asyn
       found: await ctx.sibling("gh"), held: await ctx.sibling("held"), missing: await ctx.sibling("nope"),
     }),
   };
-  const github: any = { id: "github", version: "1.0.0",  tools: [], invoke: async () => null };
+  // The probe is one the sibling's plugin lets read its credential (`Plugin.siblingReaders`, test/gateway-sibling-gate.ts).
+  const github: any = { id: "github", version: "1.0.0",  tools: [], invoke: async () => null, siblingReaders: ["probe"] };
   const store = new SqliteStore(":memory:");
   await store.init();
   await store.createAgent("t", "a");
