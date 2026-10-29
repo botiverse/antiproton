@@ -274,11 +274,13 @@ await check("objects are asked at most ASK_AT_ONCE at a time; one that hangs is 
     if (n === "a/t-a/raft_C") return new Promise(() => {});
     return get0(n).adminConnectionHoldings(...x);
   } }) as any;
-  const from = logged.length;
+  const from = logged.length, started = Date.now();
   const res = await adminCredentialInventory(new Request("https://x/admin/credential-inventory?limit=6", { headers: { "x-harness-token": TOKEN, "x-claimed-caller": "cody" } }),
     new URL("https://x/admin/credential-inventory?limit=6"), { token: TOKEN, db: w.env.CONTROL_DB as any, now: () => Date.now(), objectTimeoutMs: 60,
       holdings: (t, a, p) => (w.env.AGENT.get(`a/${t}/${a}`) as any).adminConnectionHoldings(t, a, p) });
   const body: any = await res.json();
+  // The page waited for the hung object as long as its timeout, not the default ten seconds or forever.
+  must(Date.now() - started < 3000, `the page took ${Date.now() - started} ms`);
   must(ASK_AT_ONCE === 5 && most === ASK_AT_ONCE, `at most ${most} at once`);
   const c = body.agents.find((a: any) => a.raft_agent_id === "C");
   must(c.object === "failed" && c.connections[0].state === "unknown", `the hung object: ${JSON.stringify(c)}`);
