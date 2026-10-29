@@ -47,6 +47,9 @@ export const RECONNECT_REASON = "OAuth authorization expired; reconnect required
  * What renews a mount's key (`MountGrant`), stored under OAUTH_PREFIX + the key's name (`mountKeyName`,
  * src/runtime/secrets.ts); null when there is none or it cannot be opened here. The one reading of it, for the renewal
  * and for the credential inventory (cf/src/credential-inventory.ts).
+ *
+ * A deployment with no key-encryption key (`kek` null) and a key with no renewal record both answer null, so a caller
+ * cannot tell from the answer which of the two it was.
  */
 export async function readMountGrant(
   store: { getSecret(tenantId: string, agentId: string, name: string): Promise<{ ciphertext: string; iv: string } | null> },
