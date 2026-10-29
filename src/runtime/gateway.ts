@@ -10,7 +10,7 @@ import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclus
 import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
 import { keyedOperationId } from "./operation-id.ts";
-import type { PluginErrorFields, ToolSnapshot } from "../plugins/types.ts";
+import type { PluginErrorFields, ToolSnapshot, Withdrawal } from "../plugins/types.ts";
 import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf, BRIDGE_TOOL, classifyRoute, isJsonContentType, policyKeyOf, refusalOf, stricter } from "../plugins/types.ts";
 import type { BridgeDecl, ToolSchema } from "../plugins/types.ts";
 import { admitTools } from "./mount-tools.ts";
@@ -1141,10 +1141,12 @@ export class ToolGateway {
    * mount, for an exclusive plugin, as `releaseTask` is. A mount whose plugin has no `withdraw` registers nothing.
    */
   async withdrawTask(ctx: CallContext): Promise<{
-    things: Array<{ alias: string; id: string; clean: boolean; ownKey: boolean; code?: string; why?: string; review?: string; projectResidue?: Array<{ secretId: string; name: string; reason: string }> }>;
+    things: Array<{ alias: string } & Withdrawal["things"][number]>;
+    projects: Array<{ alias: string } & Withdrawal["project"]>;
     failed: Array<{ alias: string; error: string }>;
   }> {
-    const things: Array<{ alias: string; id: string; clean: boolean; ownKey: boolean; code?: string; why?: string; review?: string; projectResidue?: Array<{ secretId: string; name: string; reason: string }> }> = [];
+    const things: Array<{ alias: string } & Withdrawal["things"][number]> = [];
+    const projects: Array<{ alias: string } & Withdrawal["project"]> = [];
     const failed: Array<{ alias: string; error: string }> = [];
     for (const mount of await this.#store.listMounts(ctx.tenantId, ctx.agentId)) {
       const plugin = this.#plugins.get(mount.plugin);
@@ -1163,12 +1165,13 @@ export class ToolGateway {
           async agentSecret() { return null; },
         });
         const r = isExclusive(plugin) ? await this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${mount.alias}`, run) : await run();
-        for (const t of r) things.push({ alias: mount.alias, ...t });
+        for (const t of r.things) things.push({ alias: mount.alias, ...t });
+        projects.push({ alias: mount.alias, ...r.project });
       } catch (e) {
         failed.push({ alias: mount.alias, error: String((e as Error)?.message ?? e).slice(0, 200) });
       }
     }
-    return { things, failed };
+    return { things, projects, failed };
   }
 
   async releaseTask(

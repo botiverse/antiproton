@@ -1831,6 +1831,20 @@ export interface PromptPart {
   by: "agent" | "setup" | "plugin";
 }
 
+/**
+ * What a `Holding.withdraw` saw. `things`: one answer per held thing; `clean` only on positive evidence that nothing
+ * is registered on it any more; `ownKey` when it records being made under the mount's current kind of key, so its
+ * deletion by this mount's release can be believed; `code` why not clean. `project`: the registrations made outside the
+ * things (run9's project scope), as listed once: `complete` with every id seen, `failed`, `no_credential` (no key to
+ * list with), or `none` (nothing of that kind here); `findings` carry a thing's placeholder. The caller keeps findings
+ * where they outlive the mount, and resolves one only on a `complete` listing without it.
+ */
+export interface Withdrawal {
+  things: Array<{ id: string; clean: boolean; ownKey: boolean; why?: string; review?: string;
+    code?: "no_credential" | "stranded" | "listing_failed" | "not_withdrawn" | "project_listing_failed" }>;
+  project: { state: "complete" | "failed" | "no_credential" | "none"; ids: string[]; findings: Array<{ boxId: string; secretId: string; name: string }>; error?: string };
+}
+
 export interface Holding {
   /**
    * Which of this plugin's tools lets go of the thing, and which postpones.
@@ -1891,14 +1905,7 @@ export interface Holding {
    * showing none; registrations made outside it are `projectResidue`), and `ownKey` when the thing records being made under the mount's current kind of key, so a
    * deletion of it by this mount's release can be believed.
    */
-  withdraw?(ctx: PluginContext): Promise<Array<{ id: string; clean: boolean; ownKey: boolean; why?: string; review?: string;
-    /**
-     * Why not clean: no key to reach it, made under a key since replaced, a listing that failed, registrations left,
-     * a project-scope listing that failed (residue never checked), or residue kept from a thing no longer held.
-     */
-    code?: "no_credential" | "stranded" | "listing_failed" | "not_withdrawn" | "project_listing_failed" | "project_residue";
-    /** Registrations made outside the thing (run9's project scope) that still act for it, which this never removes. */
-    projectResidue?: Array<{ secretId: string; name: string; reason: string; firstSeen?: string }> }>>;
+  withdraw?(ctx: PluginContext): Promise<Withdrawal>;
   /**
    * Let go of it. Scoped to the AGENT rather than to one task, safe to call
    * again, and it must throw rather than return if something billed could not

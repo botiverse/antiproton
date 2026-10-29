@@ -32,6 +32,8 @@ import { MAX_BUDGET_CENTS, PLANS, type BudgetWrite, type Plan, type TenantPlanSt
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider, type ReconnectTarget } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
 import { logEvent } from "../../../src/core/log.ts";
+import { withResidue, type BoxEnd, type ResidueStore } from "../egress-residue.ts";
+import type { Withdrawal } from "../../../src/plugins/types.ts";
 import { logTurnStop, type StopTurnOutcome } from "../../../src/runtime/turn-stop.ts";
 import { WORKING_SET } from "../../../src/plugins/state.ts";
 import { SEED_MODES, seedPathProblem, seedText, sha256Hex as sha256Sync, type SeedFileMeta, type SeedMode, type SeedSeal, type SeedWriteResult } from "../../../src/store/seed-files.ts";
@@ -85,9 +87,7 @@ export interface ProvisionAgentOps {
    * its held things let go (`AgentRuntime.releaseForDelete`).
    */
   releaseForDelete?(tenantId: string, agentId: string): Promise<{
-    things: Array<{ alias: string; id: string; clean: boolean; via?: "withdrawn" | "deleted"; why?: string; review?: string;
-      projectResidue?: Array<{ secretId: string; name: string; reason: string }>;
-      code?: string; action?: "retry_delete" | "needs_operator_cleanup" | "await_provider_reclaim"; message?: string }>;
+    things: BoxEnd[]; projects: Array<{ alias: string } & Withdrawal["project"]>;
     released: string[];
     failed: Array<{ alias: string; stage: "withdraw" | "release"; error: string }>;
   }>;
@@ -239,6 +239,8 @@ export interface ProvisionDeps {
   readAudit?: ReadAudit;
   /** Held calls (docs/raft-approvals.md): each agent's, from its object, and the provider-wide copy. Absent: the routes answer 404. */
   approvals?: ProvisionApprovals;
+  /** Where egress residue outlives a mount and its agent (cf/src/egress-residue.ts). Absent: none is kept or reported. */
+  egressResidue?: ResidueStore;
 }
 
 /** What the approval routes act through (cf/src/index.ts): the agent's object for its own holds, D1 for every agent's. */
@@ -1037,8 +1039,13 @@ export async function handleProvision(
     // failed delete: it is in the answer (`sandboxes`), with what to do next.
     const releaseHeld = async () => {
       if (!deps.agent.releaseForDelete) return null;
-      try { return await deps.agent.releaseForDelete(tenantId, row.agentId); }
-      catch (e) { return { things: [], released: [], failed: [{ alias: "*", stage: "release" as const, error: `the agent's object did not answer: ${String((e as Error)?.message ?? e).slice(0, 160)}` }] }; }
+      let r: Awaited<ReturnType<NonNullable<ProvisionAgentOps["releaseForDelete"]>>>;
+      try { r = await deps.agent.releaseForDelete(tenantId, row.agentId); }
+      catch (e) { r = { things: [], projects: [], released: [], failed: [{ alias: "*", stage: "release" as const, error: `the agent's object did not answer: ${String((e as Error)?.message ?? e).slice(0, 160)}` }] }; }
+      // Residue kept in D1 laid over the boxes: found now, or before and not yet seen gone, its box held or not.
+      if (!deps.egressResidue) return r;
+      const at = deps.now();
+      return { ...r, things: await withResidue(deps.egressResidue, tenantId, row.agentId, r.things, r.projects, at, `delete:${at}`) };
     };
     // Right after the stop, before anything slower: a box still running acts with the agent's accounts until then.
     const held = await releaseHeld();

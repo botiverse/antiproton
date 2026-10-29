@@ -58,7 +58,7 @@ function env(flag: string | undefined, opts: { throws?: string } = {}) {
         reached.push(`${n} ${t}/${a}`);
         atCall.push(...(db.raw.prepare("SELECT outcome FROM admin_audit").all() as any[]).map((r) => r.outcome));
         if (opts.throws) throw new Error(opts.throws);
-        return { things: [{ alias: "sandbox", id: "box1", clean: true, ownKey: true }], failed: [] };
+        return { things: [{ alias: "sandbox", id: "box1", clean: true, via: "withdrawn" }], projects: [{ alias: "sandbox", state: "complete", ids: [], findings: [] }], failed: [] };
       },
     }),
   };
@@ -92,6 +92,19 @@ await check("with EGRESS_VERIFY_ROUTE=1: the token and a claimed caller are requ
   const outcomes = e.rows().map((r) => r.outcome);
   must(JSON.stringify(outcomes) === JSON.stringify(["unauthorized", "wrong_method", "no_claimed_caller", "no_agent_named", "no_such_agent"]), `the audit rows: ${JSON.stringify(e.rows())}`);
   must(e.rows().every((r) => r.route === "/admin/withdraw-egress" && typeof r.at === "number") && !JSON.stringify(e.rows()).includes(TOKEN), "a row is malformed, or holds the token");
+  // An unauthorized attempt names no tenant or agent.
+  must(e.rows()[0].tenant_id === null && e.rows()[0].agent_id === null && e.rows()[0].claimed_caller === "cody", `the 401 row: ${JSON.stringify(e.rows()[0])}`);
+});
+
+await check("with EGRESS_VERIFY_ROUTE=1: ids past 128 characters are refused 400 and never written; a 401 writes no ids, its claimed caller capped", async () => {
+  const e = env("1");
+  const long = "x".repeat(129);
+  const r = await send(e, `/admin/withdraw-egress?tenantId=t-p&agentId=${long}`);
+  must(r.status === 400 && e.reached.length === 0, `${r.status} ${r.text}`);
+  await send(e, `/admin/withdraw-egress?tenantId=${long}&agentId=raft_A1`, { "x-claimed-caller": "c".repeat(500) });
+  const rows = e.rows();
+  must(rows.length === 2 && rows[0].outcome === "ids_too_long" && rows[1].outcome === "unauthorized" && rows.every((x) => x.tenant_id === null && x.agent_id === null)
+    && !JSON.stringify(rows).includes(long) && rows[1].claimed_caller.length === 64, `the rows: ${JSON.stringify(rows).slice(0, 400)}`);
 });
 
 await check("with EGRESS_VERIFY_ROUTE=1: the audit row says started before the object is called; an object that throws leaves object_threw, and nothing it said is stored", async () => {

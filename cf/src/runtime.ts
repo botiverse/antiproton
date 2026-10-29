@@ -46,6 +46,8 @@ import {
 } from "../../src/runtime/pi-tools.ts";
 import { jsRunRow, modelAttemptRow, toolRefusedRow } from "../../src/trace/seams.ts";
 import { agentDeletedAt, logTurnStop, markAgentDeleted, turnStopRow, type StopTrigger, type StopTurnOutcome } from "../../src/runtime/turn-stop.ts";
+import { unclean, type BoxEnd, type UncleanCode } from "./egress-residue.ts";
+import type { Withdrawal } from "../../src/plugins/types.ts";
 import { explainUnavailableTool } from "../../src/runtime/unavailable-tool.ts";
 import {
   bindingKey, buildBriefing, programSendCounter, clearBackstop, conversationMessages, hasAnswer, judgeOverflow, mainCallOut, mainMessages, mainTip, needsReset, noteRebuilt,
@@ -765,33 +767,26 @@ export function statusesOnly(text: string): string {
 }
 
 /**
- * Why a held thing is not clean after an agent's delete. `not_withdrawn`, `listing_failed` (registrations left,
- * or run9 refusing, unreachable or answering what cannot be read) and `project_listing_failed` (the project-scope
- * listing failed, so residue was never checked) are what the next delete retries. The rest no retry
- * fixes: `project_residue` (the box is clear, a project-scope registration still acts for it), `stranded` (made under
- * a key since replaced), `no_credential` (no key to reach it), `deletion_unconfirmed` (let go, but not made under this
- * kind of key, so a "deleted" cannot be believed).
+ * Each withdrawn thing as answered. Clean only on positive evidence: withdrawn (a complete listing showing none), or let
+ * go by a release that did not fail (`releaseFailed`; null when no release was asked) of a thing recorded as made under
+ * the mount's own kind of key, so its "deleted" can be believed. A "not found" for a thing made under another key, or
+ * under none recorded, is never taken as deleted, and a project-scope listing that failed means residue was never
+ * checked, so not clean whatever became of the box.
  */
-export type UncleanCode = "not_withdrawn" | "listing_failed" | "project_listing_failed" | "project_residue" | "stranded" | "no_credential" | "deletion_unconfirmed";
-/**
- * What to do about each: `retry_delete` (the next delete can finish it); `needs_operator_cleanup` (a known object an
- * operator can reach, #1128: project-scope residue, or a box whose deletion cannot be believed); `await_provider_reclaim`
- * (nothing reachable with any current key: a stranded box, or a box whose mount holds no key at all, which #1128,
- * starting from the agent's mount as well, cannot list or reach either; it holds the credential until run9 reclaims
- * it). Only the first is retryable.
- */
-export type UncleanAction = "retry_delete" | "needs_operator_cleanup" | "await_provider_reclaim";
-const ACTION_OF: Record<UncleanCode, UncleanAction> = {
-  not_withdrawn: "retry_delete", listing_failed: "retry_delete", project_listing_failed: "retry_delete",
-  project_residue: "needs_operator_cleanup", deletion_unconfirmed: "needs_operator_cleanup",
-  stranded: "await_provider_reclaim", no_credential: "await_provider_reclaim",
-};
-const MESSAGE_OF: Partial<Record<UncleanAction, string>> = {
-  needs_operator_cleanup: "retrying the delete cannot clear this; it needs an operator (botiverse/antiproton#1128, planned)",
-  // Nothing here says waiting fixes it: reclaim needs the box idle, and the token itself does not expire.
-  await_provider_reclaim: "Cannot be located or deleted with current keys. The credential stops working only after the provider reclaims this box, " +
-    "and reclaim requires that nothing uses the box any more; a running background job keeps it alive. OAuth App tokens do not expire on their own.",
-};
+function boxEnds(things: Array<{ alias: string } & Withdrawal["things"][number]>, releaseFailed: ReadonlySet<string> | null): BoxEnd[] {
+  return things.map((t) => {
+    const listingFailed = t.code === "project_listing_failed";
+    const deleted = releaseFailed !== null && t.ownKey && !releaseFailed.has(t.alias);
+    const via = listingFailed ? null : t.clean ? "withdrawn" as const : deleted ? "deleted" as const : null;
+    const common = { alias: t.alias, id: t.id, ...(t.review ? { review: t.review } : {}), ...(t.why ? { why: t.why } : {}) };
+    if (via) return { alias: t.alias, id: t.id, ...(t.review ? { review: t.review } : {}), clean: true, via };
+    const code: UncleanCode = listingFailed ? "project_listing_failed"
+      : t.code === "stranded" || t.code === "no_credential" ? t.code
+      : releaseFailed !== null && !releaseFailed.has(t.alias) ? "deletion_unconfirmed"
+      : t.code === "listing_failed" ? "listing_failed" : "not_withdrawn";
+    return unclean({ ...common, clean: false }, code);
+  });
+}
 
 /**
  * What an agent's delete did to what its mounts hold (`AgentRuntime.releaseForDelete`): for each held thing, whether
@@ -799,10 +794,10 @@ const MESSAGE_OF: Partial<Record<UncleanAction, string>> = {
  * that can be believed), or why not; the mounts let go; and every step that failed.
  */
 export interface ReleaseForDelete {
-  things: Array<{ alias: string; id: string; clean: boolean; via?: "withdrawn" | "deleted"; why?: string; review?: string;
-    projectResidue?: Array<{ secretId: string; name: string; reason: string; firstSeen?: string }>;
-    /** Why not clean, and what to do: retried by the next delete, or a person's (#1128). */
-    code?: UncleanCode; action?: UncleanAction; message?: string }>;
+  /** Each held thing: clean with how, or why not and what to do (residue kept in D1 is laid over them by the caller). */
+  things: BoxEnd[];
+  /** Each mount's project-scope listing, for the caller to keep residue by (`withResidue`, cf/src/egress-residue.ts). */
+  projects: Array<{ alias: string } & Withdrawal["project"]>;
   released: string[];
   failed: Array<{ alias: string; stage: "withdraw" | "release"; error: string }>;
 }
@@ -4878,11 +4873,12 @@ export class AgentRuntime {
    * real box (`POST /admin/withdraw-egress`). On a live agent the next command wires the accounts again, as it does
    * after any change of credentials, so what it shows lasts until then.
    */
-  async withdrawEgress(tenantId: string, agentId: string) {
+  async withdrawEgress(tenantId: string, agentId: string): Promise<{ things: BoxEnd[]; projects: ReleaseForDelete["projects"]; failed: Array<{ alias: string; error: string }> }> {
     await this.ready();
     const w = await this.#gateway.withdrawTask({ tenantId, agentId, taskId: LEGACY_TASK });
-    // As the delete's answer does it: a failure's statuses, never its text (`statusesOnly`).
-    return { things: w.things, failed: w.failed.map((f) => ({ alias: f.alias, error: statusesOnly(f.error) })) };
+    // Nothing is let go here, so a box is clean only when withdrawn. As the delete's answer does it: a failure's
+    // statuses, never its text (`statusesOnly`).
+    return { things: boxEnds(w.things, null), projects: w.projects, failed: w.failed.map((f) => ({ alias: f.alias, error: statusesOnly(f.error) })) };
   }
 
   async releaseForDelete(tenantId: string, agentId: string): Promise<ReleaseForDelete> {
@@ -4890,30 +4886,9 @@ export class AgentRuntime {
     const ctx = { tenantId, agentId, taskId: LEGACY_TASK };
     const w = await this.#gateway.withdrawTask(ctx);
     const r = await this.#gateway.releaseTask(ctx);
-    // Clean only on positive evidence: withdrawn (a complete listing showing none), or let go by a release that
-    // did not fail, of a thing recorded as made under the mount's own kind of key, so its "deleted" can be believed.
-    // A "not found" for a thing made under another key, or under none recorded, is never taken as deleted.
-    const releaseFailed = new Set(r.failed.map((f) => f.alias));
     return {
-      things: w.things.map((t) => {
-        // A project-scope registration carrying the box's placeholder outlives the box: run9 injects it into whatever
-        // its label matches. Never clean while one is there, deleted box or not, and always named.
-        const residue = t.projectResidue?.length ? t.projectResidue : null;
-        // A project-scope listing that failed means residue was never checked: not clean whatever became of the box.
-        const listingFailed = t.code === "project_listing_failed";
-        const via = listingFailed ? null : t.clean ? "withdrawn" as const : t.ownKey && !releaseFailed.has(t.alias) ? "deleted" as const : null;
-        const common = { alias: t.alias, id: t.id, ...(t.review ? { review: t.review } : {}), ...(residue ? { projectResidue: residue } : {}) };
-        if (via && !residue) return { ...common, clean: true, via };
-        // The action follows the reason (`ACTION_OF`): only what the next delete can do is `retry_delete`.
-        const code: UncleanCode = listingFailed ? "project_listing_failed"
-          : via || t.code === "project_residue" ? "project_residue"
-          : t.code === "stranded" || t.code === "no_credential" ? t.code
-          : !releaseFailed.has(t.alias) ? "deletion_unconfirmed"
-          : t.code === "listing_failed" ? "listing_failed" : "not_withdrawn";
-        const action = ACTION_OF[code];
-        return { ...common, clean: false, ...(via ? { via } : {}), code, action, ...(t.why ? { why: t.why } : {}),
-          ...(MESSAGE_OF[action] ? { message: MESSAGE_OF[action] } : {}) };
-      }),
+      things: boxEnds(w.things, new Set(r.failed.map((f) => f.alias))),
+      projects: w.projects,
       released: r.released,
       // A failure's text is the plugin's, and may carry what run9 answered (a delete's or a stop's body): only the
       // HTTP statuses in it go into the answer, which reaches Raft. The whole text stays in the logs and the lease.

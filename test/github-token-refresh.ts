@@ -15,6 +15,7 @@ import { adoptProvisionedAgent } from "../cf/src/provision/steps.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
 import { d1ConnectorGrants, d1Connections, d1Connectors, d1ProvisionedAgents, renewalAudience } from "../cf/src/control-plane.ts";
+import { cleanupResidue, d1EgressResidue } from "../cf/src/egress-residue.ts";
 import { handleProvision, type ProvisionDeps } from "../cf/src/provision/handlers.ts";
 import { githubExchangeCode, GITHUB_TOKEN } from "../cf/src/auth.ts";
 import { OAUTH_PREFIX, RECONNECT_REASON, reasonCode } from "../cf/src/github-refresh.ts";
@@ -268,6 +269,8 @@ async function world(opts: { expiring?: boolean; github?: boolean; run9?: Return
   }
   const deps: ProvisionDeps = {
     now: () => Date.now(), registry,
+    // Egress residue kept in this D1, as production keeps it (cf/src/egress-residue.ts).
+    egressResidue: d1EgressResidue(db),
     // An agent's DELETE only: its push and its Raft credential, which these tests do not hold.
     agent: {
       tool: async () => ({ ok: true, result: {} }), removeCredential: async () => true,
@@ -1739,13 +1742,16 @@ await check("project-scope residue outlives its box and every retry, until a com
   const failed = await w.call("DELETE", "/agents/by-raft-agent/YG");
   must(residueOf(failed.body)[0]?.id === "p7" && residueOf(failed.body)[0]?.code === "project_listing_failed" && failed.body.retry === true
     && !failed.text.includes("ghu_LEAK"), `a failed listing: ${failed.text}`);
-  const stored = String((w.hostOf(a.agentId).sql.exec("SELECT value FROM plugin_db WHERE agent_id = ? AND alias = 'sandbox' AND key LIKE '%egress-residue%'", a.agentId).toArray()[0] as any)?.value ?? "");
-  must(stored.includes("p7") && !stored.includes("ghu_") && !stored.includes("down:"), `the stored residue: ${stored}`);
-  // A person removes it; a complete listing then shows it gone, and the delete is clean.
+  const stored = JSON.stringify(w.db.raw.prepare("SELECT * FROM egress_residue WHERE agent_id = ?").all(a.agentId));
+  must(stored.includes("p7") && !stored.includes("ghu_") && !stored.includes("down:") && !stored.includes('"resolved_at":1'), `the stored residue: ${stored}`);
+  // A person removes it; a complete listing then shows it gone, the delete is clean, and the row is kept, resolved,
+  // with the evidence: listing_absent, by this delete.
   run9.f.projectListFail = false;
   run9.project.splice(0);
   const done = await w.call("DELETE", "/agents/by-raft-agent/YG");
   must(done.body.clean === true && residueOf(done.body).length === 0, `after it went: ${done.text}`);
+  const row = w.db.raw.prepare("SELECT * FROM egress_residue WHERE agent_id = ? AND secret_id = 'p7'").get(a.agentId) as any;
+  must(row && typeof row.resolved_at === "number" && row.resolved_by === "listing_absent" && /^delete:\d+$/.test(row.resolved_ref), `the resolved row: ${JSON.stringify(row)}`);
   w.dispose();
 });
 
@@ -1775,6 +1781,51 @@ await check("a release run9 refuses with a body holding a token comes back as it
   w.dispose();
 });
 
+await check("residue is kept in D1, not the mount: it survives the sandbox mount being removed, and with no key to list by it awaits reclaim, not a retry", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("YJ");
+  await w.connect(a);
+  await w.sandbox(a);
+  const [boxId] = [...run9.boxes.keys()];
+  run9.project.push({ secret_id: "p8", name: "X", value: "x", placeholder: run9.boxes.get(boxId!)!.secrets[0]!.placeholder, inject_header_name: "authorization", allowed_hosts: ["api.github.com"] });
+  const first = await w.call("DELETE", "/agents/by-raft-agent/YJ");
+  must(!run9.boxes.has(boxId!) && boxOf(first.body)?.projectResidue?.[0]?.secretId === "p8", `first: ${first.text}`);
+  // L3: the box gone and the mount holding no key: nothing can list, so no retry fixes it.
+  await a.rt.store.setMountSecretRef(TENANT, a.agentId, "sandbox", null);
+  const nokey = await w.call("DELETE", "/agents/by-raft-agent/YJ");
+  must(boxOf(nokey.body)?.code === "no_credential" && boxOf(nokey.body).action === "await_provider_reclaim" && boxOf(nokey.body).projectResidue?.[0]?.secretId === "p8"
+    && nokey.body.retry === false, `no key: ${nokey.text}`);
+  // The sandbox mount removed altogether: the residue is still reported, from D1.
+  // (A seeded mount is not removable from the console; the store removes it with its storage, as an operator would.)
+  must(await a.rt.store.removeMount(TENANT, a.agentId, "sandbox", null), "control: the mount was not removed");
+  must(!(await a.rt.store.getMountByAlias(TENANT, a.agentId, "sandbox")), "control: the mount is still there");
+  const nomount = await w.call("DELETE", "/agents/by-raft-agent/YJ");
+  must(boxOf(nomount.body)?.projectResidue?.[0]?.secretId === "p8" && nomount.body.clean === false, `no mount: ${nomount.text}`);
+  w.dispose();
+});
+
+await check("residue is read by its own columns: a deleted agent whose registry row is gone is still listed; resolved rows are kept, dropped after 180 days, each cleanup audited", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const store = d1EgressResidue(w.db);
+  const now = Date.now(), DAY = 24 * 60 * 60 * 1000;
+  await store.record("t-x", "raft_GONE", "sandbox", [{ boxId: "b1", secretId: "s-open", name: "GH_TOKEN" }], now - 400 * DAY);
+  await store.record("t-x", "raft_GONE", "sandbox", [{ boxId: "b1", secretId: "s-old", name: "GH_TOKEN" }, { boxId: "b1", secretId: "s-new", name: "GH_TOKEN" }], now - 400 * DAY);
+  must(!w.db.raw.prepare("SELECT 1 FROM provisioned_agents WHERE agent_id = 'raft_GONE'").get(), "control: the agent has a registry row");
+  must((await store.open("t-x", "raft_GONE")).length === 3, "a deleted agent's residue is not listed");
+  // Resolved only by a complete listing without them: s-old long ago, s-new lately; s-open stays open.
+  await store.resolveAbsent("t-x", "raft_GONE", "sandbox", ["s-open", "s-new"], now - 200 * DAY, "delete:1");
+  await store.resolveAbsent("t-x", "raft_GONE", "sandbox", ["s-open"], now - 10 * DAY, "delete:2");
+  const dropped = await cleanupResidue(w.db, now);
+  const left = (w.db.raw.prepare("SELECT secret_id, resolved_by, resolved_ref FROM egress_residue WHERE agent_id = 'raft_GONE' ORDER BY secret_id").all() as any[]);
+  must(dropped === 1 && JSON.stringify(left.map((r) => r.secret_id)) === JSON.stringify(["s-new", "s-open"]) && left[0].resolved_by === "listing_absent" && left[0].resolved_ref === "delete:2",
+    `after the cleanup: ${dropped} ${JSON.stringify(left)}`);
+  const audit = w.db.raw.prepare("SELECT * FROM admin_audit WHERE route = 'cron:egress-residue-cleanup'").all() as any[];
+  must(audit.length === 1 && JSON.parse(audit[0].counts).dropped === 1, `the cleanup's audit row: ${JSON.stringify(audit)}`);
+  w.dispose();
+});
+
 await check("withdraw never deletes project-scope secrets (shared run9 project: would stop prod injection); withdraw runs while the box exists: after a delete there is nothing to withdraw", async () => {
   const run9 = run9Fake();
   const w = await world({ run9 });
@@ -1786,7 +1837,7 @@ await check("withdraw never deletes project-scope secrets (shared run9 project: 
   run9.project.push({ secret_id: "p3", name: "GH_TOKEN", value: "x", placeholder, inject_header_name: "authorization", allowed_hosts: ["api.github.com"] });
   // The operator's withdrawal (the route's answer) names it too, while the box is there.
   const op = await a.rt.withdrawEgress(TENANT, a.agentId);
-  must(op.things[0]?.projectResidue?.[0]?.secretId === "p3", `the operator's answer: ${JSON.stringify(op)}`);
+  must(op.projects[0]?.findings?.[0]?.secretId === "p3", `the operator's answer: ${JSON.stringify(op)}`);
   await w.call("DELETE", "/agents/by-raft-agent/YA");
   const writes = run9.sent.filter((x) => x.method !== "GET" && /^\/projects\/default\/secrets/.test(x.path));
   must(writes.length === 0 && run9.sent.some((x) => x.method === "GET" && x.path === "/projects/default/secrets"), `project-scope writes: ${JSON.stringify(writes.map((x) => `${x.method} ${x.path}`))}`);
