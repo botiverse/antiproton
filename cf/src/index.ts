@@ -2351,6 +2351,10 @@ export class AgentDO extends DurableObject<Env> {
    * plugin hold, by presence and renewal connector. Without claiming the object, so a look at one never made does not
    * make it the agent's; null for an agent this object does not hold. As `diagnose` reads: the store is read directly
    * and never readied, no runtime is built, no alarm is set, nothing is written.
+   *
+   * Reads with direct SELECTs and never builds the runtime: building it runs migrations and creates tables, with
+   * possible side effects. Tests cannot prove this (the object's constructor already creates tables); only review keeps
+   * it so.
    */
   async adminConnectionHoldings(tenantId: string, agentId: string, plugins: readonly string[]) {
     if (!this.#isAgent(tenantId, agentId)) return null;

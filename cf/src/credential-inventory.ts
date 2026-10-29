@@ -44,6 +44,10 @@ export interface ConnectionHolding {
 /**
  * What an agent's mounts of each plugin hold, read from its store with SELECTs only: no runtime is built, nothing is
  * readied, renewed or written, and the key itself is never opened (only the renewal record, for its connector).
+ *
+ * Reads with direct SELECTs and never builds the runtime: building it runs migrations and creates tables, with
+ * possible side effects. Tests cannot prove this (the object's constructor already creates tables); only review keeps
+ * it so.
  */
 export async function readConnectionHoldings(
   store: { findMountsByPlugin(t: string, a: string, plugin: string): Promise<MountRecord[]>; getSecret(t: string, a: string, name: string): Promise<Sealed | null> },
