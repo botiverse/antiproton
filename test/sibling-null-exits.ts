@@ -61,7 +61,9 @@ await check("raftbench: a mount that is there but not raft says so, apart from a
   assert(error === "the raft mount is not a raft mount", `the error reads: ${error}`);
 });
 
-// appworld: the second account's token, missing — the call is refused before any request, never sent without it.
+// appworld: the second account's token, missing. Three cases, by the API's own spec and the gate: one the gate withheld
+// refuses the call, required or optional; a required one with no mount or no account refuses it; an optional one with
+// no mount or no account is left unset and the call goes ahead. Each writes one row saying why.
 
 const catalogue: Catalogue = {
   shop: {
@@ -72,12 +74,18 @@ const catalogue: Catalogue = {
         { name: "item", type: "string", required: true, description: "", default: null, constraints: [] },
         { name: "drive_access_token", type: "string", required: false, description: "", default: null, constraints: [] },
       ],
+    }, {
+      app_name: "shop", api_name: "share_required", path: "/share_required", method: "POST", description: "",
+      parameters: [
+        { name: "item", type: "string", required: true, description: "", default: null, constraints: [] },
+        { name: "drive_access_token", type: "string", required: true, description: "", default: null, constraints: [] },
+      ],
     }],
   },
 };
 const [shop] = appworldPlugins(catalogue, { apiBaseUrl: "https://aw.example", apps: ["shop"] });
 
-async function share(sibling: PluginContext["sibling"]) {
+async function share(sibling: PluginContext["sibling"], tool = "share") {
   const sent: any[] = [];
   const original = globalThis.fetch;
   globalThis.fetch = (async (_url: string, init: RequestInit) => {
@@ -87,27 +95,42 @@ async function share(sibling: PluginContext["sibling"]) {
   const rows: any[] = [];
   try {
     let error = "";
-    const result = await shop!.invoke("share", { item: "x" }, context(sibling, { trace: (r) => rows.push(r) }))
+    const result = await shop!.invoke(tool, { item: "x" }, context(sibling, { trace: (r) => rows.push(r) }))
       .catch((e) => { error = String((e as Error)?.message ?? e); return null; });
     return { result, sent, rows, error };
   } finally { globalThis.fetch = original; }
 }
 
-await check("appworld: a null sibling refuses the call before any request, naming it, with one row saying why", async () => {
-  const { sent, rows, error } = await share(async () => null);
-  assert(/needs the drive mount's account for drive_access_token/.test(error) && /no callable mount named drive/.test(error), `the error: ${error}`);
-  assert(sent.length === 0, `a request was sent: ${JSON.stringify(sent)}`);
-  assert(rows.length === 1 && rows[0].kind === "appworld.sibling_unset" && rows[0].status === "not_callable"
-    && rows[0].attrs.param === "drive_access_token" && rows[0].attrs.sibling === "drive", `rows: ${JSON.stringify(rows)}`);
+const NO_ACCOUNT = async () => ({ credential: null, db: memoryDb(), plugin: "drive", policy: null });
+const WITHHELD = async () => ({ credential: null, withheld: true as const, db: memoryDb(), plugin: "drive", policy: null });
+
+await check("appworld, optional token: no mount or no account leaves it unset, the call goes ahead, one row says why", async () => {
+  for (const [what, sibling, status] of [["no mount", async () => null, "not_callable"], ["no account", NO_ACCOUNT, "no_credential"]] as const) {
+    const { result, sent, rows, error } = await share(sibling as any);
+    assert(error === "" && JSON.stringify(result) === JSON.stringify({ shared: true }), `${what}: ${error || JSON.stringify(result)}`);
+    assert(sent.length === 1 && !("drive_access_token" in sent[0]), `${what}: the request: ${JSON.stringify(sent)}`);
+    assert(rows.length === 1 && rows[0].kind === "appworld.sibling_unset" && rows[0].status === status
+      && rows[0].attrs.param === "drive_access_token" && rows[0].attrs.sibling === "drive", `${what}: rows ${JSON.stringify(rows)}`);
+  }
 });
 
-await check("appworld: a sibling with no credential is told apart from a null one, and from one the gate withheld", async () => {
-  const none = await share(async () => ({ credential: null, db: memoryDb(), plugin: "drive", policy: null }));
-  assert(none.rows.length === 1 && none.rows[0].status === "no_credential" && /no account attached/.test(none.error) && none.sent.length === 0,
-    `no credential: ${JSON.stringify(none)}`);
-  const withheld = await share(async () => ({ credential: null, withheld: true, db: memoryDb(), plugin: "drive", policy: null }));
-  assert(withheld.rows.length === 1 && withheld.rows[0].status === "withheld" && /siblingReaders/.test(withheld.error) && withheld.sent.length === 0,
-    `withheld: ${JSON.stringify(withheld)}`);
+await check("appworld, required token: no mount or no account refuses the call before any request, naming the sibling", async () => {
+  for (const [what, sibling, status, why] of [
+    ["no mount", async () => null, "not_callable", /no callable mount named drive/],
+    ["no account", NO_ACCOUNT, "no_credential", /no account attached/],
+  ] as const) {
+    const { sent, rows, error } = await share(sibling as any, "share_required");
+    assert(/needs the drive mount's account for drive_access_token/.test(error) && why.test(error), `${what}: ${error}`);
+    assert(sent.length === 0 && rows.length === 1 && rows[0].status === status, `${what}: sent ${sent.length}, rows ${JSON.stringify(rows)}`);
+  }
+});
+
+await check("appworld, withheld by the gate: refused before any request, required or optional, saying siblingReaders refused it", async () => {
+  for (const tool of ["share", "share_required"]) {
+    const { sent, rows, error } = await share(WITHHELD as any, tool);
+    assert(/refused by siblingReaders/.test(error) && /drive does not list shop/.test(error), `${tool}: ${error}`);
+    assert(sent.length === 0 && rows.length === 1 && rows[0].status === "withheld", `${tool}: sent ${sent.length}, rows ${JSON.stringify(rows)}`);
+  }
 });
 
 await check("appworld: a callable sibling sets the token and writes no row (control)", async () => {

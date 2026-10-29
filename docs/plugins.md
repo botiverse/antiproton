@@ -990,8 +990,11 @@ its credential reaches Raft's Agent Login directly, past everything above, so
 a plugin listed there can mint any app's grant. AppWorld builds one plugin
 per app, and each lists the other apps of the same build (derived from the one
 app list `appworldPlugins` is built from), since an action spanning two
-accounts takes the second app's token from that app's mount; when it cannot
-get it, the call is refused before any request, naming the sibling and why.
+accounts takes the second app's token from that app's mount. A token the gate
+withholds, or a required one whose mount is missing or has no account, refuses
+the call before any request, naming the sibling and why; an optional one whose
+mount is missing or has no account is left unset and the call goes ahead, with
+a trace row saying why.
 **Editing a `siblingReaders` list is a security change.** It is a rule the gateway enforces, not a scan:
 `test/gateway-sibling-gate.ts` holds it, and `test/raft-agent-login.ts` keeps
 a scan naming every reader of `sibling` as a backstop.
