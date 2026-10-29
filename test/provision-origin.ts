@@ -133,7 +133,7 @@ const NOT_THE_PATH: Array<{ call: string; why: string }> = [
   { call: "const row = await deps.registry.get(tenantId, raftAgentId);\n  if (!row || row.deletedAt !== null) return { ok: false", why: "repairPush: the id an operator names, no provider route" },
   { call: "let row = await deps.registry.get(tenantId, raftAgentId);", why: "POST /agents: the body's raftAgentId (a create or its replay; see the cases outside /agents/<id> below)" },
   { call: "const a = raftAgentId === row.raftAgentId ? row : await deps.registry.get(tenantId, raftAgentId);", why: "reconnect in place: the other agents bound to the connector" },
-  { call: "const row = await deps.registry.get(tenantId, raftAgentId);\n      if (row) await c.detachIfFrom", why: "DELETE /connectors/:id: the agents bound to the connector" },
+  { call: "const row = await deps.registry.get(tenantId, raftAgentId).catch(() => undefined);", why: "DELETE /connectors/:id: the agents bound to the connector" },
   { call: "const got = await c.registry.get(tenantId, row.raftAgentId, p);", why: "the connection registry, keyed by an agent already found (two calls)" },
 ];
 const HANDLERS_TEXT = readFileSync(HANDLERS, "utf8");
@@ -224,7 +224,10 @@ const CONNECTOR = { id: "k1", tenantId: TENANT, provider: "github", account: "oc
  * Connections whose calls are recorded: `acted` names each agent a call changed, and each connector written or removed.
  * `store` is the tenant's connectors, every origin's, as D1 holds them.
  */
-function connections(acted: string[], bound: string[], store: Array<typeof CONNECTOR> = [CONNECTOR]) {
+/** How an agent's mount answers a detach: by the connector's credential (`match`), then by the agent (`byAgent`). */
+type DetachMode = { match: boolean | "throw"; byAgent: boolean | "throw" };
+function connections(acted: string[], bound: string[], store: Array<typeof CONNECTOR> = [CONNECTOR], modes: Record<string, DetachMode> = {}) {
+  const answer = (v: boolean | "throw", what: string) => { if (v === "throw") throw new Error(`${what} failed`); return v; };
   return {
     newId: () => "k-new",
     confirm: async () => ({ ok: true, account: "octo", accountId: "1", sealed: SEALED, refresh: null, reconnect: { connectorId: "k1", actingRole: "admin" } }),
@@ -238,7 +241,16 @@ function connections(acted: string[], bound: string[], store: Array<typeof CONNE
     },
     registry: { boundTo: async () => bound, remove: async () => {}, put: async () => {}, get: async () => null },
     reconnect: async (_t: string, agentId: string) => { acted.push(agentId); return { ok: true, updated: true }; },
-    detachIfFrom: async (_t: string, agentId: string) => { acted.push(agentId); return true; },
+    detachIfFrom: async (_t: string, agentId: string) => {
+      const m = answer(modes[agentId]?.match ?? true, "the match");
+      if (m) acted.push(agentId);
+      return m;
+    },
+    detach: async (_t: string, agentId: string) => {
+      const m = answer(modes[agentId]?.byAgent ?? true, "the detach by agent");
+      if (m) acted.push(`${agentId} by agent`);
+      return m;
+    },
     attach: async (_t: string, agentId: string) => { acted.push(agentId); return { ok: true, account: "octo" }; },
   };
 }
@@ -351,14 +363,6 @@ await check("another origin's own agent cannot list, attach, reconnect or discon
   assert(problems.length === 0, problems.join("\n        "));
 });
 
-await check("disconnecting this origin's connector takes its credential off every agent bound to it, another origin's too", async () => {
-  const acted: string[] = [];
-  const d = deps(row, { connections: connections(acted, [RAFT_AGENT, THEIR_AGENT.raftAgentId]) }, [THEIR_AGENT]);
-  const r = await send(d.deps, "DELETE", "/connectors/k1", OURS, ACTING);
-  assert(r.status === 200 && acted.includes(AGENT) && acted.includes(THEIR_AGENT.agentId) && acted.includes("connector removed"),
-    `${r.status} ${r.text}; changed ${acted.join(", ")}`);
-});
-
 /** A D1 over node:sqlite with every migration applied, up to (not including) `before` when given. */
 function d1(before?: string) {
   const db = new DatabaseSync(":memory:");
@@ -383,6 +387,35 @@ function d1(before?: string) {
   const made = (agentId: string, id: string) => db.prepare("INSERT INTO connector_events(tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at) VALUES (?, ?, ?, 'create', 'u-1', 'creator', 1)").run(TENANT, id, agentId);
   return { db, D1, rest: () => apply(files.slice(at)), agent, connector, bind, made };
 }
+
+await check("disconnect: each bound agent ends detached, cleared elsewhere, or failed; only the first is clean, and another origin's ids are not answered", async () => {
+  const MINE2: ProvisionedAgent = { ...row, raftAgentId: "01JMINE2", agentId: "raft_01JMINE2" };
+  const MINE3: ProvisionedAgent = { ...row, raftAgentId: "01JMINE3", agentId: "raft_01JMINE3" };
+  const THEIRS2: ProvisionedAgent = { ...THEIR_AGENT, raftAgentId: "01JTHEIRS2", agentId: "raft_01JTHEIRS2" };
+  const go = async (agents: ProvisionedAgent[], modes: Record<string, DetachMode>) => {
+    const acted: string[] = [];
+    const d = deps(agents[0]!, { connections: connections(acted, agents.map((a) => a.raftAgentId), [CONNECTOR], modes) }, agents.slice(1));
+    const r = await send(d.deps, "DELETE", "/connectors/k1", OURS, ACTING);
+    return { ...r, body: JSON.parse(r.text || "null"), acted };
+  };
+  // Clean: this origin's agents, one by the connector's credential, one by the agent when the match fails (an older copy).
+  const clean = await go([row, MINE2], { [MINE2.agentId]: { match: false, byAgent: true } });
+  assert(clean.status === 200 && JSON.stringify(clean.body.detached) === JSON.stringify([RAFT_AGENT, MINE2.raftAgentId]) && !("otherOrigins" in clean.body)
+    && clean.acted.includes(`${MINE2.agentId} by agent`) && clean.acted.includes("connector removed"), `clean: ${clean.status} ${clean.text}`);
+  // Cleared elsewhere: another origin's agents, held an older copy (the match fails), removed by the agent. Not clean,
+  // and their ids are not in the answer.
+  const other = await go([row, THEIR_AGENT, THEIRS2], { [THEIR_AGENT.agentId]: { match: false, byAgent: true } });
+  assert(other.status === 200 && JSON.stringify(other.body.detached) === JSON.stringify([RAFT_AGENT]) && other.body.otherOrigins?.cleared === 2
+    && other.body.otherOrigins.failed === 0 && /re-authorise or revoke it on GitHub/.test(other.body.otherOrigins.message)
+    && !other.text.includes("THEIRS") && other.acted.includes(`${THEIR_AGENT.agentId} by agent`), `elsewhere: ${other.status} ${other.text}`);
+  // Failed: neither the match nor the agent removes it. Never detached; the connector stays, for the same call again.
+  const mine = await go([row, MINE3], { [MINE3.agentId]: { match: false, byAgent: "throw" } });
+  assert(mine.status === 502 && mine.body.error.code === "partially_disconnected" && JSON.stringify(mine.body.detached) === JSON.stringify([RAFT_AGENT])
+    && mine.body.failed?.[0]?.raftAgentId === MINE3.raftAgentId && !mine.acted.includes("connector removed"), `failed: ${mine.status} ${mine.text}`);
+  const theirs = await go([row, THEIR_AGENT], { [THEIR_AGENT.agentId]: { match: "throw", byAgent: true } });
+  assert(theirs.status === 502 && theirs.body.otherOrigins?.failed === 1 && (theirs.body.failed ?? []).length === 0 && !theirs.text.includes("THEIRS")
+    && !theirs.acted.includes("connector removed"), `failed elsewhere: ${theirs.status} ${theirs.text}`);
+});
 
 await check("migration 0030 on a fixture made before it: each connector takes the origin of the agent it was made for, or none; another origin's bindings are cut, each recorded first", async () => {
   const f = d1("0030_");

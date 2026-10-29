@@ -1586,30 +1586,56 @@ async function disconnect(tenantId: string, connectorId: string, body: unknown, 
   const provider = k.provider as ConnectionProvider;
   // Not atomic with a PUT that lands between `boundTo` and the delete below: that agent keeps a copy of
   // the credential and a connectorId that no longer exists, until it is pointed elsewhere or disconnected.
+  //
+  // Every agent bound to it gives the credential up, another origin's too: one bound before connectors had an origin
+  // (0030) holds this origin's credential, which is this origin's to take back. First by the connector's own
+  // credential (`detachIfFrom`); when the mount holds something else (an older copy: a non-expiring token from before a
+  // reconnect in place, which skips another origin's agents), by the agent, since the binding says the mount is this
+  // connector's. Each agent ends in one of three ways, and only the first is clean:
+  //  - detached: this origin's agent, its copy removed;
+  //  - cleared elsewhere: another origin's agent, its copy removed, but that origin has held a working token for this
+  //    connector, which only re-authorising or revoking it on GitHub ends (a person's decision, not made here);
+  //  - failed: nothing could be removed; the connector stays, and the same call tries again.
+  // Another origin's agents are counted in the answer and named only in the log: their ids are that origin's.
   const detached: string[] = [];
   const failed: Array<{ raftAgentId: string; error: string }> = [];
-  // Every agent holding this connector's credential gives it up, another origin's too: one bound before connectors had
-  // an origin (0030) holds this origin's credential, which is this origin's to take back. The detach takes only this
-  // connector's own credential off a mount (`detachIfFrom`), never a key put there since.
+  const elsewhere: string[] = [];
+  const elsewhereFailed: Array<{ raftAgentId: string; error: string }> = [];
   for (const raftAgentId of await c.registry.boundTo(tenantId, k.id)) {
+    const row = await deps.registry.get(tenantId, raftAgentId).catch(() => undefined);
+    const ours = !row || row.raftOrigin === who.raftOrigin;
     try {
-      const row = await deps.registry.get(tenantId, raftAgentId);
-      if (row) await c.detachIfFrom(tenantId, row.agentId, provider, k.sealed, k.id);
+      if (row === undefined) throw new Error("the agent could not be read");
+      if (row) {
+        const matched = await c.detachIfFrom(tenantId, row.agentId, provider, k.sealed, k.id);
+        // Not the connector's credential by value or by what renews it: removed by the agent. False here means the
+        // mount holds nothing of the agent's own to take, which is the same end.
+        if (!matched) await c.detach(tenantId, row.agentId, provider);
+      }
       await c.registry.remove(tenantId, raftAgentId, provider);
-      detached.push(raftAgentId);
+      (ours ? detached : elsewhere).push(raftAgentId);
     } catch (e) {
-      failed.push({ raftAgentId, error: String((e as { message?: unknown })?.message ?? e).slice(0, 200) });
+      (ours ? failed : elsewhereFailed).push({ raftAgentId, error: String((e as { message?: unknown })?.message ?? e).slice(0, 200) });
     }
   }
-  if (failed.length) {
+  const otherOrigins = elsewhere.length || elsewhereFailed.length ? {
+    otherOrigins: {
+      cleared: elsewhere.length, failed: elsewhereFailed.length,
+      message: "agents of another Raft origin held this connector's credential: their copies are removed here, but that origin has had a working token; re-authorise or revoke it on GitHub to end it",
+    },
+  } : {};
+  logEvent("connect.disconnect", { tenantId, connectorId: k.id, detached: detached.join(" "), failed: failed.map((f) => f.raftAgentId).join(" "),
+    clearedElsewhere: elsewhere.join(" "), failedElsewhere: elsewhereFailed.map((f) => f.raftAgentId).join(" "),
+    errors: [...failed, ...elsewhereFailed].map((f) => f.error).join(" | ").slice(0, 500) });
+  if (failed.length || elsewhereFailed.length) {
     return Response.json({
       error: { code: "partially_disconnected", message: "some agents still hold this connector's credential; the same call finishes the job" },
-      detached, failed,
+      detached, failed, ...otherOrigins,
     }, { status: 502, headers: { "cache-control": "no-store" } });
   }
   await c.connectors.remove(tenantId, k.id);
   await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: null, action: "disconnect", ...acting, at: deps.now() });
-  return ok({ disconnected: true, connectorId: k.id, detached });
+  return ok({ disconnected: true, connectorId: k.id, detached, ...otherOrigins });
 }
 
 /**
