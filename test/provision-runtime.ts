@@ -314,11 +314,12 @@ await check("a held connection becomes the GitHub mount's credential once, only 
     must(String((await rt.store.getMountByAlias("t", "raft_c2", "gh"))?.secretRef).startsWith("agent:"), "the second agent's GitHub mount has no credential");
     // When the connector goes, a key someone put on the mount since stays; the connector's own copy goes.
     must((await rt.attachCredential("t", "raft_c2", "gh", { token: "gho_mine" })).ok, "a console key was refused");
+    if (!ok.ok) throw new Error(`the confirm failed: ${JSON.stringify(ok)}`);
     const other = await rt.detachConnectionIfFrom("t", "raft_c2", "github", ok.sealed);
-    must(ok.ok && other.ok && !other.removed && other.other === true, `a key put on the mount since was taken with the connector: ${JSON.stringify(other)}`);
+    must(other.ok && !other.removed && other.other === true, `a key put on the mount since was taken with the connector: ${JSON.stringify(other)}`);
     must(String((await rt.store.getMountByAlias("t", "raft_c2", "gh"))?.secretRef).startsWith("agent:"), "the console key is gone");
     const own = await rt.detachConnectionIfFrom("t", "raft_c1", "github", ok.sealed);
-    must(ok.ok && own.ok && own.removed, `the connector's own copy was not taken: ${JSON.stringify(own)}`);
+    must(own.ok && own.removed, `the connector's own copy was not taken: ${JSON.stringify(own)}`);
     must(!String((await rt.store.getMountByAlias("t", "raft_c1", "gh"))?.secretRef).startsWith("agent:"), "the connector's copy is still on the mount");
 
     await rt.holdConnection("t", "raft_c1", "github", "gho_old", "pend_cccccccc", Date.now() - 1, "u_owner");
