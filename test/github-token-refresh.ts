@@ -2005,7 +2005,8 @@ await check("a mount whose reference names a key other than its alias: read, sho
   const a = await w.agent("ZK");
   const connectorId = await w.connect(a);
   const alias = (await a.rt.store.findMountsByPlugin(TENANT, a.agentId, "github"))[0]!.alias;
-  const KEY = "gh_key";
+  // A name a mount could have (`MOUNT_ALIAS`) and no other mount uses: this mount's own key, which it may write.
+  const KEY = "gh-key";
   // The key and its renewal record under another name than the alias, the reference naming it.
   const host = w.hostOf(a.agentId);
   host.sql.exec("UPDATE secrets SET name = ? WHERE name = ?", KEY, alias);
@@ -2046,7 +2047,8 @@ await check("a mount whose reference names a key other than its alias: read, sho
   const guard = await a.rt.detachConnectionIfFrom(TENANT, a.agentId, "github", await seal2(kek, "ghu_" + "o".repeat(36)), "k-not-this-one");
   must(guard.ok && guard.removed === false && (guard as { other?: true }).other === true, `the disconnect's guard: ${JSON.stringify(guard)}`);
   // Removing the credential takes the key and its renewal record by that name.
-  must((await a.rt.removeCredentialOrWhy(TENANT, a.agentId, alias)).ok, "the remove was refused");
+  const removed = await a.rt.removeCredentialOrWhy(TENANT, a.agentId, alias);
+  must(removed.ok && removed.removed === true, `the remove: ${JSON.stringify(removed)}`);
   must(names().length === 0, `left after the remove: ${JSON.stringify(names())}`);
   w.dispose();
 });
@@ -2059,7 +2061,8 @@ await check("another agent's renewal and a reconnect in place reach a mount whos
   const id = await w.connect(a);
   await w.call("PUT", `/agents/by-raft-agent/ZB/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
   const alias = (await b.rt.store.findMountsByPlugin(TENANT, b.agentId, "github"))[0]!.alias;
-  const KEY = "gh_key";
+  // A name a mount could have (`MOUNT_ALIAS`) and no other mount uses: this mount's own key, which it may write.
+  const KEY = "gh-key";
   const host = w.hostOf(b.agentId);
   host.sql.exec("UPDATE secrets SET name = ? WHERE name = ?", KEY, alias);
   host.sql.exec("UPDATE secrets SET name = ? WHERE name = ?", OAUTH_PREFIX + KEY, OAUTH_PREFIX + alias);
@@ -2086,7 +2089,8 @@ await check("a box that takes a key named apart from its alias records the use u
   const a = await w.agent("ZU");
   await w.connect(a);
   const alias = (await a.rt.store.findMountsByPlugin(TENANT, a.agentId, "github"))[0]!.alias;
-  const KEY = "gh_key";
+  // A name a mount could have (`MOUNT_ALIAS`) and no other mount uses: this mount's own key, which it may write.
+  const KEY = "gh-key";
   const host = w.hostOf(a.agentId);
   host.sql.exec("UPDATE secrets SET name = ? WHERE name = ?", KEY, alias);
   host.sql.exec("UPDATE secrets SET name = ? WHERE name = ?", OAUTH_PREFIX + KEY, OAUTH_PREFIX + alias);
@@ -2156,6 +2160,67 @@ await check("renaming a mount whose key is filed under its alias moves the key, 
   must(r.ok, `the rename was refused: ${JSON.stringify(r)}`);
   must((await ref("gh2")) === "agent:gh2", `the reference: ${await ref("gh2")}`);
   must(JSON.stringify(names()) === JSON.stringify(["gh2", "oauth:gh2"]), `the rows: ${JSON.stringify(names())}`);
+  w.dispose();
+});
+
+// A mount's reference naming a key that is something else's: writes from this mount refuse it, and a remove clears
+// only the reference, which is the way out (`#foreignKey` in cf/src/runtime.ts).
+await check("a mount whose reference names another mount's key: an attach is refused (mount_key_foreign:shared) and changes nothing; a remove clears only the reference; then a key attaches under its alias", async () => {
+  const w = await world();
+  const a = await w.agent("FS");
+  await w.connect(a);
+  const host = w.hostOf(a.agentId);
+  const token = (await w.stored(a)).token!;
+  // A second mount whose reference names the first mount's key, `gh`.
+  await a.rt.store.addMount({
+    tenantId: TENANT, agentId: a.agentId, alias: "gh-b", plugin: "github",
+    installationId: "i-gh-b", connectionId: null, toolVersion: "1.0.0",
+    publicConfig: {}, secretRef: "agent:gh", policy: null,
+  });
+  const rows = () => JSON.stringify(host.sql.exec("SELECT name, ciphertext, iv FROM secrets WHERE name IN ('gh', 'oauth:gh') ORDER BY name").toArray());
+  const names = () => (host.sql.exec("SELECT name FROM secrets ORDER BY name").toArray() as any[]).map((r) => String(r.name));
+  const ref = async (at: string) => (await a.rt.store.getMountByAlias(TENANT, a.agentId, at))?.secretRef;
+  const before = rows();
+  must(JSON.stringify(names()) === JSON.stringify(["gh", "oauth:gh"]), `the fixture: ${JSON.stringify(names())}`);
+  const refused = await a.rt.attachCredential(TENANT, a.agentId, "gh-b", { token });
+  must(!refused.ok && refused.error.startsWith("mount_key_foreign:shared:") && /removing the credential clears the reference/.test(refused.error),
+    `the attach: ${JSON.stringify(refused)}`);
+  must(rows() === before && JSON.stringify(names()) === JSON.stringify(["gh", "oauth:gh"]) && (await ref("gh-b")) === "agent:gh",
+    `the refused attach changed something: ${JSON.stringify(names())} ${await ref("gh-b")}`);
+  const removed = await a.rt.removeCredentialOrWhy(TENANT, a.agentId, "gh-b");
+  must(removed.ok && removed.removed === false && removed.foreign === "gh" && removed.reason === "shared", `the remove: ${JSON.stringify(removed)}`);
+  must(rows() === before && (await ref("gh-b")) === null && (await ref("gh")) === "agent:gh", `after the remove: ${rows()} gh-b ${await ref("gh-b")}`);
+  const attached = await a.rt.attachCredential(TENANT, a.agentId, "gh-b", { token });
+  must(attached.ok, `the attach after the remove: ${JSON.stringify(attached)}`);
+  must((await ref("gh-b")) === "agent:gh-b" && rows() === before && JSON.stringify(names()) === JSON.stringify(["gh", "gh-b", "oauth:gh"]),
+    `after the attach: ${await ref("gh-b")} ${JSON.stringify(names())}`);
+  w.dispose();
+});
+
+await check("a mount whose reference names an inbound hook's signing secret: an attach and a connection's attach are refused (mount_key_foreign:not_a_mount_key); a remove clears only the reference", async () => {
+  const w = await world();
+  const { importKek, seal } = await import("../src/runtime/secrets.ts");
+  const { hookSecretName } = await import("../src/runtime/inbound.ts");
+  const kek = await importKek(KEK);
+  const a = await w.agent("FH");
+  await w.connect(a);
+  const host = w.hostOf(a.agentId);
+  const token = (await w.stored(a)).token!;
+  const hook = hookSecretName("h-1");
+  await a.rt.store.putSecret(TENANT, a.agentId, hook, { ciphertext: "signing-secret", iv: "iv" });
+  await a.rt.store.setMountSecretRef(TENANT, a.agentId, "gh", `agent:${hook}`);
+  const rows = () => JSON.stringify(host.sql.exec("SELECT name, ciphertext, iv FROM secrets ORDER BY name").toArray());
+  const ref = async () => (await a.rt.store.getMountByAlias(TENANT, a.agentId, "gh"))?.secretRef;
+  const before = rows();
+  const refused = await a.rt.attachCredential(TENANT, a.agentId, "gh", { token });
+  must(!refused.ok && refused.error.startsWith("mount_key_foreign:not_a_mount_key:"), `the attach: ${JSON.stringify(refused)}`);
+  const sealed = await seal(kek, token);
+  const connection = await a.rt.attachSealedConnection(TENANT, a.agentId, "github", sealed, null);
+  must(!connection.ok && connection.error.startsWith("mount_key_foreign:not_a_mount_key:"), `the connection's attach: ${JSON.stringify(connection)}`);
+  must(rows() === before && (await ref()) === `agent:${hook}`, `a refused attach changed something: ${rows()} ${await ref()}`);
+  const removed = await a.rt.removeCredentialOrWhy(TENANT, a.agentId, "gh");
+  must(removed.ok && removed.removed === false && removed.foreign === hook && removed.reason === "not_a_mount_key", `the remove: ${JSON.stringify(removed)}`);
+  must(rows() === before && (await ref()) === null, `after the remove: ${rows()} ${await ref()}`);
   w.dispose();
 });
 

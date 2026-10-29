@@ -203,6 +203,8 @@ import { RunJsContinuations } from "../../src/runtime/run-js-resume.ts";
 
 /** What an operator may call a mount: it becomes the `<alias>__` prefix of every tool name. */
 export const MOUNT_ALIAS = /^[a-z][a-z0-9-]{0,23}$/;
+/** Why a mount's reference names a key that is not its own (`AgentRuntime#foreignKey`). */
+export type ForeignKeyReason = "shared" | "not_a_mount_key";
 
 /**
  * How a mount added from the console is told apart: its `installationId`
@@ -1859,6 +1861,35 @@ export class AgentRuntime {
   // ---- per-agent credentials, from the console. Value in, metadata out.
 
   /**
+   * Whether the key a mount's reference names is something else's, so this mount must not write or delete it:
+   * `shared`, another mount's (another mount's reference names it, or the key is filed under another mount's alias);
+   * `not_a_mount_key`, a name no mount can have (`MOUNT_ALIAS`), such as an inbound hook's signing secret
+   * (`hook:<id>`) or a renewal record. Null for no key of the agent's, and for this mount's own key, whether or not it
+   * is named after the alias.
+   *
+   * Writes refuse a foreign name and reads never refuse, so that this state stays visible: the key is still read,
+   * shown and listed by the credential inventory (cf/src/credential-inventory.ts), which is where it is found.
+   */
+  async #foreignKey(tenantId: string, agentId: string, mount: { alias: string; secretRef: string | null }):
+    Promise<{ name: string; reason: ForeignKeyReason } | null> {
+    const name = agentKeyName(mount.secretRef);
+    if (name === null || name === mount.alias) return null;
+    if (!MOUNT_ALIAS.test(name)) return { name, reason: "not_a_mount_key" };
+    const others = (await this.store.listMounts(tenantId, agentId)).filter((m) => m.alias !== mount.alias);
+    if (others.some((m) => m.alias === name || agentKeyName(m.secretRef) === name)) return { name, reason: "shared" };
+    return null;
+  }
+
+  /** Why an attach to a mount whose reference names a foreign key (`#foreignKey`) is refused, and the way out. */
+  static foreignKeyRefusal(alias: string, foreign: { name: string; reason: ForeignKeyReason }): string {
+    const why = foreign.reason === "shared"
+      ? `${foreign.name} is another mount's key`
+      : `${foreign.name} cannot be a mount's key, so the reference is misconfigured`;
+    return `mount_key_foreign:${foreign.reason}: ${alias}'s reference names a key that is not its own (${why}); ` +
+      `removing the credential clears the reference, and a key attached after that goes under ${alias}`;
+  }
+
+  /**
    * Store a credential for one of this agent's mounts and point the mount at
    * it. `fields` is what the form posted, keyed by the plugin's declared field
    * names; a bare token comes as `{ token }`. The value is sealed before it
@@ -1898,6 +1929,8 @@ export class AgentRuntime {
           `which cannot be given back once replaced; a key of your own goes on a mount of your own`,
       };
     }
+    const foreign = await this.#foreignKey(tenantId, agentId, mount);
+    if (foreign) return { ok: false, error: AgentRuntime.foreignKeyRefusal(alias, foreign) };
     const plugin = this.#plugins.find((p) => p.id === mount.plugin);
     if (!plugin?.credential) return { ok: false, error: `${mount.plugin} takes no credential` };
     const form = credentialForm(plugin.credential);
@@ -2178,6 +2211,9 @@ export class AgentRuntime {
     // More than one and the choice would be arbitrary; say so rather than attach to one of them.
     if (mounts.length > 1) return { ok: false, error: `this agent has ${mounts.length} ${plugin} mounts (${mounts.map((m) => m.alias).join(", ")}); connect one in the console` };
     const mount = mounts[0]!;
+    // Before the connector is renewed for it: the attach below would refuse the same, after that write.
+    const foreign = await this.#foreignKey(tenantId, agentId, mount);
+    if (foreign) return { ok: false, error: AgentRuntime.foreignKeyRefusal(mount.alias, foreign) };
     let token = grant?.accessToken ?? await open(kek, sealed);
     let rec: Omit<MountGrant, "v"> | null = refresh ? {
       refreshToken: grant?.refreshToken ?? await open(kek, refresh.sealed),
@@ -2270,8 +2306,14 @@ export class AgentRuntime {
     return (await this.removeCredentialOrWhy(tenantId, agentId, alias)).ok;
   }
 
-  /** `removeCredential`, with why it was refused: the console shows that rather than a page that did not change. */
-  async removeCredentialOrWhy(tenantId: string, agentId: string, alias: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  /**
+   * `removeCredential`, with why it was refused: the console shows that rather than a page that did not change.
+   * `removed: false` with `foreign` is a reference to a key that is not this mount's (`#foreignKey`): the reference
+   * is cleared and the key and its renewal record are left where they are, which is the way out of that state.
+   */
+  async removeCredentialOrWhy(tenantId: string, agentId: string, alias: string): Promise<
+    { ok: true; removed: true } | { ok: true; removed: false; foreign: string; reason: ForeignKeyReason } | { ok: false; error: string }
+  > {
     await this.ready();
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
     if (!mount) return { ok: false, error: `no mount named ${alias}` };
@@ -2279,12 +2321,15 @@ export class AgentRuntime {
     // The key goes only once nothing it made is still held: after this, nothing could delete it.
     const held = await this.#releaseBeforeCredentialChange(tenantId, agentId, alias);
     if (held) return { ok: false, error: held };
-    const name = agentKeyName(mount.secretRef)!;
-    await this.store.removeSecret(tenantId, agentId, name);
-    await this.#oauth.forget(tenantId, agentId, name);
+    const foreign = await this.#foreignKey(tenantId, agentId, mount);
+    if (!foreign) {
+      const name = agentKeyName(mount.secretRef)!;
+      await this.store.removeSecret(tenantId, agentId, name);
+      await this.#oauth.forget(tenantId, agentId, name);
+    }
     await this.store.setMountSecretRef(tenantId, agentId, alias, AgentRuntime.seededSecretRef(mount));
     await this.#toolsAfterCredentialChange(tenantId, agentId, alias);
-    return { ok: true };
+    return foreign ? { ok: true, removed: false, foreign: foreign.name, reason: foreign.reason } : { ok: true, removed: true };
   }
 
   /**
