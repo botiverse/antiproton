@@ -132,7 +132,8 @@ function run9Fake() {
   const boxes = new Map<string, { state: string; secrets: Secret[] }>();
   const ws = "https://api.run.sys9.ai/projects/default/workspace";
   let n = 0;
-  const f = { failDelete: false, failWithdraw: false };
+  // `ignoreWithdraw`: it answers a removal 200 and keeps the registration (a removal taken but not applied).
+  const f = { failDelete: false, failWithdraw: false, ignoreWithdraw: false };
   const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json" } });
   async function handle(url: string, init?: RequestInit): Promise<Response> {
     const method = init?.method ?? "GET";
@@ -160,7 +161,7 @@ function run9Fake() {
       const b = boxes.get(m[1]!);
       if (!b) return json({ message: "no such box" }, 404);
       if (f.failWithdraw) return json({ message: "run9 is unavailable" }, 503);
-      b.secrets = b.secrets.filter((x) => x.secret_id !== m![2]);
+      if (!f.ignoreWithdraw) b.secrets = b.secrets.filter((x) => x.secret_id !== m![2]);
       return json({});
     }
     if ((m = path.match(/^\/boxes\/([^/]+)\/stop$/))) { const b = boxes.get(m[1]!); if (b) b.state = "stopped"; return json({}); }
@@ -1517,7 +1518,12 @@ await check("deleting an agent whose box run9 will neither delete nor clear: the
   const [boxId] = [...run9.boxes.keys()];
   const req = fromBox(run9, boxId!);
   const token = (await w.stored(a)).token!;
-  run9.f.failDelete = true; run9.f.failWithdraw = true;
+  run9.f.failDelete = true;
+  // First a removal run9 answers but does not apply: checked, not believed.
+  run9.f.ignoreWithdraw = true;
+  const quiet = await w.call("DELETE", "/agents/by-raft-agent/Y3");
+  must(quiet.body?.sandboxes?.failed?.[0]?.egress === "not_withdrawn" && req.send()?.authorization === `token ${token}`, `an unapplied removal: ${quiet.text}`);
+  run9.f.ignoreWithdraw = false; run9.f.failWithdraw = true;
   const del = await w.call("DELETE", "/agents/by-raft-agent/Y3");
   const failed = del.body?.sandboxes?.failed?.[0];
   must(del.status === 200 && del.body.clean === false && failed?.egress === "not_withdrawn" && failed.action === "retry_delete"
