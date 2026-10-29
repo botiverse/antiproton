@@ -224,6 +224,7 @@ async function noticeSent(w: World, op: string): Promise<string> {
 }
 const row = (w: World, op: string) => w.raw.sql.exec("SELECT * FROM approvals WHERE operation_id = ?", op).toArray()[0] as any;
 const opRow = (w: World, op: string) => w.raw.sql.exec("SELECT status FROM operations WHERE operation_id = ?", op).toArray()[0] as any;
+const DAY = 24 * 60 * 60 * 1000;
 const indexRow = (w: World, op: string) => w.DB.raw.prepare("SELECT * FROM provider_approvals WHERE operation_id = ?").get(op) as any;
 
 // ---- listing ------------------------------------------------------------------------------------------------
@@ -649,27 +650,194 @@ await check("hints: a tampered body, a tampered signature, or no timestamp do no
   must(!(await verifyHint(HINT_SECRET, { signature: sig, timestamp: null }, body, ts)), "no timestamp verified");
 });
 
-await check("provider-wide copy: a deleted agent's rows are gone and not listed; ended rows past the retention are pruned", async () => {
+await check("deleted agent: its rows are kept as the record of who decided what, and neither list shows them", async () => {
   const w = await world();
+  const op = await hold(w);
+  must((await decide(w, op, "deny")).status === 200, "decide");
+  // Still pending when the agent is deleted: a late publish could still move it forward.
+  const open = await hold(w, "still pending");
+  await w.D.alarm();
+  must(indexRow(w, open)?.status === "pending", "control: the pending hold was not copied");
+  const before = indexRow(w, op);
+  must(before?.status === "denied" && before.agent_deleted_at === null && typeof JSON.parse(before.item).args?.summary === "string", `control: ${show(before)}`);
+  // Control: both lists show it while the agent lives.
+  must((await call(w, "GET", `agents/${A}/approvals`)).body.approvals.some((a: any) => a.operationId === op), "control: per-agent list");
+  must((await call(w, "GET", "approvals")).body.approvals.some((a: any) => a.operationId === op), "control: provider list");
+  const del = await call(w, "DELETE", `agents/${A}`);
+  must(del.status === 200, `delete: ${del.status} ${del.text}`);
+  const kept = indexRow(w, op);
+  must(kept && kept.status === "denied" && kept.agent_deleted_at === Date.parse(del.body.deletedAt), `not kept, or not marked as of the delete: ${show(kept)}`);
+  const item = JSON.parse(kept.item);
+  must(item.operationId === op && item.providerAgentId === A && item.raftAgentId === RAFT_ID && item.tool === "put" && item.status === "denied"
+    && show(item.decidedBy) === show({ via: "raft", ...OWNER }) && typeof item.decidedAt === "string" && typeof item.createdAt === "string",
+    `the record does not say who decided what: ${kept.item}`);
+  // The arguments' text goes; what the decision applied to and what came of it stay.
+  must(!("args" in item) && "route" in item && "outcome" in item && typeof item.description === "string", `the record's fields: ${kept.item}`);
+  // Hidden from both lists: the per-agent route is 404, the provider list leaves it out for every token that saw it.
+  const own = await call(w, "GET", `agents/${A}/approvals`);
+  must(own.status === 404, `per-agent list of a deleted agent: ${own.status} ${own.text}`);
+  for (const auth of [w.token, w.platform]) {
+    const all = await call(w, "GET", "approvals", { auth });
+    must(all.status === 200 && all.body.approvals.every((a: any) => a.operationId !== op), `provider list shows a deleted agent's row: ${all.text}`);
+  }
+  // A repeated delete keeps the first mark. A publish after the delete (a hold that moved since) is written as the
+  // record: marked as of the delete, without the arguments' text, and not listed; a new row likewise.
+  must((await call(w, "DELETE", `agents/${A}`)).status === 200 && indexRow(w, op).agent_deleted_at === kept.agent_deleted_at, "a repeat moved the mark");
+  const { d1ApprovalIndex } = await import("../cf/src/approvals.ts");
+  const late = { tenantId: T, agentId: A, raftOrigin: ORIGIN, raftServerId: "srv-1", raftAgentId: RAFT_ID, createdAt: 1, expiresAt: null, updatedAt: Date.now() };
+  await d1ApprovalIndex(w.DB).upsert({ ...late, operationId: "op_late", status: "pending",
+    item: { operationId: "op_late", args: { summary: "late" }, route: { method: "POST", path: "/repos/o/r/pulls", repo: "o/r", body: "the body" } } as never });
+  await d1ApprovalIndex(w.DB).upsert({ ...late, operationId: open, status: "denied", item: { ...item, operationId: open, status: "denied", args: { summary: "back" } } as never });
+  const lateRow = indexRow(w, "op_late"), moved = indexRow(w, open);
+  const lateItem = lateRow ? JSON.parse(lateRow.item) : null;
+  must(lateRow?.agent_deleted_at === kept.agent_deleted_at && !("args" in lateItem) && !("body" in lateItem.route) && lateItem.route.repo === "o/r",
+    `a new row after the delete: ${show(lateRow)}`);
+  must(moved.status === "denied" && moved.agent_deleted_at === kept.agent_deleted_at && !moved.item.includes("back"), `a hold moved after the delete: ${show(moved)}`);
+  const after = await call(w, "GET", "approvals");
+  must(after.body.approvals.every((a: any) => a.operationId !== open && a.operationId !== "op_late"), `listed after the delete: ${after.text}`);
+});
+
+await check("deleted agent: a decision in flight as the delete completes reaches the kept row, with who decided, and no hint", async () => {
+  const w = await world({ hints: true });
   const op = await hold(w);
   await w.D.alarm();
   must(indexRow(w, op)?.status === "pending", "control: not copied");
-  // Retention: an ended row older than 30 days goes at the next list; a pending one of the same age stays.
-  const old = Date.now() - 31 * 24 * 60 * 60 * 1000;
-  w.DB.raw.prepare("INSERT INTO provider_approvals(tenant_id, agent_id, operation_id, raft_origin, raft_server_id, raft_agent_id, status, item, created_at, expires_at, updated_at) VALUES (?, ?, 'op_old_denied', ?, 'srv-1', ?, 'denied', '{}', 1, NULL, ?)")
-    .run(T, A, ORIGIN, RAFT_ID, old);
-  w.DB.raw.prepare("UPDATE provider_approvals SET updated_at = ? WHERE operation_id = ?").run(old, op);
-  const listed = await call(w, "GET", "approvals");
-  const ids = listed.body.approvals.map((a: any) => a.operationId);
-  must(ids.includes(op) && !ids.includes("op_old_denied") && !indexRow(w, "op_old_denied"), `retention: ${show(ids)}`);
-  // Deleted: the agent's copies are removed, and a row written after (a late publish) is still not listed.
+  // The decide request found the agent before the delete; its decision lands in the object after it.
   const del = await call(w, "DELETE", `agents/${A}`);
-  must(del.status === 200, `delete: ${del.status} ${del.text}`);
-  must(!indexRow(w, op), "the deleted agent's copy is still in D1");
-  w.DB.raw.prepare("INSERT INTO provider_approvals(tenant_id, agent_id, operation_id, raft_origin, raft_server_id, raft_agent_id, status, item, created_at, expires_at, updated_at) VALUES (?, ?, 'op_late', ?, 'srv-1', ?, 'pending', '{}', 1, NULL, ?)")
-    .run(T, A, ORIGIN, RAFT_ID, Date.now());
-  const after = await call(w, "GET", "approvals");
-  must(after.body.approvals.every((a: any) => a.operationId !== "op_late"), `a deleted agent's row is listed: ${after.text}`);
+  must(del.status === 200 && indexRow(w, op)?.agent_deleted_at === Date.parse(del.body.deletedAt), `delete: ${del.status} ${show(indexRow(w, op))}`);
+  outbound = [];
+  const r = await w.D.provisionDecide(T, A, { raftAgentId: RAFT_ID, raftServerId: "srv-1" }, op, "approved", { via: "raft", ...OWNER } as never);
+  must(r?.ok === true, `decide: ${show(r)}`);
+  for (let i = 0; i < 20 && row(w, op)?.published_state !== row(w, op)?.state; i++) { await w.D.alarm(); await sleep(10); }
+  const kept = indexRow(w, op);
+  const item = JSON.parse(kept.item);
+  // The copy follows the object, whatever it reached: approved, or run since.
+  const state = row(w, op)?.state;
+  must(["approved", "executed"].includes(state) && kept.status === state && item.status === state && show(item.decidedBy) === show({ via: "raft", ...OWNER }) && typeof item.decidedAt === "string",
+    `the kept row did not follow the decision: ${show(kept)}`);
+  must(kept.agent_deleted_at === Date.parse(del.body.deletedAt) && !("args" in item) && "outcome" in item && "route" in item, `the kept row's mark or fields: ${kept.item}`);
+  must(hints().length === 0, `a hint went to Raft for a deleted agent: ${show(hints().map((h) => h.body))}`);
+});
+
+await check("deleted agent: deleted is final in the registry, and a marked row is not listed even if the registry said otherwise", async () => {
+  const w = await world();
+  const op = await hold(w);
+  await w.D.alarm();
+  must((await call(w, "DELETE", `agents/${A}`)).status === 200, "delete");
+  const { d1ProvisionedAgents } = await import("../cf/src/control-plane.ts");
+  // A push registration (or a credential PUT, or a create's replay) that read the row before the delete, writing after.
+  const revived = await d1ProvisionedAgents(w.DB).update(T, RAFT_ID, { status: "active", pushRegistered: true, pushError: null });
+  const reg = w.DB.raw.prepare("SELECT status, deleted_at, push_registered FROM provisioned_agents WHERE raft_agent_id = ?").get(RAFT_ID) as any;
+  must(revived === false && reg.status === "deleted" && reg.deleted_at !== null && reg.push_registered === 0, `a deleted agent was revived: ${revived} ${show(reg)}`);
+  // Control: a write that keeps it deleted still lands.
+  must(await d1ProvisionedAgents(w.DB).update(T, RAFT_ID, { pushError: "x" }), "a write without a status was refused");
+  // The index's own list, with no prune before it to mark anything: an unmarked row of a deleted agent is left out
+  // by the registry alone.
+  const { d1ApprovalIndex } = await import("../cf/src/approvals.ts");
+  w.DB.raw.prepare("UPDATE provider_approvals SET agent_deleted_at = NULL WHERE operation_id = ?").run(op);
+  const direct = await d1ApprovalIndex(w.DB).list({ raftOrigin: ORIGIN, tenantId: null }, { status: null, updatedSince: null, after: null, limit: 50 });
+  must(direct.rows.every((r) => r.operationId !== op), `an unmarked row of a deleted agent was listed: ${show(direct.rows.map((r) => r.operationId))}`);
+  w.DB.raw.prepare("UPDATE provider_approvals SET agent_deleted_at = ? WHERE operation_id = ?").run(Date.now(), op);
+  // The second guard: were the registry to say active again, the kept row still is not listed.
+  w.DB.raw.prepare("UPDATE provisioned_agents SET status = 'active' WHERE raft_agent_id = ?").run(RAFT_ID);
+  const all = await call(w, "GET", "approvals");
+  must(all.status === 200 && all.body.approvals.every((a: any) => a.operationId !== op) && typeof indexRow(w, op)?.agent_deleted_at === "number", `a marked row was listed, or is gone: ${all.text} ${show(indexRow(w, op))}`);
+});
+
+await check("deleted agent: a delete whose marking failed is finished by the repeat", async () => {
+  const w = await world();
+  const op = await hold(w);
+  must((await decide(w, op, "deny")).status === 200, "decide");
+  await w.D.alarm();
+  const db = w.DB as any, prepare = db.prepare;
+  db.prepare = (q: string) => { if (q.startsWith("UPDATE provider_approvals")) throw new Error("D1 is away"); return prepare(q); };
+  const del = await call(w, "DELETE", `agents/${A}`);
+  db.prepare = prepare;
+  must(del.status === 200 && indexRow(w, op)?.agent_deleted_at === null, `control: the mark did not fail: ${show(indexRow(w, op))}`);
+  must((await call(w, "DELETE", `agents/${A}`)).status === 200 && indexRow(w, op)?.agent_deleted_at === Date.parse(del.body.deletedAt), `the repeat did not mark it: ${show(indexRow(w, op))}`);
+});
+
+await check("deleted agent: a delete whose marking failed and was not repeated is marked by the next prune, kept past 30 days, and dropped a year after the delete", async () => {
+  const w = await world();
+  const op = await hold(w);
+  must((await decide(w, op, "deny")).status === 200, "decide");
+  await w.D.alarm();
+  const db = w.DB as any, prepare = db.prepare;
+  db.prepare = (q: string) => { if (q.startsWith("UPDATE provider_approvals")) throw new Error("D1 is away"); return prepare(q); };
+  const del = await call(w, "DELETE", `agents/${A}`);
+  db.prepare = prepare;
+  must(del.status === 200 && indexRow(w, op)?.agent_deleted_at === null, `control: the mark did not fail: ${show(indexRow(w, op))}`);
+  w.DB.raw.prepare("UPDATE provider_approvals SET updated_at = ? WHERE operation_id = ?").run(Date.now() - 31 * DAY, op);
+  must((await call(w, "GET", "approvals")).status === 200, "list");
+  const marked = indexRow(w, op);
+  must(marked?.agent_deleted_at === Date.parse(del.body.deletedAt) && !("args" in JSON.parse(marked.item)), `the prune did not mark it, or dropped it as a live agent's: ${show(marked)}`);
+  // Unmarked again, its delete over a year ago: the prune marks it as of then, and drops it.
+  w.DB.raw.prepare("UPDATE provider_approvals SET agent_deleted_at = NULL WHERE operation_id = ?").run(op);
+  w.DB.raw.prepare("UPDATE provisioned_agents SET deleted_at = ? WHERE raft_agent_id = ?").run(Date.now() - 366 * DAY, RAFT_ID);
+  must((await call(w, "GET", "approvals")).status === 200 && !indexRow(w, op), `a deleted agent's unmarked row outlived the year: ${show(indexRow(w, op))}`);
+});
+
+await check("prune: a live agent's ended rows go 30 days after their last change; a deleted agent's rows a year after its delete", async () => {
+  const w = await world();
+  const { B } = await secondAgent(w);
+  const now = Date.now();
+  const put = (agent: string, op: string, status: string, updated: number) => w.DB.raw.prepare(
+    "INSERT INTO provider_approvals(tenant_id, agent_id, operation_id, raft_origin, raft_server_id, raft_agent_id, status, item, created_at, expires_at, updated_at) VALUES (?, ?, ?, ?, 'srv-1', 'x', ?, '{}', 1, NULL, ?)")
+    .run(T, agent, op, ORIGIN, status, updated);
+  // The live agent B: an ended row past 30 days goes; a pending one as old, and an ended one of 29 days, stay.
+  put(B, "op_live_old", "denied", now - 31 * DAY);
+  put(B, "op_live_pending", "pending", now - 31 * DAY);
+  put(B, "op_live_recent", "executed", now - 29 * DAY);
+  // The deleted agent A: ended long ago, kept while its delete is under a year old, dropped past it.
+  put(A, "op_audit_recent", "denied", now - 300 * DAY);
+  put(A, "op_audit_old", "denied", now - 400 * DAY);
+  must((await call(w, "DELETE", `agents/${A}`)).status === 200, "delete");
+  w.DB.raw.prepare("UPDATE provider_approvals SET agent_deleted_at = ? WHERE operation_id = 'op_audit_old'").run(now - 366 * DAY);
+  w.DB.raw.prepare("UPDATE provider_approvals SET agent_deleted_at = ? WHERE operation_id = 'op_audit_recent'").run(now - 364 * DAY);
+  must((await call(w, "GET", "approvals")).status === 200, "list");
+  const left = (w.DB.raw.prepare("SELECT operation_id FROM provider_approvals WHERE operation_id LIKE 'op_%' ORDER BY operation_id").all() as any[]).map((r) => r.operation_id);
+  must(show(left) === show(["op_audit_recent", "op_live_pending", "op_live_recent"]), `left after the prune: ${show(left)}`);
+});
+
+await check("migration 0029: an existing copy gains the mark, an already-deleted agent's rows are marked as of its delete, and each prune has its index", async () => {
+  const db = new DatabaseSync(":memory:");
+  const dir = new URL("../cf/migrations/", import.meta.url);
+  const files = readdirSync(dir).filter((n) => n.endsWith(".sql")).sort();
+  const at = files.findIndex((n) => n.startsWith("0029_"));
+  must(at > 0, "no migration 0029");
+  for (const f of files.slice(0, at)) db.exec(readFileSync(new URL(f, dir), "utf8"));
+  const agent = (id: string, status: string, deletedAt: number | null) => db.prepare(
+    "INSERT INTO provisioned_agents(tenant_id, raft_agent_id, agent_id, raft_server_id, raft_origin, name, instructions, status, created_at, updated_at, deleted_at) VALUES (?, ?, ?, 'srv-1', ?, 'n', '', ?, 1, 2, ?)")
+    .run(T, id, `raft_${id}`, ORIGIN, status, deletedAt);
+  agent("LIVE", "active", null);
+  agent("GONE", "deleted", 5000);
+  const item = (op: string) => JSON.stringify({ operationId: op, tool: "put", status: "failed", decidedBy: { via: "raft", ...OWNER }, args: { summary: "secret" },
+    outcome: { summary: "policy_denied" }, route: { method: "POST", path: "/repos/o/r/pulls", repo: "o/r", body: "secret body" }, description: "d" });
+  for (const [id, op] of [["LIVE", "op_live"], ["GONE", "op_gone"]]) {
+    db.prepare("INSERT INTO provider_approvals(tenant_id, agent_id, operation_id, raft_origin, raft_server_id, raft_agent_id, status, item, created_at, expires_at, updated_at) VALUES (?, ?, ?, ?, 'srv-1', ?, 'denied', ?, 1, NULL, 100)")
+      .run(T, `raft_${id}`, op, ORIGIN, id!, item(op!));
+  }
+  for (const f of files.slice(at)) db.exec(readFileSync(new URL(f, dir), "utf8"));
+  const get = (op: string) => db.prepare("SELECT * FROM provider_approvals WHERE operation_id = ?").get(op) as any;
+  const live = get("op_live"), gone = get("op_gone");
+  must(live.agent_deleted_at === null && live.item === item("op_live"), `a live agent's row changed: ${show(live)}`);
+  const g = JSON.parse(gone.item);
+  must(gone.agent_deleted_at === 5000 && g.operationId === "op_gone" && show(g.decidedBy) === show({ via: "raft", ...OWNER }) && !("args" in g) && !("body" in g.route)
+    && g.route.repo === "o/r" && g.route.path === "/repos/o/r/pulls" && g.outcome.summary === "policy_denied" && g.description === "d",
+    `a deleted agent's row: ${show(gone)}`);
+  // The prune's own statements, as it sends them, planned on the migrated table.
+  const sent: string[] = [];
+  const { d1ApprovalIndex } = await import("../cf/src/approvals.ts");
+  await d1ApprovalIndex({ prepare: (q: string) => ({ q, bind: () => ({ q }) }), batch: async (s: Array<{ q: string }>) => { sent.push(...s.map((x) => x.q)); return []; } } as unknown as D1Database)
+    .prune({ ended: 1, deleted: 1 });
+  const plan = (q: string) => (db.prepare(`EXPLAIN QUERY PLAN ${q}`).all(...Array((q.match(/\?/g) ?? []).length).fill(1)) as any[]).map((r) => String(r.detail)).join("; ");
+  const [mark, ended, audit] = sent.map(plan);
+  must(sent.length === 3 && ended!.includes("USING INDEX provider_approvals_ended") && audit!.includes("USING INDEX provider_approvals_audit"),
+    `the prunes do not use their indexes: ${ended} | ${audit}`);
+  // The mark reads the registry's deleted agents and reaches their rows by key: never a scan of the copy.
+  must(!/SCAN provider_approvals\b/.test(mark!) && /provider_approvals USING (?:PRIMARY KEY|INDEX)/.test(mark!), `the mark scans the copy: ${mark}`);
+  // And the registry's deleted agents by their own index, never a scan of every agent.
+  must(mark!.includes("provisioned_agents_deleted") && !/SCAN provisioned_agents(?! USING)/.test(mark!), `the mark scans the registry: ${mark}`);
 });
 
 await check("notice: the agent writing the notice's own head first does not stop it being told", async () => {

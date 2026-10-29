@@ -73,7 +73,7 @@ const NOBODY_REST = (id: string, at: number) => "The operator can still approve 
   `${EXPIRES(at)} ${TOLD} Antiproton notifies nobody of it. ` +
   `Tell your owner once that this action is blocked, ${IDS(id)}, then plan as if it will not run. ` +
   "Retrying will not make it happen sooner: calling again with the same arguments returns this same pending approval.";
-const RAFT_TEXT = (id: string, at: number) => `This call is held for approval (operation ${id}). An approval card for it goes to your owner in Raft, and they approve or deny it there; ` +
+const RAFT_TEXT = (id: string, at: number) => `This call is held for approval (operation ${id}). An approval card for it goes to your owner in Raft (or a server admin if your owner has left), and they approve or deny it there; ` +
   `if approved, it runs on its own exactly as written. ${EXPIRES(at)} ${TOLD} If you tell your owner about it, give the operation id (${id}) and the tool (ops.deploy). ` +
   `Do not retry it. ${AGAIN}`;
 /** The default deadline, give or take the test's own run time. */

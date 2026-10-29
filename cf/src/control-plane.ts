@@ -492,7 +492,11 @@ export function d1ProvisionedAgents(db: D1Database, now: () => number = Date.now
       }
       sets.push("updated_at = ?");
       values.push(now());
-      const res = await db.prepare(`UPDATE provisioned_agents SET ${sets.join(", ")} WHERE tenant_id = ? AND raft_agent_id = ?`)
+      // Deleted is final: a write that sets any other status (a push registration, a credential PUT or a create's
+      // replay that read the row before a delete landed) changes nothing on a deleted row, rather than reviving it with
+      // its deleted_at still set.
+      const final = patch.status !== undefined && patch.status !== "deleted" ? " AND status != 'deleted'" : "";
+      const res = await db.prepare(`UPDATE provisioned_agents SET ${sets.join(", ")} WHERE tenant_id = ? AND raft_agent_id = ?${final}`)
         .bind(...values, tenantId, raftAgentId).run();
       return Number(res.meta?.changes ?? 0) > 0;
     },
