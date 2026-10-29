@@ -2032,6 +2032,10 @@ await check("a mount whose reference names a key other than its alias: read, sho
   // A reconnect puts the new key and its renewal record under the reference's name, and leaves the reference as it was.
   await w.reconnect(a, connectorId);
   must((await mount()).secretRef === `agent:${KEY}` && JSON.stringify(names()) === JSON.stringify([KEY, OAUTH_PREFIX + KEY].sort()), `after a reconnect: ${(await mount()).secretRef} ${JSON.stringify(names())}`);
+  // A disconnect's guard reads the key under that name too: another credential on the mount, not "nothing there".
+  const { seal: seal2 } = await import("../src/runtime/secrets.ts");
+  const guard = await a.rt.detachConnectionIfFrom(TENANT, a.agentId, "github", await seal2(kek, "ghu_" + "o".repeat(36)), "k-not-this-one");
+  must(guard.ok && guard.removed === false && (guard as { other?: true }).other === true, `the disconnect's guard: ${JSON.stringify(guard)}`);
   // Removing the credential takes the key and its renewal record by that name.
   must((await a.rt.removeCredentialOrWhy(TENANT, a.agentId, alias)).ok, "the remove was refused");
   must(names().length === 0, `left after the remove: ${JSON.stringify(names())}`);
