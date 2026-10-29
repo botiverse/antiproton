@@ -130,7 +130,10 @@ export const REMINDED_STORE = "assistant_reminded";
 export const OWNER_KEY = "owner";
 export const RULES_KEY = "rules";
 export const DEFERRED_KEY = "deferred";
-/** Per conversation (its channelId), the `latestAt` a check last looked at: activity at or before it is not new. */
+/**
+ * Per conversation (its channelId), where its unread stood when a check last looked at it (`Reviewed`): the conversation
+ * is new to the next check only when that position moved (`newSince`).
+ */
 export const REVIEWED_KEY = "reviewed";
 /**
  * Conversations a check could not read (`Unreadable`, by channelId): never recorded as looked at, so every wake looks at
@@ -164,6 +167,15 @@ export const INBOX_LAG_FOLLOW_UPS_MS: readonly number[] = [...INBOX_LAG_RETRY_MS
  * times come from different clocks.
  */
 export const INBOX_LAG_SLACK_MS = 2_000;
+/**
+ * How long after a message's `created_at` it may still become readable: Raft assigns a message's seq and time when it
+ * is inserted, not when it commits, and the inbox replica lags the commit (about 24 s at p99), so a message can become
+ * readable after a later one a check already read. A check that records a conversation whose `latestAt` is within this
+ * of now reads once more at `latestAt` plus this (`settleAt`). Whether a conversation is new never rests on this read
+ * (`newSince` decides by position on any read); it is the fallback for the one case no field of a row can show: a
+ * doorbell whose read came before its message was readable, and no doorbell after it.
+ */
+export const SETTLE_MS = 60_000;
 
 /**
  * The time rule: whether an inbox read shows the change a doorbell announced at `changeAt`, in that some row's activity
@@ -207,11 +219,16 @@ export function seqOf(v: unknown): number | null {
  * Whether the inbox shows the change a doorbell announced, and by which rule.
  *
  * The seq rule, when the doorbell named the conversations that rang it (`sources`): caught up only when EVERY one of
- * them is a row whose `latestSeq` is at least the seq the doorbell announced in it. This is exact: a seq is the
- * conversation's own commit order, so no other conversation's activity and no clock can make a read count early, as
- * the time rule can. The unread read is asked first; what it does not show is asked of the read of every conversation
- * (`readAll`), since a conversation the owner has read since is in no unread read however long one waits, which is
- * `caught_up_via: "mixed"` when each read showed some. A row without `latestSeq` shows nothing for its conversation;
+ * them is a row whose `latestSeq` is at least the seq the doorbell announced in it. No other conversation's activity and
+ * no clock can make a read count early, as the time rule can; but it is not proof that the announced message is
+ * readable: a seq is assigned when the message is inserted, not when it commits, so a row can show a higher seq while a
+ * lower one is still uncommitted or not yet on the replica. Such a message reaches a check because a row whose unread
+ * position moved is new however old its time (`newSince`), on the next doorbell's read or, when no doorbell's read
+ * shows it, on the read a check that recorded a recent change makes once more (`SETTLE_MS`).
+ *
+ * The unread read is asked first; what it does not show is asked of the read of every conversation (`readAll`), since
+ * a conversation the owner has read since is in no unread read however long one waits, which is `caught_up_via:
+ * "mixed"` when each read showed some. A row without `latestSeq` shows nothing for its conversation;
  * but when no row of either read carries the field the Raft is one that does not send it, and the time rule decides
  * for this wake (`rule: "time"`) rather than lagging until the retries give up.
  *
@@ -227,6 +244,7 @@ export async function changeShown(
   };
   const ids = Object.keys(change.sources);
   if (!ids.length) return timeRule();
+  // A doorbell's seq is a hint that a message exists, never proof that a read shows it now: see above.
   const shows = (items: readonly InboxItem[], id: string) =>
     items.some((i) => i.channelId === id && typeof i.latestSeq === "number" && i.latestSeq >= change.sources[id]);
   const missing = ids.filter((id) => !shows(unread, id));
@@ -279,6 +297,11 @@ export interface AssistantOwner {
   changeSources: ChangeSources;
   /** How many reads in a row have not shown the change: the index into `INBOX_LAG_FOLLOW_UPS_MS`. */
   lagReads: number;
+  /**
+   * When the check that recorded a recent change reads once more (`SETTLE_MS`), or null. A doorbell's check at or after
+   * it is that read and clears it; one before it keeps it, so a doorbell in between does not cancel it.
+   */
+  settleAt: number | null;
   /** The owner-local day (YYYY-MM-DD) of the last brief turn, so one day never gets two. */
   lastBrief: string | null;
   /** The day whose brief was sent: `brief: true` counts only once, on the day its turn was posted. */
@@ -329,6 +352,7 @@ function ownerOf(raw: unknown): AssistantOwner | null {
     changeAt: str(o.changeAt) !== null && Number.isFinite(Date.parse(o.changeAt as string)) ? o.changeAt as string : null,
     changeSources: sourcesOf(o.changeSources),
     lagReads: typeof o.lagReads === "number" && o.lagReads >= 0 ? o.lagReads : 0,
+    settleAt: typeof o.settleAt === "number" && Number.isFinite(o.settleAt) ? o.settleAt : null,
     briefSent: str(o.briefSent), askedTimezone: o.askedTimezone === true, ownerName: str(o.ownerName), selfName: str(o.selfName),
     raftCheck: o.raftCheck === true,
   };
@@ -387,7 +411,7 @@ export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerCon
     userId: of.userId, timezone: validZone(of.timezone ?? null), statedTimezone: same?.statedTimezone ?? null,
     language: validLanguage(of.language), serverId: context.server.id, pausedAt: null,
     dmTarget: dm, learnedDm: same?.learnedDm ?? null, doorbellAt: same?.doorbellAt ?? null, lastCheckAt: same?.lastCheckAt ?? null,
-    changeAt: same?.changeAt ?? null, changeSources: same?.changeSources ?? {}, lagReads: same?.lagReads ?? 0, lastBrief: same?.lastBrief ?? null, briefSent: same?.briefSent ?? null, askedTimezone: same?.askedTimezone ?? false,
+    changeAt: same?.changeAt ?? null, changeSources: same?.changeSources ?? {}, lagReads: same?.lagReads ?? 0, settleAt: same?.settleAt ?? null, lastBrief: same?.lastBrief ?? null, briefSent: same?.briefSent ?? null, askedTimezone: same?.askedTimezone ?? false,
     ownerName: name, selfName: typeof context.agent.name === "string" && context.agent.name ? context.agent.name : null,
     raftCheck: of.raftCheck === true,
   };
@@ -2038,10 +2062,12 @@ export function doorbellOf(raw: unknown): { firstChangeAt: string | null; lastCh
   let sources: ChangeSources = {};
   for (const e of Array.isArray(p.sources) ? p.sources : []) {
     const o = e && typeof e === "object" ? e as Record<string, unknown> : {};
+    // A hint that the conversation changed, not that the message is readable yet (`changeShown`).
     const seq = seqOf(o.max_seq);
     if (typeof o.channel_id === "string" && o.channel_id && seq !== null) sources = mergeSources(sources, { [o.channel_id]: seq });
   }
   const eventId = typeof ev.id === "string" && EVENT_ID.test(ev.id) ? ev.id.toLowerCase() : null;
+  // `first_change_at` too says when something changed, not that a read shows it (`inboxCaughtUp`).
   return { firstChangeAt: at(p.first_change_at), lastChangeAt: at(p.last_change_at), sources, check: raftCheckOf(p.check), eventId };
 }
 
@@ -2372,8 +2398,44 @@ export interface Filtered {
   counts: Record<string, number>;
 }
 
+/**
+ * Where a conversation's unread stood when a check looked at it (`REVIEWED_KEY`): its count, its first unread message,
+ * whether it held an @mention of the owner, and its latest seq when Raft sends one. `latestAt` orders the entries
+ * (`REVIEWED_MAX`) and decides nothing, except for a row that carries no position at all (`newSince`). An entry kept
+ * before positions were is a plain `latestAt` string.
+ */
+export interface Reviewed { latestAt: string; unread: number; firstUnreadMessageId: string | null; mention: boolean; latestSeq?: number }
+
+export function reviewedEntry(i: InboxItem & { latestAt: string }): Reviewed {
+  return { latestAt: i.latestAt, unread: i.unread, firstUnreadMessageId: i.firstUnreadMessageId ?? null, mention: i.hasMention, ...(typeof i.latestSeq === "number" ? { latestSeq: i.latestSeq } : {}) };
+}
+
+/**
+ * Whether a conversation is new since a check looked at it (`before`), by position, not time: its unread count grew, its
+ * first unread message is another, an @mention appeared, or its latest seq rose. Time cannot say this: a message's
+ * `created_at` is set when it is inserted, so one that becomes readable late is older than what a check already read,
+ * and comparing times would call it seen. A first unread message that is another also covers the owner reading
+ * everything and then one more arriving (the count falls); it also makes a partial read by the owner new, one more look,
+ * since a partial read and a partial read with a late message are the same to every field the row has.
+ *
+ * Time decides only where no position can: an entry kept before positions were (a plain `latestAt`), judged as it was
+ * written, and a row with neither a first unread message nor a seq on either side (an older Raft), where the owner
+ * reading everything and one more arriving moves nothing else.
+ */
+export function newSince(i: InboxItem, before: Reviewed | string | undefined): boolean {
+  if (before === undefined) return true;
+  const at = i.latestAt ? Date.parse(i.latestAt) : NaN;
+  const later = (than: string) => { const t = Date.parse(than); return !(Number.isFinite(t) && Number.isFinite(at) && at <= t); };
+  if (typeof before === "string") return later(before);
+  const first = i.firstUnreadMessageId ?? null, seq = typeof i.latestSeq === "number" ? i.latestSeq : undefined;
+  if (i.unread > before.unread || first !== before.firstUnreadMessageId || (i.hasMention && !before.mention)) return true;
+  if (seq !== undefined && before.latestSeq !== undefined) return seq > before.latestSeq;
+  if (first === null && seq === undefined && before.latestSeq === undefined) return later(before.latestAt);
+  return false;
+}
+
 export interface PrefilterOptions {
-  rules: readonly ContactRule[]; reviewed?: Readonly<Record<string, string>>; told(key: string): Promise<boolean>; now: number;
+  rules: readonly ContactRule[]; reviewed?: Readonly<Record<string, Reviewed | string>>; told(key: string): Promise<boolean>; now: number;
   /** A doorbell's check (the default), the brief (digest items go in), or a doorbell in quiet hours (only `anytime` rules let anything through). */
   mode?: "doorbell" | "brief" | "night";
   ownerName?: string | null; selfName?: string | null;
@@ -2396,9 +2458,9 @@ const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /**
  * What of the inbox is worth a model's look, decided in code, facts first:
- * - not new (`seen`): a doorbell's check skips a conversation whose latest activity an earlier check looked at
- *   (`reviewed`, per conversation). One no check has looked at is new however old its activity: a conversation can
- *   reach the unread inbox after a check with activity from before it (a thread reply, the inbox catching up), and a
+ * - not new (`seen`): a doorbell's check skips a conversation whose unread position has not moved since an earlier
+ *   check looked at it (`reviewed`, per conversation; `newSince`). One no check has looked at is new however old its
+ *   activity: a conversation can reach the unread inbox after a check with activity from before it (a thread reply, the inbox catching up), and a
  *   time-based cutoff dropped such a one without any check reading it. One whose read failed is never recorded in
  *   `reviewed` (`assistantWake`), so it stays new. The brief passes none: it looks at everything still unread;
  * - the DM between this assistant and its owner (`own_dm`): never one of the owner's conversations to report;
@@ -2418,10 +2480,7 @@ export async function prefilter(items: readonly InboxItem[], o: PrefilterOptions
   const self = o.selfName?.replace(/^@/, "").toLowerCase() ?? null;
   const named = o.ownerName ? new RegExp(`(^|[^\\w])@?${escapeRe(o.ownerName)}(?![\\w])`, "i") : null;
   for (const i of items) {
-    const at = i.latestAt ? Date.parse(i.latestAt) : NaN;
-    const before = o.reviewed?.[i.channelId];
-    const seenUpTo = before !== undefined ? Date.parse(before) : NaN;
-    if (Number.isFinite(seenUpTo) && Number.isFinite(at) && at <= seenUpTo) { out.seen++; continue; }
+    if (!newSince(i, o.reviewed?.[i.channelId])) { out.seen++; continue; }
     const dm = i.channelType === "dm";
     if (dm && self !== null && i.channelName?.replace(/^@/, "").replace(/~(human|agent)$/, "").toLowerCase() === self) { count("own_dm"); continue; }
     if (i.unread <= 1 && i.firstUnreadMessageId && await o.told(`msg:${i.firstUnreadMessageId.slice(0, 8).toLowerCase()}`)) { out.told++; continue; }
@@ -2729,8 +2788,20 @@ async function raftIdleWake(ctx: PluginContext, deps: WakeDeps, owner: Assistant
   return { wakeAt: retry !== null ? Math.min(retry, next) : next };
 }
 
-function reviewedOf(raw: unknown): Record<string, string> {
-  return raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, string> : {};
+/** The kept `REVIEWED_KEY`, read defensively: an entry that is neither shape is dropped, so its conversation is new. */
+function reviewedOf(raw: unknown): Record<string, Reviewed | string> {
+  const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const out: Record<string, Reviewed | string> = {};
+  for (const [id, v] of Object.entries(o)) {
+    if (typeof v === "string") { out[id] = v; continue; }
+    const e = v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : null;
+    if (!e || typeof e.latestAt !== "string" || typeof e.unread !== "number") continue;
+    out[id] = {
+      latestAt: e.latestAt, unread: e.unread, firstUnreadMessageId: typeof e.firstUnreadMessageId === "string" ? e.firstUnreadMessageId : null,
+      mention: e.mention === true, ...(typeof e.latestSeq === "number" ? { latestSeq: e.latestSeq } : {}),
+    };
+  }
+  return out;
 }
 
 /**
@@ -2915,18 +2986,31 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
       // What this check looked at is not new to the next one, whether or not the model is asked; what it could not
       // read was not looked at, and nor was a read that never showed the change it was rung for. In quiet hours only
       // what went on was looked at: the rest waits, new, for the brief or the first check after.
+      // A read at or after the settle time is the settle read: it clears it. One recorded change that is recent asks one
+      // more (`SETTLE_MS`), at a time its own `latestAt` fixes, so the read it asks never asks another for the same change.
+      const settleDue = owner.settleAt !== null && now >= owner.settleAt;
+      let settleAt = settleDue ? null : owner.settleAt;
       if (lag.inbox_lagging_gave_up !== true) {
         const merged = { ...reviewed };
-        for (const i of night ? f.candidates : items) if (i.latestAt && !failed.includes(i)) merged[i.channelId] = i.latestAt;
-        const bounded = Object.fromEntries(Object.entries(merged).sort(([, a], [, b]) => Date.parse(b) - Date.parse(a)).slice(0, REVIEWED_MAX));
+        for (const i of night ? f.candidates : items) {
+          if (!i.latestAt || failed.includes(i)) continue;
+          const entry = reviewedEntry({ ...i, latestAt: i.latestAt });
+          const before = reviewed[i.channelId];
+          if (Date.parse(i.latestAt) + SETTLE_MS > now && (before === undefined || JSON.stringify(before) !== JSON.stringify(entry))) {
+            settleAt = Math.max(settleAt ?? 0, Date.parse(i.latestAt) + SETTLE_MS);
+          }
+          merged[i.channelId] = entry;
+        }
+        const atOf = (e: Reviewed | string) => Date.parse(typeof e === "string" ? e : e.latestAt);
+        const bounded = Object.fromEntries(Object.entries(merged).sort(([, a], [, b]) => atOf(b) - atOf(a)).slice(0, REVIEWED_MAX));
         await ctx.db.put(ASSISTANT_STORE, bounded as unknown as Json, REVIEWED_KEY);
       }
       const kept = await keepUnreadable(failed, rows);
-      const wakeAt = again(kept, failed);
+      const wakeAt = Math.min(again(kept, failed), settleAt ?? Infinity);
       // The short wake comes back as a doorbell, so it reads again.
-      await saveOwner(ctx, { ...owner, lastCheckAt: now, doorbellAt: wakeAt < next ? now : null });
+      await saveOwner(ctx, { ...owner, lastCheckAt: now, doorbellAt: wakeAt < next ? now : null, settleAt });
       const candidates = f.candidates.filter((i) => !failed.includes(i));
-      const counts = { conversations: items.length, candidates: candidates.length, muted: f.muted, told: f.told, seen: f.seen, unreadable: failed.length, ...ruleCounts(items, f), ...lag };
+      const counts = { conversations: items.length, candidates: candidates.length, muted: f.muted, told: f.told, seen: f.seen, unreadable: failed.length, ...ruleCounts(items, f), ...lag, ...(settleDue ? { settle_read: true } : {}) };
       if (!candidates.length) {
         if (failed.length) {
           await record(ctx, day, trigger, "unreadable", { ...counts, said: await sayUnreadable(failed, kept) });
