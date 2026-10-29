@@ -1126,7 +1126,8 @@ await check("RFC 077: an owner's DM peer and a channel's name, read by the assis
   // A second doorbell whose DM cannot be read: the unreadable outcome, which tells the owner by name.
   op = null; unreadableDm = true;
   await ctx.db.put(ASSISTANT_STORE, { ...(await ctx.db.get(ASSISTANT_STORE, OWNER_KEY)), doorbellAt: NOW - 1_000 }, OWNER_KEY);
-  items[0]!.latestAt = "2026-10-20T10:29:00.000Z"; items[1]!.latestAt = "2026-10-20T10:29:30.000Z";
+  // One more message in the DM: its unread count grows, which is what makes it new to this check.
+  items[0]!.unread = 3; items[0]!.latestAt = "2026-10-20T10:29:00.000Z"; items[1]!.latestAt = "2026-10-20T10:29:30.000Z";
   await assistantWake(ctx, deps);
   // Raft's answer to the turn's end, with the attrs src/plugins/raft.ts `reportTurnEnd` writes: the conversations counted, never named.
   const shown = [PEER, CHANNEL];
