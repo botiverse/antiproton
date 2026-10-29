@@ -193,7 +193,21 @@ export function sealedLoginRefusal(tool: string, args: unknown, sealed: AgentLog
   if (typeof a.service !== "string") return null;
   if (tool === INVOKE_TOOL && (typeof a.action !== "string" || !isAgentLoginAction(a.action))) return null;
   const s = sealed(a.service);
+  // A spelling not known here (a Raft id or client id no list has named yet) passes, to the policy and then the
+  // handler. That is safe only because the handler refuses it once Raft has resolved the app (`sealedRecord`, and
+  // `unresolvedRefusal` counts each time): were the handler ever made permissive, this pass would be a hole.
   return s ? sealedLoginMessage(tool, a.service, s, typeof a.action === "string" ? a.action : undefined) : null;
+}
+
+/**
+ * The handler's refusal of what `sealedLoginRefusal` let through, as an error, with one trace row saying so
+ * (`raft.agent_login_unresolved_refused`): the tool, and the service and action as the agent sent them. No token,
+ * no params.
+ */
+function unresolvedRefusal(ctx: PluginContext, tool: string, written: string, owner: SealedLogin, action?: string): Error {
+  ctx.trace?.({ kind: "raft.agent_login_unresolved_refused", status: "refused", verdict: "blocked",
+    attrs: { tool, service: clip(written, 80) ?? "", ...(action !== undefined ? { action: clip(action, 80) ?? "" } : {}), declaredBy: owner.plugin } });
+  return fail(sealedLoginMessage(tool, written, owner, action));
 }
 
 /** A Raft service record as the login and list routes answer it (the fields this module reads). */
@@ -696,7 +710,7 @@ export async function integrationsLogin(args: unknown, ctx: PluginContext, deps:
     if (early) throw fail(early);
     guard = (s) => {
       const owner = sealedRecord(sealed, s);
-      if (owner) throw fail(sealedLoginMessage(LOGIN_TOOL, service, owner));
+      if (owner) throw unresolvedRefusal(ctx, LOGIN_TOOL, service, owner);
     };
     const found = await matchService(deps, service);
     if (found) guard(found);
@@ -1118,7 +1132,7 @@ export async function integrationsInvoke(args: unknown, ctx: PluginContext, deps
     // endpoint is the same request, so it is refused too.
     const login = manifest.actions.filter((x) => isAgentLoginAction(x.name)).map((x) => `${x.endpoint.method} ${x.endpoint.path}`);
     if (isAgentLoginAction(name) || (action && login.includes(`${action.endpoint.method} ${action.endpoint.path}`))) {
-      throw fail(sealedLoginMessage(INVOKE_TOOL, query, owner, name));
+      throw unresolvedRefusal(ctx, INVOKE_TOOL, query, owner, name);
     }
   }
   if (!action) {

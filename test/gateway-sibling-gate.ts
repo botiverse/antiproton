@@ -240,7 +240,7 @@ await check("the asker is its mount's plugin, not its alias: a mount named stamp
   }
 });
 
-await check("a plugin's own mounts read each other as before: the gate is about other plugins", async () => {
+await check("one plugin mounted twice: both mounts run and read each other as before; the gate is about other plugins", async () => {
   const mine = asker("ledger");
   const store = new SqliteStore(":memory:");
   await store.init();
@@ -250,8 +250,11 @@ await check("a plugin's own mounts read each other as before: the gate is about 
       toolVersion: "1.0.0", publicConfig: {}, secretRef: `secret:${alias}`, policy: null });
   }
   const gateway = new ToolGateway(store, [mine], new Set(["ledger"]), { async resolve(ref: string) { return `cred-of-${ref}`; } });
+  // One plugin mounted twice registers once and both mounts run: the duplicate-id refusal is about plugin definitions.
   const r = await gateway.invoke(ctx, "one.peek", { alias: "two" }) as any;
   assert(r.status === "succeeded" && r.result.credential === "cred-of-secret:two", JSON.stringify(r));
+  const back = await gateway.invoke(ctx, "two.peek", { alias: "one" }) as any;
+  assert(back.status === "succeeded" && back.result.credential === "cred-of-secret:one", JSON.stringify(back));
 });
 
 await check("an id names one plugin: a second plugin registered under an existing id is refused, not kept over the first", async () => {

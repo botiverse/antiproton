@@ -1029,9 +1029,18 @@ await check("Stamp's UUID, the id integrations_list shows: refused by both handl
   const g = await sealedGateway(null);
   const r = await g.call("integrations_invoke", { ...INVOKE_ARGS, service: STAMP_UUID });
   must(r.status !== "succeeded" && /stamp_login/.test(r.error?.message ?? "") && !JSON.stringify(r).includes("GRANT-ONE-TIME"), `invoke by UUID: ${JSON.stringify(r).slice(0, 300)}`);
-  const l = await g.call("integrations_login", { service: STAMP_UUID });
+  // A fresh plugin for the login, since the invoke's list has already taught this one the UUID.
+  const g2 = await sealedGateway(null);
+  const l = await g2.call("integrations_login", { service: STAMP_UUID });
   must(l.status !== "succeeded" && /stamp_login/.test(l.error?.message ?? ""), `login by UUID: ${JSON.stringify(l).slice(0, 300)}`);
   must(w.logins.length === 0 && w.actions().length === 0 && w.callbacks().length === 0, `signed in or sent: ${w.logins.length} logins, ${w.actions().length} actions`);
+  // Each pass through the hook's window leaves one row, with the service and action as sent; none carries a secret.
+  const traced = [g, g2].flatMap((x) => Object.values(x.store.dumpTables()).flat() as any[])
+    .filter((row) => JSON.stringify(row).includes("raft.agent_login_unresolved_refused"));
+  must(traced.length === 2, `unresolved refusals traced: ${traced.length}`);
+  const text = JSON.stringify(traced);
+  must(text.includes(STAMP_UUID) && /integrations_invoke/.test(text) && /integrations_login/.test(text) && /agent-login/.test(text), `rows: ${text.slice(0, 400)}`);
+  must(!text.includes("GRANT-ONE-TIME") && !text.includes(CREDENTIAL) && !text.includes("C".repeat(43)), "a row carries a secret or the params");
   // Under approval: once the agent has listed its apps (where it reads the UUID), the UUID is refused before a card.
   const h = await sealedGateway();
   const listed = await h.call("integrations_list", {});
@@ -1043,6 +1052,8 @@ await check("Stamp's UUID, the id integrations_list shows: refused by both handl
     }
   }
   must((await h.store.listApprovals("tenant")).length === 0, "a card was made for the UUID");
+  // Refused by the hook, the window did not open: no unresolved row.
+  must(!JSON.stringify(h.store.dumpTables()).includes("raft.agent_login_unresolved_refused"), "a refusal the hook made was counted as unresolved");
   must(w.logins.length === 0 && w.actions().length === 0, "the UUID reached a login or the app");
 });
 
