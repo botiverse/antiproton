@@ -470,6 +470,23 @@ await check("renewal: a connector's pair reaches only its own origin's agents; a
     && JSON.stringify(kNull) === JSON.stringify({ to: [], filtered: 1, skipped: 0 }), `filtered: ${JSON.stringify(k1)} ${JSON.stringify(kNull)}`);
 });
 
+await check("credential paths take an allow list of statuses: an agent of a status not named there gets no grant, no renewed pair and no binding", async () => {
+  const f = d1();
+  f.agent("A", OURS); f.agent("S", OURS);
+  // A status added later, say a suspension: nothing hands it a credential until it is named.
+  f.db.prepare("UPDATE provisioned_agents SET status = 'suspended' WHERE raft_agent_id = 'S'").run();
+  f.db.prepare("INSERT INTO connectors(id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at, raft_origin) VALUES ('k1', ?, 'github', 'octo', 'u-1', 'c', 'i', 1, ?)").run(TENANT, OURS);
+  f.bind("A", "k1"); f.bind("S", "k1");
+  const { d1ConnectorGrants, d1Connections, renewalAudience, LIVE_AGENT_STATUSES } = await import("../cf/src/control-plane.ts");
+  assert(JSON.stringify(LIVE_AGENT_STATUSES) === JSON.stringify(["provisioning", "active"]), `live: ${JSON.stringify(LIVE_AGENT_STATUSES)}`);
+  assert((await d1ConnectorGrants(f.D1).grant(TENANT, "k1", "raft_A")) !== null, "control: the active agent was refused");
+  assert((await d1ConnectorGrants(f.D1).grant(TENANT, "k1", "raft_S")) === null, "a suspended agent found the connector");
+  const aud = await renewalAudience(f.D1, TENANT, "k1");
+  assert(JSON.stringify(aud) === JSON.stringify({ to: ["raft_A"], filtered: 0, skipped: 1 }), `audience: ${JSON.stringify(aud)}`);
+  const put = (agent: string) => d1Connections(f.D1).put({ tenantId: TENANT, raftAgentId: agent, provider: "linear", account: null, connectedBy: "u-1", connectedAt: 1, connectorId: null } as any);
+  assert((await put("A")) === true && (await put("S")) === false, "the binding write took a suspended agent");
+});
+
 await check("migration 0031: a deleted agent still bound to a connector is unbound, each recorded first; live agents keep theirs", async () => {
   const f = d1("0031_");
   f.agent("A", OURS); f.agent("Z", OURS);
