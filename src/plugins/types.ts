@@ -540,6 +540,11 @@ export interface PluginContext {
     policy: MountPolicy | null;
   } | null>;
   /**
+   * True when the agent has been deleted (its delete stopped it): a plugin registers none of its accounts anywhere
+   * any more, whatever `sandboxForms` says. Absent: not deleted, or a caller that cannot tell.
+   */
+  agentDeleted?: boolean;
+  /**
    * This agent's mounts whose plugin declares a {@link SandboxForm}, with each
    * one's credential, for the plugin that runs the agent's container.
    *
@@ -1879,6 +1884,15 @@ export interface Holding {
    */
   usage?(ctx: PluginContext): Promise<MountUsage[]>;
   /**
+   * Take back every credential this mount registered at the far end for the things it holds, without letting the
+   * things go: for an agent's delete, before the release, so a thing the release cannot end (a refusal, an outage)
+   * stops acting with the agent's accounts at once. Never a throw: an answer for each held thing, `clean` only on
+   * positive evidence that nothing is registered for it any more (a complete listing, read with a key that sees it,
+   * showing none), and `ownKey` when the thing records being made under the mount's current kind of key, so a
+   * deletion of it by this mount's release can be believed.
+   */
+  withdraw?(ctx: PluginContext): Promise<Array<{ id: string; clean: boolean; ownKey: boolean; why?: string; review?: string }>>;
+  /**
    * Let go of it. Scoped to the AGENT rather than to one task, safe to call
    * again, and it must throw rather than return if something billed could not
    * be released — a silent failure here is a resource nobody will collect.
@@ -1892,12 +1906,6 @@ export interface Holding {
    * Letting go of several may report a fact for each (an array), and a failure among them throws with
    * every fact attached (`markReleased`).
    */
-  /**
-   * Take back every credential this mount registered at the far end for the things it holds, without letting the
-   * things go: for an agent's delete, before the release, so a thing the release cannot end (a refusal, an outage)
-   * stops acting with the agent's accounts at once. What was cleared, and what could not be, each named; never a throw.
-   */
-  withdraw?(ctx: PluginContext): Promise<{ withdrawn: string[]; failed: string[] }>;
   release(ctx: PluginContext, opts?: {
     reason?: "idle"; id?: string;
     /**

@@ -133,13 +133,22 @@ function run9Fake() {
   const ws = "https://api.run.sys9.ai/projects/default/workspace";
   let n = 0;
   // `ignoreWithdraw`: it answers a removal 200 and keeps the registration (a removal taken but not applied).
-  const f = { failDelete: false, failWithdraw: false, ignoreWithdraw: false };
+  // `deleteNotFound`: it answers the box's delete 404 (as for a key of another account) and the box runs on.
+  // `listShape`: the box's secrets listing comes back in another shape (wrapped, or a proxy's page).
+  const f = { failDelete: false, failWithdraw: false, ignoreWithdraw: false, deleteNotFound: false, listShape: null as null | "wrapped" | "html" };
+  /** Project-scope registrations: injected into the boxes they label, never listed on the box. */
+  const project: Secret[] = [];
+  const calls: string[] = [];
   const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json" } });
   async function handle(url: string, init?: RequestInit): Promise<Response> {
     const method = init?.method ?? "GET";
     const path = url.startsWith(ws) ? url.slice(ws.length).split("?")[0]! : url;
     const body = typeof init?.body === "string" ? JSON.parse(init.body) : null;
+    calls.push(`${method} ${url.replace("https://api.run.sys9.ai", "")}`);
     let m: RegExpMatchArray | null;
+    if (url === "https://api.run.sys9.ai/projects/default/secrets") {
+      return json(project.map((x) => ({ secret_id: x.secret_id, name: x.name, placeholder: x.placeholder, scope: "project", box_label: { k: "v" } })));
+    }
     if (method === "POST" && path === "/boxes") { boxes.set(body.box_id, { state: "running", secrets: [] }); return json({ box_id: body.box_id }); }
     if (method === "GET" && path === "/boxes") return json([...boxes].map(([box_id, b]) => ({ box_id, state: b.state })));
     if ((m = path.match(/^\/boxes\/([^/]+)\/background-execs$/)) && method === "POST") {
@@ -155,7 +164,9 @@ function run9Fake() {
         b.secrets.push({ secret_id: `s${++n}`, name: body.name, value: body.value, placeholder: body.placeholder, inject_header_name: body.inject_header_name, allowed_hosts: body.allowed_hosts });
         return json({});
       }
-      return json(b.secrets.map((x) => ({ name: x.name, secret_id: x.secret_id })));
+      if (f.listShape === "wrapped") return json({ items: b.secrets.map((x) => ({ name: x.name, secret_id: x.secret_id })) });
+      if (f.listShape === "html") return new Response("<html>gateway</html>", { status: 200, headers: { "content-type": "text/html" } });
+      return json(b.secrets.map((x) => ({ name: x.name, secret_id: x.secret_id, placeholder: x.placeholder })));
     }
     if ((m = path.match(/^\/boxes\/([^/]+)\/secrets\/([^/]+)$/)) && method === "DELETE") {
       const b = boxes.get(m[1]!);
@@ -167,6 +178,7 @@ function run9Fake() {
     if ((m = path.match(/^\/boxes\/([^/]+)\/stop$/))) { const b = boxes.get(m[1]!); if (b) b.state = "stopped"; return json({}); }
     if ((m = path.match(/^\/boxes\/([^/]+)$/)) && method === "DELETE") {
       if (f.failDelete) return json({ message: "run9 is unavailable" }, 503);
+      if (f.deleteNotFound) return json({ message: "box not found" }, 404);
       boxes.delete(m[1]!);
       return json({});
     }
@@ -178,14 +190,14 @@ function run9Fake() {
     if (!b) return null;
     const host = new URL(url).hostname;
     const out = { ...headers };
-    for (const s of b.secrets) {
+    for (const s of [...b.secrets, ...project]) {
       if (!s.allowed_hosts.includes(host)) continue;
       const k = Object.keys(out).find((h) => h.toLowerCase() === s.inject_header_name.toLowerCase());
       if (k && out[k]!.includes(s.placeholder)) out[k] = out[k]!.replaceAll(s.placeholder, s.value);
     }
     return out;
   }
-  return { boxes, handle, egress, f };
+  return { boxes, handle, egress, f, project, calls };
 }
 
 async function world(opts: { expiring?: boolean; github?: boolean; run9?: ReturnType<typeof run9Fake> } = {}) {
@@ -340,7 +352,8 @@ async function world(opts: { expiring?: boolean; github?: boolean; run9?: Return
   const dispose = () => { for (const o of objects.values()) o.host.dispose(); };
   const sandbox = (a: { rt: AgentRuntime; agentId: string }, command = "true") =>
     a.rt.gateway().invoke({ tenantId: TENANT, agentId: a.agentId, taskId: "t1" }, "sandbox.shell", { command } as any);
-  return { db, gh, agent, connect, sandbox, reconnect, links, status, tool, stored, expireAt, age, call, grants, propagated, settle, dispose, traced, clearMode, hooks,
+  const hostOf = (agentId: string) => objects.get(agentId)!.host;
+  return { db, gh, agent, connect, sandbox, hostOf, reconnect, links, status, tool, stored, expireAt, age, call, grants, propagated, settle, dispose, traced, clearMode, hooks,
     delayPropagation: (ms: number) => { propagateDelayMs = ms; } };
 }
 
@@ -1465,26 +1478,31 @@ function fromBox(run9: ReturnType<typeof run9Fake>, boxId: string) {
   return { placeholder, send: () => run9.egress(boxId, "https://api.github.com/user", { authorization: `token ${placeholder}` }) };
 }
 
+const boxOf = (body: any) => body?.sandboxes?.boxes?.[0];
+
 await check("deleting an agent with a live sandbox: the box is deleted, and a request it makes carries no GitHub token", async () => {
   const run9 = run9Fake();
   const w = await world({ run9 });
   const a = await w.agent("Y1");
   await w.connect(a);
   must((await w.sandbox(a) as any).status === "succeeded", "control: the command did not run");
+  // Registered for the box alone, never for the project: a project-scope registration would not be on the box's list.
+  must(run9.calls.some((c) => /^POST \/projects\/default\/workspace\/boxes\/[^/]+\/secrets$/.test(c)) && !run9.calls.some((c) => /^POST \/projects\/default\/secrets/.test(c)),
+    `registered at another scope: ${run9.calls.filter((c) => c.includes("secrets")).join(", ")}`);
   const [boxId] = [...run9.boxes.keys()];
   const req = fromBox(run9, boxId!);
   const token = (await w.stored(a)).token!;
   // Control: before the delete, the box's request leaves with the agent's token in it.
   must(req.send()?.authorization === `token ${token}`, `control: the box's request did not carry the token: ${JSON.stringify(req.send())}`);
   const del = await w.call("DELETE", "/agents/by-raft-agent/Y1");
-  must(del.status === 200 && del.body.clean === true && del.body.sandboxes?.released?.includes("sandbox") && (del.body.sandboxes.failed ?? []).length === 0,
-    `the answer: ${del.status} ${del.text}`);
+  must(del.status === 200 && del.body.clean === true && del.body.sandboxes?.released?.includes("sandbox") && boxOf(del.body)?.clean === true
+    && boxOf(del.body).via === "withdrawn", `the answer: ${del.status} ${del.text}`);
   // The box is gone: nothing it sends goes anywhere, with the token or without.
   must(req.send() === null && !run9.boxes.has(boxId!), `the box is still there: ${JSON.stringify(req.send())}`);
   w.dispose();
 });
 
-await check("deleting an agent whose box run9 will not delete: its registrations are withdrawn first, so the running box's request carries no token; the answer says retry_delete", async () => {
+await check("deleting an agent whose box run9 will not delete: its registrations are withdrawn first, so the running box's request carries no token, and a command after it wires nothing again", async () => {
   const run9 = run9Fake();
   const w = await world({ run9 });
   const a = await w.agent("Y2");
@@ -1496,12 +1514,14 @@ await check("deleting an agent whose box run9 will not delete: its registrations
   must(req.send()?.authorization === `token ${token}`, "control: the box's request did not carry the token");
   run9.f.failDelete = true;
   const del = await w.call("DELETE", "/agents/by-raft-agent/Y2");
-  const failed = del.body?.sandboxes?.failed?.[0];
-  must(del.status === 200 && del.body.clean === false && failed?.alias === "sandbox" && failed.action === "retry_delete" && failed.egress === "withdrawn",
-    `the answer: ${del.status} ${del.text}`);
+  must(del.status === 200 && del.body.clean === false && boxOf(del.body)?.clean === true && boxOf(del.body).via === "withdrawn"
+    && del.body.sandboxes.failed?.[0]?.stage === "release", `the answer: ${del.status} ${del.text}`);
   // Still running, and still sending: the request leaves with the placeholder, not the token.
   const sent = req.send();
   must(sent !== null && sent.authorization === `token ${req.placeholder}` && !JSON.stringify(sent).includes(token), `the box's request after the delete: ${JSON.stringify(sent)}`);
+  // A command on the deleted agent's box (one racing the delete) wires nothing again.
+  await w.sandbox(a);
+  must(run9.boxes.get(boxId!)!.secrets.length === 0, `re-registered after the delete: ${JSON.stringify(run9.boxes.get(boxId!)!.secrets.map((x) => x.name))}`);
   // run9 answers again: the repeated delete lets the box go.
   run9.f.failDelete = false;
   const again = await w.call("DELETE", "/agents/by-raft-agent/Y2");
@@ -1509,7 +1529,7 @@ await check("deleting an agent whose box run9 will not delete: its registrations
   w.dispose();
 });
 
-await check("deleting an agent whose box run9 will neither delete nor clear: the answer says the egress still holds the token, not clean", async () => {
+await check("deleting an agent whose box run9 will neither delete nor clear: not clean, the box named with why, and its request still carries the token", async () => {
   const run9 = run9Fake();
   const w = await world({ run9 });
   const a = await w.agent("Y3");
@@ -1522,17 +1542,111 @@ await check("deleting an agent whose box run9 will neither delete nor clear: the
   // First a removal run9 answers but does not apply: checked, not believed.
   run9.f.ignoreWithdraw = true;
   const quiet = await w.call("DELETE", "/agents/by-raft-agent/Y3");
-  must(quiet.body?.sandboxes?.failed?.[0]?.egress === "not_withdrawn" && req.send()?.authorization === `token ${token}`, `an unapplied removal: ${quiet.text}`);
+  must(quiet.body?.clean === false && boxOf(quiet.body)?.clean === false && /still on the box/.test(boxOf(quiet.body).why)
+    && boxOf(quiet.body).action === "retry_delete" && req.send()?.authorization === `token ${token}`, `an unapplied removal: ${quiet.text}`);
   run9.f.ignoreWithdraw = false; run9.f.failWithdraw = true;
   const del = await w.call("DELETE", "/agents/by-raft-agent/Y3");
-  const failed = del.body?.sandboxes?.failed?.[0];
-  must(del.status === 200 && del.body.clean === false && failed?.egress === "not_withdrawn" && failed.action === "retry_delete"
-    && (del.body.sandboxes.withdrawFailed ?? []).length === 1, `the answer: ${del.status} ${del.text}`);
+  must(del.status === 200 && del.body.clean === false && boxOf(del.body)?.clean === false && boxOf(del.body).action === "retry_delete",
+    `the answer: ${del.status} ${del.text}`);
   // Said as it is: this box still sends the token.
   must(req.send()?.authorization === `token ${token}`, "the fake did not keep the registration it refused to remove");
   run9.f.failDelete = false; run9.f.failWithdraw = false;
   const again = await w.call("DELETE", "/agents/by-raft-agent/Y3");
   must(again.status === 200 && again.body.clean === true && req.send() === null, `repeat: ${again.status} ${again.text}`);
+  w.dispose();
+});
+
+await check("clean only on positive evidence: no key to reach the box, a box made under no recorded key whose delete run9 answers not found, an unreadable listing: none is clean", async () => {
+  // No key: the sandbox mount's credential is gone, so nothing can be withdrawn nor deleted.
+  {
+    const run9 = run9Fake();
+    const w = await world({ run9 });
+    const a = await w.agent("Y4");
+    await w.connect(a);
+    await w.sandbox(a);
+    await a.rt.store.setMountSecretRef(TENANT, a.agentId, "sandbox", null);
+    const del = await w.call("DELETE", "/agents/by-raft-agent/Y4");
+    must(del.body?.clean === false && boxOf(del.body)?.clean === false && /no credential/.test(boxOf(del.body).why), `no key: ${del.text}`);
+    w.dispose();
+  }
+  // A box with no recorded key (made by older code): run9's "not found" on delete is not believed, and the
+  // withdrawal could not run, so it is not clean.
+  {
+    const run9 = run9Fake();
+    const w = await world({ run9 });
+    const a = await w.agent("Y5");
+    await w.connect(a);
+    await w.sandbox(a);
+    // As older code left it: the box's record names no key it was made under.
+    const host = w.hostOf(a.agentId);
+    const rows = host.sql.exec("SELECT rowid AS r, value FROM plugin_db WHERE agent_id = ? AND alias = 'sandbox' AND store = 'box'", a.agentId).toArray() as any[];
+    must(rows.length > 0 && rows.some((x) => String(x.value).includes("credentialRef")), "control: no recorded key to strip");
+    for (const x of rows) host.sql.exec("UPDATE plugin_db SET value = ? WHERE rowid = ?", String(x.value).replace(/"credentialRef":"[^"]*",?/g, "").replace(/,}/g, "}"), x.r);
+    run9.f.failWithdraw = true; run9.f.deleteNotFound = true;
+    const del = await w.call("DELETE", "/agents/by-raft-agent/Y5");
+    must(del.body?.clean === false && boxOf(del.body)?.clean === false, `not found believed: ${del.text}`);
+    w.dispose();
+  }
+  // A listing in another shape (wrapped, or a proxy's page) is refused, never read as "none left".
+  for (const shape of ["wrapped", "html"] as const) {
+    const run9 = run9Fake();
+    const w = await world({ run9 });
+    const a = await w.agent(shape === "wrapped" ? "Y6" : "Y7");
+    await w.connect(a);
+    await w.sandbox(a);
+    const [boxId] = [...run9.boxes.keys()];
+    const token = (await w.stored(a)).token!;
+    run9.f.listShape = shape; run9.f.failDelete = true;
+    const del = await w.call("DELETE", `/agents/by-raft-agent/${a.raftAgentId}`);
+    must(del.body?.clean === false && boxOf(del.body)?.clean === false && /not a list of secrets/.test(boxOf(del.body).why ?? "")
+      && fromBox(run9, boxId!).send()?.authorization === `token ${token}`, `${shape}: ${del.text}`);
+    w.dispose();
+  }
+});
+
+await check("run9's secrets listing is read strictly: a bare array of views with their ids, anything else throws", async () => {
+  const { secretViews } = await import("../src/plugins/sandbox/providers/run9.ts");
+  must(secretViews([], "p").length === 0 && secretViews([{ secret_id: "s1", name: "GH_TOKEN" }], "p").length === 1, "control: a bare array was refused");
+  for (const bad of [{ items: [] }, "<html></html>", null, [{ name: "GH_TOKEN" }], { data: [{ secret_id: "s1" }] }]) {
+    let threw = false;
+    try { secretViews(bad, "p"); } catch { threw = true; }
+    must(threw, `read as a list: ${JSON.stringify(bad)}`);
+  }
+});
+
+await check("a project-scope registration carrying the box's placeholder is not clean; one sharing only a name is for a person to look at", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("Y8");
+  await w.connect(a);
+  await w.sandbox(a);
+  const [boxId] = [...run9.boxes.keys()];
+  const placeholder = run9.boxes.get(boxId!)!.secrets[0]!.placeholder;
+  run9.project.push({ secret_id: "p1", name: "GH_TOKEN", value: "x", placeholder: "__AP_OTHER__", inject_header_name: "authorization", allowed_hosts: ["api.github.com"] });
+  run9.f.failDelete = true;
+  const named = await w.call("DELETE", "/agents/by-raft-agent/Y8");
+  must(boxOf(named.body)?.clean === true && /a person should look/.test(boxOf(named.body).review ?? ""), `a name only: ${named.text}`);
+  run9.project.push({ secret_id: "p2", name: "OTHER", value: "x", placeholder, inject_header_name: "authorization", allowed_hosts: ["api.github.com"] });
+  const injected = await w.call("DELETE", "/agents/by-raft-agent/Y8");
+  must(boxOf(injected.body)?.clean === false && /project-scope/.test(boxOf(injected.body).why ?? ""), `a placeholder match: ${injected.text}`);
+  w.dispose();
+});
+
+await check("the operator's withdrawal alone (/admin/withdraw-egress): a live box's registrations go, the box runs on, and its request carries the placeholder", async () => {
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("Y9");
+  await w.connect(a);
+  await w.sandbox(a);
+  const [boxId] = [...run9.boxes.keys()];
+  const req = fromBox(run9, boxId!);
+  const token = (await w.stored(a)).token!;
+  must(req.send()?.authorization === `token ${token}`, "control");
+  const r = await a.rt.withdrawEgress(TENANT, a.agentId);
+  must(r.things.length === 1 && r.things[0]!.clean && run9.boxes.has(boxId!) && req.send()?.authorization === `token ${req.placeholder}`, `withdraw: ${JSON.stringify(r)}`);
+  // A live agent: its next command wires its accounts again.
+  await w.sandbox(a);
+  must(fromBox(run9, boxId!).send()?.authorization === `token ${token}`, "a live agent's next command did not wire its accounts again");
   w.dispose();
 });
 

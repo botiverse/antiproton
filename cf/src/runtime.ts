@@ -758,6 +758,17 @@ export class BoundArtifacts {
 export const isOperatorModelRef = (ref: string) => providerOfRef(ref) !== null;
 export { OPERATOR_RUN9_REF, OPERATOR_INSTABOX_REF, OPERATOR_EXA_REF } from "./operator-ref.ts";
 
+/**
+ * What an agent's delete did to what its mounts hold (`AgentRuntime.releaseForDelete`): for each held thing, whether
+ * it is clean and how that was seen (`withdrawn`: nothing registered for it any more; `deleted`: let go by a release
+ * that can be believed), or why not; the mounts let go; and every step that failed.
+ */
+export interface ReleaseForDelete {
+  things: Array<{ alias: string; id: string; clean: boolean; via?: "withdrawn" | "deleted"; why?: string; review?: string }>;
+  released: string[];
+  failed: Array<{ alias: string; stage: "withdraw" | "release"; error: string }>;
+}
+
 export interface RuntimeDeps {
   ctx: any;
   bucketName: string;
@@ -1407,6 +1418,7 @@ export class AgentRuntime {
         heldPlace: async (ctx) => heldPlaceFor(agentKind((await this.store.loadAgent(ctx.tenantId, ctx.agentId))?.config),
           ctx.taskId, approvalsUrl(deps.consoleOrigin, ctx.agentId)),
         ...(deps.approvalTtlMs !== undefined ? { approvalTtlMs: deps.approvalTtlMs } : {}),
+        agentDeleted: () => agentDeletedAt(this.#deps.ctx.storage.sql) !== null,
       });
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
@@ -4823,16 +4835,31 @@ export class AgentRuntime {
    * not parked). The withdrawal comes first because the release can fail and leave the box running. Both are
    * repeated by a repeated delete; what each could not do is named.
    */
-  async releaseForDelete(tenantId: string, agentId: string): Promise<{
-    withdrawn: Array<{ alias: string; ids: string[] }>; released: string[];
-    failed: Array<{ alias: string; stage: "withdraw" | "release"; error: string }>;
-  }> {
+  /**
+   * The withdrawal alone (`Holding.withdraw` on every mount), nothing let go: for an operator observing it against a
+   * real box (`POST /admin/withdraw-egress`). On a live agent the next command wires the accounts again, as it does
+   * after any change of credentials, so what it shows lasts until then.
+   */
+  async withdrawEgress(tenantId: string, agentId: string) {
+    await this.ready();
+    return this.#gateway.withdrawTask({ tenantId, agentId, taskId: LEGACY_TASK });
+  }
+
+  async releaseForDelete(tenantId: string, agentId: string): Promise<ReleaseForDelete> {
     await this.ready();
     const ctx = { tenantId, agentId, taskId: LEGACY_TASK };
     const w = await this.#gateway.withdrawTask(ctx);
     const r = await this.#gateway.releaseTask(ctx);
+    // Clean only on positive evidence: withdrawn (a complete listing showing none), or let go by a release that
+    // did not fail, of a thing recorded as made under the mount's own kind of key, so its "deleted" can be believed.
+    // A "not found" for a thing made under another key, or under none recorded, is never taken as deleted.
+    const releaseFailed = new Set(r.failed.map((f) => f.alias));
     return {
-      withdrawn: w.withdrawn, released: r.released,
+      things: w.things.map((t) => {
+        const via = t.clean ? "withdrawn" as const : t.ownKey && !releaseFailed.has(t.alias) ? "deleted" as const : null;
+        return { alias: t.alias, id: t.id, clean: via !== null, ...(via ? { via } : {}), ...(via || !t.why ? {} : { why: t.why }), ...(t.review ? { review: t.review } : {}) };
+      }),
+      released: r.released,
       failed: [...w.failed.map((f) => ({ ...f, stage: "withdraw" as const })), ...r.failed.map((f) => ({ ...f, stage: "release" as const }))],
     };
   }

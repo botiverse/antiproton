@@ -1575,6 +1575,12 @@ export class AgentDO extends DurableObject<Env> {
     });
   }
 
+  /** The withdrawal alone, for an operator observing it against a real box (`/admin/withdraw-egress`). */
+  async withdrawEgress(tenantId: string, agentId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("withdrawEgress", () => this.runtime().withdrawEgress(tenantId, agentId));
+  }
+
   /** An agent's delete, after its turn is stopped: its far-end registrations taken back, its held things let go. */
   async releaseForDelete(tenantId: string, agentId: string) {
     this.#claim(tenantId, agentId);
@@ -5195,6 +5201,22 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
           // another, as a stop waiting on a tool call does (cf/src/provision/handlers.ts `stopTurnOf`).
           logTurnStop({ tenantId: t, agentId: a, trigger: "admin_cancel", side: "worker" }, r);
           return Response.json({ tenantId: t, agentId: a, ...r }, { status: r.result === "failed" ? 503 : 200 });
+        }
+        case "/admin/withdraw-egress": {
+          // The withdrawal an agent's delete starts with, alone: every egress registration on every box the agent's
+          // mounts hold is removed, nothing is let go, nothing is deleted, and the answer is what each box showed
+          // (`Holding.withdraw`). For an operator observing it against a real box; the agent's next command wires its
+          // accounts again. Operator only, and never on its own a substitute for the delete.
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
+          const t = url.searchParams.get("tenantId") ?? "";
+          const a = url.searchParams.get("agentId") ?? "";
+          if (!t || !a) return Response.json({ error: "tenantId and agentId are required" }, { status: 400 });
+          const r = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).withdrawEgress(t, a);
+          logEvent("admin.withdraw_egress", { tenantId: t, agentId: a, things: r.things.length, clean: r.things.filter((x) => x.clean).length, failed: r.failed.length });
+          return Response.json({ tenantId: t, agentId: a, at: new Date().toISOString(), ...r });
         }
         case "/admin/migrate-engine":
           return await adminMigrateEngine(request, env.AUTOMATION_TOKEN,

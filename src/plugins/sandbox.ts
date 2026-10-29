@@ -1524,6 +1524,17 @@ const UNKNOWN_WIRING: Wired = { alias: "", plugin: "", placeholder: "", digest: 
  * secret is accepted again and then not substituted (measured on run9,
  * 2026-09-15: re-registered after a policy change, GitHub answered 401).
  */
+/**
+ * Whether `value` carries a placeholder made for this box (`placeholderFor`), as itself or in the base64 form a git
+ * registration wraps it in: the mark is the box id's tail, which every placeholder for the box carries.
+ */
+export function carriesBoxPlaceholder(value: string, boxId: string): boolean {
+  const mark = `_${boxId.slice(-8).replace(/[^A-Za-z0-9]/g, "_")}_`;
+  const forms = [value];
+  try { forms.push(atob(value)); } catch { /* not base64 */ }
+  return forms.some((v) => v.includes("__AP_") && v.includes(mark));
+}
+
 export function placeholderFor(
   alias: string, boxId: string,
   fresh = [...crypto.getRandomValues(new Uint8Array(3))].map((b) => b.toString(16).padStart(2, "0")).join(""),
@@ -1687,6 +1698,9 @@ async function reconcileAccounts(
   ctx: PluginContext, state: BoxState, provider: SandboxProvider,
   want: Awaited<ReturnType<typeof accountsWanted>>, machine: string,
 ): Promise<BoxState> {
+  // A deleted agent's container acts as nobody: what was wired is taken off, and nothing is wired again, whatever the
+  // mounts still hold (its delete withdraws first, and a command racing that must not put the accounts back).
+  if (ctx.agentDeleted) want = { wire: [], leftOut: [] };
   const had = state.wired ?? [];
   const same = (w: Wired, c: { alias: string; plugin: string; digest: string }) =>
     w.alias === c.alias && w.plugin === c.plugin && w.digest === c.digest && w.names !== null;
@@ -2357,6 +2371,66 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // The shared window: every machine's sessions, each naming its machine when not the default.
       return usageOf(asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY)));
     },
+    /**
+     * Every egress registration on every box this mount holds, removed, and the record of what was wired cleared:
+     * for an agent's delete (`Holding.withdraw`). run9 holds the registered value and swaps it in on the box's way
+     * out with no call back here, so this is the only way to stop a box still running from using it.
+     *
+     * A box is `clean` only on positive evidence: its registrations listed again after the removal, under this
+     * mount's key, as a complete and readable list (run9's is a bare array with no pages; anything else throws),
+     * showing none; and no project-scope registration carrying one of its placeholders (run9 injects those into the
+     * boxes they label without listing them on the box). A project registration that only shares a name is `review`:
+     * a person should look, but it is not proof. That match is a heuristic: no match does not mean none exists.
+     * Anything else is not clean: no key to reach the box with, a listing that cannot be read, a box made under a
+     * key since replaced (stranded: neither listable nor deletable with this one, so every delete reports it again).
+     */
+    async withdraw(ctx: PluginContext) {
+      const mount = await readMount(ctx);
+      const cfg = cfgOf(ctx);
+      const backend = backendFor(cfg);
+      const out: Array<{ id: string; clean: boolean; ownKey: boolean; why?: string; review?: string }> = [];
+      for (const machine of boxedMachines(mount)) {
+        const state = await readView(ctx, machine);
+        if (!state.boxId) continue;
+        // A provider that cannot hold a credential for one box has none registered on it (accountsWanted).
+        if (!backend.caps.boxSecrets) { out.push({ id: state.boxId, clean: true, ownKey: false, why: `${backend.name} wires no account into a box` }); continue; }
+        // A deletion by this mount's release is believed only for a box recorded as made under this kind of key.
+        const ownKey = !!ctx.credential && state.credentialRef !== undefined && state.credentialRef === ctx.credentialRefKind;
+        if (!ctx.credential) { out.push({ id: state.boxId, clean: false, ownKey: false, why: "no credential to reach the box with" }); continue; }
+        try {
+          const provider = backend.open(cfg, ctx.credential);
+          const before = await provider.listSecrets(state.boxId);
+          const placeholders = new Set([...before.map((x) => String(x.placeholder ?? "")), ...(state.wired ?? []).map((w) => w.placeholder)].filter(Boolean));
+          const names = new Set([...before.map((x) => String(x.name ?? "")), ...(state.wired ?? []).flatMap((w) => w.names ?? [])].filter(Boolean));
+          for (const sec of before) await provider.removeSecret(state.boxId, sec.id);
+          const left = await provider.listSecrets(state.boxId);
+          let injected = 0, named = 0;
+          if (provider.listProjectSecrets) {
+            for (const p of await provider.listProjectSecrets()) {
+              const ph = String(p.placeholder ?? "");
+              if (ph && ([...placeholders].some((x) => ph === x || ph.includes(x)) || carriesBoxPlaceholder(ph, state.boxId))) injected++;
+              else if (names.has(String(p.name ?? ""))) named++;
+            }
+          }
+          const now = await readView(ctx, machine);
+          if (now.boxId === state.boxId && (now.wired || now.leftOut)) {
+            const next = { ...now };
+            delete next.wired; delete next.leftOut;
+            await writeView(ctx, machine, next);
+          }
+          const why = left.length ? `${left.length} registration(s) still on the box after removal`
+            : injected ? `${injected} project-scope registration(s) carry this box's placeholder, so run9 still injects them` : undefined;
+          out.push({ id: state.boxId, clean: !left.length && !injected, ownKey, ...(why ? { why } : {}),
+            ...(named ? { review: `${named} project-scope registration(s) share a name with this box's accounts; a person should look` } : {}) });
+        } catch (e) {
+          out.push({ id: state.boxId, clean: false, ownKey, why: String((e as Error)?.message ?? e).slice(0, 200) });
+        }
+      }
+      for (const id of Object.keys(mount?.stranded ?? {})) {
+        out.push({ id, clean: false, ownKey: false, why: "stranded: made under a key since replaced, so with this one its registrations can be neither listed nor removed, nor the box deleted" });
+      }
+      return out;
+    },
     /** Hands this mount's box back, so an idle one is not left running on the
      *  tenant's quota because nobody thought to stop it. Safe to call when there
      *  is no box: it reports that nothing was released rather than failing.
@@ -2375,43 +2449,6 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
      *  task.
      *
      *  What happens to each machine is `releaseMachine`'s. */
-    /**
-     * Every egress registration on every box this mount holds, removed, and the record of what was wired cleared:
-     * for an agent's delete (`Holding.withdraw`). run9 holds the registered value and swaps it in on the box's way
-     * out with no call back here, so this is the only way to stop a box still running from using it. A command
-     * after this would wire the accounts again (`reconcileAccounts`); a deleted agent takes none.
-     */
-    async withdraw(ctx: PluginContext): Promise<{ withdrawn: string[]; failed: string[] }> {
-      const mount = await readMount(ctx);
-      const withdrawn: string[] = [];
-      const failed: string[] = [];
-      const cfg = cfgOf(ctx);
-      for (const machine of boxedMachines(mount)) {
-        const state = await readView(ctx, machine);
-        if (!state.boxId) continue;
-        if (!backendFor(cfg).caps.boxSecrets) continue;
-        if (!ctx.credential) { failed.push(`${state.boxId}: no credential to reach it with`); continue; }
-        try {
-          const provider = backendFor(cfg).open(cfg, ctx.credential);
-          for (const sec of await provider.listSecrets(state.boxId)) await provider.removeSecret(state.boxId, sec.id);
-          // Checked, not assumed: a removal the far end took but did not apply is not a withdrawal.
-          const left = await provider.listSecrets(state.boxId);
-          if (left.length) { failed.push(`${state.boxId}: ${left.length} registration(s) still there after removal`); continue; }
-          const now = await readView(ctx, machine);
-          if (now.boxId === state.boxId && (now.wired || now.leftOut)) {
-            const next = { ...now };
-            delete next.wired; delete next.leftOut;
-            await writeView(ctx, machine, next);
-          }
-          withdrawn.push(state.boxId);
-        } catch (e) {
-          failed.push(`${state.boxId}: ${String((e as Error)?.message ?? e).slice(0, 160)}`);
-        }
-      }
-      // A stranded box was made by a key that is gone: its registrations cannot be listed with this one.
-      for (const id of Object.keys(mount?.stranded ?? {})) failed.push(`${id}: stranded, made by another key, so its registrations cannot be reached`);
-      return { withdrawn, failed };
-    },
     async release(ctx: PluginContext, opts?: { reason?: "idle"; id?: string; forget?: boolean }): Promise<Released | Released[] | false> {
       // Which machines: the one whose box the framework named (the idle pass acts on one thing at a
       // time, each on its own clock), or every one the mount has (an operator releasing the mount, a

@@ -85,7 +85,8 @@ export interface ProvisionAgentOps {
    * its held things let go (`AgentRuntime.releaseForDelete`).
    */
   releaseForDelete?(tenantId: string, agentId: string): Promise<{
-    withdrawn: Array<{ alias: string; ids: string[] }>; released: string[];
+    things: Array<{ alias: string; id: string; clean: boolean; via?: "withdrawn" | "deleted"; why?: string; review?: string }>;
+    released: string[];
     failed: Array<{ alias: string; stage: "withdraw" | "release"; error: string }>;
   }>;
 }
@@ -1035,7 +1036,7 @@ export async function handleProvision(
     const releaseHeld = async () => {
       if (!deps.agent.releaseForDelete) return null;
       try { return await deps.agent.releaseForDelete(tenantId, row.agentId); }
-      catch (e) { return { withdrawn: [], released: [], failed: [{ alias: "*", stage: "release" as const, error: `the agent's object did not answer: ${String((e as Error)?.message ?? e).slice(0, 160)}` }] }; }
+      catch (e) { return { things: [], released: [], failed: [{ alias: "*", stage: "release" as const, error: `the agent's object did not answer: ${String((e as Error)?.message ?? e).slice(0, 160)}` }] }; }
     };
     // Right after the stop, before anything slower: a box still running acts with the agent's accounts until then.
     const held = await releaseHeld();
@@ -1110,24 +1111,22 @@ export async function handleProvision(
     };
     // What the delete could not finish, each with what to do next. Still a 200: the agent is deleted either way.
     //  - a background job whose cancel failed goes on with whatever it holds: `turn.stillRunning`, retry_delete;
-    //  - a held thing that would not go: `sandboxes.failed`, retry_delete, and `egress` says whether the credentials
-    //    registered for it were taken back (a box still running then has none of the agent's accounts) or not.
+    //  - each held thing (a box) is clean only on positive evidence (`releaseForDelete`): `via: "withdrawn"` or
+    //    `"deleted"`. Anything else (no key to reach it, a listing that could not be read, a stranded box, a "not
+    //    found" that cannot be believed) is not clean, with why and retry_delete; it may still act with the agent's
+    //    accounts. A step that failed outright is in `sandboxes.failed`.
     // `clean` is every part clean; `connectionsClean` is the connections' alone, as before.
     const answer = (agent: ReturnType<typeof view>, ends: ConnectionEnd[] | null) => {
       const stillRunning = stop && stop.result !== "failed" ? stop.stillRunning ?? [] : [];
       const turn = stop?.result === "failed" ? { stopped: false, error: stop.error, action: "retry_delete" as const }
         : stillRunning.length ? { stopped: true, stillRunning, action: "retry_delete" as const } : null;
-      const releaseFailed = held?.failed.filter((f) => f.stage === "release") ?? [];
       const sandboxes = held === null ? null : {
         released: held.released,
-        failed: releaseFailed.map((f) => ({
-          alias: f.alias, error: f.error, action: "retry_delete" as const,
-          egress: held.failed.some((w) => w.stage === "withdraw" && (w.alias === f.alias || f.alias === "*")) || f.alias === "*" ? "not_withdrawn" as const : "withdrawn" as const,
-        })),
-        ...(held.failed.some((f) => f.stage === "withdraw") ? { withdrawFailed: held.failed.filter((f) => f.stage === "withdraw").map(({ alias, error }) => ({ alias, error })) } : {}),
+        boxes: held.things.map((t) => t.clean ? t : { ...t, action: "retry_delete" as const }),
+        ...(held.failed.length ? { failed: held.failed } : {}),
       };
       const connectionsClean = ends === null ? true : ends.every((e) => e.mount === "cleared" && !e.error);
-      const clean = connectionsClean && turn === null && releaseFailed.length === 0;
+      const clean = connectionsClean && turn === null && (held === null || (held.things.every((t) => t.clean) && held.failed.length === 0));
       if (ends === null && held === null && turn === null) return ok(agent);
       return ok({ ...agent, ...(ends === null ? {} : { connections: ends, connectionsClean }), ...(turn ? { turn } : {}), ...(sandboxes ? { sandboxes } : {}), clean });
     };

@@ -652,6 +652,8 @@ export class ToolGateway {
       heldPlace?: (ctx: CallContext) => HeldPlace | Promise<HeldPlace>;
       /** How long a held call waits for a decision before it is denied as expired; 0 keeps holds open. */
       approvalTtlMs?: number;
+      /** Whether the agent was deleted: told to every plugin as `PluginContext.agentDeleted`. */
+      agentDeleted?: (tenantId: string, agentId: string) => boolean;
     } = {},  ) {
     for (const p of plugins) checkBridge(p);
     this.#approvalTtlMs = opts.approvalTtlMs ?? DEFAULT_APPROVAL_TTL_MS;
@@ -662,7 +664,10 @@ export class ToolGateway {
     this.#seeded = seeded;
     this.#credentialRejected = opts.credentialRejected;
     this.#heldPlace = opts.heldPlace;
+    this.#agentDeleted = opts.agentDeleted;
   }
+
+  #agentDeleted?: (tenantId: string, agentId: string) => boolean;
 
   #credentialRejected?: CredentialRejected;
 
@@ -1135,8 +1140,11 @@ export class ToolGateway {
    * without letting the things go (an agent's delete, before its release). Behind the same lock as a call on the
    * mount, for an exclusive plugin, as `releaseTask` is. A mount whose plugin has no `withdraw` registers nothing.
    */
-  async withdrawTask(ctx: CallContext): Promise<{ withdrawn: Array<{ alias: string; ids: string[] }>; failed: Array<{ alias: string; error: string }> }> {
-    const withdrawn: Array<{ alias: string; ids: string[] }> = [];
+  async withdrawTask(ctx: CallContext): Promise<{
+    things: Array<{ alias: string; id: string; clean: boolean; ownKey: boolean; why?: string; review?: string }>;
+    failed: Array<{ alias: string; error: string }>;
+  }> {
+    const things: Array<{ alias: string; id: string; clean: boolean; ownKey: boolean; why?: string; review?: string }> = [];
     const failed: Array<{ alias: string; error: string }> = [];
     for (const mount of await this.#store.listMounts(ctx.tenantId, ctx.agentId)) {
       const plugin = this.#plugins.get(mount.plugin);
@@ -1155,13 +1163,12 @@ export class ToolGateway {
           async agentSecret() { return null; },
         });
         const r = isExclusive(plugin) ? await this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${mount.alias}`, run) : await run();
-        if (r.withdrawn.length) withdrawn.push({ alias: mount.alias, ids: r.withdrawn });
-        for (const f of r.failed) failed.push({ alias: mount.alias, error: f.slice(0, 200) });
+        for (const t of r) things.push({ alias: mount.alias, ...t });
       } catch (e) {
         failed.push({ alias: mount.alias, error: String((e as Error)?.message ?? e).slice(0, 200) });
       }
     }
-    return { withdrawn, failed };
+    return { things, failed };
   }
 
   async releaseTask(
@@ -1896,6 +1903,7 @@ export class ToolGateway {
       ...(this.#inbound && plugin?.receive
         ? { inbound: this.#inbound(ctx.tenantId, ctx.agentId, mount.alias) } : {}),
       sibling: (alias: string) => this.#sibling(ctx, alias, db),
+      ...(this.#agentDeleted?.(ctx.tenantId, ctx.agentId) ? { agentDeleted: true } : {}),
       // Only for a plugin that declares the services it may log in to (botiverse/antiproton#1084).
       ...(plugin?.agentLogin?.services?.length && !listing ? {
         agentLogin: (service: string, codeChallenge: string, target?: string) => this.#agentLogin(ctx, plugin, service, codeChallenge, target, operationId),
