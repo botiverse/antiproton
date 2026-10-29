@@ -56,11 +56,15 @@ export async function readConnectionHoldings(
   const out: ConnectionHolding[] = [];
   for (const plugin of plugins) {
     for (const mount of await store.findMountsByPlugin(tenantId, agentId, plugin)) {
-      if (!isAgentRef(mount.secretRef)) {
+      // As the runtime decides it (cf/src/runtime.ts detachConnectionIfFrom, and GithubRefresher.read in
+      // cf/src/github-refresh.ts): the store's own mount and secret reads, the key named by the reference, its renewal
+      // record under OAUTH_PREFIX + that name. A copy of that reading, held to the runtime's by a test
+      // (test/github-token-refresh.ts) until #1135 makes it one function.
+      const name = isAgentRef(mount.secretRef) ? mount.secretRef!.slice(agentRef("").length) : null;
+      if (name === null) {
         out.push({ alias: mount.alias, plugin, key: mount.secretRef ? "shared" : "none", connectorId: null });
         continue;
       }
-      const name = mount.secretRef!.slice(agentRef("").length);
       if (!(await store.getSecret(tenantId, agentId, name))) { out.push({ alias: mount.alias, plugin, key: "dangling", connectorId: null }); continue; }
       let connectorId: string | null = null;
       const rec = kek ? await store.getSecret(tenantId, agentId, OAUTH_PREFIX + name) : null;
@@ -72,11 +76,32 @@ export async function readConnectionHoldings(
 }
 
 /**
+ * The tables and columns `readConnectionHoldings` reads through the store (`findMountsByPlugin`, `getSecret`). Every
+ * layout the object store has had carries them: `mounts` and `secrets` have only gained or dropped other columns
+ * (src/store/durable-object.ts `init`: policy, tool_snapshot added; last4 dropped). An object without one is listed
+ * `layout_unknown`, never read as "no key".
+ */
+export const HOLDINGS_LAYOUT: Readonly<Record<string, readonly string[]>> = {
+  mounts: ["tenant_id", "agent_id", "alias", "plugin", "secret_ref", "public_config"],
+  secrets: ["tenant_id", "agent_id", "name", "ciphertext", "iv"],
+};
+
+/** What of HOLDINGS_LAYOUT an object's storage lacks (`table` or `table.column`), by SELECTs that read no row. */
+export function layoutMissing(sql: { exec(q: string, ...b: unknown[]): { toArray(): unknown[] } }): string[] {
+  const missing: string[] = [];
+  for (const [table, columns] of Object.entries(HOLDINGS_LAYOUT)) {
+    if (sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", table).toArray().length === 0) { missing.push(table); continue; }
+    for (const c of columns) { try { sql.exec(`SELECT "${c}" FROM "${table}" LIMIT 0`); } catch { missing.push(`${table}.${c}`); } }
+  }
+  return missing;
+}
+
+/**
  * `unknown`: the object did not answer; ask again later. `no_object`: it answered that it holds no such agent, so there
  * is no mount to read. Asking again changes nothing, and it is never "nothing there": a person judges it
  * (NO_OBJECT_NOTE).
  */
-export type Reconciled = "both" | "mount_only" | "binding_only" | "neither" | "unknown" | "no_object";
+export type Reconciled = "both" | "mount_only" | "binding_only" | "neither" | "unknown" | "no_object" | "layout_unknown";
 
 /**
  * The object cannot say why it holds no agent: one whose provisioning never reached it and one whose storage was wiped
@@ -121,7 +146,7 @@ export interface InventoryDeps {
   token: string | undefined;
   db: D1Database;
   /** The agent's object's answer; null when the object holds no such agent (its storage was wiped). */
-  holdings: (tenantId: string, agentId: string, plugins: readonly string[]) => Promise<ConnectionHolding[] | null>;
+  holdings: (tenantId: string, agentId: string, plugins: readonly string[]) => Promise<ConnectionHolding[] | null | { layoutMissing: string[] }>;
   now: () => number;
   objectTimeoutMs?: number;
 }
@@ -211,7 +236,8 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
   //  - `raft_agent_id` (Raft's id): provisioned_connections and connector_events;
   //  - `tenant_id`: all of them.
   const agentView = async (a: typeof rows[number]) => {
-    let object: "answered" | "no_agent" | "failed" = "answered";
+    let object: "answered" | "no_agent" | "failed" | "layout_unknown" = "answered";
+    let missing: string[] = [];
     let mounts: ConnectionHolding[] = [];
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -219,9 +245,11 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
         deps.holdings(a.tenant_id, a.agent_id, plugins),
         new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), deps.objectTimeoutMs ?? OBJECT_TIMEOUT_MS); }),
       ]);
-      if (h !== null && !Array.isArray(h)) throw new TypeError("not a list");
+      if (h !== null && !Array.isArray(h) && !(Array.isArray(h.layoutMissing) && h.layoutMissing.every((x) => typeof x === "string"))) throw new TypeError("not a list");
       // Field by field: whatever else an object answers (an older build's, or a mistake) is not passed on.
-      if (h === null) object = "no_agent"; else mounts = h.map((m) => ({ alias: m.alias, plugin: m.plugin, key: m.key, connectorId: m.connectorId }));
+      if (h === null) object = "no_agent";
+      else if (!Array.isArray(h)) { object = "layout_unknown"; missing = h.layoutMissing.slice(0, 20); }
+      else mounts = h.map((m) => ({ alias: m.alias, plugin: m.plugin, key: m.key, connectorId: m.connectorId }));
     } catch (e) {
       object = "failed";
       // Its class or shape only: an object's error message can quote what it was reading.
@@ -260,7 +288,7 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
       const mine = mounts.filter((m) => m.plugin === plugin);
       const onMount = mine.some((m) => m.key === "agent");
       const binding = bindings.find((b) => b.provider === provider) ?? null;
-      const state: Reconciled = object === "failed" ? "unknown" : object === "no_agent" ? "no_object"
+      const state: Reconciled = object === "failed" ? "unknown" : object === "no_agent" ? "no_object" : object === "layout_unknown" ? "layout_unknown"
         : onMount && binding ? "both" : onMount ? "mount_only" : binding ? "binding_only" : "neither";
       const lastRemoval = removals.get(provider) ?? null;
       // A removal speaks for the present only when nothing bound it since: neither the current binding nor a later
@@ -279,7 +307,7 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
     });
     return {
       tenant_id: a.tenant_id, raft_agent_id: a.raft_agent_id, agent_id: a.agent_id, status: a.status, deleted_at: a.deleted_at,
-      object, ...(object === "no_agent" ? { objectNote: NO_OBJECT_NOTE } : {}), connections, events: { count: Number(eventCount), recent: events }, residue,
+      object, ...(object === "no_agent" ? { objectNote: NO_OBJECT_NOTE } : {}), ...(object === "layout_unknown" ? { layoutMissing: missing } : {}), connections, events: { count: Number(eventCount), recent: events }, residue,
     };
   };
   let agents: Array<Awaited<ReturnType<typeof agentView>>>;
@@ -299,7 +327,7 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
     " ORDER BY r.tenant_id, r.agent_id, r.first_seen LIMIT ?",
   ).bind(tenantId, tenantId, UNLISTED_RESIDUE_MAX + 1).all()).results;
 
-  const counts: Record<string, number> = { agents: agents.length, both: 0, mount_only: 0, binding_only: 0, neither: 0, unknown: 0, no_object: 0,
+  const counts: Record<string, number> = { agents: agents.length, both: 0, mount_only: 0, binding_only: 0, neither: 0, unknown: 0, no_object: 0, layout_unknown: 0,
     residue: agents.reduce((n, a) => n + a.residue.length, 0) };
   for (const a of agents) for (const c of a.connections) counts[c.state]! += 1;
   await audit("listed", counts, id);

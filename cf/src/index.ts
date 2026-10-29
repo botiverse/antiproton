@@ -111,7 +111,7 @@ import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens, reservedTenantProblem } from "./admin-provider-tokens.ts";
 import { cleanupResidue, d1EgressResidue, residueUnknownMessage, withResidue } from "./egress-residue.ts";
-import { adminCredentialInventory, readConnectionHoldings } from "./credential-inventory.ts";
+import { adminCredentialInventory, layoutMissing, readConnectionHoldings } from "./credential-inventory.ts";
 import { renewalAudience, d1ConnectorGrants, d1Connections, d1Connectors, type ConnectorRefresh, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
 import type { GithubGrant } from "./github-token.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps, type ReconnectTarget } from "./provision/connect.ts";
@@ -2358,6 +2358,9 @@ export class AgentDO extends DurableObject<Env> {
    */
   async adminConnectionHoldings(tenantId: string, agentId: string, plugins: readonly string[]) {
     if (!this.#isAgent(tenantId, agentId)) return null;
+    // A layout without what the read needs is said, not read as "no key".
+    const missing = layoutMissing(this.sql as never);
+    if (missing.length) return { layoutMissing: missing };
     const kek = this.env.SECRET_KEK ? await importKek(this.env.SECRET_KEK) : null;
     return readConnectionHoldings(new DurableObjectStore(this.ctx as any), kek, tenantId, agentId, plugins);
   }

@@ -571,7 +571,8 @@ object says its `github` mounts hold, and what D1 says (the `provisioned_connect
 `neither`, `unknown` (the object did not answer, `object: "failed"`: ask again later), or `no_object` (the object holds
 no such agent, `object: "no_agent"`: asking again changes nothing). A `no_object` agent is not clean: the object cannot
 tell an agent whose provisioning never reached it from one whose storage was wiped (`objectNote` says so), so a person
-judges it. Each connection also says whether a binding removal was recorded in `connector_events` (`removalRecorded`,
+judges it. `layout_unknown` (`object: "layout_unknown"`, with `layoutMissing`): the object's storage lacks a table or
+column the read needs, so it is not read as "no key". Each connection also says whether a binding removal was recorded in `connector_events` (`removalRecorded`,
 `lastRemoval`): the newest removal for that provider, counted only when nothing bound it since (neither the current
 binding's `connected_at` nor a later bind event). A `mount_only` key with `removalRecorded: false` is a binding that went
 with no event saying so. Events carry `reasonCode`, codes only: a stored reason's free text is never answered. Each agent's recent events and its open

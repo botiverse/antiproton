@@ -110,7 +110,7 @@ await check("each agent's github connection is reconciled: both, mount only, bin
   const b = r.body.agents.find((a: any) => a.raft_agent_id === "B");
   must(b.status === "deleted" && b.deleted_at === 9 && b.object === "answered", `the deleted agent: ${JSON.stringify(b)}`);
   must(r.body.agents.find((a: any) => a.raft_agent_id === "E").object === "failed", "the unanswered object");
-  must(JSON.stringify(r.body.counts) === JSON.stringify({ agents: 5, both: 1, mount_only: 1, binding_only: 1, neither: 1, unknown: 1, no_object: 0, residue: 1 }), `counts: ${JSON.stringify(r.body.counts)}`);
+  must(JSON.stringify(r.body.counts) === JSON.stringify({ agents: 5, both: 1, mount_only: 1, binding_only: 1, neither: 1, unknown: 1, no_object: 0, layout_unknown: 0, residue: 1 }), `counts: ${JSON.stringify(r.body.counts)}`);
   // Only the tenant asked for; no other tenant's object asked.
   must(!r.body.agents.some((a: any) => a.tenant_id !== "t-a") && !w.asked.some((n) => n.startsWith("a/t-b/")), `asked: ${w.asked.join(", ")}`);
 });
@@ -124,6 +124,12 @@ await check("the mount comes from the object, not from D1: a binding with a key 
     "a/t-a/raft_C": [{ alias: "github", plugin: "github", key: "dangling", connectorId: null }] });
   const r3 = await get(w3, "?tenantId=t-a&limit=25");
   must(stateOf(r3.body, "D") === "neither" && stateOf(r3.body, "C") === "binding_only", `D ${stateOf(r3.body, "D")}, C ${stateOf(r3.body, "C")}`);
+  // An object whose storage lacks what the read needs: said, never "no key".
+  const w4 = world({ "a/t-a/raft_A": { layoutMissing: ["secrets", "mounts.secret_ref"] } as any });
+  const r4 = await get(w4, "?tenantId=t-a&limit=25");
+  const a4 = r4.body.agents.find((x: any) => x.raft_agent_id === "A");
+  must(a4.object === "layout_unknown" && a4.connections[0].state === "layout_unknown" && JSON.stringify(a4.layoutMissing) === '["secrets","mounts.secret_ref"]' && r4.body.counts.layout_unknown === 1,
+    `an old layout: ${JSON.stringify(a4)}`);
   // An object that holds no such agent: no mount to read, never "nothing there", and said so.
   for (const r0 of ["A", "D"]) {
     const w2 = world({ [`a/t-a/raft_${r0}`]: null });
@@ -375,6 +381,13 @@ await check("the object's half, a deleted agent's kept storage, by a cold object
     must(o.rows() === before && o.alarm() === null && !o.writes.includes("setAlarm") && fetched.length === 0, `rows changed, an alarm, or a request: ${JSON.stringify(o.writes)} ${JSON.stringify(fetched)}`);
     // Another agent's name on this object: null, and still nothing changed.
     must((await o.D.adminConnectionHoldings("t-a", "raft_C", ["github"])) === null && o.rows() === before, "another agent's name");
+    // A layout without what the read needs: named, not read as "no key", and nothing created to fill it.
+    host.sql.exec("ALTER TABLE mounts DROP COLUMN secret_ref");
+    must(JSON.stringify(await o.D.adminConnectionHoldings("t-a", "raft_B", ["github"])) === '{"layoutMissing":["mounts.secret_ref"]}', "a mounts table without secret_ref");
+    host.sql.exec("DROP TABLE secrets");
+    const old = await o.D.adminConnectionHoldings("t-a", "raft_B", ["github"]);
+    must(JSON.stringify(old) === '{"layoutMissing":["mounts.secret_ref","secrets"]}' && o.count("secrets") === 0
+      && host.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'secrets'").toArray().length === 0, `no secrets table: ${JSON.stringify(old)}`);
   } finally { host.dispose(); }
 });
 
