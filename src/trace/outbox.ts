@@ -144,7 +144,8 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * client id no list in the isolate had named yet), and the handler refused once Raft resolved it: the tool, the
  * service and the action as the agent sent them, clipped, never a token (src/plugins/raft-agent-login.ts
  * `unresolvedRefusal`). It counts how often that window opens. `appworld.sibling_unset` is a second account's token an AppWorld
- * call could not get, the call refused before any request: `not_callable` (`ctx.sibling` answered null for that mount;
+ * call could not get — left unset for an optional one whose mount is missing or has no account, the call going ahead,
+ * and otherwise the call refused before any request: `not_callable` (`ctx.sibling` answered null for that mount;
  * when it does is PluginContext.sibling's), `no_credential`, or `withheld` (the other app does not list this one in
  * `siblingReaders`), with the parameter and the other mount's alias, never a token or a credential
  * (src/plugins/appworld.ts `invoke`). `raftbench.run_done` is one RaftBench run's end: its id

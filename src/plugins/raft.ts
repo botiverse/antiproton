@@ -3147,6 +3147,9 @@ export function createRaftPlugin(deps: {
      * mint any app's grant. stamp derives its seal key from it and reads which agent this is (`raftIdentityOf`);
      * raftbench reads its runs and events with it. reminder asks only which plugin the mount is, which needs no credential.
      */
+    // This list is this short because no other plugin reads the raft account; the one plugin family that reads across
+    // its own ids (AppWorld) lists its members on itself. A new plugin that needs another plugin's account declares it on
+    // that plugin's own `siblingReaders`; it is not added here unless it truly needs the Raft credential.
     siblingReaders: ["stamp", "raftbench"],
     /**
      * Which tools this build can offer, and what each needs, as one string: it moves when the SDK's manifest
