@@ -14,7 +14,7 @@ import { createHash } from "node:crypto";
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
 import {
-  createRaft, describeRaftRoute, hashRaftSendContent, isInterrupted, projectRaftMessage, raftbenchFailureKind, raftbenchRunAssignment, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
+  createRaft, describeRaftRoute, hashRaftSendContent, isInterrupted, projectRaftMessage, projectRaftMessages, raftbenchFailureKind, raftbenchRunAssignment, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
   type Raft, type RaftInboxBatch, type RaftInboxListing, type RaftInterrupt, type RaftMessage, type RaftOperationSpec, type RaftState, type RaftStateStore, type RaftFailure,
   type RaftIntegrationSessionStore,
 } from "@botiverse/raft-sdk";
@@ -28,7 +28,7 @@ import {
   ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, CONTACT_KEY, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY, SEND_AS_OWNER_TOOL,
   sendAsOwner, type SendAsOwnerAnswer, assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, mergeSources, noteDoorbell,
   notifyOwner, noteChatNotice, noteOwnerReply, noteToldInChat, pauseOn, replyFallback, preferences, type PersonResolve, type OwnerResolveRead, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
-  checkEnded, pushBriefImport, type AssistantApi, type RaftAnswer,
+  checkEnded, pushBriefImport, turnDelivered, type AssistantApi, type DeliveredReport, type RaftAnswer,
 } from "./raft-assistant.ts";
 import type { RaftCheck, RefusedCheck } from "./raft-assistant-check.ts";
 import { clearIntegrationSessions, INTEGRATION_SESSIONS_STORE, REMINDER_TOOL, reminderTool } from "./raft-assistant-reminder.ts";
@@ -60,6 +60,7 @@ const NOTICE_SCHEMA = "raft-agent-inbox-notice.v1";
  */
 const NOTICE_TEXT_MAX = 3_400;
 const PUSH_REGISTRATION_PATH = "/internal/agent-api/push-webhook";
+const THIRD_PARTY_DELIVERED_PATH = "/internal/agent-api/third-party-events/delivered";
 const ACTIVITY_PATH = "/internal/agent-api/activity";
 const ACTIVITY_SCHEMA = "raft-agent-activity-ingest.v1";
 const PUSH_ID = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -363,6 +364,42 @@ const STATE_KEY = "state";
  * acknowledges nothing, and the worst a failure costs is one batch handed out again.
  */
 const SINCE_KEY = "since";
+
+/**
+ * What push notices said is on its way, as `{ pairs: { [channelId]: latestSeq }, at: { [channelId]: ms }, attempt }`
+ * (`at`: when a pull first waited for that conversation; absent until then, and kept when a notice raises its seq): the next `receive_events`
+ * pull sends them as `/events` `wait_for`, so a message Raft has committed but not yet made readable to `/events` (its
+ * inbox chain trails the notice by seconds) is waited for instead of answered with an empty batch. Kept apart from
+ * `SINCE_KEY` and never read into it: a notice says what exists, not what this agent was shown, and a `since` taken
+ * from one would acknowledge messages the model never saw. A pair goes once a pull has seen it readable; `attempt` is
+ * how many times Raft has said "not yet" for the pairs kept, which Raft reads back (`wait_attempt`) to space retries.
+ */
+const WAIT_FOR_KEY = "wait_for";
+/** Raft's cap on the pairs of one `wait_for`. */
+const WAIT_FOR_MAX_PAIRS = 20;
+/**
+ * The longest one `receive_events` spends re-pulling while Raft says a noticed message is not readable yet
+ * (`retry_after_ms`); past it the call returns with `status: "still_arriving"`, and the pairs stay for the next call.
+ * It bounds when the last pull may START: no sleep is taken that would end past it. That pull may then spend Raft's own
+ * wait inside it (6 s by default, at most 30 s), and the request is cut at the mount's timeout, so a call takes at most
+ * this plus one pull: about 36 s with Raft's defaults.
+ */
+export const WAIT_FOR_MAX_MS = 30_000;
+/**
+ * How long a pair is waited for at all, from the first pull that waited for it (not from its notice, so a pair noticed
+ * while no one called `receive_events` is still waited for once; a later notice raising its seq does not restart it). A message Raft never makes readable to this agent
+ * (deleted, or in a conversation the agent has left) would otherwise cost every later `receive_events` the whole cap;
+ * past this age the pair is dropped, said on a warn line, and the pull goes on without it.
+ */
+export const WAIT_FOR_MAX_AGE_MS = 5 * 60_000;
+const CHANNEL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * What one `receive_events` result says about the inbox, beside its messages: `messages` (it shows some),
+ * `no_new_messages` (nothing new, nothing announced still missing), or `still_arriving` (Raft announced a message it
+ * had not made readable when the call stopped waiting: call again shortly).
+ */
+export type InboxStatus = "messages" | "no_new_messages" | "still_arriving";
 
 /**
  * What Raft last said about this mount's Server's rollout flags (the credential context's `features`, SDK 0.16.0),
@@ -1631,6 +1668,7 @@ function withoutDoorbells(ctx: PluginContext, batch: RaftInboxBatch): RaftInboxB
  */
 const MORE_NOTE = "More unread messages remain. Read what is addressed to you (DMs, @mentions, your threads) and stop: " +
   "inbox_list counts the rest per conversation; do not page through channel backlog.";
+const ARRIVING_NOTE = "Raft announced messages it has not made readable yet; call receive_events again in a few seconds.";
 const INBOX_NOTE = "More unread messages remain; inbox lists them per conversation. Read each DM, thread and @mention there with " +
   "its read call and answer it. The rest is background: at most its latest page (messages_read with only target), never paging back.";
 
@@ -1864,7 +1902,7 @@ function reportTurnEnd(ctx: PluginContext, report: TurnReport, answer: ObjectVal
  * recorded as seen only when it fits.
  */
 export function handOver(
-  batch: RaftInboxBatch, unoffered: ReadonlySet<string> = DEFAULT_UNOFFERED, inbox: readonly string[] | null = null,
+  batch: RaftInboxBatch, unoffered: ReadonlySet<string> = DEFAULT_UNOFFERED, inbox: readonly string[] | null = null, arriving = false,
 ): { result: Record<string, Json>; shown: RaftMessage[]; cursor: number | null; attested: boolean } {
   const queued = batch.messages.filter((m) => m.seq !== null).sort((x, y) => x.seq! - y.seq!);
   const handedOff = batch.messages.filter((m) => m.seq === null);
@@ -1878,7 +1916,9 @@ export function handOver(
       ...(attested ? [] : ["Too long to show whole; read the stored copy as the note beside this preview says. Not counted as seen, so a send there first shows what is new."]),
       ...(attested && left > 0 ? [`${left} more message${left === 1 ? " was" : "s were"} left unacknowledged so this result is not cut; they come first on your next call.`] : []),
       ...(hasMore ? [inbox ? INBOX_NOTE : MORE_NOTE] : []),
+      ...(arriving ? [ARRIVING_NOTE] : []),
     ];
+    const status: InboxStatus = arriving ? "still_arriving" : shownAt(k).length ? "messages" : "no_new_messages";
     return {
       messages: shownAt(k).map((m) => modelLine(m, unoffered)),
       hasMore,
@@ -1888,6 +1928,10 @@ export function handOver(
       ...(batch.replyTarget && left === 0 ? { replyTarget: batch.replyTarget } : {}),
       // A Server that predates cursor acks acknowledged this batch already; say so rather than imply safety.
       ...(onRead ? { acknowledged: "on this read" } : {}),
+      // Last. A result too long to show is parked, and its preview splits one budget across the keys, so one more key
+      // would cut the note the model must read there whole; such a result shows messages by construction, so
+      // `messages` is left out of it and only a status that says more than that is kept.
+      ...(attested || status !== "messages" ? { status } : {}),
     };
   };
   const fits = (r: Record<string, Json>) => JSON.stringify(r).length <= PARK_BYTES;
@@ -2965,7 +3009,10 @@ export function createRaftPlugin(deps: {
   artifacts?: RaftArtifacts | null; excluded?: Readonly<Record<string, string>>; assistant?: AssistantWire;
   /** Agent Login's invoke and login, for a test that records exactly what `grantAgentLogin` asks for. */
   agentLoginCalls?: { invoke: typeof integrationsInvoke; login: typeof integrationsLogin };
+  /** `receive_events`' cap on waiting for announced messages (`WAIT_FOR_MAX_MS`), for a test that reaches it quickly. */
+  waitForMaxMs?: number;
 } = {}): Plugin {
+  const waitForMaxMs = deps.waitForMaxMs ?? WAIT_FOR_MAX_MS;
   const loginCalls = deps.agentLoginCalls ?? { invoke: integrationsInvoke, login: integrationsLogin };
   const excluded = deps.excluded ?? EXCLUDED;
   const assistant = deps.assistant ?? RAFT_ASSISTANT_WIRE;
@@ -3466,11 +3513,22 @@ export function createRaftPlugin(deps: {
         // has already refused it from a program and from an approved call's replay.
         // Kept flags past their age are read again in the background: the pull neither waits for it nor fails with it.
         refreshFeatures(ctx);
-        const out = await raftFor(ctx, { state: false }).invoke("inbox.check",
-          { ack: "cursor", limit, ...(since !== null ? { since } : {}) }, { origin: "model" });
-        if (!out.ok) throw sdkFailure(out as RaftFailure, unofferedFor(ctx));
-        const batch = withoutDoorbells(ctx, withoutRunAssignments(ctx, (out as { data: RaftInboxBatch }).data));
-        let given = handOver(batch, unofferedFor(ctx));
+        const keep = (b: RaftInboxBatch) => withoutDoorbells(ctx, withoutRunAssignments(ctx, b));
+        // What notices announced goes as `wait_for` (`WAIT_FOR_KEY`); with nothing announced, the SDK's own pull.
+        const waiting = await freshWaitFor(ctx);
+        let batch: RaftInboxBatch, arriving = false;
+        if (Object.keys(waiting.pairs).length) {
+          const pulled = await pullWaitingFor(ctx, { since, limit, waiting, maxMs: waitForMaxMs }, keep);
+          batch = pulled.batch;
+          arriving = pulled.arriving;
+          await settleWaitFor(ctx, pulled);
+        } else {
+          const out = await raftFor(ctx, { state: false }).invoke("inbox.check",
+            { ack: "cursor", limit, ...(since !== null ? { since } : {}) }, { origin: "model" });
+          if (!out.ok) throw sdkFailure(out as RaftFailure, unofferedFor(ctx));
+          batch = keep((out as { data: RaftInboxBatch }).data);
+        }
+        let given = handOver(batch, unofferedFor(ctx), null, arriving);
         // More than this pull shows: what is unread, per conversation, so the model reads what is owed and stops
         // (`inboxSummary`). Shown in place of messages it would push over the parking line, which then come next time.
         // A listing that fails costs only the summary: the pull has happened, and its note still says what to do.
@@ -3478,7 +3536,7 @@ export function createRaftPlugin(deps: {
           const listed = await raft.invoke("inbox.list", { limit: INBOX_SUMMARY.limit }, originOf(ctx)).catch(() => null);
           if (listed?.ok) {
             const summary = renderInboxSummary((listed as { data: RaftInboxListing }).data, unofferedFor(ctx));
-            given = handOver(batch, unofferedFor(ctx), summary.lines);
+            given = handOver(batch, unofferedFor(ctx), summary.lines, arriving);
             // Shown only if the result carries the lines and is not parked: a parked result reaches the model as a
             // preview that cuts its strings, so a count in it may not have been read. Then the snapshot is still kept,
             // naming nothing, so the turn's end still consumes it.
@@ -3708,7 +3766,11 @@ export function createRaftPlugin(deps: {
      */
     async afterTurn(ctx, end) {
       // A short session's end is told to this mount only when it asked for the session: one of Raft's checks.
-      if (end.isolated) { checkEnded(ctx, end); return; }
+      if (end.isolated) {
+        checkEnded(ctx, end);
+        await turnDelivered(ctx, end, reportEventsDelivered);
+        return;
+      }
       await replyFallback(ctx, end, sendToOwner);
     },
 
@@ -3717,7 +3779,7 @@ export function createRaftPlugin(deps: {
       return assistantWake(ctx, {
         recheck: recheckOwner, inbox: (c, r) => assistant.ownerInbox(c, r), send: sendToOwner,
         messages: (c, channelId) => probeOwnerMessages(c, channelId, assistant),
-        mode: readRaftCheck, api: assistantApi,
+        mode: readRaftCheck, api: assistantApi, delivered: reportEventsDelivered,
       });
     },
   };
@@ -3834,6 +3896,157 @@ async function recheckOwner(ctx: PluginContext): Promise<AssistantOwner | null> 
 /** The plugin as most of the codebase names it: the exclusion table as written, and no object storage, so no download. */
 export const raftPlugin: Plugin = createRaftPlugin();
 
+/** The kept `wait_for` record (`WAIT_FOR_KEY`), with anything malformed left out. */
+type WaitFor = { pairs: Record<string, number>; at: Record<string, number>; attempt: number };
+function waitForOf(raw: unknown): WaitFor {
+  const o = object(raw);
+  const pairs: Record<string, number> = {}, at: Record<string, number> = {};
+  const when = object(o.at);
+  for (const [channelId, seq] of Object.entries(object(o.pairs))) {
+    if (!CHANNEL_ID.test(channelId) || typeof seq !== "number" || !Number.isSafeInteger(seq) || seq <= 0) continue;
+    pairs[channelId] = seq;
+    if (typeof when[channelId] === "number") at[channelId] = when[channelId] as number;
+  }
+  const attempt = typeof o.attempt === "number" && Number.isSafeInteger(o.attempt) && o.attempt >= 0 ? o.attempt : 0;
+  return { pairs, at, attempt };
+}
+
+function keepWaitFor(tx: { put(store: string, value: Json, key?: string): void; delete(store: string, key: string): void }, w: WaitFor): void {
+  if (!Object.keys(w.pairs).length) { tx.delete(INBOX_STORE, WAIT_FOR_KEY); return; }
+  const at = Object.fromEntries(Object.keys(w.pairs).flatMap((c) => (w.at[c] !== undefined ? [[c, w.at[c]!]] : [])));
+  tx.put(INBOX_STORE, { pairs: w.pairs, at, attempt: w.attempt } as unknown as Json, WAIT_FOR_KEY);
+}
+
+/**
+ * The kept pairs, less those first waited for more than `WAIT_FOR_MAX_AGE_MS` ago, which are dropped here with a warn
+ * line: Raft has had minutes to make them readable, so waiting for them again would only make every call wait out the
+ * cap. A pair not waited for yet is timed from now, the pull this is for being its first wait.
+ */
+async function freshWaitFor(ctx: PluginContext, now = Date.now()): Promise<WaitFor> {
+  const { kept, dropped } = await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
+    const kept = waitForOf(tx.get(INBOX_STORE, WAIT_FOR_KEY));
+    const dropped = Object.keys(kept.pairs).filter((c) => kept.at[c] !== undefined && now - kept.at[c]! > WAIT_FOR_MAX_AGE_MS);
+    for (const c of dropped) { delete kept.pairs[c]; delete kept.at[c]; }
+    const first = Object.keys(kept.pairs).filter((c) => kept.at[c] === undefined);
+    for (const c of first) kept.at[c] = now;
+    if (dropped.length || first.length) keepWaitFor(tx, kept);
+    return { kept, dropped };
+  });
+  if (dropped.length) {
+    console.warn(`raft mount ${ctx.alias}: stopped waiting for ${dropped.length} announced conversation(s) Raft did not make readable within ${WAIT_FOR_MAX_AGE_MS / 60_000} min`);
+    logEvent("raft.wait_for_dropped", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, count: dropped.length });
+  }
+  return kept;
+}
+
+/**
+ * A notice's conversations and their latest seq, kept for the next pull's `wait_for`. A doorbell is not a message of
+ * the inbox, and a target with no channel id or seq (an app event, an older Raft) has nothing to wait for. Each
+ * conversation keeps its highest seq; a new or higher one starts Raft's backoff over (`attempt` 0). Past Raft's cap,
+ * the highest seqs are kept. This writes nothing else: `SINCE_KEY` is not touched.
+ */
+async function noteWaitFor(ctx: PluginContext, targets: readonly unknown[]): Promise<void> {
+  const announced: Array<[string, number]> = [];
+  for (const t of targets) {
+    if (isDoorbellTarget(t)) continue;
+    const o = object(t);
+    const raw = o.latestSeq;
+    const seq = typeof raw === "number" ? raw : typeof raw === "string" && /^[0-9]{1,16}$/.test(raw) ? Number(raw) : NaN;
+    if (typeof o.channelId === "string" && CHANNEL_ID.test(o.channelId) && Number.isSafeInteger(seq) && seq > 0) announced.push([o.channelId.toLowerCase(), seq]);
+  }
+  if (!announced.length) return;
+  await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
+    const kept = waitForOf(tx.get(INBOX_STORE, WAIT_FOR_KEY));
+    let moved = false, waited = false;
+    for (const [channelId, seq] of announced) {
+      if ((kept.pairs[channelId] ?? 0) >= seq) continue;
+      // A raised seq keeps the conversation's clock: a pair with a time was waited for and never seen readable (a
+      // readable pull removes it), and a conversation that keeps getting notices must not keep an old, never readable
+      // seq waited for forever. Raft's backoff (`attempt`) is kept with it.
+      kept.pairs[channelId] = seq;
+      moved = true;
+      if (kept.at[channelId] !== undefined) waited = true;
+    }
+    if (!moved) return;
+    const pairs = Object.fromEntries(Object.entries(kept.pairs).sort(([, a], [, b]) => b - a).slice(0, WAIT_FOR_MAX_PAIRS));
+    keepWaitFor(tx, { pairs, at: kept.at, attempt: waited ? kept.attempt : 0 });
+  });
+}
+
+/**
+ * One `receive_events` pull with `wait_for`, straight on Raft's `/events` route (the SDK's `inbox.check` does not pass
+ * it). Raft waits inside the pull for the announced rows; when it answers that one is still not readable
+ * (`retry_after_ms`) and the batch shows nothing, the pull is made again after that delay, until the batch shows
+ * something, Raft stops saying "not yet", or the next wait would pass `maxMs`.
+ *
+ * Only the first pull sends the kept `since`. Every later one sends `since=latest`, which acknowledges nothing, so the rows a pull
+ * returned unacknowledged come back in the next one, and the last pull's batch is the one handed over and whose cursor
+ * is kept. A seq-less event is acknowledged as it is handed out, so a pull that showed one is never repeated.
+ *
+ * `has_more` alone is never re-pulled: it means the batch was cut, and its messages are handed over now, the rest
+ * coming on the model's next call; re-pulling here would hold back messages this pull already returned.
+ */
+async function pullWaitingFor(
+  ctx: PluginContext, o: { since: number | null; limit: number; waiting: WaitFor; maxMs: number },
+  keep: (b: RaftInboxBatch) => RaftInboxBatch,
+): Promise<{ batch: RaftInboxBatch; arriving: boolean; attempt: number; sent: Record<string, number> }> {
+  const started = Date.now();
+  const raft = raftFor(ctx, { state: false });
+  const sent = { ...o.waiting.pairs };
+  const waitFor = Object.entries(sent).map(([channelId, seq]) => `${channelId}:${seq}`).join(",");
+  let since = o.since, attempt = o.waiting.attempt;
+  for (;;) {
+    const out = await raft.routes.request("events", { query: {
+      ack: "cursor", limit: String(o.limit), since: since === null ? "latest" : String(since), wait_for: waitFor, wait_attempt: String(attempt),
+    } });
+    if (!out.ok) {
+      const status = (out as { status?: number | null }).status ?? null;
+      const said = (out as { error?: { message?: unknown } }).error?.message;
+      throw coded(marked(new Error(`Raft did not hand over your events: ${typeof said === "string" ? clip(said) : "no answer"}`),
+        { transient: status === null || status === 429 || status >= 500, retryable: status === null || status === 429 || status >= 500 }),
+      status !== null ? { httpStatus: status } : {});
+    }
+    since = null;
+    const data = out.data as { events: unknown[]; last_seen_seq: number | null; ack_mode?: "cursor" | "immediate"; has_more: boolean; inbox_hint?: { unread_conversations: number } | null; reply_target: string | null; retry_after_ms?: number };
+    const batch = keep({
+      messages: projectRaftMessages(data.events as never, "tool"),
+      cursor: typeof data.last_seen_seq === "number" ? data.last_seen_seq : null,
+      ackMode: data.ack_mode ?? "immediate", hasMore: data.has_more === true,
+      stillUnreadConversations: data.inbox_hint?.unread_conversations ?? null, replyTarget: data.reply_target ?? null,
+    });
+    const behind = typeof data.retry_after_ms === "number" && Number.isFinite(data.retry_after_ms) && data.retry_after_ms > 0;
+    if (!behind || batch.messages.length > 0) return { batch, arriving: behind, attempt, sent };
+    const delay = data.retry_after_ms!;
+    if (Date.now() - started + delay >= o.maxMs) {
+      logEvent("raft.wait_for_capped", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, attempt, ms: Date.now() - started });
+      return { batch, arriving: true, attempt, sent };
+    }
+    attempt++;
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+}
+
+/**
+ * The kept pairs after a pull: those it saw readable go (a pair a notice raised since stays, at its new seq); still
+ * behind, they all stay, with the retries Raft has seen counted for the next call's `wait_attempt`.
+ */
+async function settleWaitFor(ctx: PluginContext, pulled: { arriving: boolean; attempt: number; sent: Record<string, number> }): Promise<void> {
+  await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
+    const kept = waitForOf(tx.get(INBOX_STORE, WAIT_FOR_KEY));
+    if (pulled.arriving) {
+      keepWaitFor(tx, { ...kept, attempt: Math.max(kept.attempt, pulled.attempt + 1) });
+      return;
+    }
+    const left = Object.fromEntries(Object.entries(kept.pairs).filter(([channelId, seq]) => seq > (pulled.sent[channelId] ?? 0)));
+    keepWaitFor(tx, { pairs: left, at: kept.at, attempt: 0 });
+  });
+}
+
+/** Raft's `POST /third-party-events/delivered`: these events were handled (src/plugins/raft-assistant.ts `reportDelivered`). */
+const reportEventsDelivered: DeliveredReport = async (ctx, eventIds) => {
+  await call(ctx, "POST", THIRD_PARTY_DELIVERED_PATH, { eventIds });
+};
+
 /**
  * A signed inbox notice: Raft's own words about what is unread, handed to the
  * model as they are, after what to do with it (`wakeInstruction`): read it
@@ -3876,13 +4089,14 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
     return { deliver: false, reason: "the signed notice names a different Raft agent" };
   }
   const body = payload.text.length > NOTICE_TEXT_MAX ? `${payload.text.slice(0, NOTICE_TEXT_MAX)}… (cut)` : payload.text;
+  await noteWaitFor(ctx, payload.targets);
   // An assistant's doorbell is its code's (src/plugins/raft-assistant.ts `assistantWake`), which decides whether a model
   // is asked at all; only the rest of the notice — its owner writing to it — wakes the model, in its chat.
   const owner = await loadOwner(ctx);
   const assistant = owner !== null;
   const bells = assistant ? payload.targets.filter(isDoorbellTarget) : [];
   const change = bells.length > 0 ? await doorbellChange(ctx, bells) : null;
-  const bell = change !== null && await noteDoorbell(ctx, Date.now(), change.firstChangeAt, change.sources, change.checks);
+  const bell = change !== null && await noteDoorbell(ctx, Date.now(), change.firstChangeAt, change.sources, change.checks, change.eventIds);
   if (bell && payload.targets.every(isDoorbellTarget)) {
     return { deliver: false, wake: true, reason: "an assistant's doorbell, for its code to check", dedupeKey: payload.noticeId };
   }
@@ -3907,10 +4121,15 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
  * receive_events keeps alone). Null and no sources is the old behaviour: the wake decides on its first read. `last_change_at` is when
  * Raft sent the doorbell, not when anything changed, so it says nothing about whether a read is recent enough.
  */
-async function doorbellChange(ctx: PluginContext, targets: readonly unknown[]): Promise<{ firstChangeAt: string | null; sources: ChangeSources; checks: Array<RaftCheck | RefusedCheck> }> {
+async function doorbellChange(ctx: PluginContext, targets: readonly unknown[]): Promise<{
+  firstChangeAt: string | null; sources: ChangeSources; checks: Array<(RaftCheck & { eventIds?: string[] }) | RefusedCheck>; eventIds: string[];
+}> {
   let earliest: string | null = null, sources: ChangeSources = {};
-  const checks: Array<RaftCheck | RefusedCheck> = [];
-  if (!ctx.credential) return { firstChangeAt: earliest, sources, checks };
+  const checks: Array<(RaftCheck & { eventIds?: string[] }) | RefusedCheck> = [];
+  // Each doorbell read here by its id, to be reported delivered once handled: with its check when it brought one Raft
+  // will have run, else with the doorbell (src/plugins/raft-assistant.ts `reportDelivered`).
+  const eventIds: string[] = [];
+  if (!ctx.credential) return { firstChangeAt: earliest, sources, checks, eventIds };
   for (const t of targets) {
     const channel = (t as { target: string }).target;
     try {
@@ -3919,14 +4138,18 @@ async function doorbellChange(ctx: PluginContext, targets: readonly unknown[]): 
       const at = bell?.firstChangeAt ?? null;
       if (bell) sources = mergeSources(sources, bell.sources);
       // Raft's check for this doorbell or brief, when it ran one (`payload.check`).
-      if (bell?.check) checks.push(bell.check);
+      if (bell?.check && !("refused" in bell.check) && bell.eventId) checks.push({ ...bell.check, eventIds: [bell.eventId] });
+      else {
+        if (bell?.check) checks.push(bell.check);
+        if (bell?.eventId) eventIds.push(bell.eventId);
+      }
       if (at !== null && (earliest === null || Date.parse(at) < Date.parse(earliest))) earliest = at;
       if (at === null) logEvent("raft.doorbell_unread", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, ok: out.ok });
     } catch (e) {
       logEvent("raft.doorbell_unread", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, error: String((e as Error)?.message ?? e).slice(0, 120) });
     }
   }
-  return { firstChangeAt: earliest, sources, checks };
+  return { firstChangeAt: earliest, sources, checks, eventIds };
 }
 
 /**

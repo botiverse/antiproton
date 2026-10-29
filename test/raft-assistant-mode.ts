@@ -218,6 +218,8 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string;
     /** Every login body; every request to the app (`METHOD path`), each action call's body and cookie; the action's answer. */
     logins: [] as any[], appRequests: [] as string[], actionCalls: [] as Array<{ action: string; body: any; cookie: string | null }>,
     actionAnswer: { status: 200, body: { ok: true, result: { reminder: { id: "rem_1", title: "APP-ANSWER-TITLE" } } } as unknown },
+    /** Every delivered report's `eventIds`, and how Raft answers the next: a status, or `drop` for no answer. */
+    delivered: [] as string[][], deliveredAnswer: 200 as number | "drop",
   };
   globalThis.fetch = (async (url: any, init?: any) => {
     const u = new URL(String(url));
@@ -252,6 +254,14 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string;
       const id = `${channel.slice("agent-event:".length)}-2222-4333-8444-555566667777`;
       return json(200, { messages: [{ message_id: id, sender_name: "system.assistant", sender_type: "third_party_app", channel_type: "dm", content: "System event: ...",
         third_party_event: { id, kind: "event", client_id: "system.assistant", client_name: "system.assistant", payload } }], has_more: false, has_older: false, has_newer: false });
+    }
+    if (path === "/third-party-events/delivered" && init?.method === "POST") {
+      const answer = r.deliveredAnswer;
+      if (answer === "drop") throw new TypeError("fetch failed");
+      if (answer !== 200) return json(answer, { error: "Failed to record third-party event delivery" });
+      const ids = JSON.parse(String(init?.body ?? "{}")).eventIds as string[];
+      r.delivered.push(ids);
+      return json(200, { ok: true, delivered: ids.length });
     }
     if (path === "/assistant/send-as-owner" && init?.method === "POST") {
       r.asOwner.push(JSON.parse(String(init?.body ?? "{}")));
@@ -675,10 +685,10 @@ await check("a check and the brief ask for summaries in Raft's language when it 
     a.r.unread = [conv(1)];
     await atTime(DAY, () => noteDoorbell(a.ctx));
     const checked = await atTime(DAY, () => wake(a.ctx));
-    must(checked.turnKey === "assistant.check", `control: ${show(language)}: a check: ${show(checked)}`);
+    must(/^assistant\.check:[0-9a-f]{8}$/.test(checked.turnKey), `control: ${show(language)}: a check: ${show(checked)}`);
     a.r.all = [conv(1)];
     const brief = await atTime("2026-10-21T06:00:05Z", () => wake(a.ctx));
-    must(brief.turnKey === "assistant.brief", `control: ${show(language)}: a brief: ${show(brief)}`);
+    must(/^assistant\.brief:[0-9a-f]{8}$/.test(brief.turnKey), `control: ${show(language)}: a brief: ${show(brief)}`);
     for (const [kind, out] of [["check", checked], ["brief", brief]] as const) {
       const said = (out.turn as string).match(/Write each summary in [^.]*\./g);
       must(show(said) === show(language === "zh-CN" ? ["Write each summary in zh-CN, your owner's language."] : null), `${show(language)}: ${kind}: ${show(out.turn)}`);
@@ -745,7 +755,7 @@ await check("a doorbell with new activity starts one short session of its own wi
   const { noteDoorbell } = await import("../src/plugins/raft-assistant.ts");
   await atTime(DAY, () => noteDoorbell(a.ctx));
   const out = await atTime(DAY, () => wake(a.ctx));
-  must(out.isolated === true && out.turnKey === "assistant.check" && out.wakeAt === at("2026-10-21T06:00:00Z"), `invoked: ${show(out)}`);
+  must(out.isolated === true && /^assistant\.check:[0-9a-f]{8}$/.test(out.turnKey) && out.wakeAt === at("2026-10-21T06:00:00Z"), `invoked: ${show(out)}`);
   must(out.turn.includes(conv(1).channelId) && out.turn.includes("@ada review this?") && out.turn.includes("raft__assistant_notify_owner"), out.turn);
   must(a.traced.at(-1)?.status === "invoked" && a.traced.at(-1)?.attrs.candidates === 2, show(a.traced));
   must(a.read(ASSISTANT_STORE, OWNER_KEY).doorbellAt === null, "the doorbell was taken");
@@ -977,7 +987,7 @@ await check("the brief: once a day between 08:00 and noon, in a short session wi
   a.r.unread = [conv(1)];
   a.r.all = [conv(1), conv(4, { unread: 0, latestAt: "2026-10-20T15:00:00.000Z", latestPreview: "agreed: ship Friday" })];
   const morning = await atTime("2026-10-21T06:00:05Z", () => wake(a.ctx));
-  must(morning.isolated === true && morning.turnKey === "assistant.brief" && morning.wakeAt === at("2026-10-22T06:00:00Z") &&
+  must(morning.isolated === true && /^assistant\.brief:[0-9a-f]{8}$/.test(morning.turnKey) && morning.wakeAt === at("2026-10-22T06:00:00Z") &&
     morning.turn.includes("agreed: ship Friday") && morning.turn.includes(conv(1).channelId), `morning: ${show(morning)}`);
   must(a.traced.at(-1)?.status === "invoked" && a.traced.at(-1)?.attrs.trigger === "brief", show(a.traced.at(-1)));
   const twice = await atTime("2026-10-21T07:00:00Z", () => wake(a.ctx));
@@ -1223,7 +1233,7 @@ await check("digest #design: a doorbell leaves it for the brief with no model ca
   // The brief: the digest row is in its input, and the kept item goes out.
   a.r.unread = [conv(1, { channelName: "design" })];
   const morning = await atTime("2026-10-21T06:00:05Z", () => wake(a.ctx));
-  must(morning.turnKey === "assistant.brief" && morning.turn.includes(conv(1).channelId), show(morning));
+  must(/^assistant\.brief:[0-9a-f]{8}$/.test(morning.turnKey) && morning.turn.includes(conv(1).channelId), show(morning));
   const brief = await atTime("2026-10-21T06:01:00Z", () => notify(a.ctx, { brief: true, items: [] }));
   must(brief.state === "sent" && a.r.sends[0].content === "Morning. @ka wants a look: #design:aaaaaaa1", show(a.r.sends));
 });
@@ -1409,7 +1419,7 @@ await check("items the night held beyond the brief's 3 come back at the next wak
   // Morning: the owner has read #ch5 meanwhile (no longer unread, and quiet for over a day, so not in the brief's reads).
   a.r.unread = [conv(1), conv(2), conv(3), conv(4)];
   a.r.all = [conv(1), conv(2), conv(3), conv(4), old5];
-  must((await atTime("2026-10-21T06:00:05Z", () => wake(a.ctx))).turnKey === "assistant.brief", "control: the brief");
+  must(/^assistant\.brief:[0-9a-f]{8}$/.test((await atTime("2026-10-21T06:00:05Z", () => wake(a.ctx))).turnKey), "control: the brief");
   const brief = await atTime("2026-10-21T06:01:00Z", () => notify(a.ctx, { brief: true, items: [] }));
   must(brief.state === "sent" && brief.items === 3 && brief.more === 2, show(brief));
   const reviewed = a.read(ASSISTANT_STORE, REVIEWED_KEY);
@@ -2832,6 +2842,9 @@ await check("reply fallback: never for a check or the brief: their turn keys sen
   const a = await assistant(raft({ dm: "dm:@ada" }));
   await afterTurn(a.ctx, ended("c1", { turnKey: "assistant.check" }));
   await afterTurn(a.ctx, ended("c2", { turnKey: "assistant.brief" }));
+  // Each session's own key, its kind and a nonce, is the same kind of turn.
+  await afterTurn(a.ctx, ended("c4", { turnKey: "assistant.check:0a1b2c3d" }));
+  await afterTurn(a.ctx, ended("c5", { turnKey: "assistant.brief:0a1b2c3d" }));
   must(a.r.sends.length === 0 && fallbackRows(a).length === 0, `sent: ${show(a.r.sends)}`);
   const iso = { ...a.ctx, caller: { ...a.ctx.caller, taskId: "iso_0123456789abcdef0123" } };
   await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "from a check" }, iso).catch(() => null);
@@ -3021,7 +3034,7 @@ await check("raftCheck true: the brief's timer neither reads the inbox nor posts
   const owner = a.read(ASSISTANT_STORE, OWNER_KEY);
   must(same.turn === undefined && owner.raftCheck === false && owner.lastBrief === "2026-10-20" && owner.briefSent === "2026-10-20", `the day of the rollback: ${show(same)} ${show(owner)}`);
   const back = await atTime("2026-10-21T06:30:00Z", () => wake(a.ctx));
-  must(back.isolated === true && back.turnKey === "assistant.brief" && a.r.inboxReads.length > 0, `flag off, next morning: ${show(back)}`);
+  must(back.isolated === true && /^assistant\.brief:[0-9a-f]{8}$/.test(back.turnKey) && a.r.inboxReads.length > 0, `flag off, next morning: ${show(back)}`);
 });
 
 await check("raftCheck false, Raft's flag turned on since the listing: the brief's timer reads it and does not brief", async () => {
@@ -3280,7 +3293,7 @@ await check("rollback: Raft's flag read off with checks queued: they are dropped
   a.r.raftCheck = false;
   await atTime(DAY, () => ring(a, { first_change_at: "2026-10-20T09:59:00.000Z", last_change_at: DAY, check: raftCheckPayload() }));
   const out = await atTime(DAY, () => wake(a.ctx));
-  must(out.isolated === true && out.turnKey === "assistant.check" && out.turn.includes(conv(1).channelId), `the local check did not run: ${show(out)}`);
+  must(out.isolated === true && /^assistant\.check:[0-9a-f]{8}$/.test(out.turnKey) && out.turn.includes(conv(1).channelId), `the local check did not run: ${show(out)}`);
   must(a.r.inboxReads.length > 0, "the inbox was not read here");
   const dropped = wakeRows(a).find((r) => r.status === "check_refused");
   must(dropped?.attrs.reason === "raft_check_off" && dropped.attrs.check_id === CHECK_ID, show(wakeRows(a)));
@@ -3293,7 +3306,7 @@ await check("rollback: the flag kept on, Raft's turned off, a doorbell without a
   a.r.raftCheck = false;
   await atTime(DAY, () => ring(a, { first_change_at: "2026-10-20T09:59:00.000Z", last_change_at: DAY }));
   const out = await atTime(DAY, () => wake(a.ctx));
-  must(out.isolated === true && out.turnKey === "assistant.check" && a.read(ASSISTANT_STORE, OWNER_KEY).raftCheck === false, `dropped: ${show(out)} ${show(wakeRows(a))}`);
+  must(out.isolated === true && /^assistant\.check:[0-9a-f]{8}$/.test(out.turnKey) && a.read(ASSISTANT_STORE, OWNER_KEY).raftCheck === false, `dropped: ${show(out)} ${show(wakeRows(a))}`);
   must(!wakeRows(a).some((r) => r.status === "skipped_no_check"), show(wakeRows(a)));
 });
 
@@ -3671,6 +3684,191 @@ await check("reminder end to end: the chat's call reaches the app; a check is no
       if (widened) list.splice(list.indexOf(REMINDER_TOOL), 1);
       w.host.dispose();
     }
+  }
+});
+
+// ---- a doorbell fetched by its id is reported delivered once handled ------------------------------------------------
+
+/** The id of the doorbell `ring` last rang, as the fake `/history` gives it. */
+const lastBellId = (a: { r: ReturnType<typeof raft> }) => `${Object.keys(a.r.bellEvents).at(-1)!.slice("agent-event:".length)}-2222-4333-8444-555566667777`;
+const checkEnd = (turnKey: string, outcome: string) => ({ turnId: `op_${turnKey}_${outcome}`, turnKey, finalText: null, outcome, isolated: true });
+
+await check("delivered: a Raft check's doorbell is reported only after its session ends completed, once; never at the wake", async () => {
+  const a = await raftAssistant();
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
+  const id = lastBellId(a);
+  const out = await atTime(DAY, () => wake(a.ctx));
+  must(out.turnKey === `assistant.raft_check:doorbell:${CHECK_ID}`, `control: the check is posted: ${show(out)}`);
+  must(a.r.delivered.length === 0, `reported before the session ran: ${show(a.r.delivered)}`);
+  await afterTurn(a.ctx, checkEnd(out.turnKey, "completed"));
+  must(show(a.r.delivered) === show([[id]]), `after the session: ${show(a.r.delivered)}`);
+  // The same end told again reports nothing more.
+  await afterTurn(a.ctx, checkEnd(out.turnKey, "completed"));
+  must(a.r.delivered.length === 1, `told twice: ${show(a.r.delivered)}`);
+});
+
+await check("delivered: a check session that fails or is cancelled reports nothing, and a later end of that key does not either", async () => {
+  for (const outcome of ["failed", "cancelled"]) {
+    const a = await raftAssistant();
+    await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
+    const out = await atTime(DAY, () => wake(a.ctx));
+    await afterTurn(a.ctx, checkEnd(out.turnKey, outcome));
+    must(a.r.delivered.length === 0, `${outcome}: reported ${show(a.r.delivered)}`);
+    await afterTurn(a.ctx, checkEnd(out.turnKey, "completed"));
+    must(a.r.delivered.length === 0, `${outcome}, then a stray completed end: reported ${show(a.r.delivered)}`);
+  }
+});
+
+await check("delivered: a report Raft does not take is said on a warn line and sent again at the next wake; nothing is lost or sent twice", async () => {
+  const a = await raftAssistant();
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
+  const id = lastBellId(a);
+  const out = await atTime(DAY, () => wake(a.ctx));
+  a.r.deliveredAnswer = 500;
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+  try { await afterTurn(a.ctx, checkEnd(out.turnKey, "completed")); } finally { console.warn = warn; }
+  must(a.r.delivered.length === 0 && warned.some((w) => /could not report 1 handled event\(s\) delivered/.test(w)), `warned: ${show(warned)}`);
+  must(show(a.read(ASSISTANT_STORE, "event_delivery")?.unreported) === show([id]), `kept: ${show(a.read(ASSISTANT_STORE, "event_delivery"))}`);
+  // No answer at all is the same.
+  a.r.deliveredAnswer = "drop";
+  console.warn = () => {};
+  try { await atTime(DAY, () => wake(a.ctx)); } finally { console.warn = warn; }
+  must(a.r.delivered.length === 0 && show(a.read(ASSISTANT_STORE, "event_delivery")?.unreported) === show([id]), "a dropped report was forgotten");
+  a.r.deliveredAnswer = 200;
+  await atTime(DAY, () => wake(a.ctx));
+  must(show(a.r.delivered) === show([[id]]) && a.read(ASSISTANT_STORE, "event_delivery")?.unreported.length === 0, `retried: ${show(a.r.delivered)}`);
+  await atTime(DAY, () => wake(a.ctx));
+  must(a.r.delivered.length === 1, `sent again with nothing left: ${show(a.r.delivered)}`);
+});
+
+await check("delivered, code-only: skipped_no_check and the local check's final outcome report at once; a local check's model call waits for its end", async () => {
+  // Raft runs the check and sent none: handled in code, at that outcome.
+  const a = await raftAssistant();
+  await atTime(DAY, () => ring(a, { first_change_at: DAY, last_change_at: DAY }));
+  const idle = lastBellId(a);
+  await atTime(DAY, () => wake(a.ctx));
+  must(wakeRows(a).at(-1)?.status === "skipped_no_check" && show(a.r.delivered) === show([[idle]]), `skipped_no_check: ${show(a.r.delivered)}`);
+  // The local check with nothing to look at: skipped_empty.
+  const b = await assistant(raft({ dm: "dm:@ada" }));
+  await atTime(DAY, () => ring(b, {}));
+  const empty = lastBellId(b);
+  await atTime(DAY, () => wake(b.ctx));
+  must(wakeRows(b).at(-1)?.status === "skipped_empty" && show(b.r.delivered) === show([[empty]]), `skipped_empty: ${show(wakeRows(b).at(-1))} ${show(b.r.delivered)}`);
+  // The local check that asks the model: reported when that session ends completed, not before.
+  const c = await assistant(raft({ dm: "dm:@ada" }));
+  c.r.unread = [conv(1, { hasMention: true })];
+  await atTime(DAY, () => ring(c, {}));
+  const asked = lastBellId(c);
+  const out = await atTime(DAY, () => wake(c.ctx));
+  must(/^assistant\.check:[0-9a-f]{8}$/.test(out.turnKey) && c.r.delivered.length === 0, `invoked: ${show(out)} ${show(c.r.delivered)}`);
+  await afterTurn(c.ctx, checkEnd(out.turnKey, "completed"));
+  must(show(c.r.delivered) === show([[asked]]), `after the local check: ${show(c.r.delivered)}`);
+});
+
+/** Two local checks under way at once: doorbell x read by the first, y by the second, each its own session key. */
+async function twoLocalChecks() {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.unread = [conv(1, { hasMention: true })];
+  await atTime(DAY, () => ring(a, {}));
+  const x = lastBellId(a);
+  const s1 = await atTime(DAY, () => wake(a.ctx));
+  a.r.unread = [conv(2, { hasMention: true, latestAt: "2026-10-20T09:59:00.000Z" })];
+  await atTime(DAY, () => ring(a, {}));
+  const y = lastBellId(a);
+  const s2 = await atTime(DAY, () => wake(a.ctx));
+  must(/^assistant\.check:/.test(s1.turnKey) && /^assistant\.check:/.test(s2.turnKey) && s1.turnKey !== s2.turnKey, `control: two sessions, two keys: ${show(s1.turnKey)} ${show(s2.turnKey)}`);
+  return { a, x, y, s1, s2 };
+}
+
+await check("delivered, two local checks at once: the first completing reports its doorbell alone; the second failing then reports nothing", async () => {
+  const { a, x, s1, s2 } = await twoLocalChecks();
+  await afterTurn(a.ctx, checkEnd(s1.turnKey, "completed"));
+  must(show(a.r.delivered) === show([[x]]), `the first's end: ${show(a.r.delivered)}`);
+  await afterTurn(a.ctx, checkEnd(s2.turnKey, "failed"));
+  must(show(a.r.delivered) === show([[x]]), `the second failed, yet: ${show(a.r.delivered)}`);
+});
+
+await check("delivered, two local checks at once, the other order: the first failing leaves the second's doorbell, reported when it completes", async () => {
+  const { a, y, s1, s2 } = await twoLocalChecks();
+  await afterTurn(a.ctx, checkEnd(s1.turnKey, "failed"));
+  must(a.r.delivered.length === 0, `the first failed, yet: ${show(a.r.delivered)}`);
+  await afterTurn(a.ctx, checkEnd(s2.turnKey, "completed"));
+  must(show(a.r.delivered) === show([[y]]), `the second completed: ${show(a.r.delivered)}`);
+});
+
+await check("delivered, a session whose end never comes: a later session's completed end reports its own doorbell, never the lost one's", async () => {
+  const { a, x, y, s2 } = await twoLocalChecks();
+  await afterTurn(a.ctx, checkEnd(s2.turnKey, "completed"));
+  must(show(a.r.delivered) === show([[y]]) && !a.r.delivered.flat().includes(x), `reported: ${show(a.r.delivered)}`);
+});
+
+await check("delivered: doorbells noted at the same moment are both kept (one transaction per change)", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  const x = "10000001-2222-4333-8444-555566667777", y = "10000002-2222-4333-8444-555566667777";
+  await atTime(DAY, () => Promise.all([noteDoorbell(a.ctx as never, at(DAY), null, {}, [], [x]), noteDoorbell(a.ctx as never, at(DAY), null, {}, [], [y])]));
+  must(show([...a.read(ASSISTANT_STORE, "event_delivery").rung].sort()) === show([x, y]), `rung: ${show(a.read(ASSISTANT_STORE, "event_delivery"))}`);
+});
+
+await check("delivered: a refusal (4xx, not 429) is final for its ids: warned, dropped, never sent again; a 429 is kept", async () => {
+  const a = await raftAssistant();
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
+  const out = await atTime(DAY, () => wake(a.ctx));
+  a.r.deliveredAnswer = 400;
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+  try { await afterTurn(a.ctx, checkEnd(out.turnKey, "completed")); } finally { console.warn = warn; }
+  must(warned.some((w) => /refused to record 1 handled event\(s\) delivered \(HTTP 400\); dropped/.test(w)), `warned: ${show(warned)}`);
+  must(a.read(ASSISTANT_STORE, "event_delivery")?.unreported.length === 0, `kept: ${show(a.read(ASSISTANT_STORE, "event_delivery"))}`);
+  a.r.deliveredAnswer = 200;
+  await atTime(DAY, () => wake(a.ctx));
+  must(a.r.delivered.length === 0, `sent again after a refusal: ${show(a.r.delivered)}`);
+  // A 429 may clear: kept, and sent at the next wake.
+  const b = await raftAssistant();
+  await atTime(DAY, () => ring(b, { check: raftCheckPayload() }));
+  const id = lastBellId(b);
+  const o2 = await atTime(DAY, () => wake(b.ctx));
+  b.r.deliveredAnswer = 429;
+  console.warn = () => {};
+  try { await afterTurn(b.ctx, checkEnd(o2.turnKey, "completed")); } finally { console.warn = warn; }
+  b.r.deliveredAnswer = 200;
+  await atTime(DAY, () => wake(b.ctx));
+  must(show(b.r.delivered) === show([[id]]), `the 429 was not sent again: ${show(b.r.delivered)}`);
+});
+
+await check("delivered: an unreadable outcome with a short wake still due is not final; the wake that reads it settles the doorbell", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.unread = [conv(1, { hasMention: true })];
+  a.r.broken.add(conv(1).channelId);
+  await atTime(DAY, () => ring(a, {}));
+  const id = lastBellId(a);
+  const first = await atTime(DAY, () => wake(a.ctx));
+  must(wakeRows(a).at(-1)?.status === "unreadable" && first.wakeAt === at(DAY) + 2 * 60_000, `control: unreadable, a retry due: ${show(first)} ${show(wakeRows(a).at(-1))}`);
+  must(a.r.delivered.length === 0 && show(a.read(ASSISTANT_STORE, "event_delivery").rung) === show([id]), `reported with a retry due: ${show(a.r.delivered)}`);
+  a.r.broken.clear();
+  const again = await atTime("2026-10-20T10:02:00Z", () => wake(a.ctx));
+  must(/^assistant\.check:/.test(again.turnKey), `the retry asks the model: ${show(again)}`);
+  await afterTurn(a.ctx, checkEnd(again.turnKey, "completed"));
+  must(show(a.r.delivered) === show([[id]]), `after the retry's session: ${show(a.r.delivered)}`);
+});
+
+await check("delivered: a 401, 403 or 408 is the credential or the timing, not the ids: kept, and sent once Raft takes it", async () => {
+  for (const status of [401, 403, 408]) {
+    const a = await raftAssistant();
+    await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
+    const id = lastBellId(a);
+    const out = await atTime(DAY, () => wake(a.ctx));
+    a.r.deliveredAnswer = status;
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+    try { await afterTurn(a.ctx, checkEnd(out.turnKey, "completed")); } finally { console.warn = warn; }
+    must(warned.some((w) => /could not report 1 handled event\(s\) delivered; kept/.test(w)) && show(a.read(ASSISTANT_STORE, "event_delivery")?.unreported) === show([id]), `${status}: ${show(warned)}`);
+    a.r.deliveredAnswer = 200;
+    await atTime(DAY, () => wake(a.ctx));
+    must(show(a.r.delivered) === show([[id]]), `${status}: not sent again once accepted: ${show(a.r.delivered)}`);
   }
 });
 
