@@ -359,33 +359,70 @@ await check("disconnecting this origin's connector takes its credential off ever
     `${r.status} ${r.text}; changed ${acted.join(", ")}`);
 });
 
-await check("migration 0030: each existing connector gets the origin of the agent it was made for, else its bound agents' one origin, else none", async () => {
+/** A D1 over node:sqlite with every migration applied, up to (not including) `before` when given. */
+function d1(before?: string) {
   const db = new DatabaseSync(":memory:");
   const dir = new URL("../cf/migrations/", import.meta.url);
   const files = readdirSync(dir).filter((n) => n.endsWith(".sql")).sort();
-  const at = files.findIndex((n) => n.startsWith("0030_"));
-  assert(at > 0, "no migration 0030");
-  for (const f of files.slice(0, at)) db.exec(readFileSync(new URL(f, dir), "utf8"));
+  const at = before ? files.findIndex((n) => n.startsWith(before)) : files.length;
+  assert(at > 0, `no migration ${before}`);
+  const apply = (fs: string[]) => { for (const f of fs) db.exec(readFileSync(new URL(f, dir), "utf8")); };
+  apply(files.slice(0, at));
+  const stmt = (q: string, b: unknown[] = []): any => ({
+    bind: (...v: unknown[]) => stmt(q, v),
+    first: async () => (db.prepare(q).get(...(b as any[])) as any) ?? null,
+    all: async () => ({ results: db.prepare(q).all(...(b as any[])) }),
+    run: async () => ({ meta: { changes: Number(db.prepare(q).run(...(b as any[])).changes) } }),
+  });
+  const D1 = { prepare: (q: string) => stmt(q) } as unknown as D1Database;
+  /** A fixture: agents of two origins, connectors, bindings and create events, as they could be before 0030. */
   const agent = (id: string, origin: string) => db.prepare("INSERT INTO provisioned_agents(tenant_id, raft_agent_id, agent_id, raft_server_id, raft_origin, name, instructions, status, created_at, updated_at) VALUES (?, ?, ?, 'srv-1', ?, 'n', '', 'active', 1, 1)")
     .run(TENANT, id, `raft_${id}`, origin);
-  // One connection per agent and provider: an agent for each binding.
-  for (const [id, origin] of [["A", OURS], ["B", THEIRS], ["C", OURS], ["D", THEIRS], ["E", OURS], ["F", OURS], ["G", THEIRS]] as const) agent(id, origin);
   const connector = (id: string) => db.prepare("INSERT INTO connectors(id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at) VALUES (?, ?, 'github', 'octo', 'u-1', 'c', 'i', 1)").run(id, TENANT);
   const bind = (agentId: string, id: string) => db.prepare("INSERT INTO provisioned_connections(tenant_id, raft_agent_id, provider, account, connected_by, connected_at, connector_id) VALUES (?, ?, 'github', 'octo', 'u-1', 1, ?)").run(TENANT, agentId, id);
   const made = (agentId: string, id: string) => db.prepare("INSERT INTO connector_events(tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at) VALUES (?, ?, ?, 'create', 'u-1', 'creator', 1)").run(TENANT, id, agentId);
-  // Made for A (ours), since bound to B of another origin too: the maker's.
-  connector("k_made"); made("A", "k_made"); bind("A", "k_made"); bind("B", "k_made");
-  // Made for an agent with no row any more, bound to D alone: D's.
-  connector("k_orphan"); made("GONE", "k_orphan"); bind("D", "k_orphan");
-  // No event, bound to C and E, both ours: ours.
-  connector("k_bound"); bind("C", "k_bound"); bind("E", "k_bound");
-  // No event, bound to agents of two origins; and none bound: no origin.
-  connector("k_split"); bind("F", "k_split"); bind("G", "k_split");
-  connector("k_none");
-  for (const f of files.slice(at)) db.exec(readFileSync(new URL(f, dir), "utf8"));
-  const got = Object.fromEntries((db.prepare("SELECT id, raft_origin FROM connectors ORDER BY id").all() as any[]).map((r) => [r.id, r.raft_origin]));
-  const want = { k_bound: OURS, k_made: OURS, k_none: null, k_orphan: THEIRS, k_split: null };
+  return { db, D1, rest: () => apply(files.slice(at)), agent, connector, bind, made };
+}
+
+await check("migration 0030 on a fixture made before it: each connector takes the origin of the agent it was made for, or none; another origin's bindings are cut, each recorded first", async () => {
+  const f = d1("0030_");
+  // One connection per agent and provider: an agent for each binding.
+  for (const [id, origin] of [["A", OURS], ["B", THEIRS], ["C", OURS], ["D", THEIRS], ["E", OURS], ["F", OURS], ["G", THEIRS]] as const) f.agent(id, origin);
+  // Made for A (ours); B of another origin bound to it too, as nothing stopped before 0030.
+  f.connector("k_made"); f.made("A", "k_made"); f.bind("A", "k_made"); f.bind("B", "k_made");
+  // Made for an agent with no row any more, bound to D alone: no origin, not D's.
+  f.connector("k_orphan"); f.made("GONE", "k_orphan"); f.bind("D", "k_orphan");
+  // No event, bound to C and E, both ours: no origin either; bound agents say who holds it, not who made it.
+  f.connector("k_bound"); f.bind("C", "k_bound"); f.bind("E", "k_bound");
+  f.connector("k_split"); f.bind("F", "k_split"); f.bind("G", "k_split");
+  f.connector("k_none");
+  f.rest();
+  const got = Object.fromEntries((f.db.prepare("SELECT id, raft_origin FROM connectors ORDER BY id").all() as any[]).map((r) => [r.id, r.raft_origin]));
+  const want = { k_bound: null, k_made: OURS, k_none: null, k_orphan: null, k_split: null };
   assert(JSON.stringify(got) === JSON.stringify(want), `backfilled: ${JSON.stringify(got)}`);
+  const bindings = (f.db.prepare("SELECT raft_agent_id || ':' || connector_id AS b FROM provisioned_connections ORDER BY b").all() as any[]).map((r) => r.b);
+  assert(JSON.stringify(bindings) === JSON.stringify(["A:k_made", "C:k_bound", "D:k_orphan", "E:k_bound", "F:k_split", "G:k_split"]), `bindings left: ${JSON.stringify(bindings)}`);
+  const cut = f.db.prepare("SELECT * FROM connector_events WHERE action = 'origin_mismatch_removed'").all() as any[];
+  assert(cut.length === 1 && cut[0].connector_id === "k_made" && cut[0].raft_agent_id === "B" && cut[0].acting_role === "system" && cut[0].at > 1_700_000_000_000
+    && JSON.stringify(JSON.parse(cut[0].reason)) === JSON.stringify({ agentOrigin: THEIRS, connectorOrigin: OURS, provider: "github" }), `the record of the cut: ${JSON.stringify(cut)}`);
+});
+
+await check("renewal: a connector's pair reaches only its own origin's agents; another origin's agent, or any agent of one with no origin, finds no connector", async () => {
+  const f = d1();
+  for (const [id, origin] of [["A", OURS], ["B", THEIRS], ["C", OURS], ["F", OURS]] as const) f.agent(id, origin);
+  const put = (id: string, origin: string | null) => f.db.prepare("INSERT INTO connectors(id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at, raft_origin) VALUES (?, ?, 'github', 'octo', 'u-1', 'c', 'i', 1, ?)").run(id, TENANT, origin);
+  put("k1", OURS); put("k_null", null);
+  // A binding of another origin's agent that the migration did not see (written around the new checks).
+  f.bind("A", "k1"); f.bind("B", "k1"); f.bind("C", "k1"); f.bind("F", "k_null");
+  const { connectorAudience, d1ConnectorGrants } = await import("../cf/src/control-plane.ts");
+  const g = d1ConnectorGrants(f.D1);
+  assert((await g.grant(TENANT, "k1", "raft_A"))?.id === "k1", "control: its own origin's agent finds it");
+  assert((await g.grant(TENANT, "k1", "raft_B")) === null, "another origin's agent found the connector");
+  assert((await g.grant(TENANT, "k_null", "raft_F")) === null, "an agent of a connector with no origin found it");
+  assert((await g.grant(TENANT, "k1", "raft_NOBODY")) === null, "an agent with no row found it");
+  const to = await connectorAudience(f.D1, TENANT, "k1");
+  assert(JSON.stringify(to) === JSON.stringify(["raft_A", "raft_C"]), `handed to: ${JSON.stringify(to)}`);
+  assert((await connectorAudience(f.D1, TENANT, "k_null")).length === 0, "a connector with no origin was handed to its agents");
 });
 
 console.log(`  ${routes.size} (method, path) pairs take an agent id; ${served.length} (both spellings) served for their own origin; ${Object.keys(OUTSIDE).length} cases outside /agents/<id>`);

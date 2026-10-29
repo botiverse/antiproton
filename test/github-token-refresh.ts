@@ -516,18 +516,18 @@ await check("a refusal that lost its lease to a renewal that landed does not mar
   const a = await w.agent("A20");
   const id = await w.connect(a);
   // At the D1 level: once another renewal has stored a new pair, marking with the spent token changes nothing.
-  const spent = (await w.grants.grant(TENANT, id))!.refresh!.sealed.ciphertext;
+  const spent = (await w.grants.grant(TENANT, id, a.agentId))!.refresh!.sealed.ciphertext;
   const { seal } = await import("../src/runtime/secrets.ts");
   const { kek } = await w.stored(a);
   const landB = async () => {
     const { grant } = await w.gh.code();
-    const k = (await w.grants.grant(TENANT, id))!;
+    const k = (await w.grants.grant(TENANT, id, a.agentId))!;
     must(await w.grants.rotate(TENANT, id, { sealed: await seal(kek, grant.accessToken), refresh: { sealed: await seal(kek, grant.refreshToken!), expiresAt: grant.expiresAt, refreshExpiresAt: grant.refreshExpiresAt }, at: Date.now() }, k.refresh!.sealed.ciphertext, "B"), "B's rotation did not land");
     return grant.accessToken;
   };
   const bToken = await landB();
   must(!(await w.grants.markBroken(TENANT, id, "bad_refresh_token", Date.now(), "A", spent)), "a stale markBroken landed");
-  must((await w.grants.grant(TENANT, id))!.brokenAt === null, "the connector was marked over a good pair");
+  must((await w.grants.grant(TENANT, id, a.agentId))!.brokenAt === null, "the connector was marked over a good pair");
   // Through the code: A's renewal is refused, and B's lands between A's last read and A's markBroken.
   must(await a.rt.adoptConnection(TENANT, a.agentId, "github", id) && (await w.stored(a)).token === bToken, "A did not take B's first pair");
   await w.age(a, id);
@@ -539,7 +539,7 @@ await check("a refusal that lost its lease to a renewal that landed does not mar
   const r = await w.tool(a);
   must(raced && raced !== bToken, "the race did not happen");
   must(succeeded(r), `A's call failed: ${errorText(r)}`);
-  must((await w.grants.grant(TENANT, id))!.brokenAt === null && (await w.status("A20")).body.oauthStatus === "connected", "the connector was marked broken");
+  must((await w.grants.grant(TENANT, id, a.agentId))!.brokenAt === null && (await w.status("A20")).body.oauthStatus === "connected", "the connector was marked broken");
   const s2 = await w.stored(a);
   must(s2.token === raced && !s2.rec.brokenAt, "A's mount did not take B's pair, or kept a broken flag");
   must((w.db.raw.prepare("SELECT count(*) AS n FROM connector_events WHERE connector_id = ? AND action = 'broken'").get(id) as any).n === 0, "a broken event was written");
@@ -657,12 +657,12 @@ await check("the lease is its holder's: one that outlived it cannot free the ren
   must(await g.lease(TENANT, id, 2_500, Date.now() + 60_000, "h2"), "h2 could not take over an expired lease");
   await g.release(TENANT, id, "h1");
   must(!(await g.lease(TENANT, id, Date.now(), Date.now() + 1_000, "h3")), "h1's late release freed h2's lease");
-  const k = (await g.grant(TENANT, id))!;
+  const k = (await g.grant(TENANT, id, a.agentId))!;
   must(!(await g.rotate(TENANT, id, { sealed: k.sealed, refresh: k.refresh!, at: Date.now() }, "not-the-ciphertext", "h1")), "a stale rotation landed");
   await g.markBroken(TENANT, id, "test", Date.now(), "h1", null);
-  must((await g.grant(TENANT, id))!.refreshingUntil !== null, "h1 marking it broken released h2's lease");
+  must((await g.grant(TENANT, id, a.agentId))!.refreshingUntil !== null, "h1 marking it broken released h2's lease");
   await g.release(TENANT, id, "h2");
-  must((await g.grant(TENANT, id))!.refreshingUntil === null, "h2 could not release its own lease");
+  must((await g.grant(TENANT, id, a.agentId))!.refreshingUntil === null, "h2 could not release its own lease");
   w.dispose();
 });
 

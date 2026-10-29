@@ -110,7 +110,7 @@ import { d1ServiceTokens } from "./control-plane.ts";
 import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens, reservedTenantProblem } from "./admin-provider-tokens.ts";
-import { d1ConnectorGrants, d1Connections, d1Connectors, type ConnectorRefresh, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
+import { connectorAudience, d1ConnectorGrants, d1Connections, d1Connectors, type ConnectorRefresh, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
 import type { GithubGrant } from "./github-token.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps, type ReconnectTarget } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
@@ -3026,14 +3026,13 @@ function githubRenewal(env: Env): RuntimeDeps["github"] {
   return {
     app, grants: d1ConnectorGrants(env.CONTROL_DB),
     async propagate(tenantId, connectorId, fromAgentId) {
-      const agents = d1ProvisionedAgents(env.CONTROL_DB);
-      for (const raftAgentId of await d1Connections(env.CONTROL_DB).boundTo(tenantId, connectorId)) {
-        const row = await agents.get(tenantId, raftAgentId);
-        if (!row || row.agentId === fromAgentId) continue;
+      // Only the connector's own origin's agents (`connectorAudience`).
+      for (const agentId of await connectorAudience(env.CONTROL_DB, tenantId, connectorId)) {
+        if (agentId === fromAgentId) continue;
         try {
-          await env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, row.agentId))).connectionAdopt(tenantId, row.agentId, CONNECTION_PLUGIN.github, connectorId);
+          await env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId))).connectionAdopt(tenantId, agentId, CONNECTION_PLUGIN.github, connectorId);
         } catch (e) {
-          logEvent("github.refresh", { tenantId, agentId: row.agentId, connectorId, outcome: "propagate-failed", reason: clip(String((e as Error)?.message ?? e)) });
+          logEvent("github.refresh", { tenantId, agentId, connectorId, outcome: "propagate-failed", reason: clip(String((e as Error)?.message ?? e)) });
         }
       }
     },

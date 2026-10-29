@@ -606,7 +606,7 @@ export interface ConnectorRefresh {
 
 export interface ConnectorEvent {
   tenantId: string; connectorId: string; raftAgentId: string | null;
-  action: "create" | "bind" | "unbind" | "disconnect" | "broken" | "reconnect";
+  action: "create" | "bind" | "unbind" | "disconnect" | "broken" | "reconnect" | "origin_mismatch_removed";
   /** `system` for what the deployment records itself (`broken`), with SYSTEM_ACTOR as the user. */
   actingRaftUserId: string; actingRole: "creator" | "admin" | "system"; at: number;
   /** Why, for `broken`: GitHub's error, never a token. */
@@ -720,7 +720,12 @@ export interface ConnectorGrant extends Connector {
  * token is single-use, and GitHub spends the old access token with it.
  */
 export interface ConnectorGrants {
-  grant(tenantId: string, id: string): Promise<ConnectorGrant | null>;
+  /**
+   * The connector, for renewing `agentId`'s copy of it: only when that agent is of the connector's Raft origin (0030).
+   * Another origin's agent, or any agent of a connector with no origin, finds none, so it is never handed a pair
+   * nor can it mark the connector broken.
+   */
+  grant(tenantId: string, id: string, agentId: string): Promise<ConnectorGrant | null>;
   /** Take the right to trade the refresh token until `until`, as `holder`; false while someone else holds it. */
   lease(tenantId: string, id: string, now: number, until: number, holder: string): Promise<boolean>;
   /** Give it back; only `holder`'s own lease is released. */
@@ -742,10 +747,28 @@ export interface ConnectorGrants {
   markAgentBroken(tenantId: string, agentId: string, provider: string, reason: string, at: number): Promise<boolean>;
 }
 
+/**
+ * The agents a connector's renewed pair is handed to (cf/src/index.ts `githubRenewal`): those bound to it of the
+ * connector's own Raft origin (0030). Another origin's agent bound to it is never handed the pair, and a connector
+ * with no origin is handed to nobody.
+ */
+export async function connectorAudience(db: D1Database, tenantId: string, connectorId: string): Promise<string[]> {
+  const r = await db.prepare(
+    `SELECT p.agent_id FROM provisioned_connections pc
+       JOIN connectors c ON c.tenant_id = pc.tenant_id AND c.id = pc.connector_id
+       JOIN provisioned_agents p ON p.tenant_id = pc.tenant_id AND p.raft_agent_id = pc.raft_agent_id
+      WHERE pc.tenant_id = ? AND pc.connector_id = ? AND c.raft_origin = p.raft_origin ORDER BY p.agent_id`,
+  ).bind(tenantId, connectorId).all<any>();
+  return (r.results ?? []).map((x: any) => String(x.agent_id));
+}
+
 export function d1ConnectorGrants(db: D1Database): ConnectorGrants {
   return {
-    async grant(tenantId, id) {
-      const r = await db.prepare("SELECT * FROM connectors WHERE tenant_id = ? AND id = ?").bind(tenantId, id).first<any>();
+    async grant(tenantId, id, agentId) {
+      const r = await db.prepare(
+        `SELECT c.* FROM connectors c JOIN provisioned_agents p ON p.tenant_id = c.tenant_id AND p.agent_id = ?
+          WHERE c.tenant_id = ? AND c.id = ? AND c.raft_origin = p.raft_origin`,
+      ).bind(agentId, tenantId, id).first<any>();
       if (!r) return null;
       return { ...connectorRow(r), refreshedAt: r.refreshed_at == null ? null : Number(r.refreshed_at), refreshingUntil: r.refreshing_until == null ? null : Number(r.refreshing_until) };
     },
