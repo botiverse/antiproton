@@ -8,9 +8,10 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { createRaftPlugin } from "../src/plugins/raft.ts";
 import { stampPlugin } from "../src/plugins/stamp.ts";
+import { REFUSE_REASON_BYTES } from "../src/plugins/types.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
 import {
-  ACTION_MAX_BYTES, AGENT_LOGIN_TOOLS, LIST_TOOL, SESSION_STORE, actionUrl, followsTemplate, appUrlProblem, cookieHeaderFor, freshCookies, parseSetCookie, readManifest, withheld,
+  ACTION_MAX_BYTES, AGENT_LOGIN_TOOLS, LIST_TOOL, SESSION_STORE, sealedLoginMessage, sealedRecord, loginKey, actionUrl, followsTemplate, appUrlProblem, cookieHeaderFor, freshCookies, parseSetCookie, readManifest, withheld,
 } from "../src/plugins/raft-agent-login.ts";
 import { setLogSink } from "../src/core/log.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
@@ -917,8 +918,14 @@ await check("through the gateway: yes and no from the raft mount's own credentia
 // Stamp's `POST /api/auth/agent/exchange` — skipping the card `stamp_login` raises and putting the session in the
 // conversation. The declarations are read from the real plugins, never from a list written here.
 
+/**
+ * Stamp's Raft record as it really is (from the production Raft integration list, quoted in the review of
+ * botiverse/antiproton#1111): a UUID id, with the declared `stamp` as its client id. A fixture with `id: "stamp"` hid
+ * that a refusal comparing only the resolved id let the UUID through.
+ */
+const STAMP_UUID = "1ec470f7-004e-4371-b9f1-475b695300c5";
 const STAMP_SVC = {
-  ...SERVICE, id: "stamp", clientId: "stamp-client-7f3a", name: "Stamp", homepageUrl: APP, returnUrl: `${APP}/auth/raft/callback`, agentManifestUrl: MANIFEST_URL,
+  ...SERVICE, id: STAMP_UUID, clientId: "stamp", name: "Stamp", homepageUrl: APP, returnUrl: `${APP}/auth/raft/callback`, agentManifestUrl: MANIFEST_URL,
 };
 const AGENT_LOGIN_ACTION = { name: "agent-login", description: "a grant for the CLI", endpoint: { method: "POST", path: "/api/auth/agent/login" },
   parameters: { schema: { type: "string", required: true }, code_challenge: { type: "string", required: true }, code_challenge_method: { type: "string", required: true } } };
@@ -954,6 +961,9 @@ function sealedMount() {
 await check("the declaration is the plugins' own: stamp declares stamp with stamp_login, and no other runtime plugin declares one", async () => {
   must(JSON.stringify(stampPlugin.agentLogin) === JSON.stringify({ services: ["stamp"], tool: "stamp_login" }), JSON.stringify(stampPlugin.agentLogin));
   must(stampPlugin.tools.some((t) => t.name === stampPlugin.agentLogin!.tool), "the declared login tool is not one of stamp's tools");
+  // The longest refusal (both values past their clip) still fits `refuse`'s bound, or it would be replaced by the fixed text.
+  const longest = sealedLoginMessage("integrations_invoke", "s".repeat(500), { service: "stamp", plugin: "stamp", tool: "stamp_login" }, "a".repeat(500));
+  must(longest.length <= REFUSE_REASON_BYTES, `the longest refusal is ${longest.length} characters`);
   // Any other plugin of cf/src/runtime.ts declaring a service is a new security decision, and turns this red until read.
   const runtime = readFileSync(new URL("../cf/src/runtime.ts", import.meta.url), "utf8");
   const declaring = readdirSync(new URL("../src/plugins/", import.meta.url)).filter((f) => f.endsWith(".ts"))
@@ -968,7 +978,7 @@ await check("the bypass, walked: no Stamp session, integrations_invoke {stamp, a
   const g = await sealedGateway();
   const r = await g.call("integrations_invoke", INVOKE_ARGS);
   must(r.status === "rejected" && r.error?.code === "route_refused", `answer: ${JSON.stringify(r)}`);
-  must(/stamp_login/.test(r.error.message) && /sealed/.test(r.error.message) && /agent-login/.test(r.error.message), `message: ${r.error.message}`);
+  must(/stamp_login/.test(r.error.message) && /sealed/.test(r.error.message) && /agent-login \(action "agent-login"\)/.test(r.error.message), `message: ${r.error.message}`);
   must((await g.store.listApprovals("tenant")).length === 0, "a card was made for a refused agent-login");
   must(w.seen.length === 0, `something was sent: ${w.seen.map((x) => x.url).join(", ")}`);
   // Its record: the operation ended rejected (none left pending), and its tool.call row names the tool and the service.
@@ -976,7 +986,7 @@ await check("the bypass, walked: no Stamp session, integrations_invoke {stamp, a
   const ops = Object.entries(dump).filter(([k]) => /operation/i.test(k)).flatMap(([, rows]) => rows as any[]);
   must(ops.length >= 1 && ops.every((o) => o.status === "rejected"), `operations: ${JSON.stringify(ops).slice(0, 400)}`);
   const rows = JSON.stringify(dump);
-  must(/raft\.integrations_invoke/.test(rows) && /route_refused/.test(rows) && /run agent-login for \\+"stamp\\+"/.test(rows), "the refusal left no record naming tool and service");
+  must(/raft\.integrations_invoke/.test(rows) && /route_refused/.test(rows) && /agent-login \(action \\+"agent-login\\+"\) for service \\+"stamp\\+"/.test(rows), "the refusal left no record naming tool and service");
   must(!rows.includes("GRANT-ONE-TIME") && !rows.includes(CREDENTIAL), "the record carries a secret");
   // Control: the same gateway holds an undeclared app's write for a person, so "no card" above is the refusal's doing.
   const held = await g.call("integrations_invoke", { service: "reminder-app", action: "list-reminders" });
@@ -988,7 +998,7 @@ await check("integrations_login for a declared service is refused the same way, 
   w.install();
   const g = await sealedGateway();
   const r = await g.call("integrations_login", { service: "stamp", target: "#general" });
-  must(r.status === "rejected" && r.error?.code === "route_refused" && /stamp_login/.test(r.error.message) && /sign in to/.test(r.error.message), JSON.stringify(r));
+  must(r.status === "rejected" && r.error?.code === "route_refused" && /stamp_login/.test(r.error.message) && /a login for service "stamp"/.test(r.error.message), JSON.stringify(r));
   must((await g.store.listApprovals("tenant")).length === 0 && w.seen.length === 0, "a card was made or Raft was asked");
 });
 
@@ -1012,17 +1022,64 @@ await check("every spelling of the service and the action is refused before a ca
   must(help.status === "pending", `stamp help: ${JSON.stringify(help)}`);
 });
 
-await check("a client id only Raft's list resolves is refused by the handler before any login, and before a card once a list has been read", async () => {
+await check("Stamp's UUID, the id integrations_list shows: refused by both handlers before any login, and before a card once listed", async () => {
   const w = world({ service: STAMP_SVC, manifest: stampManifest(), actionBody: GRANT_BODY, list: bothListed({}) });
   w.install();
+  // Under the default policy (writes run): the refuse hook has not seen the UUID, the handler refuses it.
+  const g = await sealedGateway(null);
+  const r = await g.call("integrations_invoke", { ...INVOKE_ARGS, service: STAMP_UUID });
+  must(r.status !== "succeeded" && /stamp_login/.test(r.error?.message ?? "") && !JSON.stringify(r).includes("GRANT-ONE-TIME"), `invoke by UUID: ${JSON.stringify(r).slice(0, 300)}`);
+  const l = await g.call("integrations_login", { service: STAMP_UUID });
+  must(l.status !== "succeeded" && /stamp_login/.test(l.error?.message ?? ""), `login by UUID: ${JSON.stringify(l).slice(0, 300)}`);
+  must(w.logins.length === 0 && w.actions().length === 0 && w.callbacks().length === 0, `signed in or sent: ${w.logins.length} logins, ${w.actions().length} actions`);
+  // Under approval: once the agent has listed its apps (where it reads the UUID), the UUID is refused before a card.
+  const h = await sealedGateway();
+  const listed = await h.call("integrations_list", {});
+  must(listed.status === "succeeded" && JSON.stringify(listed).includes(STAMP_UUID), `list: ${JSON.stringify(listed).slice(0, 200)}`);
+  for (const service of [STAMP_UUID, STAMP_UUID.toUpperCase(), "Stamp"]) {
+    for (const [tool, args] of [["integrations_invoke", { ...INVOKE_ARGS, service }], ["integrations_login", { service }]] as const) {
+      const x = await h.call(tool, args);
+      must(x.status === "rejected" && x.error?.code === "route_refused" && /stamp_login/.test(x.error.message), `${tool} ${service}: ${JSON.stringify(x)}`);
+    }
+  }
+  must((await h.store.listApprovals("tenant")).length === 0, "a card was made for the UUID");
+  must(w.logins.length === 0 && w.actions().length === 0, "the UUID reached a login or the app");
+});
+
+await check("each identifier on its own makes a service declared: id, client id, name; an app whose three are all other is not", async () => {
+  const records = [
+    { which: "id", svc: { ...STAMP_SVC, id: "stamp", clientId: "c-0d1e", name: "Gatekeeper" }, ask: "c-0d1e" },
+    { which: "clientId", svc: { ...STAMP_SVC, id: STAMP_UUID, clientId: "stamp", name: "Gatekeeper" }, ask: STAMP_UUID },
+    { which: "name", svc: { ...STAMP_SVC, id: STAMP_UUID, clientId: "c-0d1e", name: "Stamp" }, ask: STAMP_UUID },
+  ];
+  // The rule itself, with nothing learned: the resolved record is declared by whichever of its three is.
+  const only = (k: string) => (loginKey(k) === "stamp" ? { service: "stamp", plugin: "stamp", tool: "stamp_login" } : null);
+  for (const { which, svc } of records) must(sealedRecord(only, svc as any)?.plugin === "stamp", `${which}: the resolved record is not declared`);
+  must(sealedRecord(only, { ...SERVICE, id: STAMP_UUID, clientId: "c-0d1e", name: "Gatekeeper" } as any) === null, "a record with no declared identifier is declared");
+  for (const { which, svc, ask } of records) {
+    const w = world({ service: svc, manifest: stampManifest(), actionBody: GRANT_BODY, list: { body: { services: [SERVICE, svc], activeLogins: [] } } });
+    w.install();
+    const m = sealedMount();
+    const e = await failure(() => m.plugin.invoke("integrations_invoke", { ...INVOKE_ARGS, service: ask }, m.ctx));
+    must(/stamp_login/.test(e.message), `${which}: invoke ${e.message}`);
+    const l = await failure(() => m.plugin.invoke("integrations_login", { service: ask }, m.ctx));
+    must(/stamp_login/.test(l.message), `${which}: login ${l.message}`);
+    must(w.logins.length === 0 && w.actions().length === 0, `${which}: ${w.logins.length} logins, ${w.actions().length} actions`);
+    // The list taught the hook all three spellings of that record.
+    for (const spelling of [svc.id, svc.clientId, svc.name]) {
+      must(/stamp_login/.test(m.plugin.refuse!("integrations_invoke", { service: spelling, action: "agent-login" }) ?? ""), `${which}: ${spelling} not refused up front`);
+    }
+  }
+  // The reverse: an app none of whose identifiers is declared keeps its agent-login, by any of them.
+  const other = { ...SERVICE, id: "9b2c4e1a-55d0-4c8e-a1f7-3e6d2b0c9f41", clientId: "ledger-app", name: "Ledger" };
+  const w = world({ service: other, manifest: manifest({ actions: [AGENT_LOGIN_ACTION] }), actionBody: GRANT_BODY, list: { body: { services: [STAMP_SVC, other], activeLogins: [] } } });
+  w.install();
   const m = sealedMount();
-  const e = await failure(() => m.plugin.invoke("integrations_invoke", { ...INVOKE_ARGS, service: "stamp-client-7f3a" }, m.ctx));
-  must(/stamp_login/.test(e.message), `handler: ${e.message}`);
-  must(w.logins.length === 0 && w.actions().length === 0, `signed in or sent: ${w.logins.length} logins, ${w.actions().length} actions`);
-  const l = await failure(() => m.plugin.invoke("integrations_login", { service: "STAMP-CLIENT-7F3A" }, m.ctx));
-  must(/stamp_login/.test(l.message) && w.logins.length === 0, `login handler: ${l.message}, ${w.logins.length} logins`);
-  // The list that resolved it taught the refusal hook the spelling: refused before the policy from now on.
-  must(/stamp_login/.test(m.plugin.refuse!("integrations_invoke", { service: "Stamp-Client-7f3a", action: "agent-login" }) ?? ""), "the learned client id is not refused up front");
+  for (const ask of [other.id, other.clientId, other.name]) {
+    must(m.plugin.refuse!("integrations_invoke", { ...INVOKE_ARGS, service: ask }) === undefined, `undeclared ${ask} refused up front`);
+    const out = await m.plugin.invoke("integrations_invoke", { ...INVOKE_ARGS, service: ask }, m.ctx) as any;
+    must(JSON.stringify(out).includes("GRANT-ONE-TIME"), `undeclared ${ask}: ${JSON.stringify(out).slice(0, 200)}`);
+  }
 });
 
 await check("a name only Raft resolves to a declared service makes no session: the login stops before the handoff", async () => {
@@ -1032,7 +1089,7 @@ await check("a name only Raft resolves to a declared service makes no session: t
   const m = sealedMount();
   const e = await failure(() => m.plugin.invoke("integrations_login", { service: "stamp-by-another-name" }, m.ctx));
   must(/stamp_login/.test(e.message), `message: ${e.message}`);
-  must(w.logins.length === 1 && w.callbacks().length === 0 && !m.tables.get(m.scope, SESSION_STORE, "stamp"), "a session was handed off or kept");
+  must(w.logins.length === 1 && w.callbacks().length === 0 && !m.tables.get(m.scope, SESSION_STORE, STAMP_UUID), "a session was handed off or kept");
 });
 
 await check("an action by another name that reaches Agent Login's endpoint is the same request, and refused", async () => {
@@ -1042,6 +1099,8 @@ await check("an action by another name that reaches Agent Login's endpoint is th
   const m = sealedMount();
   const e = await failure(() => m.plugin.invoke("integrations_invoke", { ...INVOKE_ARGS, action: "mint-cli-grant" }, m.ctx));
   must(/stamp_login/.test(e.message) && w.logins.length === 0 && w.actions().length === 0, `${e.message}; ${w.logins.length} logins`);
+  // The record carries the action as the agent sent it, not only the fixed name.
+  must(/action "mint-cli-grant"/.test(e.message), `the alias is not in the refusal: ${e.message}`);
 });
 
 await check("an undeclared service is unchanged: its agent-login runs, through the gateway and the handler", async () => {
@@ -1074,9 +1133,21 @@ await check("structural: only the raft plugin asks Raft for Agent Login, and no 
   // plugin's: the Agent Login tools, and the assistant's Reminder tool, which picks the Reminder app alone (`reminderServiceOf`).
   const login = files.filter((f) => /routes\.integrations\.|\.integrations\.(call|login|invoke)\(|integrations\/login/.test(text(f)));
   must(JSON.stringify(login.sort()) === JSON.stringify(["raft-agent-login.ts", "raft-assistant-reminder.ts", "raft.ts"]), `Agent Login callers: ${login.join(", ")}`);
-  // A plugin that reads another mount (`ctx.sibling`) can hold the Raft credential; each of these was read for what it does with it.
-  const siblings = files.filter((f) => /\.sibling\(/.test(text(f)));
-  must(JSON.stringify(siblings.sort()) === JSON.stringify(["appworld.ts", "raft-identity.ts", "raftbench.ts", "reminder.ts", "stamp.ts"]), `sibling readers: ${siblings.join(", ")}`);
+  // Who reads another mount (`ctx.sibling`). The rule is the gateway's (`Plugin.siblingReaders`,
+  // test/gateway-sibling-gate.ts); this is the backstop that names every reader, in code with its comments stripped,
+  // however it is spelled: `.sibling(`, `?.sibling?.(`, `["sibling"]`, or destructured out of the context.
+  const code = (t: string) => t.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+  const READS = /\??\.\s*sibling\b|\[\s*["'`]sibling["'`]\s*\]|\{[^{}]*\bsibling\b[^{}]*\}\s*=/;
+  const roots = [["../src/", "src/"], ["../cf/src/", "cf/src/"]] as const;
+  const siblings = roots.flatMap(([rel, label]) => readdirSync(new URL(rel, import.meta.url), { recursive: true }).map(String)
+    .filter((f) => f.endsWith(".ts") && READS.test(code(readFileSync(new URL(rel + f, import.meta.url), "utf8")))).map((f) => label + f));
+  must(JSON.stringify(siblings.sort()) === JSON.stringify([
+    "src/plugins/appworld.ts", "src/plugins/raft-identity.ts", "src/plugins/raftbench.ts", "src/plugins/reminder.ts", "src/plugins/stamp.ts",
+  ]), `sibling readers: ${siblings.join(", ")}`);
+  // The pattern itself catches the spellings a plain `.sibling(` scan missed.
+  for (const spelling of ["ctx.sibling?.(\"raft\")", "ctx?.sibling(\"raft\")", "const { sibling } = ctx;", "ctx[\"sibling\"](\"raft\")", "const { db, sibling: s } = ctx"]) {
+    must(READS.test(spelling), `the scan misses ${spelling}`);
+  }
   // A container is given the credentials of mounts whose plugin declares a sandbox form: raft must never be one.
   const forms = files.filter((f) => /\bsandboxForm:\s*\{/.test(text(f)));
   must(JSON.stringify(forms) === JSON.stringify(["github.ts"]), `sandbox forms: ${forms.join(", ")}`);

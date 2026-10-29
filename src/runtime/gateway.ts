@@ -658,6 +658,13 @@ export class ToolGateway {
     } = {},  ) {
     for (const p of plugins) checkBridge(p);
     this.#approvalTtlMs = opts.approvalTtlMs ?? DEFAULT_APPROVAL_TTL_MS;
+    // An id names one plugin, or a later one would take over an earlier one's mounts and every grant made to its id
+    // (`Plugin.siblingReaders`, `agentLogin`): a second plugin under an id already registered is refused, never kept.
+    const ids = new Set<string>();
+    for (const p of plugins) {
+      if (ids.has(p.id)) throw new Error(`two plugins are registered as ${JSON.stringify(p.id)}: a plugin id names one plugin`);
+      ids.add(p.id);
+    }
     this.#store = store;
     this.#plugins = new Map(plugins.map((p) => [p.id, p]));
     this.#secrets = secrets;
@@ -1909,7 +1916,7 @@ export class ToolGateway {
       // A mount's own hooks, and only for a plugin that can take what they carry.
       ...(this.#inbound && plugin?.receive
         ? { inbound: this.#inbound(ctx.tenantId, ctx.agentId, mount.alias) } : {}),
-      sibling: (alias: string) => this.#sibling(ctx, alias, db),
+      sibling: (alias: string) => this.#sibling(ctx, alias, db, mount.plugin),
       ...(this.#agentDeleted?.(ctx.tenantId, ctx.agentId) ? { agentDeleted: true } : {}),
       // Only for a plugin that declares the services it may log in to (botiverse/antiproton#1084).
       ...(plugin?.agentLogin?.services?.length && !listing ? {
@@ -2346,7 +2353,7 @@ export class ToolGateway {
     if (!asking.agentLogin?.services.includes(service)) {
       throw new Error(`${asking.id} may not log in to ${JSON.stringify(service).slice(0, 60)}: it declares ${JSON.stringify(asking.agentLogin?.services ?? [])}`);
     }
-    const usable = await this.#sibling(ctx, RAFT_LOGIN_ALIAS, (m) => this.#db(ctx, m));
+    const usable = await this.#sibling(ctx, RAFT_LOGIN_ALIAS, (m) => this.#db(ctx, m), null);
     const mount = usable ? await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, RAFT_LOGIN_ALIAS) : null;
     const raft = mount ? this.#plugins.get(mount.plugin) : undefined;
     if (!mount || !raft?.grantAgentLogin) {
@@ -2365,7 +2372,7 @@ export class ToolGateway {
    */
   async integrationInstalled(tenantId: string, agentId: string, service: string): Promise<"yes" | "no" | "unknown"> {
     const ctx = { tenantId, agentId };
-    const usable = await this.#sibling(ctx, RAFT_LOGIN_ALIAS, (m) => this.#db(ctx, m));
+    const usable = await this.#sibling(ctx, RAFT_LOGIN_ALIAS, (m) => this.#db(ctx, m), null);
     const mount = usable ? await this.#store.getMountByAlias(tenantId, agentId, RAFT_LOGIN_ALIAS) : null;
     const raft = mount ? this.#plugins.get(mount.plugin) : undefined;
     if (!mount || !raft?.integrationInstalled || !usable?.credential) return "unknown";
@@ -2375,8 +2382,16 @@ export class ToolGateway {
   /**
    * Another of this agent's mounts, as `PluginContext.sibling` hands it: the one lookup, for a call's context and a
    * credential check's alike, so a check sees exactly what a call would and nothing more.
+   *
+   * `asking` is the plugin id of the mount whose context asks — the mount record's `plugin`, which the platform set
+   * when the mount was added and which names a registered plugin, never the alias its owner chose — or null for the
+   * gateway's own lookups (`#agentLogin`, `integrationInstalled`), which hand the credential to the sibling's own
+   * plugin only. The sibling's credential goes to its own plugin and to those its plugin names in
+   * `Plugin.siblingReaders`; any other asker gets the same answer with `credential: null`, so a plugin that only asks
+   * which plugin a mount is (reminder) sees no difference, and one that would act with another mount's credential
+   * cannot.
    */
-  async #sibling(ctx: { tenantId: string; agentId: string }, alias: string, db: (m: MountRecord) => PluginDatabase) {
+  async #sibling(ctx: { tenantId: string; agentId: string }, alias: string, db: (m: MountRecord) => PluginDatabase, asking: string | null) {
     const store = this.#store;
     const secrets = this.#secrets;
     // Only this agent's own mounts: never a lookup by tenant or by plugin.
@@ -2392,8 +2407,9 @@ export class ToolGateway {
     const choices = await store.pluginChoices(ctx.tenantId, ctx.agentId);
     if (!pluginEnabled(this.#seeded.has(other.plugin), choices[other.plugin])) return null;
     if (otherPlugin.version !== other.toolVersion) return null;
+    const reads = asking === null || asking === other.plugin || (otherPlugin.siblingReaders ?? []).includes(asking);
     return {
-      credential: other.secretRef
+      credential: reads && other.secretRef
         ? await secrets.resolve(other.secretRef, { tenantId: other.tenantId, agentId: other.agentId })
         : null,
       // The sibling's null is ambiguous in exactly the same three ways as this mount's.
@@ -2419,7 +2435,7 @@ export class ToolGateway {
       agentDb: this.#agentDb({ tenantId, agentId }, mount),
       // The same lookup a call's context has (`#sibling`): a check may need to read another of this agent's mounts
       // (stamp reads which Raft agent this is from the raft mount), and it sees no more than a call would.
-      sibling: (alias: string) => this.#sibling({ tenantId, agentId }, alias, (m) => this.#db({ tenantId, agentId }, m)),
+      sibling: (alias: string) => this.#sibling({ tenantId, agentId }, alias, (m) => this.#db({ tenantId, agentId }, m), mount.plugin),
       async sandboxForms() { return []; },
       async agentSecret() { return null; },
     };

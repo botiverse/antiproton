@@ -3039,9 +3039,10 @@ export function createRaftPlugin(deps: {
   const learn = (services: readonly ServiceRecord[]) => {
     const ids = declared();
     for (const s of services) {
-      if (!ids.has(loginKey(s.id))) continue;
-      learned.set(loginKey(s.clientId), loginKey(s.id));
-      learned.set(loginKey(s.name), loginKey(s.id));
+      // Declared by any of the three: Stamp's record is a UUID id with `stamp` as its client id.
+      const key = [s.id, s.clientId, s.name].map(loginKey).find((k) => ids.has(k));
+      if (key === undefined) continue;
+      for (const k of [s.id, s.clientId, s.name]) learned.set(loginKey(k), key);
     }
   };
   const sealed = (service: string): SealedLogin | null => {
@@ -3140,6 +3141,13 @@ export function createRaftPlugin(deps: {
     refuse(tool: string, args: Json): string | undefined {
       return sealedLoginRefusal(tool, args, sealed) ?? undefined;
     },
+    /**
+     * Who may read this mount's Raft credential through `ctx.sibling`. **A security change to edit**: the credential
+     * reaches Raft's Agent Login directly, past `refuse` above and every handler check, so a plugin listed here can
+     * mint any app's grant. stamp derives its seal key from it and reads which agent this is (`raftIdentityOf`);
+     * raftbench reads its runs and events with it. reminder asks only which plugin the mount is, which needs no credential.
+     */
+    siblingReaders: ["stamp", "raftbench"],
     /**
      * Which tools this build can offer, and what each needs, as one string: it moves when the SDK's manifest
      * (an operation or its capability), `EXCLUDED` or the presence of object storage changes the generated set, and a snapshot taken under another basis is re-taken at the next

@@ -962,9 +962,13 @@ hold the session in its conversation, without the person the plugin's login
 tool asks. The refusal is `Plugin.refuse`, so it comes before any approval
 card, and its sentence names the declared `tool` as the way in. The service
 is compared folded (NFKC, invisible characters dropped, trimmed, lower-cased)
-and the action with case and separators ignored; a client id or name is also
-refused once Raft's list has said which service it is, and the handlers check
-again against the service Raft resolved, before a login or a handoff. The
+and the action with case and separators ignored. A resolved app is declared
+when its id, client id or name folds to a declared service (Stamp's Raft id is
+a UUID; `stamp` is its client id): every spelling of such an app is refused
+before a card once any Raft list (`integrations_list` among them) has named
+it, and the handlers check the app Raft resolved again, before a login or a
+handoff. The refusal, and the record of it, carry the service and the action
+as the agent sent them. The
 declarations are read from the runtime's plugins (`createRaftPlugin({ registry
 })` in `cf/src/runtime.ts`), never from a list in the raft plugin. **Adding a
 service to a plugin's `agentLogin.services` is a security decision**: it hands
@@ -973,6 +977,20 @@ away from the agent. `test/raft-agent-login.ts` pins the refusal, its variants
 and that an undeclared service is unchanged; `test/stamp-plugin.ts` and
 `test/stamp-bridge.ts` pin that no stamp tool and no `sdk:stamp` request
 reaches `/api/auth/*`.
+
+**Another mount's credential goes only where its plugin says.**
+`ctx.sibling(alias)` answers any of the agent's callable mounts with its
+plugin, policy and database, but its `credential` only to that mount's own
+plugin and to the plugins its plugin lists in `siblingReaders`
+(`Plugin.siblingReaders`); every other asker gets `credential: null`. The
+asker is the plugin id the platform recorded on its mount, never the mount's
+alias, and the gateway refuses two plugins registered under one id, so no
+plugin can take a listed one's place. `raft` lists `["stamp", "raftbench"]`:
+its credential reaches Raft's Agent Login directly, past everything above, so
+a plugin listed there can mint any app's grant. **Editing a `siblingReaders`
+list is a security change.** It is a rule the gateway enforces, not a scan:
+`test/gateway-sibling-gate.ts` holds it, and `test/raft-agent-login.ts` keeps
+a scan naming every reader of `sibling` as a backstop.
 
 Two more are a personal assistant's reads of its owner's Raft:
 `assistant_owner_inbox` (the owner's channels and threads with unread counts,
@@ -1453,8 +1471,9 @@ the plugin registered while it was on. That is safe because `unmount` is
 **cleanup only** — cancel registrations, subscriptions, reminders — and never
 wakes the agent, posts a message or calls a model. That is a rule the plugin
 keeps, not a limit the runtime enforces: the context has nothing that wakes the
-agent, but `sibling` hands over another mount's credential and the network is
-open, so a plugin could still post somewhere.
+agent, but `sibling` can hand over another mount's credential (to a plugin that
+mount's plugin lists in `siblingReaders`) and the network is open, so a plugin
+could still post somewhere.
 
 Revoking through `ctx.inbound` inside `unmount` is allowed and changes nothing
 about the order; telling the service to stop sending is the part only the
