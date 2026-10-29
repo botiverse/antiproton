@@ -1958,50 +1958,83 @@ await check("the console's view of a connected mount reads the key's own record:
   w.dispose();
 });
 
-// Guards agreement between two read paths until #1135 unifies them; at that point keep the outcome assertions and drop
-// the agreement check.
-await check("the inventory's read of a mount agrees with the runtime's (key present, none, dangling; the renewal record's connector), and lists the right state for each", async () => {
+// The inventory's read now is the runtime's (`agentKeyName`, `readMountGrant`): one function, so only outcomes are
+// asserted here. Before #1135 this also compared the inventory with detachConnectionIfFrom's guard.
+await check("the inventory's read of a mount, by outcome: a key present (with its renewal record's connector), none, dangling, a shared account; and the state each is listed in", async () => {
   const w = await world();
-  const { importKek, seal } = await import("../src/runtime/secrets.ts");
+  const { importKek, seal, mountKeyName } = await import("../src/runtime/secrets.ts");
   const kek = await importKek(KEK);
-  const present = await w.agent("ZP"), none = await w.agent("ZN"), dangling = await w.agent("ZD");
+  const present = await w.agent("ZP"), none = await w.agent("ZN"), dangling = await w.agent("ZD"), shared = await w.agent("ZS");
   const connectorId = await w.connect(present);
   await w.connect(dangling);
-  // A key the mount still names but that is not stored.
-  w.hostOf(dangling.agentId).sql.exec("DELETE FROM secrets WHERE name = 'gh'");
-  const other = await seal(kek, "ghu_" + "o".repeat(36));
+  // A key the mount still names but that is not stored. Its name by the naming rule (#1135), not spelled here: a
+  // rename of it would otherwise delete nothing and leave the fixture a key that is present.
+  const mountOf = async (a: typeof present) => (await a.rt.store.findMountsByPlugin(TENANT, a.agentId, "github"))[0]!;
+  const keyName = mountKeyName(await mountOf(dangling));
+  w.hostOf(dangling.agentId).sql.exec("DELETE FROM secrets WHERE name = ?", keyName);
+  must(!(await dangling.rt.store.getSecret(TENANT, dangling.agentId, keyName)), "the dangling fixture still has its key");
+  // The deployment's account on the mount, not one of the agent's.
+  await shared.rt.store.setMountSecretRef(TENANT, shared.agentId, (await mountOf(shared)).alias, "operator:github");
   const read = (a: typeof present) => readConnectionHoldings(a.rt.store, kek, TENANT, a.agentId, ["github"]);
-  // The runtime's own reading, read-only for a connector the mount does not name: `other` when a key of the agent's is
-  // on it, nothing when there is none.
-  const runtimeHeld = async (a: typeof present) => {
-    const r = await a.rt.detachConnectionIfFrom(TENANT, a.agentId, "github", other, "k-not-this-one");
-    must(r.ok && r.removed === false, `the read-only probe removed something: ${JSON.stringify(r)}`);
-    return (r as { other?: true }).other === true;
-  };
-  const view = { present: await read(present), none: await read(none), dangling: await read(dangling) };
-  const held = { present: await runtimeHeld(present), none: await runtimeHeld(none), dangling: await runtimeHeld(dangling) };
-  // Agreement.
-  for (const k of ["present", "none", "dangling"] as const) {
-    must(view[k].some((m) => m.key === "agent") === held[k], `${k}: the inventory says ${JSON.stringify(view[k])}, the runtime ${held[k]}`);
-  }
-  // Outcomes.
-  must(held.present && view.present[0]?.key === "agent" && view.present[0].connectorId === connectorId, `present: ${JSON.stringify(view.present)}`);
-  must(!held.none && view.none[0]?.key !== "agent" && view.none[0]?.connectorId === null, `none: ${JSON.stringify(view.none)}`);
-  must(!held.dangling && view.dangling[0]?.key === "dangling", `dangling: ${JSON.stringify(view.dangling)}`);
-  // The renewal record names the connector the runtime renews from: a detach that names it does take the key (last:
-  // it changes the mount).
+  const key = async (a: typeof present) => (await read(a)).map((m) => [m.key, m.connectorId]);
+  must(JSON.stringify(await key(present)) === JSON.stringify([["agent", connectorId]]), `present: ${JSON.stringify(await read(present))}`);
+  must(JSON.stringify(await key(none)) === JSON.stringify([["none", null]]), `none: ${JSON.stringify(await read(none))}`);
+  must(JSON.stringify(await key(dangling)) === JSON.stringify([["dangling", null]]), `dangling: ${JSON.stringify(await read(dangling))}`);
+  must(JSON.stringify(await key(shared)) === JSON.stringify([["shared", null]]), `shared: ${JSON.stringify(await read(shared))}`);
   const inventory = async () => {
     const res = await adminCredentialInventory(new Request("https://x/admin/credential-inventory?tenantId=" + TENANT + "&limit=25", { headers: { "x-harness-token": "tok", "x-claimed-caller": "test" } }),
       new URL("https://x/admin/credential-inventory?tenantId=" + TENANT + "&limit=25"),
-      { token: "tok", db: w.db, now: () => Date.now(), holdings: async (_t, a, p) => readConnectionHoldings(({ raft_ZP: present, raft_ZN: none, raft_ZD: dangling } as any)[a].rt.store, kek, TENANT, a, p) });
+      { token: "tok", db: w.db, now: () => Date.now(), holdings: async (_t, a, p) => readConnectionHoldings(({ raft_ZP: present, raft_ZN: none, raft_ZD: dangling, raft_ZS: shared } as any)[a].rt.store, kek, TENANT, a, p) });
     const body: any = await res.json();
     return Object.fromEntries(body.agents.map((x: any) => [x.raft_agent_id, x.connections[0].state]));
   };
-  must(JSON.stringify(await inventory()) === JSON.stringify({ ZD: "binding_only", ZN: "neither", ZP: "both" }), `with bindings: ${JSON.stringify(await inventory())}`);
+  must(JSON.stringify(await inventory()) === JSON.stringify({ ZD: "binding_only", ZN: "neither", ZP: "both", ZS: "neither" }), `with bindings: ${JSON.stringify(await inventory())}`);
   w.db.raw.prepare("DELETE FROM provisioned_connections WHERE raft_agent_id = 'ZP'").run();
   must((await inventory()).ZP === "mount_only", "a key with no binding");
-  const taken = await present.rt.detachConnectionIfFrom(TENANT, present.agentId, "github", other, view.present[0]!.connectorId);
+  // The connector read is the one the runtime renews from: a detach naming it takes the key.
+  const other = await seal(kek, "ghu_" + "o".repeat(36));
+  const taken = await present.rt.detachConnectionIfFrom(TENANT, present.agentId, "github", other, connectorId);
   must(taken.ok && taken.removed === true, `the runtime does not renew from the connector the inventory read: ${JSON.stringify(taken)}`);
+  w.dispose();
+});
+
+await check("a mount whose reference names a key other than its alias: read, shown, renewed, reconnected and removed under the reference's name, never the alias", async () => {
+  const w = await world();
+  const { importKek, mountKeyName } = await import("../src/runtime/secrets.ts");
+  const kek = await importKek(KEK);
+  const a = await w.agent("ZK");
+  const connectorId = await w.connect(a);
+  const alias = (await a.rt.store.findMountsByPlugin(TENANT, a.agentId, "github"))[0]!.alias;
+  const KEY = "gh_key";
+  // The key and its renewal record under another name than the alias, the reference naming it.
+  const host = w.hostOf(a.agentId);
+  host.sql.exec("UPDATE secrets SET name = ? WHERE name = ?", KEY, alias);
+  host.sql.exec("UPDATE secrets SET name = ? WHERE name = ?", OAUTH_PREFIX + KEY, OAUTH_PREFIX + alias);
+  await a.rt.store.setMountSecretRef(TENANT, a.agentId, alias, `agent:${KEY}`);
+  const names = () => (host.sql.exec("SELECT name FROM secrets ORDER BY name").toArray() as any[]).map((r) => String(r.name));
+  const mount = async () => (await a.rt.store.findMountsByPlugin(TENANT, a.agentId, "github"))[0]!;
+  must(mountKeyName(await mount()) === KEY && JSON.stringify(names()) === JSON.stringify([KEY, OAUTH_PREFIX + KEY].sort()), `the fixture: ${JSON.stringify(names())}`);
+  // The console's view reads the key's own record.
+  const meta = await a.rt.credentialMeta(TENANT, a.agentId, await mount());
+  must(meta.attached && meta.verified === true && typeof meta.account === "string", `the console's view: ${JSON.stringify(meta)}`);
+  // The inventory sees the key and its connector.
+  must(JSON.stringify((await readConnectionHoldings(a.rt.store, kek, TENANT, a.agentId, ["github"])).map((m) => [m.key, m.connectorId])) === JSON.stringify([["agent", connectorId]]), "the inventory");
+  // An expiring key is renewed under the reference's name: the record there is updated, nothing appears under the alias.
+  const { open, seal } = await import("../src/runtime/secrets.ts");
+  const recRow = await a.rt.store.getSecret(TENANT, a.agentId, OAUTH_PREFIX + KEY);
+  const rec = JSON.parse(await open(kek, recRow!));
+  await a.rt.store.putSecret(TENANT, a.agentId, OAUTH_PREFIX + KEY, await seal(kek, JSON.stringify({ ...rec, expiresAt: Date.now() - 1000 })));
+  w.db.raw.prepare("UPDATE connectors SET expires_at = ? WHERE id = ?").run(Date.now() - 1000, connectorId);
+  const renewals = w.gh.s.refreshes;
+  await w.tool(a);
+  const after = JSON.parse(await open(kek, (await a.rt.store.getSecret(TENANT, a.agentId, OAUTH_PREFIX + KEY))!));
+  must(w.gh.s.refreshes === renewals + 1 && after.expiresAt > Date.now() && JSON.stringify(names()) === JSON.stringify([KEY, OAUTH_PREFIX + KEY].sort()), `the renewal: ${w.gh.s.refreshes - renewals}, ${JSON.stringify(names())}`);
+  // A reconnect puts the new key and its renewal record under the reference's name, and leaves the reference as it was.
+  await w.reconnect(a, connectorId);
+  must((await mount()).secretRef === `agent:${KEY}` && JSON.stringify(names()) === JSON.stringify([KEY, OAUTH_PREFIX + KEY].sort()), `after a reconnect: ${(await mount()).secretRef} ${JSON.stringify(names())}`);
+  // Removing the credential takes the key and its renewal record by that name.
+  must((await a.rt.removeCredentialOrWhy(TENANT, a.agentId, alias)).ok, "the remove was refused");
+  must(names().length === 0, `left after the remove: ${JSON.stringify(names())}`);
   w.dispose();
 });
 

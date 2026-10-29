@@ -22,8 +22,8 @@ import { isOperator } from "./auth.ts";
 import { errorClassOf } from "./error-class.ts";
 import { CONNECTION_PLUGIN, type ConnectionProvider } from "./provision/connect.ts";
 import { logEvent } from "../../src/core/log.ts";
-import { agentRef, isAgentRef, open, type Sealed } from "../../src/runtime/secrets.ts";
-import { OAUTH_PREFIX, reasonCode } from "./github-refresh.ts";
+import { agentKeyName, type Sealed } from "../../src/runtime/secrets.ts";
+import { readMountGrant, reasonCode } from "./github-refresh.ts";
 import type { MountRecord } from "../../src/core/types.ts";
 
 /** One mount of a connection plugin, as the agent's object reads it (`readConnectionHoldings`). */
@@ -57,19 +57,15 @@ export async function readConnectionHoldings(
   const out: ConnectionHolding[] = [];
   for (const plugin of plugins) {
     for (const mount of await store.findMountsByPlugin(tenantId, agentId, plugin)) {
-      // As the runtime decides it (cf/src/runtime.ts detachConnectionIfFrom, and GithubRefresher.read in
-      // cf/src/github-refresh.ts): the store's own mount and secret reads, the key named by the reference, its renewal
-      // record under OAUTH_PREFIX + that name. A copy of that reading, held to the runtime's by a test
-      // (test/github-token-refresh.ts) until #1135 makes it one function.
-      const name = isAgentRef(mount.secretRef) ? mount.secretRef!.slice(agentRef("").length) : null;
+      // The runtime's own reading (`agentKeyName`, `readMountGrant`): the store's mount and secret reads, the key the
+      // reference names, its renewal record under that name.
+      const name = agentKeyName(mount.secretRef);
       if (name === null) {
         out.push({ alias: mount.alias, plugin, key: mount.secretRef ? "shared" : "none", connectorId: null });
         continue;
       }
       if (!(await store.getSecret(tenantId, agentId, name))) { out.push({ alias: mount.alias, plugin, key: "dangling", connectorId: null }); continue; }
-      let connectorId: string | null = null;
-      const rec = kek ? await store.getSecret(tenantId, agentId, OAUTH_PREFIX + name) : null;
-      if (kek && rec) { try { connectorId = (JSON.parse(await open(kek, rec)) as { connectorId?: string | null }).connectorId ?? null; } catch { /* stays null */ } }
+      const connectorId = (await readMountGrant(store, kek, tenantId, agentId, name))?.connectorId ?? null;
       out.push({ alias: mount.alias, plugin, key: "agent", connectorId });
     }
   }

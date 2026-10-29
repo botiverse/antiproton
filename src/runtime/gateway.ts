@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { StorageAdapter } from "../core/store.ts";
 import type { Json, MountPolicy, MountRecord, OperationStatus, PolicyDecision } from "../core/types.ts";
-import { AGENT_REF, agentRef, isAgentRef, KEPT_NAME, KEPT_PREFIX, OWNER_PREFIX, secretRefKind } from "./secrets.ts";
+import { agentKeyName, agentRef, isAgentRef, KEPT_NAME, KEPT_PREFIX, OWNER_PREFIX, secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { AgentLoginAnswer, Plugin, PluginContext, PluginDatabase, PluginNext, PromptPart, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead, ListedTools, TurnEnd } from "../plugins/types.ts";
@@ -1889,7 +1889,7 @@ export class ToolGateway {
       // Only for the mount's own key, and only where the deployment can renew one.
       ...(this.#credentialRejected && credential && isAgentRef(mount.secretRef) ? {
         credentialRejected: (token: string) => this.#credentialRejected!(
-          { tenantId: mount.tenantId, agentId: mount.agentId }, mount.secretRef!.slice(AGENT_REF.length), token),
+          { tenantId: mount.tenantId, agentId: mount.agentId }, agentKeyName(mount.secretRef)!, token),
       } : {}),
       // What kind of credential the mount names, so a null `credential` can be read as "names none" or
       // "names one that did not arrive" rather than guessed. The KIND, never the reference: a reference
@@ -1930,7 +1930,7 @@ export class ToolGateway {
             // change, and only registering the credential with a box puts it to work.
             credential: m.secretRef ? await secrets.resolve(m.secretRef, scope, { touch: false }) : null,
             used: async () => {
-              if (isAgentRef(m.secretRef)) await store.touchSecret(scope.tenantId, scope.agentId, m.secretRef!.slice(AGENT_REF.length), Date.now());
+              if (isAgentRef(m.secretRef)) await store.touchSecret(scope.tenantId, scope.agentId, agentKeyName(m.secretRef)!, Date.now());
             },
           });
         }

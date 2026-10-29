@@ -43,6 +43,20 @@ export type OAuthStatus = "connected" | "disconnected" | "error";
 export const RECONNECT_REASON = "OAuth authorization expired; reconnect required";
 
 /** What renews one mount's access token. Sealed as JSON under `oauth:<name>`. */
+/**
+ * What renews a mount's key (`MountGrant`), stored under OAUTH_PREFIX + the key's name (`mountKeyName`,
+ * src/runtime/secrets.ts); null when there is none or it cannot be opened here. The one reading of it, for the renewal
+ * and for the credential inventory (cf/src/credential-inventory.ts).
+ */
+export async function readMountGrant(
+  store: { getSecret(tenantId: string, agentId: string, name: string): Promise<{ ciphertext: string; iv: string } | null> },
+  kek: CryptoKey | null, tenantId: string, agentId: string, name: string,
+): Promise<MountGrant | null> {
+  const row = kek ? await store.getSecret(tenantId, agentId, OAUTH_PREFIX + name) : null;
+  if (!kek || !row) return null;
+  try { return JSON.parse(await open(kek, row)) as MountGrant; } catch { return null; }
+}
+
 export interface MountGrant {
   v: 1;
   refreshToken: string | null;
@@ -321,10 +335,7 @@ export class GithubRefresher {
   #sleep(ms: number) { return this.#d.sleep?.(ms) ?? new Promise<void>((r) => setTimeout(r, ms)); }
 
   async read(tenantId: string, agentId: string, name: string): Promise<MountGrant | null> {
-    const kek = await this.#d.kek;
-    const row = kek ? await this.#d.store.getSecret(tenantId, agentId, OAUTH_PREFIX + name) : null;
-    if (!kek || !row) return null;
-    try { return JSON.parse(await open(kek, row)) as MountGrant; } catch { return null; }
+    return readMountGrant(this.#d.store, await this.#d.kek, tenantId, agentId, name);
   }
 
   /** After a connection's token is put on a mount: what renews it, or nothing for one that does not expire. */

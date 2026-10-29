@@ -138,7 +138,7 @@ import { ToolGateway, type HeldPlace, type InvokeOpts } from "../../src/runtime/
 import { assertMountConfig, configFromForm, mergeMountSettings, repeatsMount, validateMount, type SettingValue } from "../../src/runtime/mount-config.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { OPERATOR_EXA_REF, OPERATOR_RUN9_REF, resolveOperatorRef } from "./operator-ref.ts";
-import { agentSecrets, agentRef, importKek, isAgentRef, open, OWNER_PREFIX, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
+import { agentSecrets, agentKeyName, agentRef, importKek, isAgentRef, mountKeyName, open, OWNER_PREFIX, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
 import {
   acceptInbound, claimPendingInbound, ensureInboundTable, hasPendingInbound, hookSecretName, inboundMessage, markPostingInbound, newHookId, newHookSecret,
   nextPendingInbound, pendingInboundCount, recentInbound, recordInbound, requeueInbound, seenBefore, settleInbound, underRate,
@@ -1437,7 +1437,7 @@ export class AgentRuntime {
         // Every reader of a mount's key comes through here — a tool call, the sandbox's egress before each
         // command, a program's calls — so an expiring one is renewed here, before it is handed out.
         if (isAgentRef(ref) && scope && deps.github) {
-          try { await this.#oauth.beforeUse(scope.tenantId, scope.agentId, ref.slice(agentRef("").length)); }
+          try { await this.#oauth.beforeUse(scope.tenantId, scope.agentId, agentKeyName(ref)!); }
           catch (e) { console.error("github: renewing before use failed:", String((e as Error)?.message ?? e).slice(0, 200)); }
         }
         return agentSecrets(this.store, await kekPromise, operator).resolve(ref, scope, opts);
@@ -1910,7 +1910,9 @@ export class AgentRuntime {
     // holding a key). Mount-time validation saw a mount with no key; this is
     // the moment it gains one, and "mount first, attach later" must not be a
     // way around a refusal the seed path would have made.
-    const problems = validateMount(plugin, mount.publicConfig as any, agentRef(alias));
+    // Where the key goes: the name the mount's reference already gives, or its alias (`mountKeyName`).
+    const name = mountKeyName(mount);
+    const problems = validateMount(plugin, mount.publicConfig as any, agentRef(name));
     if (problems.length) return { ok: false, error: problems.map((x) => x.message).join("; ") };
     // The value a plugin reads: a bare token, or one JSON object of the fields.
     const value = plugin.credential.shape === "token"
@@ -1930,7 +1932,6 @@ export class AgentRuntime {
     const held = await this.#releaseBeforeCredentialChange(tenantId, agentId, alias, value);
     if (held) return { ok: false, error: held };
     const sealed = await seal(kek, value);
-    const name = alias;
     await this.store.putSecret(tenantId, agentId, name, { ciphertext: sealed.ciphertext, iv: sealed.iv });
     // A key put here is renewed by nothing: what renewed the one it replaces goes with it. A connection's own
     // attach writes it again afterwards (`attachSealedConnection`).
@@ -2152,7 +2153,7 @@ export class AgentRuntime {
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
     const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
     if (!mount || !isAgentRef(mount.secretRef)) return { ok: true, updated: false };
-    const name = mount.secretRef!.slice(agentRef("").length);
+    const name = agentKeyName(mount.secretRef)!;
     const renewedFrom = (await this.#oauth.read(tenantId, agentId, name))?.connectorId === connectorId;
     const held = await this.store.getSecret(tenantId, agentId, name);
     if (!held || (!renewedFrom && await open(kek, held) !== await open(kek, was))) return { ok: true, updated: false };
@@ -2190,8 +2191,9 @@ export class AgentRuntime {
     }
     const r = await this.attachCredential(tenantId, agentId, mount.alias, { token });
     if (!r.ok) return { ok: false, error: r.error };
-    // After the attach, which clears it: the attach is what wrote the mount's secret this renews.
-    await this.#oauth.remember(tenantId, agentId, mount.alias, rec);
+    // After the attach, which clears it: the attach is what wrote the mount's secret this renews, under the name
+    // `mountKeyName` gives (the attach wrote the reference to that name).
+    await this.#oauth.remember(tenantId, agentId, mountKeyName(mount), rec);
     return { ok: true, account: r.account };
   }
 
@@ -2204,7 +2206,7 @@ export class AgentRuntime {
     await this.ready();
     const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
     if (!mount || !isAgentRef(mount.secretRef)) return false;
-    const name = mount.secretRef!.slice(agentRef("").length);
+    const name = agentKeyName(mount.secretRef)!;
     if ((await this.#oauth.read(tenantId, agentId, name))?.connectorId !== connectorId) return false;
     return (await this.#oauth.renew(tenantId, agentId, name, "adopt", null)).ok;
   }
@@ -2244,7 +2246,7 @@ export class AgentRuntime {
     const kek = await this.#kek;
     const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
     if (!kek || !mount || !isAgentRef(mount.secretRef)) return { ok: true, removed: false };
-    const name = mount.secretRef!.slice(agentRef("").length);
+    const name = agentKeyName(mount.secretRef)!;
     // A renewed connector's token differs from the copy a mount took before the renewal reached it, so the mount
     // is also the connector's while what renews it names that connector: a key put there since cleared that.
     const renewedFrom = connectorId !== null && (await this.#oauth.read(tenantId, agentId, name))?.connectorId === connectorId;
@@ -2277,8 +2279,9 @@ export class AgentRuntime {
     // The key goes only once nothing it made is still held: after this, nothing could delete it.
     const held = await this.#releaseBeforeCredentialChange(tenantId, agentId, alias);
     if (held) return { ok: false, error: held };
-    await this.store.removeSecret(tenantId, agentId, alias);
-    await this.#oauth.forget(tenantId, agentId, alias);
+    const name = agentKeyName(mount.secretRef)!;
+    await this.store.removeSecret(tenantId, agentId, name);
+    await this.#oauth.forget(tenantId, agentId, name);
     await this.store.setMountSecretRef(tenantId, agentId, alias, AgentRuntime.seededSecretRef(mount));
     await this.#toolsAfterCredentialChange(tenantId, agentId, alias);
     return { ok: true };
@@ -2436,7 +2439,8 @@ export class AgentRuntime {
     tenantId: string, agentId: string, mount: { alias: string; plugin: string; secretRef: string | null },
   ) {
     const attached = !!mount.secretRef;
-    const meta = isAgentRef(mount.secretRef) ? await this.store.secretMeta(tenantId, agentId, mount.alias) : null;
+    const name = agentKeyName(mount.secretRef);
+    const meta = name !== null ? await this.store.secretMeta(tenantId, agentId, name) : null;
     return {
       attached,
       // A reference the operator configured at deploy time, not one entered
