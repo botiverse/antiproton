@@ -258,12 +258,13 @@ export function d1ApprovalIndex(db: D1Database): ApprovalIndex {
     async prune(before) {
       // Each spelled as its partial index (migration 0029). The mark first, from the registry's deleted agents (a few
       // rows, not a scan of the copy): a delete whose mark failed leaves rows only until the next prune, and they are
-      // then a deleted agent's, dropped a year after its delete. Until marked they are not a live agent's either.
+      // then a deleted agent's, dropped a year after its delete, never at 30 days as a live agent's: the batch is one
+      // transaction, so the 30-day delete only ever sees them marked.
       await db.batch([
         db.prepare(`UPDATE provider_approvals SET agent_deleted_at = ${DELETED_AT}, item = json_remove(item, ${AUDIT_DROPS}) ` +
           "WHERE agent_deleted_at IS NULL AND (tenant_id, agent_id) IN (SELECT tenant_id, agent_id FROM provisioned_agents WHERE status = 'deleted')"),
-        db.prepare("DELETE FROM provider_approvals WHERE agent_deleted_at IS NULL AND status IN ('denied', 'expired', 'executed', 'failed') AND updated_at < ? " +
-          `AND NOT ${AGENT_DELETED}`).bind(before.ended),
+        db.prepare("DELETE FROM provider_approvals WHERE agent_deleted_at IS NULL AND status IN ('denied', 'expired', 'executed', 'failed') AND updated_at < ?")
+          .bind(before.ended),
         db.prepare("DELETE FROM provider_approvals WHERE agent_deleted_at IS NOT NULL AND agent_deleted_at < ?").bind(before.deleted),
       ]);
     },

@@ -731,6 +731,13 @@ await check("deleted agent: deleted is final in the registry, and a marked row i
   must(revived === false && reg.status === "deleted" && reg.deleted_at !== null && reg.push_registered === 0, `a deleted agent was revived: ${revived} ${show(reg)}`);
   // Control: a write that keeps it deleted still lands.
   must(await d1ProvisionedAgents(w.DB).update(T, RAFT_ID, { pushError: "x" }), "a write without a status was refused");
+  // The index's own list, with no prune before it to mark anything: an unmarked row of a deleted agent is left out
+  // by the registry alone.
+  const { d1ApprovalIndex } = await import("../cf/src/approvals.ts");
+  w.DB.raw.prepare("UPDATE provider_approvals SET agent_deleted_at = NULL WHERE operation_id = ?").run(op);
+  const direct = await d1ApprovalIndex(w.DB).list({ raftOrigin: ORIGIN, tenantId: null }, { status: null, updatedSince: null, after: null, limit: 50 });
+  must(direct.rows.every((r) => r.operationId !== op), `an unmarked row of a deleted agent was listed: ${show(direct.rows.map((r) => r.operationId))}`);
+  w.DB.raw.prepare("UPDATE provider_approvals SET agent_deleted_at = 1 WHERE operation_id = ?").run(op);
   // The second guard: were the registry to say active again, the kept row still is not listed.
   w.DB.raw.prepare("UPDATE provisioned_agents SET status = 'active' WHERE raft_agent_id = ?").run(RAFT_ID);
   const all = await call(w, "GET", "approvals");
