@@ -445,7 +445,7 @@ function connectionsFake() {
     async clear(_t, agentId, provider) { detached.push(`${agentId}/${provider}/cleared`); return { ok: true, cleared: true }; },
     async detachIfFrom(_t, agentId, provider, sealed) {
       if (failDetach.has(agentId)) throw new Error("the agent's object did not answer");
-      detached.push(`${agentId}/${provider}/${sealed.ciphertext}`); return true;
+      detached.push(`${agentId}/${provider}/${sealed.ciphertext}`); return { ok: true, removed: true };
     },
     async confirm(_t, _a, _p, pending, raftUserId) {
       return pending === "pend_ok_12345" && raftUserId === "u_owner"

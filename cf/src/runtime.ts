@@ -2190,18 +2190,24 @@ export class AgentRuntime {
    * since, in the console, is not the connector's to take when the connector goes. Compared by value,
    * because each attach seals afresh and the ciphertexts never match.
    */
-  async detachConnectionIfFrom(tenantId: string, agentId: string, plugin: string, sealed: Sealed, connectorId: string | null = null): Promise<boolean> {
+  async detachConnectionIfFrom(tenantId: string, agentId: string, plugin: string, sealed: Sealed, connectorId: string | null = null):
+    Promise<{ ok: true; removed: boolean; other?: true } | { ok: false; error: string; gone?: true }> {
     await this.ready();
+    // As `clearConnection` answers it: removed, nothing of the connector's there (`other`: another credential is), a
+    // refusal with why (something the key made is still held), or `gone` (this object holds no such agent).
+    if (!(await this.store.loadAgent(tenantId, agentId))) return { ok: false, gone: true, error: "the agent's object holds no such agent: its storage was wiped" };
     const kek = await this.#kek;
     const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
-    if (!kek || !mount || !isAgentRef(mount.secretRef)) return false;
+    if (!kek || !mount || !isAgentRef(mount.secretRef)) return { ok: true, removed: false };
     const name = mount.secretRef!.slice(agentRef("").length);
     // A renewed connector's token differs from the copy a mount took before the renewal reached it, so the mount
     // is also the connector's while what renews it names that connector: a key put there since cleared that.
     const renewedFrom = connectorId !== null && (await this.#oauth.read(tenantId, agentId, name))?.connectorId === connectorId;
     const held = await this.store.getSecret(tenantId, agentId, name);
-    if (!held || (!renewedFrom && await open(kek, held) !== await open(kek, sealed))) return false;
-    return this.removeCredential(tenantId, agentId, mount.alias);
+    if (!held) return { ok: true, removed: false };
+    if (!renewedFrom && await open(kek, held) !== await open(kek, sealed)) return { ok: true, removed: false, other: true };
+    const r = await this.removeCredentialOrWhy(tenantId, agentId, mount.alias);
+    return r.ok ? { ok: true, removed: true } : r;
   }
 
   /**

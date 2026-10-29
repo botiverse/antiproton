@@ -242,15 +242,21 @@ function connections(acted: string[], bound: string[], store: Array<typeof CONNE
     },
     registry: { boundTo: async () => bound, remove: async () => {}, put: async () => {}, get: async () => null },
     reconnect: async (_t: string, agentId: string) => { acted.push(agentId); return { ok: true, updated: true }; },
+    // As the runtime answers: removed, or the mount holds another credential; a throw is an object that did not answer.
     detachIfFrom: async (_t: string, agentId: string) => {
       const m = answer(modes[agentId]?.match ?? true, "the match");
       if (m) acted.push(agentId);
-      return m;
+      return m ? { ok: true, removed: true } : { ok: true, removed: false, other: true };
     },
     detach: async (_t: string, agentId: string) => {
       const m = answer(modes[agentId]?.byAgent ?? true, "the detach by agent");
       if (m) acted.push(`${agentId} by agent`);
       return m;
+    },
+    clear: async (_t: string, agentId: string) => {
+      const m = answer(modes[agentId]?.byAgent ?? true, "the detach by agent");
+      if (m) acted.push(`${agentId} by agent`);
+      return { ok: true, cleared: m };
     },
     attach: async (_t: string, agentId: string) => { acted.push(agentId); return { ok: true, account: "octo" }; },
   };
@@ -408,7 +414,7 @@ await check("disconnect: each bound agent ends detached, kept, cleared elsewhere
   // and their ids are not in the answer.
   const other = await go([row, THEIR_AGENT, THEIRS2], { [THEIR_AGENT.agentId]: { match: false, byAgent: true } });
   assert(other.status === 200 && JSON.stringify(other.body.detached) === JSON.stringify([RAFT_AGENT]) && other.body.otherOrigins?.cleared === 2
-    && other.body.otherOrigins.failed === 0 && /re-authorise or revoke it on GitHub/.test(other.body.otherOrigins.message)
+    && other.body.otherOrigins.failed === 0 && /#1128/.test(other.body.otherOrigins.message) && /ALL of this GitHub account/.test(other.body.otherOrigins.message)
     && !other.text.includes("THEIRS") && other.acted.includes(`${THEIR_AGENT.agentId} by agent`), `elsewhere: ${other.status} ${other.text}`);
   // Failed: neither the match nor the agent removes it. Never detached; the connector stays, for the same call again.
   const mine = await go([row, MINE3], { [MINE3.agentId]: { match: "throw", byAgent: true } });

@@ -185,7 +185,12 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
       },
       async link(spec) { links.push(spec); return { url: "https://ap.example/connect/start?t=x", expiresAt: new Date().toISOString() }; },
       reconnect: (t, a, _p, connectorId, was, sealed, refresh) => rtOf(a).reconnectConnection(t, a, "github", connectorId, was, sealed, refresh),
-      detachIfFrom: (t, a, _p, sealed, connectorId) => rtOf(a).detachConnectionIfFrom(t, a, "github", sealed, connectorId ?? null),
+      detachIfFrom: async (t, a, _p, sealed, connectorId) => {
+        const mode = clearMode.get(a);
+        if (mode === "unreachable") throw new Error("the agent's object did not answer");
+        if (mode === "refused") return { ok: false, error: "gh is held by a background task" };
+        return rtOf(a).detachConnectionIfFrom(t, mode === "gone" ? `${a}_wiped` : a, "github", sealed, connectorId ?? null);
+      },
       detach: (t, a) => rtOf(a).detachConnection(t, a, "github"),
       clear: async (t, a) => {
         const mode = clearMode.get(a);
@@ -1319,6 +1324,57 @@ await check("removing an agent's GitHub connection that has no connector (from b
   const ev = w.db.raw.prepare("SELECT * FROM connector_events WHERE action = 'unbind' AND raft_agent_id = 'Z6'").all() as any[];
   must(ev.length === 1 && ev[0].connector_id === null && ev[0].provider === "github" && JSON.parse(ev[0].reason).outcome === "cleared"
     && JSON.parse(ev[0].reason).bound === true, `the record: ${JSON.stringify(ev)}`);
+  w.dispose();
+});
+
+await check("removing a connection with no binding: an object holding no such agent is a plain clean 204; a refused clear is 409 with no connection kept", async () => {
+  const w = await world();
+  const a = await w.agent("Z7");
+  await w.connect(a);
+  w.db.raw.prepare("DELETE FROM provisioned_connections WHERE raft_agent_id = 'Z7'").run();
+  w.clearMode.set(a.agentId, "gone");
+  const gone = await w.call("DELETE", "/agents/by-raft-agent/Z7/connections/github");
+  must(gone.status === 204, `wiped, no binding: ${gone.status} ${gone.text}`);
+  w.clearMode.set(a.agentId, "refused");
+  const held = await w.call("DELETE", "/agents/by-raft-agent/Z7/connections/github");
+  must(held.status === 409 && held.body.binding === "none" && !/was kept/.test(held.body.error.message), `refused, no binding: ${held.status} ${held.text}`);
+  w.dispose();
+});
+
+await check("disconnecting a connector one of whose agents refuses the clear: 502, that binding and the connector kept, the others unbound; each recorded; the retry finishes", async () => {
+  const w = await world();
+  const a = await w.agent("Z8");
+  const b = await w.agent("Z9");
+  const id = await w.connect(a);
+  must((await w.call("PUT", `/agents/by-raft-agent/Z9/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" })).status === 200, "bind Z9");
+  w.clearMode.set(b.agentId, "refused");
+  const r = await w.call("DELETE", `/connectors/${id}`, { actingRaftUserId: "u_owner", actingRole: "creator" });
+  must(r.status === 502 && r.body.error.code === "partially_disconnected" && JSON.stringify(r.body.detached) === JSON.stringify(["Z8"])
+    && r.body.failed?.[0]?.raftAgentId === "Z9" && r.body.failed[0].action === "retry_delete", `the answer: ${r.status} ${r.text}`);
+  const bound = (agent: string) => !!w.db.raw.prepare("SELECT 1 FROM provisioned_connections WHERE raft_agent_id = ?").get(agent);
+  must(!bound("Z8") && bound("Z9") && !!w.db.raw.prepare("SELECT 1 FROM connectors WHERE id = ?").get(id) && (await w.stored(b)).token !== null, "bindings, connector or mount");
+  const outcomes = () => Object.fromEntries((w.db.raw.prepare("SELECT raft_agent_id, reason FROM connector_events WHERE action = 'unbind' AND connector_id = ? ORDER BY rowid").all(id) as any[])
+    .map((e) => [e.raft_agent_id, JSON.parse(e.reason).outcome]));
+  must(JSON.stringify(outcomes()) === JSON.stringify({ Z8: "cleared", Z9: "not_cleared" }), `the records: ${JSON.stringify(outcomes())}`);
+  w.clearMode.clear();
+  const again = await w.call("DELETE", `/connectors/${id}`, { actingRaftUserId: "u_owner", actingRole: "creator" });
+  must(again.status === 200 && again.body.disconnected === true && !bound("Z9") && !w.db.raw.prepare("SELECT 1 FROM connectors WHERE id = ?").get(id)
+    && (await w.stored(b)).token === null && outcomes().Z9 === "cleared", `retry: ${again.status} ${again.text}`);
+  w.dispose();
+});
+
+await check("disconnecting a connector one of whose agents' objects holds no such agent: its binding goes, and the answer says what to do, the operator's cleanup before any revoke", async () => {
+  const w = await world();
+  const a = await w.agent("ZA");
+  const b = await w.agent("ZB");
+  const id = await w.connect(a);
+  must((await w.call("PUT", `/agents/by-raft-agent/ZB/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" })).status === 200, "bind ZB");
+  w.clearMode.set(b.agentId, "gone");
+  const r = await w.call("DELETE", `/connectors/${id}`, { actingRaftUserId: "u_owner", actingRole: "creator" });
+  const msg = r.body?.revokeOnGithub?.message ?? "";
+  must(r.status === 200 && JSON.stringify(r.body.revokeOnGithub?.agents) === JSON.stringify(["ZB"]) && r.body.revokeOnGithub.action === "revoke_on_github"
+    && msg.indexOf("#1128") < msg.indexOf("Last resort") && /ALL of this GitHub account's tokens/.test(msg), `the answer: ${r.status} ${r.text}`);
+  must(!w.db.raw.prepare("SELECT 1 FROM provisioned_connections WHERE raft_agent_id = 'ZB'").get(), "the wiped agent's binding was kept");
   w.dispose();
 });
 
