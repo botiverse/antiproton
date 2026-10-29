@@ -16,6 +16,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
 import { d1ConnectorGrants, d1Connections, d1Connectors, d1ProvisionedAgents, renewalAudience } from "../cf/src/control-plane.ts";
 import { cleanupResidue, d1EgressResidue } from "../cf/src/egress-residue.ts";
+import { readConnectionHoldings } from "../cf/src/credential-inventory.ts";
 import { handleProvision, type ProvisionDeps } from "../cf/src/provision/handlers.ts";
 import { githubExchangeCode, GITHUB_TOKEN } from "../cf/src/auth.ts";
 import { OAUTH_PREFIX, RECONNECT_REASON, reasonCode } from "../cf/src/github-refresh.ts";
@@ -1924,23 +1925,23 @@ await check("residue records that cannot be read leave the delete not clean even
   w2.dispose();
 });
 
-await check("the credential inventory's read of a mount: the key's presence, its connector and a fingerprint, never the key; nothing changed by reading", async () => {
+await check("the credential inventory's read of a mount: the key's presence and its renewal connector, nothing else and nothing derived from the key; nothing changed by reading", async () => {
   const w = await world();
   const a = await w.agent("YQ");
-  const empty = await a.rt.connectionHoldings(TENANT, a.agentId, ["github"]);
-  must(empty.length === 1 && empty[0]!.key !== "agent" && empty[0]!.fingerprint === null, `before the connect: ${JSON.stringify(empty)}`);
+  const { importKek } = await import("../src/runtime/secrets.ts");
+  const kek = await importKek(KEK);
+  const empty = await readConnectionHoldings(a.rt.store, kek, TENANT, a.agentId, ["github"]);
+  must(JSON.stringify(empty) === JSON.stringify([{ alias: "gh", plugin: "github", key: empty[0]?.key === "shared" ? "shared" : "none", connectorId: null }]), `before the connect: ${JSON.stringify(empty)}`);
   const connectorId = await w.connect(a);
-  const { token } = await w.stored(a);
   const rows = () => JSON.stringify(w.hostOf(a.agentId).sql.exec("SELECT * FROM secrets ORDER BY name").toArray());
   const before = rows(), renewals = w.gh.s.refreshes;
-  const got = await a.rt.connectionHoldings(TENANT, a.agentId, ["github"]);
-  const { createHash } = await import("node:crypto");
-  must(got.length === 1 && got[0]!.alias === "gh" && got[0]!.plugin === "github" && got[0]!.key === "agent" && got[0]!.connectorId === connectorId
-    && got[0]!.fingerprint === `sha256:${createHash("sha256").update(token!).digest("hex").slice(0, 16)}`, `after the connect: ${JSON.stringify(got)}`);
-  must(!JSON.stringify(got).includes(token!), "the key itself in the answer");
+  const got = await readConnectionHoldings(a.rt.store, kek, TENANT, a.agentId, ["github"]);
+  // Exactly these fields and values: a field derived from the key (a hash, a prefix, a length) is a difference here.
+  must(JSON.stringify(got) === JSON.stringify([{ alias: "gh", plugin: "github", key: "agent", connectorId }]), `after the connect: ${JSON.stringify(got)}`);
+  // Without the key to open the renewal record: still present, its connector unknown.
+  must(JSON.stringify(await readConnectionHoldings(a.rt.store, null, TENANT, a.agentId, ["github"])) === JSON.stringify([{ alias: "gh", plugin: "github", key: "agent", connectorId: null }]), "without a kek");
   must(rows() === before && w.gh.s.refreshes === renewals, "reading changed what the object holds, or renewed it");
-  // A plugin the agent has no mount of: nothing.
-  must((await a.rt.connectionHoldings(TENANT, a.agentId, ["nope"])).length === 0, "a mount of a plugin it does not have");
+  must((await readConnectionHoldings(a.rt.store, kek, TENANT, a.agentId, ["nope"])).length === 0, "a mount of a plugin it does not have");
   w.dispose();
 });
 

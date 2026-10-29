@@ -9,17 +9,23 @@
  *
  * Read-only and bounded: one page of agents per call (at most INVENTORY_PAGE_MAX objects asked), resumed by `cursor`,
  * optionally within one tenant. Every call, refused ones included, is a row in admin_audit (migration 0033). Never a
- * credential value: a key on a mount is reported by its presence and a fingerprint (`AgentRuntime.connectionHoldings`).
+ * credential value, nor anything derived from one: a key on a mount is reported by its presence and the connector its
+ * renewal names (`readConnectionHoldings`). A hash of a key would confirm a guessed or leaked one and match it across
+ * systems, so there is none.
  *
  * What it cannot see: run9's egress registrations (only the residue already recorded in egress_residue is listed);
  * agents this deployment did not provision (console agents have no binding and no connector events); and a mount
- * whose object did not answer (`object: "failed"`, its connections `unknown`).
+ * whose object did not answer (`object: "failed"`, its connections `unknown`) or holds no such agent (`object:
+ * "no_agent"`, its connections `no_object`).
  */
 import { isOperator } from "./auth.ts";
 import { CONNECTION_PLUGIN, type ConnectionProvider } from "./provision/connect.ts";
 import { logEvent } from "../../src/core/log.ts";
+import { agentRef, isAgentRef, open, type Sealed } from "../../src/runtime/secrets.ts";
+import { OAUTH_PREFIX } from "./github-refresh.ts";
+import type { MountRecord } from "../../src/core/types.ts";
 
-/** One mount of a connection plugin, as the agent's object reads it (`AgentRuntime.connectionHoldings`). */
+/** One mount of a connection plugin, as the agent's object reads it (`readConnectionHoldings`). */
 export interface ConnectionHolding {
   alias: string;
   plugin: string;
@@ -28,13 +34,51 @@ export interface ConnectionHolding {
    * deployment's seeded account; `none`: nothing; `dangling`: the mount names a key of the agent's that is not stored.
    */
   key: "agent" | "shared" | "none" | "dangling";
-  /** The connector the key's renewal record names; null when none is recorded (a key that does not renew, or older). */
+  /**
+   * The connector the key's renewal record names; null when none is recorded (a key that does not renew, or older) or
+   * the record cannot be opened here (no SECRET_KEK, or sealed under another).
+   */
   connectorId: string | null;
-  /** `sha256:` and 16 hex characters of the key's hash; null when there is no key or it could not be opened here. */
-  fingerprint: string | null;
 }
 
-export type Reconciled = "both" | "mount_only" | "binding_only" | "neither" | "unknown";
+/**
+ * What an agent's mounts of each plugin hold, read from its store with SELECTs only: no runtime is built, nothing is
+ * readied, renewed or written, and the key itself is never opened (only the renewal record, for its connector).
+ */
+export async function readConnectionHoldings(
+  store: { findMountsByPlugin(t: string, a: string, plugin: string): Promise<MountRecord[]>; getSecret(t: string, a: string, name: string): Promise<Sealed | null> },
+  kek: CryptoKey | null, tenantId: string, agentId: string, plugins: readonly string[],
+): Promise<ConnectionHolding[]> {
+  const out: ConnectionHolding[] = [];
+  for (const plugin of plugins) {
+    for (const mount of await store.findMountsByPlugin(tenantId, agentId, plugin)) {
+      if (!isAgentRef(mount.secretRef)) {
+        out.push({ alias: mount.alias, plugin, key: mount.secretRef ? "shared" : "none", connectorId: null });
+        continue;
+      }
+      const name = mount.secretRef!.slice(agentRef("").length);
+      if (!(await store.getSecret(tenantId, agentId, name))) { out.push({ alias: mount.alias, plugin, key: "dangling", connectorId: null }); continue; }
+      let connectorId: string | null = null;
+      const rec = kek ? await store.getSecret(tenantId, agentId, OAUTH_PREFIX + name) : null;
+      if (kek && rec) { try { connectorId = (JSON.parse(await open(kek, rec)) as { connectorId?: string | null }).connectorId ?? null; } catch { /* stays null */ } }
+      out.push({ alias: mount.alias, plugin, key: "agent", connectorId });
+    }
+  }
+  return out;
+}
+
+/**
+ * `unknown`: the object did not answer; ask again later. `no_object`: it answered that it holds no such agent, so there
+ * is no mount to read. Asking again changes nothing, and it is never "nothing there": a person judges it
+ * (NO_OBJECT_NOTE).
+ */
+export type Reconciled = "both" | "mount_only" | "binding_only" | "neither" | "unknown" | "no_object";
+
+/**
+ * The object cannot say why it holds no agent: one whose provisioning never reached it and one whose storage was wiped
+ * look the same from here, and the registry row exists either way.
+ */
+export const NO_OBJECT_NOTE = "cannot distinguish never provisioned from storage wiped; do not treat as clean";
 
 export const INVENTORY_PAGE_DEFAULT = 10;
 export const INVENTORY_PAGE_MAX = 25;
@@ -119,12 +163,18 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
   const providers = Object.keys(CONNECTION_PLUGIN) as ConnectionProvider[];
   const plugins = providers.map((p) => CONNECTION_PLUGIN[p]);
 
+  // Three ids name one agent here, and a swapped one answers an empty list, not an error:
+  //  - `agent_id` (the provider's agent id, `raft_<raft id>`): egress_residue.agent_id, and the object's name,
+  //    agentObjectName(tenant_id, agent_id), through `deps.holdings`;
+  //  - `raft_agent_id` (Raft's id): provisioned_connections and connector_events;
+  //  - `tenant_id`: all of them.
   const agentView = async (a: typeof rows[number]) => {
     let object: "answered" | "no_agent" | "failed" = "answered";
     let mounts: ConnectionHolding[] = [];
     try {
       const h = await deps.holdings(a.tenant_id, a.agent_id, plugins);
-      if (h === null) object = "no_agent"; else mounts = h;
+      // Field by field: whatever else an object answers (an older build's, or a mistake) is not passed on.
+      if (h === null) object = "no_agent"; else mounts = h.map((m) => ({ alias: m.alias, plugin: m.plugin, key: m.key, connectorId: m.connectorId }));
     } catch { object = "failed"; }
     const bindings = (await db.prepare(
       "SELECT provider, connector_id, account, connected_at, broken_at FROM provisioned_connections WHERE tenant_id = ? AND raft_agent_id = ?",
@@ -139,15 +189,23 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
       "SELECT alias, box_id, secret_id, title, reason_code, first_seen, last_seen, reopened_count FROM egress_residue" +
       " WHERE tenant_id = ? AND agent_id = ? AND resolved_at IS NULL ORDER BY first_seen",
     ).bind(a.tenant_id, a.agent_id).all()).results;
+    // Per provider, by its own query: the newest event that took a binding away, however many events came after it (an
+    // event recorded before 0032 names no provider).
+    const removals = new Map<string, typeof events[number] | null>();
+    for (const provider of providers) {
+      removals.set(provider, await db.prepare(
+        `SELECT action, connector_id, provider, acting_role, at, reason FROM connector_events WHERE tenant_id = ? AND raft_agent_id = ?` +
+        ` AND action IN (${REMOVALS.map(() => "?").join(", ")}) AND (provider = ? OR provider IS NULL) ORDER BY at DESC LIMIT 1`,
+      ).bind(a.tenant_id, a.raft_agent_id, ...REMOVALS, provider).first<typeof events[number]>());
+    }
     const connections = providers.map((provider) => {
       const plugin = CONNECTION_PLUGIN[provider];
       const mine = mounts.filter((m) => m.plugin === plugin);
       const onMount = mine.some((m) => m.key === "agent");
       const binding = bindings.find((b) => b.provider === provider) ?? null;
-      const state: Reconciled = object === "failed" ? "unknown"
+      const state: Reconciled = object === "failed" ? "unknown" : object === "no_agent" ? "no_object"
         : onMount && binding ? "both" : onMount ? "mount_only" : binding ? "binding_only" : "neither";
-      // The newest event that took a binding away (an event recorded before 0032 names no provider).
-      const lastRemoval = events.find((e) => REMOVALS.includes(e.action) && (e.provider === null || e.provider === provider)) ?? null;
+      const lastRemoval = removals.get(provider) ?? null;
       return {
         provider, plugin, state, mounts: mine,
         binding: binding ? { connector_id: binding.connector_id, account: binding.account, connected_at: binding.connected_at, broken_at: binding.broken_at } : null,
@@ -159,7 +217,7 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
     });
     return {
       tenant_id: a.tenant_id, raft_agent_id: a.raft_agent_id, agent_id: a.agent_id, status: a.status, deleted_at: a.deleted_at,
-      object, connections, events: { count: Number(eventCount), recent: events }, residue,
+      object, ...(object === "no_agent" ? { objectNote: NO_OBJECT_NOTE } : {}), connections, events: { count: Number(eventCount), recent: events }, residue,
     };
   };
   let agents: Array<Awaited<ReturnType<typeof agentView>>>;
@@ -180,7 +238,7 @@ export async function adminCredentialInventory(request: Request, url: URL, deps:
     " ORDER BY r.tenant_id, r.agent_id, r.first_seen LIMIT ?",
   ).bind(tenantId, tenantId, UNLISTED_RESIDUE_MAX + 1).all()).results;
 
-  const counts: Record<string, number> = { agents: agents.length, both: 0, mount_only: 0, binding_only: 0, neither: 0, unknown: 0,
+  const counts: Record<string, number> = { agents: agents.length, both: 0, mount_only: 0, binding_only: 0, neither: 0, unknown: 0, no_object: 0,
     residue: agents.reduce((n, a) => n + a.residue.length, 0) };
   for (const a of agents) for (const c of a.connections) counts[c.state]! += 1;
   await audit("listed", counts, id);

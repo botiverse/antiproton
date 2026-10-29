@@ -40,7 +40,7 @@ import { maskRawRefs } from "../../src/store/refs.ts";
 import { chatPanel } from "./chat.ts";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
-import { secretRefKind } from "../../src/runtime/secrets.ts";
+import { importKek, secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend, type SuspendRequest } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
@@ -111,7 +111,7 @@ import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens, reservedTenantProblem } from "./admin-provider-tokens.ts";
 import { cleanupResidue, d1EgressResidue, residueUnknownMessage, withResidue } from "./egress-residue.ts";
-import { adminCredentialInventory } from "./credential-inventory.ts";
+import { adminCredentialInventory, readConnectionHoldings } from "./credential-inventory.ts";
 import { renewalAudience, d1ConnectorGrants, d1Connections, d1Connectors, type ConnectorRefresh, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
 import type { GithubGrant } from "./github-token.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps, type ReconnectTarget } from "./provision/connect.ts";
@@ -2348,12 +2348,14 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * The credential inventory's half in this object (cf/src/credential-inventory.ts): what this agent's mounts of each
-   * plugin hold, by presence and fingerprint. Without claiming the object, so a look at one never made does not make
-   * it the agent's; null for an agent this object does not hold. Reads only.
+   * plugin hold, by presence and renewal connector. Without claiming the object, so a look at one never made does not
+   * make it the agent's; null for an agent this object does not hold. As `diagnose` reads: the store is read directly
+   * and never readied, no runtime is built, no alarm is set, nothing is written.
    */
   async adminConnectionHoldings(tenantId: string, agentId: string, plugins: readonly string[]) {
     if (!this.#isAgent(tenantId, agentId)) return null;
-    return this.runtime().connectionHoldings(tenantId, agentId, plugins);
+    const kek = this.env.SECRET_KEK ? await importKek(this.env.SECRET_KEK) : null;
+    return readConnectionHoldings(new DurableObjectStore(this.ctx as any), kek, tenantId, agentId, plugins);
   }
 
   #isAgent(tenantId: string, agentId: string): boolean {

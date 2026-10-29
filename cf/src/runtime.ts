@@ -47,7 +47,6 @@ import {
 import { jsRunRow, modelAttemptRow, toolRefusedRow } from "../../src/trace/seams.ts";
 import { agentDeletedAt, logTurnStop, markAgentDeleted, turnStopRow, type StopTrigger, type StopTurnOutcome } from "../../src/runtime/turn-stop.ts";
 import { unclean, type BoxEnd, type UncleanCode } from "./egress-residue.ts";
-import type { ConnectionHolding } from "./credential-inventory.ts";
 import type { Withdrawal } from "../../src/plugins/types.ts";
 import { explainUnavailableTool } from "../../src/runtime/unavailable-tool.ts";
 import {
@@ -2222,35 +2221,6 @@ export class AgentRuntime {
     if (!mount || !isAgentRef(mount.secretRef)) return { ok: true, cleared: false };
     const r = await this.removeCredentialOrWhy(tenantId, agentId, mount.alias);
     return r.ok ? { ok: true, cleared: true } : r;
-  }
-
-  /**
-   * What this agent's mounts of each plugin hold, for the operator's credential inventory (cf/src/credential-inventory.ts):
-   * per mount, whether a key of the agent's is on it, the connector its renewal names (null for none, or none recorded),
-   * and a fingerprint of the key: the first 16 hex characters of its SHA-256, enough to tell two copies apart or alike,
-   * never enough to recover it. Reads only: nothing is renewed, opened for use or changed.
-   */
-  async connectionHoldings(tenantId: string, agentId: string, plugins: readonly string[]): Promise<ConnectionHolding[]> {
-    await this.ready();
-    const kek = await this.#kek;
-    const out: ConnectionHolding[] = [];
-    for (const plugin of plugins) {
-      for (const mount of await this.store.findMountsByPlugin(tenantId, agentId, plugin)) {
-        if (!isAgentRef(mount.secretRef)) {
-          out.push({ alias: mount.alias, plugin, key: mount.secretRef ? "shared" : "none", connectorId: null, fingerprint: null });
-          continue;
-        }
-        const name = mount.secretRef!.slice(agentRef("").length);
-        const held = await this.store.getSecret(tenantId, agentId, name);
-        if (!held) { out.push({ alias: mount.alias, plugin, key: "dangling", connectorId: null, fingerprint: null }); continue; }
-        // A key that cannot be opened here (no SECRET_KEK, or sealed under another) is still a key on the mount.
-        let fingerprint: string | null = null;
-        if (kek) { try { fingerprint = `sha256:${sha256Hex(await open(kek, held)).slice(0, 16)}`; } catch { /* stays null */ } }
-        const connectorId = (await this.#oauth.read(tenantId, agentId, name))?.connectorId ?? null;
-        out.push({ alias: mount.alias, plugin, key: "agent", connectorId, fingerprint });
-      }
-    }
-    return out;
   }
 
   /** Remove the credential from this agent's mount of that plugin; false when there was none. */
