@@ -59,5 +59,5 @@ CREATE TABLE IF NOT EXISTS egress_residue (
   last_overturned_ref TEXT,
   PRIMARY KEY (tenant_id, agent_id, secret_id)
 );
-CREATE INDEX IF NOT EXISTS egress_residue_open ON egress_residue(tenant_id, agent_id, resolved_at);
+CREATE INDEX IF NOT EXISTS egress_residue_open ON egress_residue(tenant_id, agent_id, alias, resolved_at);
 CREATE INDEX IF NOT EXISTS egress_residue_resolved ON egress_residue(resolved_at) WHERE resolved_at IS NOT NULL;

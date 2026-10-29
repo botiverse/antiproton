@@ -32,7 +32,7 @@ import { MAX_BUDGET_CENTS, PLANS, type BudgetWrite, type Plan, type TenantPlanSt
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider, type ReconnectTarget } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
 import { logEvent } from "../../../src/core/log.ts";
-import { withResidue, type BoxEnd, type ResidueStore } from "../egress-residue.ts";
+import { residueUnknownMessage, withResidue, type BoxEnd, type ResidueStore } from "../egress-residue.ts";
 import type { Withdrawal } from "../../../src/plugins/types.ts";
 import { logTurnStop, type StopTurnOutcome } from "../../../src/runtime/turn-stop.ts";
 import { WORKING_SET } from "../../../src/plugins/state.ts";
@@ -1043,9 +1043,9 @@ export async function handleProvision(
       try { r = await deps.agent.releaseForDelete(tenantId, row.agentId); }
       catch (e) { r = { things: [], projects: [], released: [], failed: [{ alias: "*", stage: "release" as const, error: `the agent's object did not answer: ${String((e as Error)?.message ?? e).slice(0, 160)}` }] }; }
       // Residue kept in D1 laid over the boxes: found now, or before and not yet seen gone, its box held or not.
-      if (!deps.egressResidue) return r;
+      if (!deps.egressResidue) return { ...r, residueUnknown: false };
       const at = deps.now();
-      return { ...r, things: await withResidue(deps.egressResidue, tenantId, row.agentId, r.things, r.projects, at, `delete:${at}`) };
+      return { ...r, ...await withResidue(deps.egressResidue, tenantId, row.agentId, r.things, r.projects, at, `delete:${at}`) };
     };
     // Right after the stop, before anything slower: a box still running acts with the agent's accounts until then.
     const held = await releaseHeld();
@@ -1135,7 +1135,10 @@ export async function handleProvision(
         ...(held.failed.length ? { failed: held.failed } : {}),
       };
       const connectionsClean = ends === null ? true : ends.every((e) => e.mount === "cleared" && !e.error);
-      const clean = connectionsClean && turn === null && (held === null || (held.things.every((t) => t.clean) && held.failed.length === 0));
+      // Residue records that could not be read leave the delete not clean and retryable even with no box held: what a
+      // box deleted earlier left is known only from them (`withResidue`).
+      const residueUnknown = held?.residueUnknown === true;
+      const clean = connectionsClean && turn === null && !residueUnknown && (held === null || (held.things.every((t) => t.clean) && held.failed.length === 0));
       // `retry`: whether a repeated DELETE can finish anything left. Never true when all that is left is a person's
       // (`needs_operator_cleanup`, or a connection's `revoke_on_github`).
       // A release that failed is retried too, unless what it failed on is only what no retry fixes (a stranded box).
@@ -1144,10 +1147,11 @@ export async function handleProvision(
         const mine = held.things.filter((t) => f.alias === "*" || t.alias === f.alias);
         return mine.length === 0 || mine.some((t) => t.clean || t.action === "retry_delete");
       });
-      const retry = turn !== null || (ends ?? []).some((e) => e.action === "retry_delete")
+      const retry = turn !== null || residueUnknown || (ends ?? []).some((e) => e.action === "retry_delete")
         || (held !== null && (releaseRetry || held.things.some((t) => t.action === "retry_delete")));
       if (ends === null && held === null && turn === null) return ok(agent);
-      return ok({ ...agent, ...(ends === null ? {} : { connections: ends, connectionsClean }), ...(turn ? { turn } : {}), ...(sandboxes ? { sandboxes } : {}), clean, retry });
+      return ok({ ...agent, ...(ends === null ? {} : { connections: ends, connectionsClean }), ...(turn ? { turn } : {}), ...(sandboxes ? { sandboxes } : {}),
+        ...(residueUnknown ? { residueUnknown, residueMessage: residueUnknownMessage("delete") } : {}), clean, retry });
     };
     if (row.status === "deleted") {
       const ends = await unbind(deps.now());

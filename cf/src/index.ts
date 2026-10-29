@@ -110,7 +110,7 @@ import { d1ServiceTokens } from "./control-plane.ts";
 import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens, reservedTenantProblem } from "./admin-provider-tokens.ts";
-import { cleanupResidue, d1EgressResidue, withResidue } from "./egress-residue.ts";
+import { cleanupResidue, d1EgressResidue, residueUnknownMessage, withResidue } from "./egress-residue.ts";
 import { renewalAudience, d1ConnectorGrants, d1Connections, d1Connectors, type ConnectorRefresh, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
 import type { GithubGrant } from "./github-token.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps, type ReconnectTarget } from "./provision/connect.ts";
@@ -5274,10 +5274,11 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
             return Response.json({ error: "the agent's object did not answer" }, { status: 503 });
           }
           // Residue kept in D1 laid over the boxes, as the delete does it; resolved only by this call's complete listing.
-          const things = await withResidue(d1EgressResidue(env.CONTROL_DB), t, a, w.things, w.projects, Date.now(), `admin_audit:${id}`);
+          const { things, residueUnknown } = await withResidue(d1EgressResidue(env.CONTROL_DB), t, a, w.things, w.projects, Date.now(), `admin_audit:${id}`, "withdrawal");
           await audit("withdrawn", { things: things.length, clean: things.filter((x) => x.clean).length,
-            residue: things.reduce((n, x) => n + (x.projectResidue?.length ?? 0), 0), failed: w.failed.length }, id);
-          return Response.json({ tenantId: t, agentId: a, at: new Date().toISOString(), things, failed: w.failed });
+            residue: things.reduce((n, x) => n + (x.projectResidue?.length ?? 0), 0), failed: w.failed.length, residueUnknown: residueUnknown ? 1 : 0 }, id);
+          return Response.json({ tenantId: t, agentId: a, at: new Date().toISOString(), things, failed: w.failed,
+            ...(residueUnknown ? { residueUnknown, residueMessage: residueUnknownMessage("withdrawal") } : {}) });
         }
         case "/admin/migrate-engine":
           return await adminMigrateEngine(request, env.AUTOMATION_TOKEN,

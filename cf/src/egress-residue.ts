@@ -140,7 +140,8 @@ export function unclean(end: Omit<BoxEnd, "action" | "message">, code: UncleanCo
 export async function withResidue(
   store: ResidueStore, tenantId: string, agentId: string,
   boxes: BoxEnd[], projects: Array<{ alias: string } & Withdrawal["project"]>, at: number, ref: string,
-): Promise<BoxEnd[]> {
+  doing: "delete" | "withdrawal" = "delete",
+): Promise<{ things: BoxEnd[]; residueUnknown: boolean }> {
   // This call's own findings hold their box back directly, whatever the table says or whether it could be written.
   const fresh = projects.flatMap((p) => p.findings.map((f) => ({ ...f, alias: p.alias })));
   // A failure to observe or record must not change the course of the action: a residue store that cannot be written
@@ -169,7 +170,13 @@ export async function withResidue(
   const out = boxes.map((b) => {
     const residue = residueOf(b.id);
     const end = residue.length ? { ...b, projectResidue: residue } : b;
-    if (open === null) return unclean({ ...end, why: "the record of project-scope residue could not be kept or read, so it was not checked" }, "residue_store_failed");
+    // Still retry_delete: re-running is harmless and gives the store another try. When the write failed, this answer is
+    // the only copy of what was found, so it says to keep the ids.
+    if (open === null) {
+      const ids = residue.map((r) => r.secretId);
+      return unclean({ ...end, why: `The ${doing} completed, but residue records could not be saved or read, so whether residue exists is unknown.` +
+        (ids.length ? ` Record these secret_ids: ${ids.join(", ")}.` : "") }, "residue_store_failed");
+    }
     if (!residue.length) return b;
     // The box's own reason stands when it has one; a box otherwise clear is held back by its residue.
     return b.clean ? unclean(end, "project_residue") : end;
@@ -185,7 +192,15 @@ export async function withResidue(
       : "the box is gone; project-scope registration(s) carrying its placeholder are still there";
     out.push(unclean({ alias, id: boxId, clean: false, why, projectResidue: residueOf(boxId) }, code));
   }
-  return out;
+  // Apart from the boxes, and whether any is held: residue left by a box deleted earlier is known only from the table,
+  // so a table that could not be read means no one can say there is none. Clean requires "checked and found nothing",
+  // not "found nothing".
+  return { things: out, residueUnknown: open === null };
+}
+
+/** The answer's top-level message when `residueUnknown` (see withResidue). */
+export function residueUnknownMessage(doing: "delete" | "withdrawal"): string {
+  return `Residue records could not be read: residue this agent left earlier cannot be listed, so this is not a clean ${doing}. The ${doing} itself completed.`;
 }
 
 /**
@@ -193,16 +208,17 @@ export async function withResidue(
  * one, and each run recorded in admin_audit, whatever it dropped.
  */
 export async function cleanupResidue(db: D1Database, now: number): Promise<number | null> {
-  let dropped: number;
-  try { dropped = await d1EgressResidue(db).dropResolved(now - RESOLVED_RESIDUE_KEEP_MS); }
-  catch (e) {
-    // Its own failure, kept apart from the usage retention it runs beside: a row saying it failed, and a log line.
+  // Everything inside one try, the success's own audit row included: any failure here is this cleanup's, recorded as
+  // failed, and never thrown into the usage retention it runs beside.
+  try {
+    const dropped = await d1EgressResidue(db).dropResolved(now - RESOLVED_RESIDUE_KEEP_MS);
+    await db.prepare("INSERT INTO admin_audit (at, route, outcome, counts, finished_at) VALUES (?, 'cron:egress-residue-cleanup', 'cleaned', ?, ?)")
+      .bind(now, JSON.stringify({ dropped }), now).run();
+    return dropped;
+  } catch (e) {
     console.warn(`egress residue cleanup failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
     await db.prepare("INSERT INTO admin_audit (at, route, outcome, finished_at) VALUES (?, 'cron:egress-residue-cleanup', 'failed', ?)")
       .bind(now, now).run().catch(() => console.warn("egress residue cleanup: its failure could not be recorded"));
     return null;
   }
-  await db.prepare("INSERT INTO admin_audit (at, route, outcome, counts, finished_at) VALUES (?, 'cron:egress-residue-cleanup', 'cleaned', ?, ?)")
-    .bind(now, JSON.stringify({ dropped }), now).run();
-  return dropped;
 }

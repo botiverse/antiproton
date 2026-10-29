@@ -1840,8 +1840,13 @@ await check("a residue row follows where its secret is seen now (box, title, mou
   // A cleanup whose drop fails: no throw, and a failed row of its own.
   const broken = { prepare: (q: string) => q.startsWith("DELETE") ? { bind: () => ({ run: async () => { throw new Error("D1 is away"); } }) } : (w.db as any).prepare(q) } as unknown as D1Database;
   must((await cleanupResidue(broken, now)) === null, "the failed cleanup did not say so");
+  // A cleanup whose own success row cannot be written: still not thrown, and recorded as failed.
+  const noAudit = { prepare: (q: string) => q.includes("'cleaned'") ? { bind: () => ({ run: async () => { throw new Error("D1 is away"); } }) } : (w.db as any).prepare(q) } as unknown as D1Database;
+  let threw = false;
+  try { must((await cleanupResidue(noAudit, now)) === null, "a failed success row was not a failure"); } catch { threw = true; }
+  must(!threw, "a failed success row threw out of the cleanup");
   const audit = w.db.raw.prepare("SELECT outcome FROM admin_audit WHERE route = 'cron:egress-residue-cleanup'").all() as any[];
-  must(audit.length === 1 && audit[0].outcome === "failed", `the failed cleanup's row: ${JSON.stringify(audit)}`);
+  must(audit.length === 2 && audit.every((x) => x.outcome === "failed"), `the failed cleanups' rows: ${JSON.stringify(audit)}`);
   w.dispose();
 });
 
@@ -1879,12 +1884,44 @@ await check("a residue store that fails does not change the delete's course: eve
   w.db.raw.exec("DROP TABLE egress_residue");
   const r = await w.call("DELETE", "/agents/by-raft-agent/YL");
   must(r.status === 200 && r.body.status === "deleted" && boxOf(r.body)?.code === "residue_store_failed" && boxOf(r.body).action === "retry_delete"
-    && boxOf(r.body).projectResidue?.[0]?.secretId === "p6" && r.body.retry === true, `the answer: ${r.status} ${r.text}`);
+    && boxOf(r.body).projectResidue?.[0]?.secretId === "p6" && r.body.retry === true
+    && /^The delete completed, but residue records could not be saved or read/.test(boxOf(r.body).why) && /Record these secret_ids: p6/.test(boxOf(r.body).why),
+    `the answer: ${r.status} ${r.text}`);
   // The rest of the delete ran: the registry says deleted, the GitHub binding is gone.
   must((w.db.raw.prepare("SELECT status FROM provisioned_agents WHERE raft_agent_id = 'YL'").get() as any)?.status === "deleted"
     && !w.db.raw.prepare("SELECT 1 FROM provisioned_connections WHERE raft_agent_id = 'YL'").get(), "the delete did not finish");
   void id;
   w.dispose();
+});
+
+await check("residue records that cannot be read leave the delete not clean even with no box held: clean needs checked and found nothing", async () => {
+  // A box deleted with residue left: the residue is then known only from the table.
+  const run9 = run9Fake();
+  const w = await world({ run9 });
+  const a = await w.agent("YM");
+  await w.connect(a);
+  await w.sandbox(a);
+  const [boxId] = [...run9.boxes.keys()];
+  run9.project.push({ secret_id: "p7", name: "X", value: "x", placeholder: run9.boxes.get(boxId!)!.secrets[0]!.placeholder, inject_header_name: "authorization", allowed_hosts: ["api.github.com"] });
+  const first = await w.call("DELETE", "/agents/by-raft-agent/YM");
+  must(run9.boxes.size === 0 && first.body.clean === false && first.body.residueUnknown === undefined, `control, the first delete: ${first.text}`);
+  w.db.raw.exec("DROP TABLE egress_residue");
+  const again = await w.call("DELETE", "/agents/by-raft-agent/YM");
+  must(again.status === 200 && again.body.clean === false && again.body.retry === true && again.body.residueUnknown === true
+    && /^Residue records could not be read: residue this agent left earlier cannot be listed, so this is not a clean delete\. The delete itself completed\.$/.test(again.body.residueMessage),
+    `the repeated delete: ${again.text}`);
+  // Not counted as a box.
+  must(!(again.body.sandboxes?.boxes ?? []).some((b: any) => b.code === "residue_store_failed"), `a box entry for it: ${again.text}`);
+  w.dispose();
+  // An agent that never had a box: "none" cannot be told from "cannot check".
+  const run9b = run9Fake();
+  const w2 = await world({ run9: run9b });
+  const b = await w2.agent("YN");
+  await w2.connect(b);
+  w2.db.raw.exec("DROP TABLE egress_residue");
+  const never = await w2.call("DELETE", "/agents/by-raft-agent/YN");
+  must(never.status === 200 && never.body.status === "deleted" && never.body.clean === false && never.body.retry === true && never.body.residueUnknown === true, `never had a box: ${never.text}`);
+  w2.dispose();
 });
 
 await check("withdraw never deletes project-scope secrets (shared run9 project: would stop prod injection); withdraw runs while the box exists: after a delete there is nothing to withdraw", async () => {
