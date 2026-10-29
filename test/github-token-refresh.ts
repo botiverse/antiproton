@@ -2042,6 +2042,35 @@ await check("a mount whose reference names a key other than its alias: read, sho
   w.dispose();
 });
 
+await check("another agent's renewal and a reconnect in place reach a mount whose reference names a key other than its alias, under that name", async () => {
+  const w = await world();
+  const { importKek, open } = await import("../src/runtime/secrets.ts");
+  const kek = await importKek(KEK);
+  const a = await w.agent("ZA"), b = await w.agent("ZB");
+  const id = await w.connect(a);
+  await w.call("PUT", `/agents/by-raft-agent/ZB/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
+  const alias = (await b.rt.store.findMountsByPlugin(TENANT, b.agentId, "github"))[0]!.alias;
+  const KEY = "gh_key";
+  const host = w.hostOf(b.agentId);
+  host.sql.exec("UPDATE secrets SET name = ? WHERE name = ?", KEY, alias);
+  host.sql.exec("UPDATE secrets SET name = ? WHERE name = ?", OAUTH_PREFIX + KEY, OAUTH_PREFIX + alias);
+  await b.rt.store.setMountSecretRef(TENANT, b.agentId, alias, `agent:${KEY}`);
+  const names = () => (host.sql.exec("SELECT name FROM secrets ORDER BY name").toArray() as any[]).map((r) => String(r.name));
+  const bKey = async () => { const r = await b.rt.store.getSecret(TENANT, b.agentId, KEY); return r ? open(kek, r) : null; };
+  // a renews; b adopts the new pair.
+  await w.expireAt(a, Date.now() + 30_000, id);
+  await w.tool(a);
+  await w.settle();
+  must(w.propagated.includes(b.agentId) && (await bKey()) === (await w.stored(a)).token && JSON.stringify(names()) === JSON.stringify([KEY, OAUTH_PREFIX + KEY].sort()),
+    `after a's renewal: ${JSON.stringify(names())}, b's key is a's: ${(await bKey()) === (await w.stored(a)).token}`);
+  // A reconnect in place from a reaches b under the same name.
+  await w.reconnect(a, id);
+  await w.settle();
+  must((await bKey()) === (await w.stored(a)).token && JSON.stringify(names()) === JSON.stringify([KEY, OAUTH_PREFIX + KEY].sort()),
+    `after a reconnect: ${JSON.stringify(names())}, b's key is a's: ${(await bKey()) === (await w.stored(a)).token}`);
+  w.dispose();
+});
+
 await check("withdraw never deletes project-scope secrets (shared run9 project: would stop prod injection); withdraw runs while the box exists: after a delete there is nothing to withdraw", async () => {
   const run9 = run9Fake();
   const w = await world({ run9 });
