@@ -737,11 +737,11 @@ await check("deleted agent: deleted is final in the registry, and a marked row i
   w.DB.raw.prepare("UPDATE provider_approvals SET agent_deleted_at = NULL WHERE operation_id = ?").run(op);
   const direct = await d1ApprovalIndex(w.DB).list({ raftOrigin: ORIGIN, tenantId: null }, { status: null, updatedSince: null, after: null, limit: 50 });
   must(direct.rows.every((r) => r.operationId !== op), `an unmarked row of a deleted agent was listed: ${show(direct.rows.map((r) => r.operationId))}`);
-  w.DB.raw.prepare("UPDATE provider_approvals SET agent_deleted_at = 1 WHERE operation_id = ?").run(op);
+  w.DB.raw.prepare("UPDATE provider_approvals SET agent_deleted_at = ? WHERE operation_id = ?").run(Date.now(), op);
   // The second guard: were the registry to say active again, the kept row still is not listed.
   w.DB.raw.prepare("UPDATE provisioned_agents SET status = 'active' WHERE raft_agent_id = ?").run(RAFT_ID);
   const all = await call(w, "GET", "approvals");
-  must(all.status === 200 && all.body.approvals.every((a: any) => a.operationId !== op) && indexRow(w, op)?.agent_deleted_at !== null, `a marked row was listed: ${all.text}`);
+  must(all.status === 200 && all.body.approvals.every((a: any) => a.operationId !== op) && typeof indexRow(w, op)?.agent_deleted_at === "number", `a marked row was listed, or is gone: ${all.text} ${show(indexRow(w, op))}`);
 });
 
 await check("deleted agent: a delete whose marking failed is finished by the repeat", async () => {
