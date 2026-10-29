@@ -3027,7 +3027,7 @@ function githubRenewal(env: Env): RuntimeDeps["github"] {
     app, grants: d1ConnectorGrants(env.CONTROL_DB),
     async propagate(tenantId, connectorId, fromAgentId) {
       // Only the connector's own origin's agents (`connectorAudience`).
-      const { to, filtered } = await renewalAudience(env.CONTROL_DB, tenantId, connectorId);
+      const { to, filtered, skipped } = await renewalAudience(env.CONTROL_DB, tenantId, connectorId);
       let sent = 0;
       for (const agentId of to) {
         if (agentId === fromAgentId) continue;
@@ -3039,7 +3039,7 @@ function githubRenewal(env: Env): RuntimeDeps["github"] {
         }
       }
       // In production `filtered` stays 0: a non-zero count means another origin's agent is still bound to the connector.
-      logEvent("connect.renewal_push", { connectorId, sent, filtered });
+      logEvent("connect.renewal_push", { tenantId, connectorId, sent, filtered, skipped });
     },
   };
 }

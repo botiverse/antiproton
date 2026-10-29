@@ -459,9 +459,13 @@ await check("renewal: a connector's pair reaches only its own origin's agents; a
   assert(JSON.stringify(to) === JSON.stringify(["raft_A", "raft_C"]), `handed to: ${JSON.stringify(to)}`);
   assert((await connectorAudience(f.D1, TENANT, "k_null")).length === 0, "a connector with no origin was handed to its agents");
   // What the renewal push logs: the agents bound but left out, by origin or by the connector having none.
+  // A deleted agent of the connector's origin still bound is no origin's leak: in `to` as before, never `filtered`. A
+  // binding whose agent has no row is `skipped`.
+  f.agent("H", OURS); f.db.prepare("UPDATE provisioned_agents SET status = 'deleted', deleted_at = 2 WHERE raft_agent_id = 'H'").run();
+  f.bind("H", "k1"); f.bind("NOROW", "k1");
   const k1 = await renewalAudience(f.D1, TENANT, "k1"), kNull = await renewalAudience(f.D1, TENANT, "k_null");
-  assert(JSON.stringify(k1) === JSON.stringify({ to: ["raft_A", "raft_C"], filtered: 1 }) && JSON.stringify(kNull) === JSON.stringify({ to: [], filtered: 1 }),
-    `filtered: ${JSON.stringify(k1)} ${JSON.stringify(kNull)}`);
+  assert(JSON.stringify(k1) === JSON.stringify({ to: ["raft_A", "raft_C", "raft_H"], filtered: 1, skipped: 1 })
+    && JSON.stringify(kNull) === JSON.stringify({ to: [], filtered: 1, skipped: 0 }), `filtered: ${JSON.stringify(k1)} ${JSON.stringify(kNull)}`);
 });
 
 console.log(`  ${routes.size} (method, path) pairs take an agent id; ${served.length} (both spellings) served for their own origin; ${Object.keys(OUTSIDE).length} cases outside /agents/<id>`);

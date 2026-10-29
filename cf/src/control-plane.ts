@@ -763,14 +763,23 @@ export async function connectorAudience(db: D1Database, tenantId: string, connec
 }
 
 /**
- * `connectorAudience`, and how many of the agents bound to the connector it left out: bound to it in
- * `provisioned_connections`, but of another origin, or of a connector with no origin.
+ * `connectorAudience`, and the agents bound to the connector it left out, in two counts: `filtered`, left out by
+ * origin (another origin's agent, or any agent of a connector with no origin); `skipped`, left out for anything else
+ * (a binding whose agent or connector has no row). An agent's status is not a reason: a deleted agent of the
+ * connector's origin is in `to`, as it was before connectors had an origin.
  */
-export async function renewalAudience(db: D1Database, tenantId: string, connectorId: string): Promise<{ to: string[]; filtered: number }> {
+export async function renewalAudience(db: D1Database, tenantId: string, connectorId: string): Promise<{ to: string[]; filtered: number; skipped: number }> {
   const to = await connectorAudience(db, tenantId, connectorId);
-  const bound = await db.prepare("SELECT COUNT(*) AS n FROM provisioned_connections WHERE tenant_id = ? AND connector_id = ?")
-    .bind(tenantId, connectorId).first<any>();
-  return { to, filtered: Math.max(0, Number(bound?.n ?? 0) - to.length) };
+  const r = await db.prepare(
+    `SELECT COUNT(*) AS bound,
+            COUNT(CASE WHEN p.agent_id IS NOT NULL AND c.id IS NOT NULL AND (c.raft_origin IS NULL OR p.raft_origin != c.raft_origin) THEN 1 END) AS filtered
+       FROM provisioned_connections pc
+       LEFT JOIN connectors c ON c.tenant_id = pc.tenant_id AND c.id = pc.connector_id
+       LEFT JOIN provisioned_agents p ON p.tenant_id = pc.tenant_id AND p.raft_agent_id = pc.raft_agent_id
+      WHERE pc.tenant_id = ? AND pc.connector_id = ?`,
+  ).bind(tenantId, connectorId).first<any>();
+  const filtered = Number(r?.filtered ?? 0);
+  return { to, filtered, skipped: Math.max(0, Number(r?.bound ?? 0) - to.length - filtered) };
 }
 
 export function d1ConnectorGrants(db: D1Database): ConnectorGrants {
