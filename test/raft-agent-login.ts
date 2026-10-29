@@ -949,7 +949,7 @@ async function sealedGateway(policy: any = { write: "approval" }) {
   });
   const gateway = new ToolGateway(store, [plugin], new Set([plugin.id]), { async resolve() { return CREDENTIAL; } });
   const caller = { tenantId: "tenant", agentId: "agent", taskId: "task", contextId: "ctx_turn" } as any;
-  return { store, plugin, caller, call: (tool: string, args: unknown) => gateway.invoke(caller, `raft.${tool}`, args as any) as Promise<any> };
+  return { store, plugin, caller, gateway, call: (tool: string, args: unknown) => gateway.invoke(caller, `raft.${tool}`, args as any) as Promise<any> };
 }
 /** The raft mount's context, built as the runtime builds the plugin. */
 function sealedMount() {
@@ -1055,6 +1055,32 @@ await check("Stamp's UUID, the id integrations_list shows: refused by both handl
   // Refused by the hook, the window did not open: no unresolved row.
   must(!JSON.stringify(h.store.dumpTables()).includes("raft.agent_login_unresolved_refused"), "a refusal the hook made was counted as unresolved");
   must(w.logins.length === 0 && w.actions().length === 0, "the UUID reached a login or the app");
+});
+
+await check("a raw agent-login held by an approval card and approved through Raft is still refused on the replay: by the hook once learned, else by the handler", async () => {
+  const w = world({ service: STAMP_SVC, manifest: stampManifest(), actionBody: GRANT_BODY, list: bothListed({}) });
+  w.install();
+  const RAFT_DECIDER = { via: "raft" as const, raftUserId: "u_owner", role: "agent_owner" as const };
+  for (const learnFirst of [true, false]) {
+    // The UUID is not known to the hook when the call is made, so the card is made (the window).
+    const g = await sealedGateway();
+    const held = await g.call("integrations_invoke", { ...INVOKE_ARGS, service: STAMP_UUID });
+    must(held.status === "pending" && held.error?.code === "awaiting_approval", `held: ${JSON.stringify(held)}`);
+    if (learnFirst) {
+      const listed = await g.call("integrations_list", {});
+      must(listed.status === "succeeded", `list: ${JSON.stringify(listed).slice(0, 200)}`);
+    }
+    const decided = await g.gateway.applyApproval("tenant", held.operationId, "approved", "u_owner", RAFT_DECIDER, { run: "later" });
+    must(decided.ok, `decision: ${JSON.stringify(decided)}`);
+    const ran = await g.gateway.runApproved("tenant", held.operationId);
+    const out = JSON.stringify(ran);
+    must(ran && ran.result.status !== "succeeded" && /stamp_login/.test(out) && !out.includes("GRANT-ONE-TIME"), `replay (learned ${learnFirst}): ${out.slice(0, 400)}`);
+    // The hold ends failed, and its notice says it was approved but not run.
+    const record = await g.store.getApproval("tenant", held.operationId) as any;
+    must(record?.state === "failed", `hold after the replay: ${JSON.stringify(record).slice(0, 300)}`);
+    must(learnFirst ? (ran!.result as any).error?.code === "route_refused" : ran!.result.status === "failed", `replay (learned ${learnFirst}) refused by the wrong line: ${out.slice(0, 300)}`);
+  }
+  must(w.logins.length === 0 && w.actions().length === 0, `a replay signed in or sent: ${w.logins.length} logins, ${w.actions().length} actions`);
 });
 
 await check("each identifier on its own makes a service declared: id, client id, name; an app whose three are all other is not", async () => {
