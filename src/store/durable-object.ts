@@ -4,11 +4,12 @@ import { AGENT_SCOPE_ALIAS, PluginDbTables } from "./plugin-db.ts";
 import { appendUsage, type UsageRow } from "../usage/outbox.ts";
 import { completedPayload, type CompletedFacts } from "./operation-event.ts";
 import type {
-  AdvanceTxn, ApprovalRecord, CommitResult, Json, Lease, ModelBinding, MountPolicy, MountRecord,
+  AdvanceTxn, ApprovalRecord, ApprovalState, CommitResult, DecidedBy, Json, Lease, ModelBinding, MountPolicy, MountRecord,
   OperationRecord, OperationStatus, RuntimeEvent, TaskRecord, WaitSpec,
 } from "../core/types.ts";
 import { appendTrace, type TraceRow } from "../trace/outbox.ts";
 import { approvalRow, operationEnds, toolCallRow } from "../trace/seams.ts";
+import { APPROVAL_COLUMNS, decisionProblem, FINAL_STATES, mapApproval, migrateApprovals, type UntoldApproval } from "./approvals-schema.ts";
 import {
   applySeedPass, markSeedsChosen, pendingSeedNotices, readSeedRecord, returnSeedNotices, SEED_RECORD_SCHEMA, takeSeedNotices, voidSeedNotices,
   type SeedNoticeRow, type SeedPlan,
@@ -65,11 +66,7 @@ const SCHEMA = [
   secret_ref TEXT NOT NULL, updated_at INTEGER NOT NULL,
   PRIMARY KEY (tenant_id, agent_id));`,
   `CREATE TABLE IF NOT EXISTS approvals (
-  tenant_id TEXT NOT NULL, operation_id TEXT NOT NULL, agent_id TEXT NOT NULL,
-  task_id TEXT NOT NULL, mount_alias TEXT NOT NULL, tool TEXT NOT NULL,
-  request TEXT NOT NULL, state TEXT NOT NULL, approver TEXT, decided_at INTEGER,
-  created_at INTEGER NOT NULL,
-  PRIMARY KEY (tenant_id, operation_id));`,
+  ${APPROVAL_COLUMNS});`,
   `CREATE TABLE IF NOT EXISTS snapshots (
   tenant_id TEXT NOT NULL, task_id TEXT NOT NULL, through_sequence INTEGER NOT NULL,
   state TEXT NOT NULL, state_version INTEGER NOT NULL, created_at INTEGER NOT NULL,
@@ -107,13 +104,6 @@ const SCHEMA = [
 
 const j = (v: Json) => JSON.stringify(v ?? null);
 
-const mapApproval = (r: any): ApprovalRecord => ({
-  tenantId: r.tenant_id, operationId: r.operation_id, agentId: r.agent_id,
-  taskId: r.task_id, mountAlias: r.mount_alias, tool: r.tool,
-  request: JSON.parse(r.request), state: r.state, approver: r.approver ?? null,
-  decidedAt: r.decided_at == null ? null : Number(r.decided_at),
-  createdAt: Number(r.created_at),
-});
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
 type Ctx = { storage: { sql: Sql; transactionSync<T>(cb: () => T): T } };
@@ -152,6 +142,7 @@ export class DurableObjectStore implements StorageAdapter {
     ]) {
       try { this.#sql.exec(alter); } catch { /* already present */ }
     }
+    migrateApprovals((q) => { this.#sql.exec(q); }, (fn) => this.#tx(fn));
 
     // The sandbox plugin was called `run9` until 2026-09-12, when the capability
     // took the name and run9 became the provider behind it. Mount rows and the
@@ -690,30 +681,30 @@ export class DurableObjectStore implements StorageAdapter {
     };
   }
 
-  async requireApproval(a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt">) {
+  async requireApproval(a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt" | "decidedBy" | "expiresAt" | "outcome" | "runAt"> & { expiresAt?: number | null }) {
     this.#sql.exec(
       `INSERT INTO approvals(tenant_id, operation_id, agent_id, task_id, mount_alias, tool,
-         request, state, approver, decided_at, created_at)
-       VALUES (?,?,?,?,?,?,?,'pending',NULL,NULL,?)
+         request, state, approver, decided_at, created_at, expires_at)
+       VALUES (?,?,?,?,?,?,?,'pending',NULL,NULL,?,?)
        ON CONFLICT(tenant_id, operation_id) DO NOTHING`,
       a.tenantId, a.operationId, a.agentId, a.taskId, a.mountAlias, a.tool,
-      j(a.request), this.#now());
+      j(a.request), this.#now(), a.expiresAt ?? null);
   }
 
-  async holdApproval(a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt">, same: (held: ApprovalRecord) => boolean) {
+  async holdApproval(a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt" | "decidedBy" | "expiresAt" | "outcome" | "runAt"> & { expiresAt?: number | null }, same: (held: ApprovalRecord) => boolean) {
     // One synchronous transaction: no await between the lookup and the insert (StorageAdapter `holdApproval`).
     return this.#tx(() => {
       const existing = (this.#all(
-        "SELECT * FROM approvals WHERE tenant_id=? AND agent_id=? AND mount_alias=? AND tool=? AND state='pending' ORDER BY created_at ASC",
-        a.tenantId, a.agentId, a.mountAlias, a.tool) as any[]).map(mapApproval).find(same);
+        "SELECT * FROM approvals WHERE tenant_id=? AND agent_id=? AND mount_alias=? AND tool=? AND state='pending' AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at ASC",
+        a.tenantId, a.agentId, a.mountAlias, a.tool, this.#now()) as any[]).map(mapApproval).find(same);
       if (existing) return { created: false as const, existing };
       this.#sql.exec(
         `INSERT INTO approvals(tenant_id, operation_id, agent_id, task_id, mount_alias, tool,
-           request, state, approver, decided_at, created_at)
-         VALUES (?,?,?,?,?,?,?,'pending',NULL,NULL,?)
+           request, state, approver, decided_at, created_at, expires_at)
+         VALUES (?,?,?,?,?,?,?,'pending',NULL,NULL,?,?)
          ON CONFLICT(tenant_id, operation_id) DO NOTHING`,
         a.tenantId, a.operationId, a.agentId, a.taskId, a.mountAlias, a.tool,
-        j(a.request), this.#now());
+        j(a.request), this.#now(), a.expiresAt ?? null);
       return { created: true as const };
     });
   }
@@ -724,33 +715,62 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async decideApproval(
-    tenantId: string, operationId: string, decision: "approved" | "denied", approver: string,
+    tenantId: string, operationId: string, decision: "approved" | "denied" | "expired", approver: string,
+    opts: { decidedBy?: DecidedBy; notice?: string } = {},
   ) {
     return this.#tx(() => {
       const r = this.#one("SELECT * FROM approvals WHERE tenant_id=? AND operation_id=?", tenantId, operationId);
       if (!r) return { ok: false as const, reason: "not_found" as const };
-      // Deciding twice would let one approval authorise two executions.
-      if (r.state !== "pending") return { ok: false as const, reason: "already_decided" as const };
       const at = this.#now();
+      // Deciding twice would let one approval authorise two executions.
+      const problem = decisionProblem(r, decision, at);
+      if (problem) return { ok: false as const, reason: problem, record: mapApproval(r) };
+      const by = opts.decidedBy ? JSON.stringify(opts.decidedBy) : null;
       this.#sql.exec(
-        "UPDATE approvals SET state=?, approver=?, decided_at=? WHERE tenant_id=? AND operation_id=?",
-        decision, approver, at, tenantId, operationId);
+        "UPDATE approvals SET state=?, approver=?, decided_at=?, decided_by=?, notice=? WHERE tenant_id=? AND operation_id=?",
+        decision, approver, at, by, opts.notice ?? null, tenantId, operationId);
       // The wait is over either way; the row says how long and which way.
       appendTrace(this.#sql, [approvalRow({
         tenantId, agentId: r.agent_id, taskId: r.task_id, operationId,
         mountAlias: r.mount_alias, tool: r.tool, decision, approver,
         createdAt: Number(r.created_at), decidedAt: at,
       })]);
-      return { ok: true as const, record: mapApproval({ ...r, state: decision, approver, decided_at: at }) };
+      return { ok: true as const, record: mapApproval({ ...r, state: decision, approver, decided_at: at, decided_by: by }) };
     });
   }
 
-  async listApprovals(tenantId: string, state?: "pending" | "approved" | "denied") {
+  async listApprovals(tenantId: string, state?: ApprovalState) {
     const rows = state
       ? this.#all("SELECT * FROM approvals WHERE tenant_id=? AND state=? ORDER BY created_at ASC", tenantId, state)
       : this.#all("SELECT * FROM approvals WHERE tenant_id=? ORDER BY created_at ASC", tenantId);
     return (rows as any[]).map(mapApproval);
   }
+
+  async claimApprovalRun(tenantId: string, operationId: string, at: number) {
+    return this.#tx(() => {
+      const r = this.#one("SELECT state, run_at FROM approvals WHERE tenant_id=? AND operation_id=?", tenantId, operationId);
+      if (!r || r.state !== "approved" || r.run_at != null) return false;
+      this.#sql.exec("UPDATE approvals SET run_at=? WHERE tenant_id=? AND operation_id=?", at, tenantId, operationId);
+      return true;
+    });
+  }
+
+  async finishApproval(tenantId: string, operationId: string, state: "executed" | "failed", outcome: { summary: string }, notice: string) {
+    return this.#tx(() => {
+      const r = this.#one("SELECT state FROM approvals WHERE tenant_id=? AND operation_id=?", tenantId, operationId);
+      if (!r || r.state !== "approved") return false;
+      this.#sql.exec("UPDATE approvals SET state=?, outcome=?, notice=? WHERE tenant_id=? AND operation_id=?",
+        state, JSON.stringify(outcome), notice, tenantId, operationId);
+      return true;
+    });
+  }
+
+  async untoldApprovals(tenantId: string): Promise<UntoldApproval[]> {
+    return (this.#all(`SELECT * FROM approvals WHERE tenant_id=? AND state IN (${FINAL_STATES.map(() => "?").join(",")}) AND told_at IS NULL ORDER BY decided_at ASC`,
+      tenantId, ...FINAL_STATES) as any[])
+      .map((r) => ({ ...mapApproval(r), notice: r.notice ?? null }));
+  }
+
 
   async addMount(m: MountRecord) {
     if (m.alias === AGENT_SCOPE_ALIAS) throw new Error("a mount needs a name: the empty one is where agent-level plugin data is kept");

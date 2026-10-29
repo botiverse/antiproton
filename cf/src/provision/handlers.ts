@@ -19,7 +19,8 @@
  */
 import { auditRead, auditRefused, type ReadAudit } from "../read-audit.ts";
 import { RECONNECT_REASON, type OAuthStatus } from "../github-refresh.ts";
-import type { Json } from "../../../src/core/types.ts";
+import type { ApprovalState, DecidedBy, Json } from "../../../src/core/types.ts";
+import { APPROVAL_RETENTION_MS, decodeCursor, encodeCursor, type ApprovalIndex, type ApprovalItem, type ProvisionDecideResult } from "../approvals.ts";
 import { originProblem } from "../../../src/plugins/types.ts";
 import { secretShape } from "../secret-shape.ts";
 import {
@@ -222,6 +223,16 @@ export interface ProvisionDeps {
   plans?: Pick<TenantPlanStore, "set">;
   /** Where the eval exports' reads are audited (cf/src/read-audit.ts). Absent: not recorded, and an assistant's are refused anyway. */
   readAudit?: ReadAudit;
+  /** Held calls (docs/raft-approvals.md): each agent's, from its object, and the provider-wide copy. Absent: the routes answer 404. */
+  approvals?: ProvisionApprovals;
+}
+
+/** What the approval routes act through (cf/src/index.ts): the agent's object for its own holds, D1 for every agent's. */
+export interface ProvisionApprovals {
+  list(tenantId: string, agentId: string, ids: { raftAgentId: string; raftServerId: string }, status: ApprovalState | null): Promise<ApprovalItem[] | null>;
+  decide(tenantId: string, agentId: string, ids: { raftAgentId: string; raftServerId: string }, operationId: string,
+    decision: "approved" | "denied", decidedBy: Extract<DecidedBy, { via: "raft" }>): Promise<ProvisionDecideResult | null>;
+  index: ApprovalIndex;
 }
 
 /** What the import route asks of the agent's object; each is one RPC (cf/src/index.ts AgentDO). */
@@ -517,6 +528,118 @@ async function stopTurnOf(stop: NonNullable<ProvisionAgentOps["stopTurn"]>, tena
   return out;
 }
 
+const APPROVAL_STATES: readonly ApprovalState[] = ["pending", "approved", "executed", "failed", "denied", "expired"];
+/** Who Raft let decide: the agent's owner, or, once the owner has left the server, its owner or an admin. */
+const DECIDER_ROLES = ["agent_owner", "server_owner", "server_admin"] as const;
+const OPERATION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const APPROVALS_PAGE_DEFAULT = 50, APPROVALS_PAGE_MAX = 200;
+
+/** `?status=`: one state, or absent (or `any`) for every state. */
+function statusParam(query: URLSearchParams): ApprovalState | null | Fail {
+  const v = query.get("status");
+  if (v === null || v === "" || v === "any") return null;
+  if (!(APPROVAL_STATES as readonly string[]).includes(v)) {
+    return { status: 400, code: "invalid", param: "status", message: `status is one of ${APPROVAL_STATES.join(", ")}, or any` };
+  }
+  return v as ApprovalState;
+}
+
+/** `GET /agents/{id}/approvals`: the agent's held calls, newest last, read from its own object. */
+async function agentApprovals(tenantId: string, row: ProvisionedAgent, query: URLSearchParams, a: ProvisionApprovals): Promise<Response> {
+  const status = statusParam(query);
+  if (isFail(status)) return fail(status);
+  const items = await a.list(tenantId, row.agentId, { raftAgentId: row.raftAgentId, raftServerId: row.raftServerId }, status);
+  if (items === null) return fail({ status: 404, code: "not_found", message: `no provisioned agent ${row.agentId}` });
+  return ok({ providerAgentId: row.agentId, raftAgentId: row.raftAgentId, approvals: items });
+}
+
+/**
+ * `POST /agents/{id}/approvals/{operationId}/decide`. Raft has checked, on its own server, that `decidedBy` may decide
+ * for this agent; the provider token is what antiproton trusts, and `decidedBy` is recorded and logged as said.
+ */
+async function decideApproval(tenantId: string, row: ProvisionedAgent, operationId: string, body: unknown, credentialId: string | null,
+  a: ProvisionApprovals): Promise<Response> {
+  if (!OPERATION_ID.test(operationId)) return fail({ status: 404, code: "approval_not_found", message: `no held call ${operationId.slice(0, 128)}` });
+  const shape = 'the body is { "decision": "approve" | "deny", "decidedBy": { "raftUserId": string, "role": "agent_owner" | "server_owner" | "server_admin" } }';
+  const b = typeof body === "object" && body !== null && !Array.isArray(body) ? body as Record<string, unknown> : null;
+  if (!b) return fail({ status: 422, code: "invalid", message: shape });
+  const extra = Object.keys(b).find((k) => k !== "decision" && k !== "decidedBy");
+  if (extra) return fail({ status: 422, code: "invalid", param: extra, message: `unknown field ${extra}; ${shape}` });
+  if (b.decision !== "approve" && b.decision !== "deny") {
+    return fail({ status: 422, code: b.decision === undefined ? "missing" : "invalid", param: "decision", message: shape });
+  }
+  const by = typeof b.decidedBy === "object" && b.decidedBy !== null && !Array.isArray(b.decidedBy) ? b.decidedBy as Record<string, unknown> : null;
+  const byExtra = by ? Object.keys(by).find((k) => k !== "raftUserId" && k !== "role") : undefined;
+  if (!by || byExtra || typeof by.raftUserId !== "string" || !RAFT_ID.test(by.raftUserId)) {
+    return fail({ status: 422, code: b.decidedBy === undefined ? "missing" : "invalid", param: byExtra ? `decidedBy.${byExtra}` : "decidedBy", message: shape });
+  }
+  // A role this contract does not name is refused, never read as the nearest one: it is the grounds of the decision.
+  if (typeof by.role !== "string" || !(DECIDER_ROLES as readonly string[]).includes(by.role)) {
+    return fail({ status: 400, code: "invalid_role", param: "decidedBy.role", message: `decidedBy.role is one of ${DECIDER_ROLES.join(", ")}` });
+  }
+  const decision = b.decision === "approve" ? "approved" as const : "denied" as const;
+  const decidedBy = { via: "raft" as const, raftUserId: by.raftUserId, role: by.role as (typeof DECIDER_ROLES)[number] };
+  const r = await a.decide(tenantId, row.agentId, { raftAgentId: row.raftAgentId, raftServerId: row.raftServerId }, operationId, decision, decidedBy);
+  // The audit line: who Raft said decided, on whose token, and what came of it.
+  logEvent("provision.approval_decide", {
+    tenantId, agentId: row.agentId, raftAgentId: row.raftAgentId, operationId, decision, raftUserId: decidedBy.raftUserId, role: decidedBy.role,
+    credentialId, outcome: r === null ? "no_agent" : r.ok ? (r.replay ? "replay" : "decided") : r.code,
+  });
+  if (r === null) return fail({ status: 404, code: "not_found", message: `no provisioned agent ${row.agentId}` });
+  // Answered before an approved call runs: `approval.status` is `approved` until the run ends it (`executed`/`failed`).
+  if (r.ok) return ok({ approval: r.item, replay: r.replay });
+  if (r.code === "approval_not_found") return fail({ status: 404, code: r.code, message: `no held call ${operationId} for ${row.agentId}` });
+  const item = r.item;
+  const message = r.code === "approval_expired"
+    ? "nobody decided this held call before it expired; it was denied as expired and nothing was run"
+    : `this held call was already decided: ${item?.status ?? "decided"}`;
+  // `decision` is what was decided (an approval is "approved" whether its run is under way or ended), `status` where it is now.
+  const decided = item ? (item.status === "executed" || item.status === "failed" ? "approved" : item.status) : null;
+  return Response.json({ error: {
+    code: r.code, message,
+    ...(item ? { decision: decided, status: item.status, decidedBy: item.decidedBy, decidedAt: item.decidedAt } : {}),
+  }, ...(item ? { approval: item } : {}) }, { status: 409, headers: { "cache-control": "no-store" } });
+}
+
+/**
+ * `GET /approvals`: every held call of the provider's agents, oldest change first, from D1's copy (migration 0028).
+ * A tenant token reads its tenant; a platform token every tenant made at its origin, or one server's with
+ * `?raftServerId=`. `updatedSince` (ISO time or ms) and `status` narrow it; `cursor` continues a page.
+ */
+async function providerApprovals(who: ProviderTokenIdentity, raftServerId: string | null, query: URLSearchParams, index: ApprovalIndex): Promise<Response> {
+  let tenantId: string | null;
+  if (who.scope === "tenant") tenantId = who.tenantId;
+  else if (raftServerId === null || raftServerId === "") tenantId = null;
+  else {
+    const t = tenantFor(who, raftServerId);
+    if (isFail(t)) return fail(t);
+    tenantId = t;
+  }
+  const status = statusParam(query);
+  if (isFail(status)) return fail(status);
+  const sinceRaw = query.get("updatedSince");
+  let updatedSince: number | null = null;
+  if (sinceRaw !== null && sinceRaw !== "") {
+    updatedSince = /^\d{1,16}$/.test(sinceRaw) ? Number(sinceRaw) : Date.parse(sinceRaw);
+    if (!Number.isFinite(updatedSince)) return fail({ status: 400, code: "invalid", param: "updatedSince", message: "updatedSince is an ISO 8601 time or milliseconds since the epoch" });
+  }
+  const limitRaw = query.get("limit");
+  const limit = limitRaw === null || limitRaw === "" ? APPROVALS_PAGE_DEFAULT : Number(limitRaw);
+  if (!Number.isInteger(limit) || limit < 1 || limit > APPROVALS_PAGE_MAX) {
+    return fail({ status: 400, code: "invalid", param: "limit", message: `limit is a whole number from 1 to ${APPROVALS_PAGE_MAX}` });
+  }
+  const cursorRaw = query.get("cursor");
+  const after = cursorRaw ? decodeCursor(cursorRaw) : null;
+  if (cursorRaw && !after) return fail({ status: 400, code: "invalid", param: "cursor", message: "cursor is one a previous page answered, as it was answered" });
+  // Ended holds are kept for APPROVAL_RETENTION_MS after their last change, then dropped here, before the read.
+  await index.prune(Date.now() - APPROVAL_RETENTION_MS);
+  const page = await index.list({ raftOrigin: who.raftOrigin, tenantId }, { status, updatedSince, after, limit });
+  return ok({
+    approvals: page.rows.map((r) => ({ ...r.item, status: r.status, updatedAt: new Date(r.updatedAt).toISOString() })),
+    nextCursor: page.next ? encodeCursor(page.next) : null,
+  });
+}
+
 export async function handleProvision(
   method: string, path: string,
   headers: { idempotencyKey: string | null; raftServerId: string | null; credentialId?: string | null; readReason?: string | null }, body: unknown,
@@ -602,6 +725,11 @@ export async function handleProvision(
     await deps.models.picker.set(tenant, b.enabled, headers.credentialId ?? "provider", at);
     logEvent("provision.model_picker", { tenantId: tenant, raftServerId: seg[1], enabled: b.enabled });
     return ok({ raftServerId: seg[1], modelPicker: b.enabled, updatedAt: new Date(at).toISOString() });
+  }
+  // Every held call of the provider's agents, from D1's copy: what Raft reconciles its cards against.
+  if (seg[0] === "approvals" && seg.length === 1 && method === "GET") {
+    if (!deps.approvals) return null;
+    return providerApprovals(who, headers.raftServerId, query, deps.approvals.index);
   }
   if (seg[0] !== "agents") return null;
   // On POST the body names the server; elsewhere the URL does.
@@ -784,6 +912,19 @@ export async function handleProvision(
     return evalSetup(method, rest.slice(1).join("/"), tenantId, found.agentId, query, raw, headers.credentialId ?? null, deps.seed,
       { audit: deps.readAudit ?? null, reason: headers.readReason ?? null });
   }
+  // `…/approvals` and `…/approvals/{operationId}/decide`: this agent's held calls, from its own object.
+  if (rest[1] === "approvals" && ((rest.length === 2 && method === "GET") || (rest.length === 4 && rest[3] === "decide" && method === "POST"))) {
+    if (!deps.approvals) return null;
+    const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+    // The token's own origin, as well as its tenant: a platform token derives the tenant from `?raftServerId=` alone, so
+    // without this another Raft deployment's token naming this server's id would read and decide its holds.
+    if (!found || found.status === "deleted" || found.raftOrigin !== who.raftOrigin) {
+      return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
+    }
+    return rest.length === 2
+      ? agentApprovals(tenantId, found, query, deps.approvals)
+      : decideApproval(tenantId, found, rest[2]!, body, headers.credentialId ?? null, deps.approvals);
+  }
   const read = method === "GET" && rest.length >= 2 ? surfaceReadOf(rest.slice(1), "provider") : null;
   if (read && deps.surface) {
     const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
@@ -866,6 +1007,12 @@ export async function handleProvision(
     const t = deps.now();
     const patch = { status: "deleted" as const, pushRegistered: false, pushError: off.ok ? null : off.error, deletedAt: t };
     await deps.registry.update(tenantId, row.raftAgentId, patch);
+    // The provider-wide copy of its holds goes with it: their arguments' summaries are the agent's to keep, not D1's.
+    // A failure is logged, not a failed delete: the list leaves a deleted agent's rows out anyway (`d1ApprovalIndex`).
+    if (deps.approvals) {
+      try { await deps.approvals.index.removeAgent(tenantId, row.agentId); }
+      catch (e) { console.warn(`removing the approval copies of ${tenantId}/${row.agentId} failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`); }
+    }
     return ok(view({ ...row, ...patch, updatedAt: t }));
   }
 

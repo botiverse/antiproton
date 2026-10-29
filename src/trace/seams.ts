@@ -122,7 +122,7 @@ export function failureAttrs(f: ToolFailure): Record<string, unknown> {
 /** The approval.wait row for a decision that just landed. */
 export function approvalRow(a: {
   tenantId: string; agentId: string; taskId: string; operationId: string;
-  mountAlias: string; tool: string; decision: "approved" | "denied"; approver: string;
+  mountAlias: string; tool: string; decision: "approved" | "denied" | "expired"; approver: string;
   createdAt: number; decidedAt: number;
 }): TraceRow {
   return {

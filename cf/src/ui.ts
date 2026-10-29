@@ -1035,7 +1035,7 @@ export function trajectory(
       if (!a) continue;
       out.push(`<div class="step decided">
         <div class="lbl">${esc(a.tool)} ${rel}
-          <span class="badge ${a.state === "approved" ? "ok" : "bad"}">${esc(a.state)}</span>
+          <span class="badge ${a.state === "approved" || a.state === "executed" ? "ok" : "bad"}">${esc(a.state)}</span>
           ${a.approver ? `<span class="badge">by ${esc(a.approver)}</span>` : ""}</div>
         <pre>${esc(pretty(a.request?.args ?? {}, 800))}</pre>
       </div>`);
