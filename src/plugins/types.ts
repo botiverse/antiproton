@@ -518,12 +518,22 @@ export interface PluginContext {
    * route either. Callers that want the sibling's credential read null as
    * "not there"; reminder's `onRaft` reads it as "not hosted on Raft", and
    * its comment says what that costs.
+   *
+   * The credential itself is handed only to the sibling's own plugin and to the
+   * plugins its plugin lists in {@link Plugin.siblingReaders}, matched on this
+   * mount's plugin id; any other caller gets the sibling with `credential: null`.
    */
   sibling(alias: string): Promise<{
     credential: string | null;
     /** As on this mount: what kind of credential that mount names, so a null
      *  one can be reported as unreadable rather than absent. */
     credentialRefKind?: CredentialRefKind;
+    /**
+     * Present, and true, when that mount has a credential but this plugin may not read it
+     * (`Plugin.siblingReaders`): `credential` is null by the gateway's rule, not for want of one. A plugin that
+     * needs it fails loudly with that, rather than act without it.
+     */
+    withheld?: true;
     /** That mount's database, opened under that mount's plugin. */
     db: PluginDatabase;
     /**
@@ -2219,8 +2229,21 @@ export interface Plugin {
   /**
    * The services this plugin may obtain an Agent Login grant for (`PluginContext.agentLogin`). Absent: none, and
    * its contexts have no such method. stamp declares `["stamp"]` and nothing else.
+   *
+   * A declared service's Agent Login belongs to this plugin alone: the raft plugin refuses the agent's own
+   * `integrations_login` for it and `integrations_invoke` of its `agent-login` action, before any approval card, so
+   * the grant (and the session it is exchanged for) never reaches the model. `tool` is this plugin's own login tool,
+   * which that refusal names as the way in. Adding a service here is therefore a security decision, not a formality.
    */
-  agentLogin?: { services: readonly string[] };
+  agentLogin?: { services: readonly string[]; tool?: string };
+  /**
+   * The plugins (by registered id, `Plugin.id`) that may read this plugin's mounts' credential through
+   * `PluginContext.sibling`. Absent: none but this plugin's own mounts; every other asker gets the sibling with
+   * `credential: null` (its plugin, policy and database as before). Matched against the asking mount's plugin id as
+   * the platform recorded it, never an alias. **Editing it is a security change**: a plugin listed here can act as
+   * this mount's account, outside every tool, policy and refusal this plugin has (raft's: every Agent Login).
+   */
+  siblingReaders?: readonly string[];
   /**
    * Issue the grant `PluginContext.agentLogin` asks for, from this plugin's own credential (the raft plugin). Called
    * by the gateway only, on the raft mount's own context, with a service the requesting plugin declared. The request

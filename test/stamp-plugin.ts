@@ -14,7 +14,7 @@ import { stampPlugin, STAMP_WITHHELD, SESSION_STORE, parseSession, loadSession, 
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { keepRaftIdentity } from "../src/plugins/raft-identity.ts";
-import { createRaftPlugin } from "../src/plugins/raft.ts";
+import { createRaftPlugin, raftPlugin } from "../src/plugins/raft.ts";
 import { sealText } from "./../src/plugins/raft-agent-login.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -641,7 +641,8 @@ await check("issue_comment needs an issue number", async () => {
 // policy allowed everything, so approve, merge and `api` ran with nobody there.
 
 /** The raft plugin as a sibling sees it: its id, its version pin and its context store; nothing it calls. */
-const RAFT_STUB = { id: "raft", version: "1.0.0", tools: [], async invoke() { return {}; },
+// Who may read its credential is the real raft plugin's list (`Plugin.siblingReaders`), stamp among them.
+const RAFT_STUB = { id: "raft", version: "1.0.0", tools: [], async invoke() { return {}; }, siblingReaders: raftPlugin.siblingReaders,
   database: { version: 8, stores: { context: {} } } } as any;
 
 /** A store with this agent's Raft mount, its identity kept as the raft plugin keeps it. */
@@ -697,6 +698,22 @@ await check("with no mount policy, approve, merge and api wait for a person; rea
   reset();
   const read = await call("pr_view", { repo: "o/r", number: 7 });
   must(read.status === "succeeded", `pr_view: ${JSON.stringify(read)}`);
+});
+
+await check("api and api_get never reach /api/auth: the exchange, the refresh, the session and the revoke, refused before a card", async () => {
+  // The exchange needs no credential, so the only thing between a grant an agent obtained and a session in its
+  // conversation is that no stamp tool sends it; the bridge's half is test/stamp-bridge.ts item 6.
+  const call = await gatewayMount({ write: "approval", read: "approval" });
+  const cards = (await call.store.listApprovals("t")).length;
+  for (const path of ["/api/auth/agent/exchange", "/api/auth/agent/refresh", "/api/auth/agent/revoke", "/api/auth/agent/login", "/API/AUTH/agent/exchange"]) {
+    reset();
+    const r = await call("api", { path, method: "POST", body: { schema: "raft-cli-agent-login-exchange.v1", grant: "g", code_verifier: "v" } });
+    must(r.status === "rejected" && r.error?.code === "route_refused" && /path must start with/.test(r.error.message), `api ${path}: ${JSON.stringify(r)}`);
+    const threw = await refusal(invoke("api_get", { path }, makeCtx().ctx));
+    must(/path must start with/.test(threw), `api_get ${path}: ${threw}`);
+    must(seen.length === 0, `${path} reached ${seen.map((x) => x.path).join(", ")}`);
+  }
+  must((await call.store.listApprovals("t")).length === cards, "a card was made for an /api/auth call");
 });
 
 await check("only the mount naming the tool lifts the hold: a mount-wide write allow does not", async () => {

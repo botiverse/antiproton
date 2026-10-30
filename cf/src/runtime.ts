@@ -1423,7 +1423,8 @@ export class AgentRuntime {
       // The key is read when a secret tool runs, not now: `#kek` is set a few lines below.
       statePlugin(this.store, this.#artifacts as any, deps.bucketName, () => this.#kek),
       artifactsPlugin(this.#artifacts, deps.bucketName),
-      createRaftPlugin({ artifacts: this.#artifacts }),
+      // The plugins are read for their `agentLogin` declarations: a declared service's login is its plugin's alone.
+      createRaftPlugin({ artifacts: this.#artifacts, registry: () => plugins }),
       mcpPlugin,
       createReminderPlugin({ serviceUrl: deps.reminderApp?.origin, clientCredential: deps.reminderApp?.credential }),
       raftbenchPlugin,

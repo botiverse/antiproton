@@ -21,7 +21,7 @@ import {
 import { PARK_BYTES } from "./artifacts.ts";
 import {
   ACTIONS_TOOL, AGENT_LOGIN_TOOLS, INVOKE_TOOL, LIST_TOOL, LOGIN_TOOL, SESSION_STORE, integrationsActions, integrationsInvoke, integrationsList, integrationsLogin,
-  notInstalled, serviceInstalled, type AgentLoginDeps, type ManifestCache,
+  loginKey, notInstalled, sealedLoginRefusal, serviceInstalled, type AgentLoginDeps, type ManifestCache, type SealedLogin, type ServiceRecord,
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
 import {
@@ -3011,9 +3011,45 @@ export function createRaftPlugin(deps: {
   agentLoginCalls?: { invoke: typeof integrationsInvoke; login: typeof integrationsLogin };
   /** `receive_events`' cap on waiting for announced messages (`WAIT_FOR_MAX_MS`), for a test that reaches it quickly. */
   waitForMaxMs?: number;
+  /**
+   * The runtime's plugins (cf/src/runtime.ts), read for their `agentLogin` declarations: a service one declares is
+   * logged in to by that plugin's own tool, never by the agent's `integrations_login` or an `agent-login` invoke here
+   * (`Plugin.refuse` below). Absent (a test's plugin built alone): no service is declared.
+   */
+  registry?: () => readonly Pick<Plugin, "id" | "agentLogin">[];
 } = {}): Plugin {
   const waitForMaxMs = deps.waitForMaxMs ?? WAIT_FOR_MAX_MS;
   const loginCalls = deps.agentLoginCalls ?? { invoke: integrationsInvoke, login: integrationsLogin };
+  /** Every declared service, folded (`loginKey`), with the plugin that declared it and that plugin's login tool. */
+  const declared = (): Map<string, SealedLogin> => {
+    const out = new Map<string, SealedLogin>();
+    for (const p of deps.registry?.() ?? []) {
+      for (const service of p.agentLogin?.services ?? []) {
+        if (typeof service === "string" && service) out.set(loginKey(service), { service, plugin: p.id, tool: p.agentLogin?.tool ?? null });
+      }
+    }
+    return out;
+  };
+  /**
+   * A declared service's client id and name as Raft's list last answered them in this isolate, folded, to its id: so
+   * `Plugin.refuse`, which cannot ask Raft, refuses those spellings before a card too once any list has been read. Only
+   * ever widens what is refused; the handlers' check on the resolved service does not depend on it.
+   */
+  const learned = new Map<string, string>();
+  const learn = (services: readonly ServiceRecord[]) => {
+    const ids = declared();
+    for (const s of services) {
+      // Declared by any of the three: Stamp's record is a UUID id with `stamp` as its client id.
+      const key = [s.id, s.clientId, s.name].map(loginKey).find((k) => ids.has(k));
+      if (key === undefined) continue;
+      for (const k of [s.id, s.clientId, s.name]) learned.set(loginKey(k), key);
+    }
+  };
+  const sealed = (service: string): SealedLogin | null => {
+    const ids = declared();
+    const key = loginKey(service);
+    return ids.get(key) ?? ids.get(learned.get(key) ?? "") ?? null;
+  };
   const excluded = deps.excluded ?? EXCLUDED;
   const assistant = deps.assistant ?? RAFT_ASSISTANT_WIRE;
   const artifacts = deps.artifacts ?? null;
@@ -3066,7 +3102,9 @@ export function createRaftPlugin(deps: {
   /** Connected Apps' manifests, by URL, for `MANIFEST_TTL_MS`: public documents, so one cache serves every mount. */
   const manifests: ManifestCache = new Map();
   /** Agent Login's Raft client: its state is never saved, since a login and a list book nothing as seen. */
-  const agentLogin = (ctx: PluginContext): AgentLoginDeps => ({ raft: () => raftFor(ctx, { state: false }), timeoutMs: timeout(ctx) });
+  const agentLogin = (ctx: PluginContext): AgentLoginDeps => ({ raft: () => raftFor(ctx, { state: false }), timeoutMs: timeout(ctx), learn });
+  /** The same, for the agent's own login and invoke: a declared service's Agent Login is refused (`sealed`). */
+  const agentsOwnLogin = (ctx: PluginContext): AgentLoginDeps => (declared().size ? { ...agentLogin(ctx), sealed } : agentLogin(ctx));
   /** When each mount's managed MCP catalogue was last listed in this isolate, and which a call found stale (src/plugins/raft-mcp.ts). */
   const mcp = mcpClock();
   /** An assistant's one composed DM to its owner, sent as `messages_send` would send it (`notifyOwner`). */
@@ -3093,6 +3131,26 @@ export function createRaftPlugin(deps: {
   const plugin: Plugin = {
     id: "raft",
     version: "1.0.0",
+    /**
+     * A raw Agent Login for a service another plugin declares (`Plugin.agentLogin`) — `integrations_login` naming it,
+     * or `integrations_invoke` of its `agent-login` action — is refused before any card: that grant, exchanged by the
+     * agent, would put the service's session in the conversation and skip the person the plugin's own login tool asks.
+     * `grantAgentLogin` is that plugin's way in and does not pass through here. The handlers refuse it again, on the
+     * service Raft resolves a client id or name to.
+     */
+    refuse(tool: string, args: Json): string | undefined {
+      return sealedLoginRefusal(tool, args, sealed) ?? undefined;
+    },
+    /**
+     * Who may read this mount's Raft credential through `ctx.sibling`. **A security change to edit**: the credential
+     * reaches Raft's Agent Login directly, past `refuse` above and every handler check, so a plugin listed here can
+     * mint any app's grant. stamp derives its seal key from it and reads which agent this is (`raftIdentityOf`);
+     * raftbench reads its runs and events with it. reminder asks only which plugin the mount is, which needs no credential.
+     */
+    // This list is this short because no other plugin reads the raft account; the one plugin family that reads across
+    // its own ids (AppWorld) lists its members on itself. A new plugin that needs another plugin's account declares it on
+    // that plugin's own `siblingReaders`; it is not added here unless it truly needs the Raft credential.
+    siblingReaders: ["stamp", "raftbench"],
     /**
      * Which tools this build can offer, and what each needs, as one string: it moves when the SDK's manifest
      * (an operation or its capability), `EXCLUDED` or the presence of object storage changes the generated set, and a snapshot taken under another basis is re-taken at the next
@@ -3468,9 +3526,9 @@ export function createRaftPlugin(deps: {
       if (name === UPLOAD_TOOL) return uploadAttachment(args, ctx, artifacts, unofferedFor(ctx));
       const a = object(args);
       if (name === LIST_TOOL) return integrationsList(ctx, agentLogin(ctx));
-      if (name === LOGIN_TOOL) return integrationsLogin(args, ctx, agentLogin(ctx));
+      if (name === LOGIN_TOOL) return integrationsLogin(args, ctx, agentsOwnLogin(ctx));
       if (name === ACTIONS_TOOL) return integrationsActions(args, ctx, agentLogin(ctx), manifests);
-      if (name === INVOKE_TOOL) return integrationsInvoke(args, ctx, agentLogin(ctx), manifests);
+      if (name === INVOKE_TOOL) return integrationsInvoke(args, ctx, agentsOwnLogin(ctx), manifests);
       if (name === OWNER_INBOX_TOOL || name === OWNER_MESSAGES_TOOL) return ownerRead(name, args, ctx, assistant, unofferedFor(ctx));
       if (name === NOTIFY_TOOL || name === PREFERENCES_TOOL) {
         // Offered as the owner reads are, and refused the same way where the mount's list does not name them.

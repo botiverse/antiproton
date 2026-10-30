@@ -5,9 +5,17 @@
  * named its plugin. Each case pairs the direct call (the control: refused, as it always was) with the sibling
  * read (refused now too), and a mount that is callable still answers, so a gate that refused everything would
  * not pass either.
+ *
+ * And the credential of a callable sibling goes only to that mount's own plugin and the plugins its plugin lists in
+ * `Plugin.siblingReaders`: the raft mount's credential reaches Raft's Agent Login directly, past every refusal the
+ * raft plugin makes, so any other plugin gets the sibling with `credential: null` (plugin, db and policy as before).
+ * The asker is matched by the plugin id the platform recorded on its mount, never an alias its owner chose, and an id
+ * names one plugin: a second registration under an existing id is refused, so no plugin takes a listed one's place.
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
+import { createRaftPlugin } from "../src/plugins/raft.ts";
+import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -19,7 +27,8 @@ function assert(cond: unknown, msg: string): asserts cond { if (!cond) throw new
 
 const ctx = { tenantId: "t", agentId: "a", taskId: "k" };
 const run = [{ name: "run", summary: "", parameters: {}, sideEffects: "read" as const, idempotency: "native" as const }];
-const service = (id: string, version = "1.0.0"): Plugin => ({ id, version, tools: run, async invoke() { return { ran: id }; } });
+// Each lets the probe read its mounts' credential (`siblingReaders`), so these cases are about callability alone.
+const service = (id: string, version = "1.0.0"): Plugin => ({ id, version, tools: run, async invoke() { return { ran: id }; }, siblingReaders: ["probe"] });
 
 // The plugin that asks: reports what each sibling answered, without the db handle.
 const probe: Plugin = {
@@ -161,6 +170,156 @@ await check("a missing sibling is still null", async () => {
   const { peek } = await fixture();
   const got = await peek("nope");
   assert(got.nope === null, `sibling("nope") answered ${JSON.stringify(got.nope)}`);
+});
+
+// ---- Who may read a sibling's credential (`Plugin.siblingReaders`) ----
+
+const RAFT_CREDENTIAL = "sk_agent_sibling_gate_0123456789";
+
+/** A plugin whose one tool reports what `ctx.sibling(alias)` handed it. */
+function asker(id: string): Plugin {
+  return {
+    id, version: "1.0.0",
+    tools: [{ name: "peek", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
+    async invoke(_tool, args, ctx) {
+      const s = await ctx.sibling(String((args as { alias?: unknown })?.alias ?? "raft"));
+      return s ? { credential: s.credential, plugin: s.plugin, db: typeof s.db?.get === "function", kind: s.credentialRefKind ?? null } : { none: true };
+    },
+  } as Plugin;
+}
+
+const raft = createRaftPlugin();
+
+async function gated(plugins: Plugin[], mounts: Array<{ alias: string; plugin: string }>) {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  const all = [raft, ...plugins];
+  const version = (id: string) => all.find((p) => p.id === id)!.version;
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "raft", plugin: "raft", installationId: "i-raft", connectionId: null,
+    toolVersion: version("raft"), publicConfig: { serverUrl: "https://raft.example" }, secretRef: "secret:raft", policy: null });
+  for (const m of mounts) {
+    await store.addMount({ tenantId: "t", agentId: "a", alias: m.alias, plugin: m.plugin, installationId: `i-${m.alias}`, connectionId: null,
+      toolVersion: version(m.plugin), publicConfig: {}, secretRef: null, policy: null });
+  }
+  const resolved: string[] = [];
+  const gateway = new ToolGateway(store, all, new Set(all.map((p) => p.id)),
+    { async resolve(ref: string) { resolved.push(ref); return ref === "secret:raft" ? RAFT_CREDENTIAL : null; } });
+  return Object.assign(async (alias: string, args: unknown = {}) => {
+    const r = await gateway.invoke(ctx, `${alias}.peek`, args as any) as any;
+    assert(r.status === "succeeded", `${alias}.peek: ${JSON.stringify(r)}`);
+    return r.result as { credential?: string | null; plugin?: string; db?: boolean; kind?: string | null; none?: true };
+  }, { resolved });
+}
+
+await check("raft names who may read its credential: stamp and raftbench, and that is a security decision written beside it", async () => {
+  assert(JSON.stringify(raft.siblingReaders) === JSON.stringify(["stamp", "raftbench"]), `siblingReaders: ${JSON.stringify(raft.siblingReaders)}`);
+});
+
+await check("a listed plugin gets the raft credential; one not listed gets the mount with credential null, plugin and db unchanged", async () => {
+  const peek = await gated([asker("stamp"), asker("raftbench"), asker("reminder"), asker("newcomer")],
+    [{ alias: "stamp", plugin: "stamp" }, { alias: "bench", plugin: "raftbench" }, { alias: "reminder", plugin: "reminder" }, { alias: "newcomer", plugin: "newcomer" }]);
+  for (const alias of ["stamp", "bench"]) {
+    const s = await peek(alias);
+    assert(s.credential === RAFT_CREDENTIAL && s.plugin === "raft", `${alias}: ${JSON.stringify(s)}`);
+  }
+  for (const alias of ["reminder", "newcomer"]) {
+    peek.resolved.length = 0;
+    const s = await peek(alias);
+    assert(!peek.resolved.includes("secret:raft"), `${alias}'s read resolved the raft credential`);
+    assert(s.credential === null, `${alias} was handed the raft credential`);
+    // What reminder reads (which plugin the mount is) and the database are as they were.
+    assert(s.plugin === "raft" && s.db === true, `${alias}: ${JSON.stringify(s)}`);
+  }
+});
+
+await check("the asker is its mount's plugin, not its alias: a mount named stamp of another plugin gets no credential", async () => {
+  const peek = await gated([asker("newcomer")], [{ alias: "stamp", plugin: "newcomer" }, { alias: "raftbench", plugin: "newcomer" }]);
+  for (const alias of ["stamp", "raftbench"]) {
+    const s = await peek(alias);
+    assert(s.credential === null && s.plugin === "raft", `a ${alias}-named mount of another plugin: ${JSON.stringify(s)}`);
+  }
+});
+
+await check("one plugin mounted twice: both mounts run and read each other as before; the gate is about other plugins", async () => {
+  const mine = asker("ledger");
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  for (const alias of ["one", "two"]) {
+    await store.addMount({ tenantId: "t", agentId: "a", alias, plugin: "ledger", installationId: `i-${alias}`, connectionId: null,
+      toolVersion: "1.0.0", publicConfig: {}, secretRef: `secret:${alias}`, policy: null });
+  }
+  const gateway = new ToolGateway(store, [mine], new Set(["ledger"]), { async resolve(ref: string) { return `cred-of-${ref}`; } });
+  // One plugin mounted twice registers once and both mounts run: the duplicate-id refusal is about plugin definitions.
+  const r = await gateway.invoke(ctx, "one.peek", { alias: "two" }) as any;
+  assert(r.status === "succeeded" && r.result.credential === "cred-of-secret:two", JSON.stringify(r));
+  const back = await gateway.invoke(ctx, "two.peek", { alias: "one" }) as any;
+  assert(back.status === "succeeded" && back.result.credential === "cred-of-secret:one", JSON.stringify(back));
+});
+
+await check("an id names one plugin: a second plugin registered under an existing id is refused, not kept over the first", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  let threw = "";
+  try { new ToolGateway(store, [asker("stamp"), raft, asker("stamp")], new Set()); } catch (e) { threw = String((e as Error).message); }
+  assert(/two plugins are registered as "stamp"/.test(threw), `a second "stamp" was accepted: ${threw || "no error"}`);
+  threw = "";
+  try { new ToolGateway(store, [raft, createRaftPlugin()], new Set()); } catch (e) { threw = String((e as Error).message); }
+  assert(/"raft"/.test(threw), `a second "raft" was accepted: ${threw || "no error"}`);
+});
+
+// A plugin family whose members read each other's accounts: AppWorld builds one plugin per app, and an action
+// spanning two accounts (venmo's `phone_access_token`) takes the second app's token from that app's mount. The gate
+// must leave that working, offline: a fake AppWorld server answers the logins and records what the action was sent.
+await check("an AppWorld app reads its family's other app's account: venmo's action is sent with phone's token", async () => {
+  const p = (name: string) => ({ name, type: "string", required: true, description: "", default: null, constraints: [] });
+  const catalogue: Catalogue = {
+    venmo: { description: "payments", apis: [{ app_name: "venmo", api_name: "send_money", path: "/send_money", method: "POST",
+      description: "pay a contact", parameters: [p("access_token"), p("phone_access_token"), p("amount")] }] },
+    phone: { description: "contacts", apis: [{ app_name: "phone", api_name: "contacts", path: "/contacts", method: "GET",
+      description: "list contacts", parameters: [p("access_token")] }] },
+  };
+  const family = appworldPlugins(catalogue, { apiBaseUrl: "http://appworld.test" });
+  // Derived from the family, not typed: each lists the others.
+  for (const plugin of family) {
+    assert(JSON.stringify(plugin.siblingReaders) === JSON.stringify(family.map((x) => x.id).filter((id) => id !== plugin.id)), `${plugin.id}: ${JSON.stringify(plugin.siblingReaders)}`);
+  }
+  const sent: Array<{ url: string; body: any; authorization: string | null }> = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: any, init: any = {}) => {
+    const url = String(input);
+    const m = /^http:\/\/appworld\.test\/(\w+)\/auth\/token$/.exec(url);
+    if (m) return new Response(JSON.stringify({ access_token: `token-of-${m[1]}` }), { status: 200, headers: { "content-type": "application/json" } });
+    sent.push({ url, body: init.body ? JSON.parse(init.body) : null, authorization: new Headers(init.headers).get("authorization") });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as any;
+  const family2 = async (plugins: Plugin[]) => {
+    const store = new SqliteStore(":memory:");
+    await store.init();
+    await store.createAgent("t", "a");
+    for (const app of ["venmo", "phone"]) {
+      await store.addMount({ tenantId: "t", agentId: "a", alias: app, plugin: app, installationId: `i-${app}`, connectionId: null,
+        toolVersion: "1.0.0", publicConfig: {}, secretRef: `secret:${app}`, policy: null });
+    }
+    return new ToolGateway(store, plugins, new Set(plugins.map((x) => x.id)),
+      { async resolve(ref: string) { return JSON.stringify({ username: ref, password: "pw" }); } });
+  };
+  try {
+    const r = await (await family2(family)).invoke(ctx, "venmo.send_money", { amount: "5" }) as any;
+    assert(r.status === "succeeded", `send_money: ${JSON.stringify(r)}`);
+    // What actually left: venmo's own token in the header, phone's in the parameter the action names.
+    const call = sent.find((x) => x.url.endsWith("/venmo/send_money"));
+    assert(call?.authorization === "Bearer token-of-venmo", `venmo's own token was not sent: ${call?.authorization}`);
+    assert(call?.body?.phone_access_token === "token-of-phone", `the action was sent without phone's token: ${JSON.stringify(call?.body)}`);
+    // And a phone that does not let venmo read it: refused loudly, naming the sibling and the gate, before any request.
+    sent.length = 0;
+    const closed = family.map((x) => (x.id === "phone" ? { ...x, siblingReaders: [] } : x));
+    const refused = await (await family2(closed)).invoke(ctx, "venmo.send_money", { amount: "5" }) as any;
+    assert(refused.status === "failed" && /phone mount's account/.test(refused.error?.message ?? "") && /siblingReaders/.test(refused.error.message),
+      `a withheld sibling: ${JSON.stringify(refused)}`);
+    assert(!sent.some((x) => x.url.endsWith("/venmo/send_money")), "the action was sent without phone's token");
+  } finally { globalThis.fetch = realFetch; }
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

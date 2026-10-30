@@ -157,6 +157,9 @@ leaves the call to the policy as before — and fails closed: a throw, or an
 answer that is not a non-empty string, refuses the call with a fixed message,
 and so does a reason past 300 characters (`String.length`): never a cut copy
 of it. The bound is on this hook's answer only, not on a route table's texts.
+The operation ends `rejected`, and its `tool.call` trace row carries the
+refusal's code and sentence (bounded and redacted, as a failure's are), never
+the arguments, so a refused attempt leaves a record of what refused it.
 Keep the same refusal in the tool's handler too, for an `invoke` that does not
 come through the gateway. `test/plugin-refuse.ts` holds the core's half.
 
@@ -943,6 +946,59 @@ the app answers 401 is sent once more after a fresh login. Only v0 manifests
 run, and a manifest whose `base_url` has a path is refused rather than joined; `test/raft-agent-login.ts` holds all of it against a fake Raft and a fake
 app.
 
+**A plugin can own a service's Agent Login.** A plugin that declares
+`agentLogin: { services, tool }` (`Plugin.agentLogin` in
+`src/plugins/types.ts`) gets `ctx.agentLogin(service, codeChallenge)`: the
+gateway has the agent's raft mount run the app's `agent-login` action for it
+(`grantAgentLogin`), the plugin exchanges the one-time grant itself, and the
+session it gets stays sealed in that plugin's mount. stamp declares
+`{ services: ["stamp"], tool: "stamp_login" }`, and is the only plugin that
+declares one. For a declared service the raft plugin refuses the agent's own
+`integrations_login`, and `integrations_invoke` of its `agent-login` action
+(or of any action the manifest points at the same endpoint): otherwise the
+agent could pass a code challenge of its own, get the grant back, exchange it
+at the app (Stamp's `POST /api/auth/agent/exchange` takes no credential) and
+hold the session in its conversation, without the person the plugin's login
+tool asks. The refusal is `Plugin.refuse`, so it comes before any approval
+card, and its sentence names the declared `tool` as the way in. The service
+is compared folded (NFKC, invisible characters dropped, trimmed, lower-cased)
+and the action with case and separators ignored. A resolved app is declared
+when its id, client id or name folds to a declared service (Stamp's Raft id is
+a UUID; `stamp` is its client id): every spelling of such an app is refused
+before a card once any Raft list (`integrations_list` among them) has named
+it, and the handlers check the app Raft resolved again, before a login or a
+handoff. The refusal, and the record of it, carry the service and the action
+as the agent sent them. The
+declarations are read from the runtime's plugins (`createRaftPlugin({ registry
+})` in `cf/src/runtime.ts`), never from a list in the raft plugin. **Adding a
+service to a plugin's `agentLogin.services` is a security decision**: it hands
+that plugin the agent's Agent Login for the service and takes the raw one
+away from the agent. `test/raft-agent-login.ts` pins the refusal, its variants
+and that an undeclared service is unchanged; `test/stamp-plugin.ts` and
+`test/stamp-bridge.ts` pin that no stamp tool and no `sdk:stamp` request
+reaches `/api/auth/*`.
+
+**Another mount's credential goes only where its plugin says.**
+`ctx.sibling(alias)` answers any of the agent's callable mounts with its
+plugin, policy and database, but its `credential` only to that mount's own
+plugin and to the plugins its plugin lists in `siblingReaders`
+(`Plugin.siblingReaders`); every other asker gets `credential: null`. The
+asker is the plugin id the platform recorded on its mount, never the mount's
+alias, and the gateway refuses two plugins registered under one id, so no
+plugin can take a listed one's place. `raft` lists `["stamp", "raftbench"]`:
+its credential reaches Raft's Agent Login directly, past everything above, so
+a plugin listed there can mint any app's grant. AppWorld builds one plugin
+per app, and each lists the other apps of the same build (derived from the one
+app list `appworldPlugins` is built from), since an action spanning two
+accounts takes the second app's token from that app's mount. A token the gate
+withholds, or a required one whose mount is missing or has no account, refuses
+the call before any request, naming the sibling and why; an optional one whose
+mount is missing or has no account is left unset and the call goes ahead, with
+a trace row saying why.
+**Editing a `siblingReaders` list is a security change.** It is a rule the gateway enforces, not a scan:
+`test/gateway-sibling-gate.ts` holds it, and `test/raft-agent-login.ts` keeps
+a scan naming every reader of `sibling` as a backstop.
+
 Two more are a personal assistant's reads of its owner's Raft:
 `assistant_owner_inbox` (the owner's channels and threads with unread counts,
 mentions and a preview of the latest message) and `assistant_owner_messages`
@@ -1422,8 +1478,9 @@ the plugin registered while it was on. That is safe because `unmount` is
 **cleanup only** — cancel registrations, subscriptions, reminders — and never
 wakes the agent, posts a message or calls a model. That is a rule the plugin
 keeps, not a limit the runtime enforces: the context has nothing that wakes the
-agent, but `sibling` hands over another mount's credential and the network is
-open, so a plugin could still post somewhere.
+agent, but `sibling` can hand over another mount's credential (to a plugin that
+mount's plugin lists in `siblingReaders`) and the network is open, so a plugin
+could still post somewhere.
 
 Revoking through `ctx.inbound` inside `unmount` is allowed and changes nothing
 about the order; telling the service to stop sending is the part only the
