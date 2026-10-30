@@ -613,8 +613,8 @@ export function statePlugin(
           if (whenFullOf(key) === "refuse") {
             const spilt = spills ? { encoded: body.length, inlineMax: STATE_INLINE_MAX } : null;
             const refused = typeof a.value === "string"
-              ? putRefusal(key, a.value, cfg.maxDocumentBytes, spilt)
-              : putRefusal(key, "", Number.POSITIVE_INFINITY, spilt);
+              ? putRefusal(key, { text: a.value, max: cfg.maxDocumentBytes }, spilt)
+              : putRefusal(key, { notText: true }, spilt);
             if (refused) throw refused;
           }
           // Checked before writing, not after: the point is to refuse, not to

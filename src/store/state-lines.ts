@@ -88,12 +88,16 @@ export function documentFull(key: string, size: number, after: number, max: numb
  * that does not change what fits, since a `put` replaces the whole document.
  */
 export function putRefusal(
-  key: string, text: string, max: number, spills: { encoded: number; inlineMax: number } | null,
+  key: string,
+  // A value that is not text has no lines and no character cap: it was never appendable, and the only thing to
+  // protect is that it can still be replaced in place.
+  value: { text: string; max: number } | { notText: true },
+  spills: { encoded: number; inlineMax: number } | null,
 ): Error | null {
   const code = `${key}_full`;
-  // `max` is infinite only for a value that is not text: it has no lines, so it was never appendable, and the only
-  // thing to protect is that it can still be replaced in place.
-  const textual = Number.isFinite(max);
+  const textual = !("notText" in value);
+  const text = textual ? value.text : "";
+  const max = textual ? value.max : Number.POSITIVE_INFINITY;
   const why = !textual
     ? (spills ? `a value this large is kept in object storage (its JSON encodes to ${spills.encoded}; the limit here is `
         + `${spills.inlineMax}), where \`${key}\` could not be rewritten in place, so nothing was written.` : null)
