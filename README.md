@@ -560,7 +560,7 @@ SWE-bench rows below say which environment produced them.
 | `pi-loop` | 3 | pi's harness on our storage, and a rebuilt harness finding the transcript again |
 | `pi-bridge` | 11 | pi's request shape against our provider client, both ways |
 | `executor` · `http-plugin` | 46 | sandbox contract in-process (`executor` 11 runs the `spec/executor-spec` rows including script syntax errors), fetch and HTML extraction (`http-plugin` 10) |
-| `state` | 21 | memory that survives a task, byte budgets, per-agent isolation, `remember` and `put` sharing one namespace, every row `list` returns carrying the `ref` it is read back by, parked notes pointing to read calls, path segment traversal refusal, and stale unreadable rows offering `forget` |
+| `state` | 28 | memory that survives a task, byte budgets, per-agent isolation, a full document dropping whole oldest lines and `remember` quoting them back, `remember` refusing a value that is not text, `revise` changing or deleting the one line its match is in and refusing zero or several matches, both stores answering the same, `remember` and `put` sharing one namespace, every row `list` returns carrying the `ref` it is read back by, parked notes pointing to read calls, path segment traversal refusal, and stale unreadable rows offering `forget` |
 | `markdown` | 11 | the console renders the agent's markdown and never its HTML |
 | `model-binding` | 6 | whose key an agent spends |
 
@@ -746,7 +746,7 @@ them:
   of arbitrary plugins at runtime are not supported: plugins are registered at
   build time in `cf/src/runtime.ts`. Revoking or removing a mount must preserve
   prompt resolution integrity: the system prompt names the mount and tool
-  (e.g. "kept by the `state` mount, correct one with its `remember` tool") rather
+  (e.g. "kept by the `state` mount, … correct or delete that line with its `revise` tool") rather
   than the underlying dispatch address, and drops the instruction when the mount
   is absent.
 - **OAuth mounts.** An operator configures a credential by pasting it — a token,

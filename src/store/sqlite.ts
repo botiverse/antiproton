@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
+import { appendLines, documentText, reviseLines } from "./state-lines.ts";
 import type { PluginChoice, ToolSnapshot } from "../plugins/types.ts";
 import { AGENT_SCOPE_ALIAS, PluginDbTables } from "./plugin-db.ts";
 import { appendUsage, pendingUsage, type UsageRow } from "../usage/outbox.ts";
@@ -880,17 +881,21 @@ export class SqliteStore implements StorageAdapter {
   async appendState(
     tenantId: string, agentId: string, key: string, text: string, maxBytes: number,
   ) {
-    const prior = await this.getState(tenantId, agentId, key);
-    // Appending to something that was spilled would mean fetching it back and
-    // rewriting it, which is exactly the read-modify-write this exists to avoid.
-    if (prior?.ref) throw new Error(`${key} is too large to append to; read it and put a new one`);
-    const before = typeof prior?.value === "string" ? prior.value : "";
-    const joined = before ? `${before}\n${text}` : text;
-    // Keep the tail: a journal's recent end is the part worth having.
-    const truncated = joined.length > maxBytes;
-    const kept = truncated ? joined.slice(joined.length - maxBytes) : joined;
+    // What the text becomes is decided in state-lines.ts, the same for both stores.
+    const before = documentText(key, await this.getState(tenantId, agentId, key), "append to");
+    const { kept, dropped } = appendLines(before, text, maxBytes);
     await this.putState(tenantId, agentId, key, { value: kept, ref: null, bytes: kept.length });
-    return { bytes: kept.length, truncated };
+    return { bytes: kept.length, dropped };
+  }
+
+  async reviseState(
+    tenantId: string, agentId: string, key: string, match: string, replace: string | null, maxBytes: number,
+  ) {
+    const prior = await this.getState(tenantId, agentId, key);
+    if (!prior) throw new Error(`there is no \`${key}\` to revise`);
+    const { kept, line, was } = reviseLines(key, documentText(key, prior, "revise"), match, replace, maxBytes);
+    await this.putState(tenantId, agentId, key, { value: kept, ref: null, bytes: kept.length });
+    return { bytes: kept.length, line, was };
   }
 
   async getState(tenantId: string, agentId: string, key: string) {
