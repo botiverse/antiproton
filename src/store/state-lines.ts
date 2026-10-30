@@ -91,7 +91,13 @@ export function putRefusal(
   key: string, text: string, max: number, spills: { encoded: number; inlineMax: number } | null,
 ): Error | null {
   const code = `${key}_full`;
-  const why = text.length > max
+  // `max` is infinite only for a value that is not text: it has no lines, so it was never appendable, and the only
+  // thing to protect is that it can still be replaced in place.
+  const textual = Number.isFinite(max);
+  const why = !textual
+    ? (spills ? `a value this large is kept in object storage (its JSON encodes to ${spills.encoded}; the limit here is `
+        + `${spills.inlineMax}), where \`${key}\` could not be rewritten in place, so nothing was written.` : null)
+    : text.length > max
     ? `\`${key}\` holds at most ${max} characters, and this put is ${text.length}, so nothing was written.`
     : spills
       ? `a \`put\` is kept where it can still be appended to and revised only up to ${spills.inlineMax} of its JSON `
@@ -99,7 +105,8 @@ export function putRefusal(
         + "`remember` uses: newlines, quotes, backslashes and other control characters count extra."
       : null;
   if (!why) return null;
-  return Object.assign(new Error(`${code}: ${why} Put a shorter document: keep the lines that are still true`), { code });
+  const advice = textual ? "Put a shorter document: keep the lines that are still true" : "Put a smaller value";
+  return Object.assign(new Error(`${code}: ${why} ${advice}`), { code });
 }
 
 /** Whether `text` is more than one line. */
