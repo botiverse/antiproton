@@ -235,7 +235,9 @@ export function statePlugin(
           "the same store `put`, `get`, `list` and `forget` use, so `get` on `journal` returns it " +
           "and a `put` to that key replaces the whole document rather than appending to it. To " +
           "change or delete one line, use `revise`. A full document drops its oldest lines to make " +
-          "room, and the reply quotes them, so you can save again whatever you still need.",
+          "room, and the reply quotes them. Remembering into it again drops more, so free up space " +
+          "first: delete or shorten a line that is no longer true with `revise`, or drop a whole " +
+          "document with `forget`, then remember what you still need.",
         parameters: {
           type: "object",
           properties: {
@@ -490,7 +492,10 @@ export function statePlugin(
               + (quoted.excerpt.length < all.length
                 ? `\`dropped.text\` quotes the first ${quoted.excerpt.length} of their ${all.length} characters. `
                 : "`dropped.text` quotes them. ")
-              + "They are gone from the document: remember again anything there you still need.",
+              // Remembering them straight back would drop the next oldest lines, so the advice is to make room first.
+              + "They are gone from the document. Remembering them again would drop more of its oldest lines, so free up space first, "
+              + "by deleting or shortening a line that is no longer true with `revise` or dropping a whole document "
+              + "with `forget`, then remember what you still need.",
           };
         }
 

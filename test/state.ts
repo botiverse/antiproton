@@ -424,6 +424,27 @@ await check("a full document drops whole oldest lines, never part of one, and re
   }
 });
 
+await check("the drop receipt and remember's description say to free up space with revise or forget before remembering again", async () => {
+  // Remembering a dropped line straight back into a full document drops the next oldest one, so advice that says only
+  // "remember again" turns one loss into a chain of them.
+  const { plugin } = (await backends())[0]!;
+  const ctx = capped(40);
+  await plugin.invoke("remember", { key: "journal", text: A }, ctx);
+  await plugin.invoke("remember", { key: "journal", text: B }, ctx);
+  const r = await plugin.invoke("remember", { key: "journal", text: C }, ctx) as any;
+  const summary = plugin.tools.find((t) => t.name === "remember")!.summary;
+  for (const [what, text] of [["the receipt", String(r.note)], ["remember's description", summary]] as const) {
+    if (/(remember|save) again/i.test(text)) throw new Error(`${what} still says to remember again: ${text}`);
+    const free = text.indexOf("free up space first");
+    // Delete or shorten: a longer replacement past the cap is itself refused, so it frees nothing.
+    if (free === -1 || !/(delete or shorten|deleting or shortening) a line [^.]*`revise`/.test(text) || !text.includes("`forget`")) {
+      throw new Error(`${what} does not say to free up space with revise or forget: ${text}`);
+    }
+    const then = text.indexOf("then remember what you still need");
+    if (then < free) throw new Error(`${what} does not put freeing space before remembering: ${text}`);
+  }
+});
+
 /** A state mount behind the real gateway, with every trace row it writes kept: the gateway fills in the agent and the
  * mount and refuses a kind a plugin may not write, so a row seen here is the row the outbox gets. */
 async function traced(maxDocumentBytes: number) {
