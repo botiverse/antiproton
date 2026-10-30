@@ -3177,9 +3177,18 @@ const offeredTest = (offered: Iterable<string>) => { const set = new Set(offered
 /** An assistant's memory mount (`memoryMountOf`) and the session's tools on it, bare names. */
 export interface AssistantMemory { alias: string; offered: Iterable<string> }
 
+/** How the chat removes something from its notes, by the tools it has: `revise` an entry, else rewrite or drop the document. */
+const forgetWith = (t: (n: string) => string, has: (n: string) => boolean): string =>
+  has("revise") ? ` with ${t("revise")}`
+  : has("put") && has("forget") ? `, writing the document again without it with ${t("put")}, or dropping a whole one with ${t("forget")}`
+  : has("put") ? `, writing the document again without it with ${t("put")}`
+  : has("forget") ? ` with ${t("forget")}`
+  : "";
+
 /**
  * What an assistant is told about its notes: what is worth keeping and where, said once and the same in its chat and
- * its checks, after a line for which one it is in. Guidance and nothing more: code never decides what the model keeps,
+ * its checks, after a line for which one it is in; the chat's alone, what to do when its owner asks it to forget
+ * something or what it remembers. Guidance and nothing more: code never decides what the model keeps,
  * including what it read in its owner's inbox, or when it writes it. Null without `remember` on the memory mount; the
  * sentence about correcting an entry only with `revise`.
  */
@@ -3194,6 +3203,9 @@ export function memoryGuidance(m: AssistantMemory | null | undefined, session: "
       : `You keep notes with ${t("remember")}, shown to you under "What you already know" in your chat with your owner and in every check. If this check shows you something that will matter later, note it: a note tells no one, so it is not output.`,
     "Keep what will matter later: your owner's standing preferences, how they like to be addressed, decisions and why they were made, and what you have said you will do. Put lasting facts in `memory` and running notes in `journal`, so routine notes don't push the facts out.",
     has("revise") ? `When an entry turns out wrong or stops being true, change or remove it with ${t("revise")} rather than adding one that contradicts it.` : null,
+    // The chat's alone, since only the chat talks to the owner: asking it is the owner's only way to see and manage the
+    // notes today.
+    session === "chat" ? `When your owner asks you to forget something, remove it from your notes${forgetWith(t, has)}; when they ask what you remember about them, tell them truthfully from your notes.` : null,
     "Write conclusions, not what you read: copy as little of anyone's messages as you can.",
   ].filter((x): x is string => x !== null).join(" ");
 }

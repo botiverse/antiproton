@@ -2453,8 +2453,16 @@ await check("the memory guidance names only the tools offered, the same in a cha
     must(full.includes(s), `chat guidance lacks ${s}: ${full}`);
   }
   must(!memoryGuidance(m(["remember", "forget"]), "chat")!.includes("revise"), "revise named without the tool");
+  // Asked to forget, or what it remembers: the chat's alone, removed with the best tool it has.
+  const asked = (offered: string[]) => /When your owner asks you to forget something, remove it from your notes[^;]*; when they ask what you remember about them, tell them truthfully from your notes\./
+    .exec(memoryGuidance(m(offered), "chat")!)?.[0] ?? "";
+  must(asked([...MEMORY_TOOLS]).includes("with `state__revise`;"), `with revise: ${asked([...MEMORY_TOOLS])}`);
+  must(asked(["remember", "put", "forget"]).includes("`state__put`") && asked(["remember", "put", "forget"]).includes("`state__forget`") && !asked(["remember", "put", "forget"]).includes("revise"),
+    `without revise: ${asked(["remember", "put", "forget"])}`);
   const check = memoryGuidance(m([...MEMORY_TOOLS]), "check")!;
-  must(check.includes("not output") && check.endsWith(full.slice(full.indexOf("Keep what will matter later"))), `check guidance: ${check}`);
+  must(!/asks you to forget|what you remember/.test(check), `the check is told about the owner asking: ${check}`);
+  const shared = (g: string) => g.slice(g.indexOf("Keep what will matter later")).replace(/ When your owner asks you to forget[^.]*\./, "");
+  must(check.includes("not output") && check.endsWith(shared(full)), `check guidance: ${check}`);
   must(assistantPrompt("raft", CHAT_TOOLS, m([...MEMORY_TOOLS])).includes(full) && !assistantPrompt("raft").includes("You keep notes"), "the chat's code part");
   must(assistantCheckPrompt("raft", CHECK_TOOLS, { memory: m([...MEMORY_TOOLS]) }).endsWith(check) && !assistantCheckPrompt("raft").includes("You keep notes"), "the check's prompt");
   must(assistantCheckPrompt("raft", CHECK_TOOLS, { raftCheck: true, memory: m([...MEMORY_TOOLS]) }).endsWith(check), "Raft's check's prompt");
