@@ -28,7 +28,8 @@
  * behalf.
  *
  * A row the outbox read but refused (`dropped`: kind or verdict outside the
- * contract's vocabulary) is not carried and not silent: the pass warns, and
+ * contract's vocabulary) is not carried and not silent: the pass warns, naming
+ * the refused rows' kinds and the first one's seq (`PendingTrace`), and
  * `trace_drops` keeps one line per pass that /admin/diagnose shows beside
  * `alarm_errors` — the number has a place that changes because of it, not
  * only a place that reads it.
@@ -98,9 +99,12 @@ export async function flushTrace(
   sql.exec(LOCAL);
   const known = sql.exec("SELECT through_seq FROM trace_sent WHERE id = 1").toArray()[0];
   const sent = known ? Number(known.through_seq) : 0;
-  const { rows, dropped, through } = pendingTrace(sql, sent, limit);
+  const { rows, dropped, droppedKinds, firstDroppedSeq, through } = pendingTrace(sql, sent, limit);
   if (dropped > 0) {
-    console.warn(`trace outbox for ${tenantId}/${agentId}: ${dropped} row(s) outside the contract's vocabulary were dropped`);
+    // Which kinds and where, as JSON: the cursor moves past these rows and the prune takes them, so this line is all
+    // that is left of them. The kinds are as stored (cut to a length), so they are quoted, never spliced in raw.
+    console.warn(`trace outbox for ${tenantId}/${agentId}: ${dropped} row(s) outside the contract's vocabulary were dropped, ` +
+      `first seq ${firstDroppedSeq}, kinds ${JSON.stringify(droppedKinds)}`);
     sql.exec(DROPS);
     const at = now();
     sql.exec("DELETE FROM trace_drops WHERE at < ?", at - TRACE_DROPS_KEEP_MS);

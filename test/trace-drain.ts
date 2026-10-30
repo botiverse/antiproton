@@ -94,6 +94,7 @@ await check("a row the outbox refused is warned about, written down, and does no
   const { out, warned } = await quiet(() => flushTrace(b, host.sql, OWNER.tenantId, OWNER.agentId, 500, () => 42));
   must(out.rows === 2 && out.dropped === 1, `flush said ${JSON.stringify(out)}`);
   must(warned.length === 1 && /1 row\(s\)/.test(warned[0]!), `warned: ${JSON.stringify(warned)}`);
+  must(warned[0]!.includes('first seq 2, kinds {"not.a.kind":1}'), `the warning does not say which row: ${warned[0]}`);
   const d = drops(host.sql);
   must(d.length === 1 && Number(d[0].dropped) === 1 && Number(d[0].at) === 42, `trace_drops ${JSON.stringify(d)}`);
   must(b.puts.length === 1 && b.puts[0]!.key === "trace/t1/a1/1-3.ndjson", "the good rows were not written");

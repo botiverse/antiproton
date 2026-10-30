@@ -10,7 +10,7 @@
  * vocabulary is the contract, checked at write and again at read, because
  * the drain dispatches on it and a wrong value would not redden there.
  */
-import { appendTrace, ensureTraceOutbox, pendingTrace, pruneTrace, TRACE_ATTRS_MAX, TRACE_FIELD_MAX, type TraceRow } from "../src/trace/outbox.ts";
+import { appendTrace, DROPPED_KIND_MAX, DROPPED_KINDS_MAX, ensureTraceOutbox, pendingTrace, pruneTrace, TRACE_ATTRS_MAX, TRACE_FIELD_MAX, type TraceRow } from "../src/trace/outbox.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -113,6 +113,35 @@ check("and at read: a corrupted row is counted, not passed through as a valid ty
   pending = pendingTrace(host.sql, 0);
   eq(pending.rows.length, 1, "the row is back once its vocabulary is");
   eq(pending.rows[0].attrs, { unparseable: true }, "and a parseable-but-wrong-shaped attrs is the same one shape of damage");
+});
+
+check("a dropped row is said by its stored kind and seq, the kind cut to a length, the attrs never read", () => {
+  const host = sqliteHost();
+  ensureTraceOutbox(host.sql);
+  appendTrace(host.sql, [row({ spanId: "op_1" })]);
+  const raw = (kind: string, verdict = "ok") => host.sql.exec(
+    "INSERT INTO trace_outbox (at, tenant_id, agent_id, kind, span_id, parent_id, status, verdict, ms, attrs) VALUES (?, 't', 'a', ?, 'x', NULL, 's', ?, NULL, '{\"token\":\"ghu_secret\"}')",
+    T0, kind, verdict);
+  raw("bogus.kind"); raw("bogus.kind"); raw("x".repeat(500)); raw("__proto__"); raw("tool.call", "weird");
+  const pending = pendingTrace(host.sql, 0);
+  eq(pending.dropped, 5, "every refused row counted");
+  eq(pending.firstDroppedSeq, 2, "the first refused row's seq");
+  eq(pending.droppedKinds, { "bogus.kind": 2, ["x".repeat(DROPPED_KIND_MAX)]: 1, ["__proto__"]: 1, "tool.call": 1 }, "by kind, with counts");
+  must(!JSON.stringify(pending.droppedKinds).includes("ghu_secret"), "attrs leaked");
+  eq(pending.rows.map((r) => r.seq), [1], "the good row still read");
+  const clean = pendingTrace(host.sql, 6);
+  eq([clean.droppedKinds, clean.firstDroppedSeq], [{}, null], "nothing dropped, nothing said");
+});
+
+check("past DROPPED_KINDS_MAX distinct kinds, the rest are counted under one name", () => {
+  const host = sqliteHost();
+  ensureTraceOutbox(host.sql);
+  for (let i = 0; i < DROPPED_KINDS_MAX + 3; i++) host.sql.exec(
+    "INSERT INTO trace_outbox (at, tenant_id, agent_id, kind, span_id, parent_id, status, verdict, ms, attrs) VALUES (?, 't', 'a', ?, 'x', NULL, 's', 'ok', NULL, '{}')",
+    T0, `bogus.${i}`);
+  const kinds = pendingTrace(host.sql, 0).droppedKinds;
+  eq(Object.keys(kinds).length, DROPPED_KINDS_MAX + 1, "the named kinds and the rest");
+  eq(kinds["…"], 3, "the rest");
 });
 
 check("a raft.state_save_failed row stored before the rename to raft.state_failed is still drained as a row, not counted as damage", () => {
