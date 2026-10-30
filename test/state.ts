@@ -424,6 +424,72 @@ await check("a full document drops whole oldest lines, never part of one, and re
   }
 });
 
+/** A state mount behind the real gateway, with every trace row it writes kept: the gateway fills in the agent and the
+ * mount and refuses a kind a plugin may not write, so a row seen here is the row the outbox gets. */
+async function traced(maxDocumentBytes: number) {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  const plugin = statePlugin(store, null, "local");
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "notes", plugin: "state", installationId: "i", connectionId: null,
+    toolVersion: plugin.version, publicConfig: { maxDocumentBytes }, secretRef: null, policy: null });
+  const rows: any[] = [];
+  const record = store.recordTrace.bind(store);
+  store.recordTrace = async (r) => { rows.push(...r); return record(r); };
+  const gw = new ToolGateway(store, [plugin], new Set(["state"]), { async resolve() { return null; } });
+  const call = { tenantId: "t", agentId: "a", taskId: "k" };
+  const remember = async (key: string, text: string) => {
+    const out = await gw.invoke(call, "notes.remember", { key, text });
+    if (out.status !== "succeeded") throw new Error(`remember: ${JSON.stringify(out)}`);
+    return out.result as any;
+  };
+  return { store, rows, remember, dropped: () => rows.filter((r) => r.kind === "state.dropped") };
+}
+
+await check("a remember that drops lines writes one state.dropped row with the key (or other) and the counts; one that fits writes none", async () => {
+  const { remember, dropped } = await traced(40);
+  await remember("memory", A);
+  await remember("memory", B);
+  if (dropped().length !== 0) throw new Error(`a write that fit was traced: ${JSON.stringify(dropped())}`);
+  const r = await remember("memory", C);
+  const rows = dropped();
+  if (rows.length !== 1) throw new Error(`${rows.length} rows for one overflow: ${JSON.stringify(rows)}`);
+  const [row] = rows;
+  if (row.tenantId !== "t" || row.agentId !== "a" || row.status !== "dropped" || row.verdict !== "ok") {
+    throw new Error(`the row's envelope: ${JSON.stringify(row)}`);
+  }
+  // The same counts the reply gives the agent, and nothing else but the mount the gateway adds.
+  const want = { mount: "notes", key: "memory", lines: 2, characters: 33 };
+  if (JSON.stringify(row.attrs) !== JSON.stringify(want) || r.dropped.lines !== 2 || r.dropped.characters !== 33) {
+    throw new Error(`attrs ${JSON.stringify(row.attrs)}, reply ${JSON.stringify(r.dropped)}`);
+  }
+  await remember("memory", "delta");
+  if (dropped().length !== 1) throw new Error(`a later write that fit was traced: ${JSON.stringify(dropped())}`);
+  // Any key is traced, but a name the agent chose is recorded only as "other": it may itself be note text.
+  await remember("owner-said-call-me-sam", A);
+  await remember("owner-said-call-me-sam", C);
+  const other = dropped().slice(1);
+  if (other.length !== 1 || other[0].attrs.key !== "other" || other[0].attrs.lines !== 1 || other[0].attrs.characters !== A.length) {
+    throw new Error(`another key's drop: ${JSON.stringify(other)}`);
+  }
+});
+
+await check("a state.dropped row carries none of the dropped lines and none of the document", async () => {
+  const { store, rows, remember, dropped } = await traced(60);
+  const LOST = "SENTINEL-LOST-7f3a owner said call the dentist";
+  const KEPT = "SENTINEL-KEPT-91c2";
+  await remember("memory", LOST);
+  const r = await remember("memory", `${KEPT} ${"k".repeat(30)}`);
+  if (r.dropped?.lines !== 1 || !r.dropped.text.includes(LOST)) throw new Error(`the overflow did not happen: ${JSON.stringify(r)}`);
+  if (!(await store.getState("t", "a", "memory"))?.value?.includes(KEPT)) throw new Error("the document does not hold the kept line");
+  if (dropped().length !== 1) throw new Error(`${dropped().length} rows`);
+  // Every row the call wrote, not only the one asked for: no row of the call may carry either.
+  const text = JSON.stringify(rows);
+  for (const s of ["SENTINEL-LOST", "dentist", "SENTINEL-KEPT", "kkkkkkkk"]) {
+    if (text.includes(s)) throw new Error(`a trace row carries ${s}: ${text}`);
+  }
+});
+
 await check("the receipt is quoted up to its limit, and a line too long for any document is refused rather than cut", async () => {
   for (const { name, store, plugin } of await backends()) {
     const ctx = capped(4000);
