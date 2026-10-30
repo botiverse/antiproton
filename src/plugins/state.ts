@@ -7,7 +7,7 @@ import type { Json } from "../core/types.ts";
 import { importKek, KEPT_NAME, KEPT_PREFIX, open, seal } from "../runtime/secrets.ts";
 import { STATE_INLINE_MAX, STATE_KEY } from "./state-key.ts";
 import type { SeedFileMeta, SeedMode } from "../store/seed-files.ts";
-import { documentFull, type WhenFull } from "../store/state-lines.ts";
+import { putRefusal, type WhenFull } from "../store/state-lines.ts";
 
 type SealingKey = Awaited<ReturnType<typeof importKek>>;
 
@@ -602,13 +602,16 @@ export function statePlugin(
           if (body.length > cfg.maxValueBytes) {
             throw new Error(`value is ${body.length} bytes; the limit is ${cfg.maxValueBytes}`);
           }
-          // Text put to a document that refuses when full is held to the same cap a `remember` is, in the same unit:
-          // past it, the next `remember` would be refused anyway, and on a document that dropped instead it would
-          // silently lose everything above the cap at once. A value that is not text has no lines to keep or lose
-          // and is stored as before.
-          if (typeof a.value === "string" && a.value.length > cfg.maxDocumentBytes && whenFullOf(key) === "refuse") {
-            const now = (await store.getState(tenantId, agentId, key))?.value;
-            throw withShown(documentFull(key, typeof now === "string" ? now.length : null, a.value.length, cfg.maxDocumentBytes, "put"), key);
+          // The one test of whether this value is moved to object storage, used both by the refusal below and by
+          // the write at the end, so the two cannot disagree about what is moved.
+          const spills = body.length > STATE_INLINE_MAX;
+          // Text put to a document that refuses when full is held to the cap a `remember` is, in the same unit: past
+          // it, the next `remember` would be refused anyway. And it must stay inline: moved to object storage, the
+          // document could no longer be appended to or revised (src/store/state-lines.ts `putRefusal`). A value that
+          // is not text has no lines to keep or lose and is stored as before.
+          if (typeof a.value === "string" && whenFullOf(key) === "refuse") {
+            const refused = putRefusal(key, a.value, cfg.maxDocumentBytes, spills ? { encoded: body.length, inlineMax: STATE_INLINE_MAX } : null);
+            if (refused) throw refused;
           }
           // Checked before writing, not after: the point is to refuse, not to
           // notice afterwards that the object is full.
@@ -635,7 +638,7 @@ export function statePlugin(
               `delete something with the \`forget\` tool on \`${ctx.alias}\``,
             );
           }
-          if (body.length <= STATE_INLINE_MAX) {
+          if (!spills) {
             await store.putState(tenantId, agentId, key, {
               value: a.value ?? null, ref: null, bytes: body.length,
             });

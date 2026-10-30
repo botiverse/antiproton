@@ -296,7 +296,7 @@ export interface StorageAdapter {
    *  throws `<key>_full` (src/store/state-lines.ts `appendLines`); it refuses a
    *  value that is not a string rather than replace it. */
   appendState(
-    tenantId: string, agentId: string, key: string, text: string, maxBytes: number, whenFull?: WhenFull,
+    tenantId: string, agentId: string, key: string, text: string, maxBytes: number, whenFull: WhenFull,
   ): Promise<{ bytes: number; dropped: string[] }>;
   /** Replace the one line of a text document that contains `match`, or remove
    *  it when `replace` is null; `line` is its number from 1 and `was` its text

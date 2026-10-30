@@ -58,7 +58,7 @@ await check("追加是一次调用，且保留末尾", async () => {
 
   // A full document drops its head, not its tail: the recent end is the part
   // worth having.
-  const r = await store.appendState("t", "a", "journal", "the newest line", 20);
+  const r = await store.appendState("t", "a", "journal", "the newest line", 20, "drop");
   if (!r.dropped.length) throw new Error("an overfull document was not trimmed");
   const after = await store.getState("t", "a", "journal");
   if (!String(after?.value).endsWith("the newest line")) throw new Error("trimming lost the tail");
@@ -540,7 +540,8 @@ await check("remember on a full memory or todo is refused on both stores, writes
       const budget = WORKING_SET.find((d) => d.key === key)!.budget;
       for (const want of [`\`${key}\` is full: it is 33 characters, this line adds 30 to make it 63, and it holds at most 50`,
         "nothing was written", "free at least 13 characters first", "`revise`", "`forget`", "then remember this again",
-        "blank lines or layout, `put` the document again within 50 characters",
+        // No number for `put`: what binds a put is its JSON length, not this cap.
+        "blank lines or layout, `put` the document again, shorter, instead",
         `The prompt shows only the first and last part of \`${key}\` past ${budget} characters`, "`get` reads all of it"]) {
         if (!said.includes(want)) throw new Error(`${name}: ${key}: the refusal does not say ${JSON.stringify(want)}: ${said}`);
       }
@@ -606,7 +607,7 @@ await check("put of text past the cap to memory or todo is refused with the same
     for (const key of ["memory", "todo"]) {
       await plugin.invoke("remember", { key, text: A }, ctx);
       const r = await refusal(() => plugin.invoke("put", { key, value: "p".repeat(41) }, ctx));
-      if (r.code !== `${key}_full` || !(r.threw ?? "").startsWith(`${key}_full: \`${key}\` holds at most 40 characters, and this put is 41, so nothing was written; it is 16 now`)) {
+      if (r.code !== `${key}_full` || !(r.threw ?? "").startsWith(`${key}_full: \`${key}\` holds at most 40 characters, and this put is 41, so nothing was written. Put a shorter`)) {
         throw new Error(`${name}: ${key}: ${JSON.stringify(r)}`);
       }
       if ((await store.getState("t", "a", key))?.value !== A) throw new Error(`${name}: ${key}: a refused put changed the document`);
@@ -748,12 +749,75 @@ await check("revise refuses a value that is not text, one kept in object storage
 /** One sequence on both stores: every reply, refusal and value the same, character for character. Both call the rules in
  *  state-lines.ts, so this catches a store that stops calling them; the concurrency check is the one that tells the
  *  stores' own reads and writes apart. */
+await check("a text put to memory or todo that put would move to object storage is refused by its JSON length, never its character count", async () => {
+  // Moved there, the document could no longer be appended to or revised, and the 64 KiB character cap does not stop it:
+  // the move is decided on the JSON, past 32 KiB. Two shapes, since they prove different things.
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(64 * 1024);
+    for (const key of ["memory", "todo"]) {
+      await plugin.invoke("remember", { key, text: A }, ctx);
+      // (a) 22,000 characters, under both 32 KiB and the cap; its newlines encode to two each, so its JSON is 33,002.
+      // (b) one 33,000-character line: no escapes, the JSON is only its quotes longer.
+      for (const [shape, value] of [["newlines", "m\n".repeat(11_000)], ["one line", "x".repeat(33_000)]] as const) {
+        const encoded = JSON.stringify(value).length;
+        const r = await refusal(() => plugin.invoke("put", { key, value }, ctx));
+        const said = r.threw ?? "";
+        if (r.code !== `${key}_full` || !said.startsWith(`${key}_full: a \`put\` is kept where it can still be appended to and revised only up to 32768 of its JSON encoding, and this one encodes to ${encoded}, so nothing was written.`)
+          || !said.includes("the encoded length, not the character count `remember` uses")) {
+          throw new Error(`${name}: ${key}: ${shape}: ${JSON.stringify(r).slice(0, 400)}`);
+        }
+        // No character count beside the encoded limit: not the value's, not the cap, not the prompt's budget.
+        for (const n of [value.length, 64 * 1024, ...WORKING_SET.map((d) => d.budget)]) {
+          if (said.includes(String(n))) throw new Error(`${name}: ${key}: ${shape}: the refusal shows ${n}, a character count: ${said}`);
+        }
+        if ((await store.getState("t", "a", key))?.value !== A) throw new Error(`${name}: ${key}: ${shape}: a refused put changed the document`);
+      }
+      // Just inside the row: stored inline, and it can still be remembered into and revised.
+      const fits = "m\n".repeat(10_000);
+      const ok = await plugin.invoke("put", { key, value: fits }, ctx) as any;
+      if (ok.stored !== "inline") throw new Error(`${name}: ${key}: ${JSON.stringify(ok)}`);
+      await plugin.invoke("remember", { key, text: "after the put" }, ctx);
+      await plugin.invoke("revise", { key, match: "after the" }, ctx);
+    }
+  }
+});
+
+await check("refusals on a document ending with a newline, on one already past the cap, of several lines, and of text too long for any document", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(50);
+    // The seeded shape: the trailing newline is in the size, and the line adds only itself.
+    await store.putState("t", "a", "memory", { value: `${A}\n${B}\n`, ref: null, bytes: 0 });
+    const seeded = await refusal(() => plugin.invoke("remember", { key: "memory", text: C }, ctx));
+    if (seeded.code !== "memory_full" || !(seeded.threw ?? "").includes("it is 34 characters, this line adds 29 to make it 63, and it holds at most 50")
+      || !(seeded.threw ?? "").includes("free at least 13 characters first")) throw new Error(`${name}: seeded shape: ${JSON.stringify(seeded)}`);
+    if ((await store.getState("t", "a", "memory"))?.value !== `${A}\n${B}\n`) throw new Error(`${name}: seeded shape changed`);
+    // Already past the cap, as a `put` under a larger cap leaves it: any line is refused, and the shortfall says how far.
+    const over = `${"o".repeat(30)}\n${"p".repeat(29)}`;
+    await store.putState("t", "a", "todo", { value: over, ref: null, bytes: 0 });
+    const past = await refusal(() => plugin.invoke("remember", { key: "todo", text: "q" }, ctx));
+    if (past.code !== "todo_full" || !(past.threw ?? "").includes("it is 60 characters, this line adds 2 to make it 62, and it holds at most 50")
+      || !(past.threw ?? "").includes("free at least 12 characters first")) throw new Error(`${name}: past the cap: ${JSON.stringify(past)}`);
+    if ((await store.getState("t", "a", "todo"))?.value !== over) throw new Error(`${name}: past the cap changed`);
+    // Several lines are text, not a line.
+    const many = await refusal(() => plugin.invoke("remember", { key: "memory", text: "first line here\nsecond line" }, ctx));
+    if (!(many.threw ?? "").includes("this text adds 27 to make it 61")) throw new Error(`${name}: several lines: ${JSON.stringify(many)}`);
+    // Too long for any document: on memory and todo it carries the code; on journal it does not.
+    for (const key of ["memory", "todo", "journal"]) {
+      const long = await refusal(() => plugin.invoke("remember", { key, text: "y".repeat(51) }, ctx));
+      const want = key === "journal" ? undefined : `${key}_full`;
+      if (long.code !== want || !(long.threw ?? "").startsWith(`${want ? `${want}: ` : ""}that line is 51 characters; a document holds at most 50, so nothing was written`)) {
+        throw new Error(`${name}: ${key}: too long: ${JSON.stringify(long)}`);
+      }
+    }
+  }
+});
+
 await check("the sqlite store and the Durable Object store answer the same sequence identically", async () => {
   const runs: string[] = [];
   for (const { store, plugin } of await backends()) {
     const ctx = capped(50);
     const log: unknown[] = [];
-    const steps: Array<[string, Record<string, unknown>]> = [
+    const steps: Array<[string, Record<string, unknown>, PluginContext?]> = [
       ["remember", { key: "journal", text: "第一行 é😀" }], ["remember", { key: "journal", text: A }],
       ["remember", { key: "journal", text: B }], ["remember", { key: "journal", text: C }],
       ["revise", { key: "journal", match: "charlie", replace: "c" }], ["revise", { key: "journal", match: "c" }],
@@ -762,14 +826,18 @@ await check("the sqlite store and the Durable Object store answer the same seque
       ["remember", { key: "memory", text: A }], ["remember", { key: "memory", text: B }],
       ["remember", { key: "memory", text: C }], ["revise", { key: "memory", match: "alpha" }],
       ["remember", { key: "memory", text: C }], ["put", { key: "todo", value: "t".repeat(51) }],
+      ["remember", { key: "todo", text: "u".repeat(51) }], ["remember", { key: "memory", text: "v\nw".repeat(10) }],
+      ["put", { key: "memory", value: "m\n".repeat(11_000) }, capped(64 * 1024)],
     ];
-    for (const [tool, args] of steps) {
-      log.push(await attempt(() => plugin.invoke(tool, args, ctx)));
+    for (const [tool, args, own] of steps) {
+      // The code too, not only the sentence: a store that refused with another code would still say the same words.
+      log.push(await refusal(() => plugin.invoke(tool, args, own ?? ctx)));
       log.push((await store.getState("t", "a", String(args.key)))?.value ?? null);
     }
     runs.push(JSON.stringify(log));
   }
   if (runs[0] !== runs[1]) throw new Error(`the stores differ:\nsqlite ${runs[0]}\ndurable ${runs[1]}`);
+  if (!runs[0]!.includes('"code":"memory_full"') || !runs[0]!.includes('"code":"todo_full"')) throw new Error(`no code was compared: ${runs[0]}`);
 });
 
 await check("concurrent remember and revise calls on one key lose no write, and each revise reply is true of the final document", async () => {

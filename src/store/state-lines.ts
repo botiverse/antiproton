@@ -44,31 +44,66 @@ const blank = (line: string) => !line.trim();
 export type WhenFull = "drop" | "refuse";
 
 /**
- * The refusal of a write that would take a document that refuses when full
- * (`WhenFull`) from `size` to `after` characters, past `max`; `size` is null
- * for a `put` over a value that is not text. `short` is how much content must
- * go first, which is less than `after - max` when blank lines at the head are
- * given up for free. Every number is in the unit the cap is checked in, the
- * text's length, so one `revise` can free enough.
+ * The refusal of a `remember` that would take a document that refuses when
+ * full (`WhenFull`) from `size` to `after` characters, past `max`. `short` is
+ * how much content must go first, which is less than `after - max` when blank
+ * lines at the head are given up for free. Every number is in the unit the cap
+ * is checked in, the text's length, so one `revise` can free enough.
  *
  * The code is `<key>_full`, on the error for the call's record and also at the
  * start of the sentence: the gateway shows the model every plugin error as
  * `tool_error`, so the sentence is the only place the model can read it.
+ *
+ * The `put` it suggests for blank lines and layout has no number: what binds a
+ * `put` is not this cap but `putRefusal`'s, in another unit.
  */
-export function documentFull(
-  key: string, size: number | null, after: number, max: number, verb: "remember" | "put" = "remember", short = after - max,
-): Error {
+export function documentFull(key: string, size: number, after: number, max: number, short: number, text: string): Error {
   const code = `${key}_full`;
-  const message = verb === "put"
-    ? `${code}: \`${key}\` holds at most ${max} characters, and this put is ${after}, so nothing was written`
-      + `${size === null ? "" : `; it is ${size} now`}. Put at most ${max} characters: keep the lines that are still true`
-    : `${code}: \`${key}\` is full: it is ${size} characters, this line adds ${after - size!} to make it ${after}, and it `
-      + `holds at most ${max}, so nothing was written. It keeps its oldest lines rather than dropping them: free at least `
-      + `${short} characters first, by deleting or shortening a line that is no longer true with \`revise\` or `
-      + "dropping the whole document with `forget`, then remember this again. If what has to go is blank lines or "
-      + `layout, \`put\` the document again within ${max} characters instead: \`revise\` changes a line that has text on it`;
-  return Object.assign(new Error(message), { code });
+  return Object.assign(new Error(
+    `${code}: \`${key}\` is full: it is ${size} characters, this ${multiline(text) ? "text" : "line"} adds ${after - size} `
+    + `to make it ${after}, and it holds at most ${max}, so nothing was written. It keeps its oldest lines rather than `
+    + `dropping them: free at least ${short} characters first, by deleting or shortening a line that is no longer true `
+    + "with `revise` or dropping the whole document with `forget`, then remember this again. If what has to go is blank "
+    + "lines or layout, `put` the document again, shorter, instead: `revise` changes a line that has text on it",
+  ), { code });
 }
+
+/**
+ * The refusal of a text `put` to a document that refuses when full, or null
+ * when it may be written. Two limits, each in its own unit and its own
+ * sentence. The document's cap, in characters of the text, as `remember`
+ * counts it. And the row's: only a `put` can leave a document in object
+ * storage (`appendState` always writes it inline), and one left there can no
+ * longer be appended to or revised (`documentText`), so a text `put` that
+ * would be moved there is refused rather than stored where the next
+ * `remember` would be refused for a reason the agent cannot fix by freeing
+ * space. `spills` is `put`'s own decision to move the value, not a second
+ * judgement of it: non-null exactly when `put` would, with the quantity and the
+ * limit it decided by, the length of the JSON and STATE_INLINE_MAX
+ * (src/plugins/state-key.ts). No sentence about how much of the document the
+ * prompt shows is added to this refusal (`withShown`): that is in characters.
+ *
+ * The document's size now is left out: every number in one message is in one
+ * unit, and the size in the encoded unit would be a second read for a figure
+ * that does not change what fits, since a `put` replaces the whole document.
+ */
+export function putRefusal(
+  key: string, text: string, max: number, spills: { encoded: number; inlineMax: number } | null,
+): Error | null {
+  const code = `${key}_full`;
+  const why = text.length > max
+    ? `\`${key}\` holds at most ${max} characters, and this put is ${text.length}, so nothing was written.`
+    : spills
+      ? `a \`put\` is kept where it can still be appended to and revised only up to ${spills.inlineMax} of its JSON `
+        + `encoding, and this one encodes to ${spills.encoded}, so nothing was written. That is the encoded length, not the character count `
+        + "`remember` uses: every newline and quote counts double."
+      : null;
+  if (!why) return null;
+  return Object.assign(new Error(`${code}: ${why} Put a shorter document: keep the lines that are still true`), { code });
+}
+
+/** Whether `text` is more than one line. */
+const multiline = (text: string) => /[\r\n]/.test(text);
 
 /**
  * `text` added as the document's last line, and the oldest whole lines dropped
@@ -88,13 +123,15 @@ export function documentFull(
  * not after a blank line.
  */
 export function appendLines(
-  key: string, before: string, text: string, max: number, whenFull: WhenFull = "drop",
+  key: string, before: string, text: string, max: number, whenFull: WhenFull,
 ): { kept: string; dropped: string[] } {
   if (text.length > max) {
-    throw new Error(
-      `${/[\r\n]/.test(text) ? "that text" : "that line"} is ${text.length} characters; `
+    // A document that refuses when full says so by its code here too: the model reads the code only in the sentence.
+    const code = whenFull === "refuse" ? `${key}_full` : null;
+    throw Object.assign(new Error(
+      `${code ? `${code}: ` : ""}${multiline(text) ? "that text" : "that line"} is ${text.length} characters; `
       + `a document holds at most ${max}, so nothing was written`,
-    );
+    ), code ? { code } : {});
   }
   const size = before.length;
   const eol = before.includes("\r\n") ? "\r\n" : "\n";
@@ -110,7 +147,7 @@ export function appendLines(
     // they go for free, and only content that would still have to go is refused. `revise` could not remove them.
     let free = length;
     while (free > max && i < lines.length && blank(lines[i]!)) { free -= lines[i]!.length + 1; i++; }
-    if (free > max) throw documentFull(key, size, length, max, "remember", free - max);
+    if (free > max) throw documentFull(key, size, length, max, free - max, text);
     length = free;
   }
   while (length > max && i < lines.length) {

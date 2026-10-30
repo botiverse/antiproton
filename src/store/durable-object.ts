@@ -595,7 +595,7 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async appendState(
-    tenantId: string, agentId: string, key: string, text: string, maxBytes: number, whenFull: WhenFull = "drop",
+    tenantId: string, agentId: string, key: string, text: string, maxBytes: number, whenFull: WhenFull,
   ) {
     // What the text becomes is decided in state-lines.ts, the same for both stores.
     // Read and written in one synchronous transaction: an await between the two
