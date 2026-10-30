@@ -96,7 +96,7 @@ export function putRefusal(
     : spills
       ? `a \`put\` is kept where it can still be appended to and revised only up to ${spills.inlineMax} of its JSON `
         + `encoding, and this one encodes to ${spills.encoded}, so nothing was written. That is the encoded length, not the character count `
-        + "`remember` uses: every newline and quote counts double."
+        + "`remember` uses: newlines, quotes, backslashes and other control characters count extra."
       : null;
   if (!why) return null;
   return Object.assign(new Error(`${code}: ${why} Put a shorter document: keep the lines that are still true`), { code });
