@@ -128,7 +128,7 @@ export function integrationSessionStore(ctx: PluginContext, seen: string[] = [])
       note(session);
       const sealed = await sealText(ctx, SESSION_INFO, JSON.stringify(session), sessionAad(key));
       const row: StoredIntegrationSession = { v: 1, agentId: key.agentId, clientId: key.clientId, ...sealed };
-      await ctx.db.put(INTEGRATION_SESSIONS_STORE, row as unknown as Json, key.clientId);
+      await ctx.db.put(INTEGRATION_SESSIONS_STORE, row, key.clientId);
     },
     async delete(key) {
       await ctx.db.delete(INTEGRATION_SESSIONS_STORE, key.clientId);
