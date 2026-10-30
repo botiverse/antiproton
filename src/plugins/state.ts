@@ -132,6 +132,19 @@ export const WORKING_SET: ReadonlyArray<{
 /** What a `remember` on `key` does when it does not fit: a document of the agent's own naming drops, like `journal`. */
 const whenFullOf = (key: string): WhenFull => WORKING_SET.find((d) => d.key === key)?.whenFull ?? "drop";
 
+/**
+ * A `<key>_full` refusal with one sentence added on how much of the document the prompt shows: an agent deciding what
+ * to free has to know that the copy in front of it may be missing its middle. The budget is the working set's own, so
+ * the sentence cannot name a number the injection does not use. Any other error is returned as it is.
+ */
+function withShown(e: unknown, key: string): unknown {
+  const doc = WORKING_SET.find((d) => d.key === key);
+  if (!doc || (e as { code?: unknown })?.code !== `${key}_full`) return e;
+  (e as Error).message += `. The prompt shows only the first and last part of \`${key}\` past ${doc.budget} characters, `
+    + "saying how much is left out between them; `get` reads all of it";
+  return e;
+}
+
 /** Named once because `workingSet` looks a mount up by it. A second copy of the
  *  string is how the injected text came to name a tool nothing had to provide. */
 const PLUGIN_ID = "state";
@@ -483,7 +496,8 @@ export function statePlugin(
         case "remember": {
           const text = String(a.text ?? "").trim();
           if (!text) throw new Error("nothing to remember");
-          const r = await store.appendState(tenantId, agentId, key, text, cfg.maxDocumentBytes, whenFullOf(key));
+          const r = await store.appendState(tenantId, agentId, key, text, cfg.maxDocumentBytes, whenFullOf(key))
+            .catch((e) => { throw withShown(e, key); });
           // `bytes` is the document's length as the cap counts it, characters, so the two can be read together.
           const cap = cfg.maxDocumentBytes;
           if (!r.dropped.length) return { key, bytes: r.bytes, cap };
@@ -594,7 +608,7 @@ export function statePlugin(
           // and is stored as before.
           if (typeof a.value === "string" && a.value.length > cfg.maxDocumentBytes && whenFullOf(key) === "refuse") {
             const now = (await store.getState(tenantId, agentId, key))?.value;
-            throw documentFull(key, typeof now === "string" ? now.length : null, a.value.length, cfg.maxDocumentBytes, "put");
+            throw withShown(documentFull(key, typeof now === "string" ? now.length : null, a.value.length, cfg.maxDocumentBytes, "put"), key);
           }
           // Checked before writing, not after: the point is to refuse, not to
           // notice afterwards that the object is full.

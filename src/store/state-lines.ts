@@ -46,22 +46,28 @@ export type WhenFull = "drop" | "refuse";
 /**
  * The refusal of a write that would take a document that refuses when full
  * (`WhenFull`) from `size` to `after` characters, past `max`; `size` is null
- * for a `put` over a value that is not text. Every number is
- * in the unit the cap is checked in, the text's length, and the shortfall is
- * given outright, so one `revise` can free enough. `code` is `<key>_full`, for
- * the call's trace row; the agent reads the sentence.
+ * for a `put` over a value that is not text. `short` is how much content must
+ * go first, which is less than `after - max` when blank lines at the head are
+ * given up for free. Every number is in the unit the cap is checked in, the
+ * text's length, so one `revise` can free enough.
+ *
+ * The code is `<key>_full`, on the error for the call's record and also at the
+ * start of the sentence: the gateway shows the model every plugin error as
+ * `tool_error`, so the sentence is the only place the model can read it.
  */
 export function documentFull(
-  key: string, size: number | null, after: number, max: number, verb: "remember" | "put" = "remember",
+  key: string, size: number | null, after: number, max: number, verb: "remember" | "put" = "remember", short = after - max,
 ): Error {
+  const code = `${key}_full`;
   const message = verb === "put"
-    ? `\`${key}\` holds at most ${max} characters, and this put is ${after}, so nothing was written`
+    ? `${code}: \`${key}\` holds at most ${max} characters, and this put is ${after}, so nothing was written`
       + `${size === null ? "" : `; it is ${size} now`}. Put at most ${max} characters: keep the lines that are still true`
-    : `\`${key}\` is full: it is ${size} characters, this line adds ${after - size!} to make it ${after}, and it holds at `
-      + `most ${max}, so nothing was written. It keeps its oldest lines rather than dropping them: free at least `
-      + `${after - max} characters first, by deleting or shortening a line that is no longer true with \`revise\` or `
-      + "dropping the whole document with `forget`, then remember this again";
-  return Object.assign(new Error(message), { code: `${key}_full` });
+    : `${code}: \`${key}\` is full: it is ${size} characters, this line adds ${after - size!} to make it ${after}, and it `
+      + `holds at most ${max}, so nothing was written. It keeps its oldest lines rather than dropping them: free at least `
+      + `${short} characters first, by deleting or shortening a line that is no longer true with \`revise\` or `
+      + "dropping the whole document with `forget`, then remember this again. If what has to go is blank lines or "
+      + `layout, \`put\` the document again within ${max} characters instead: \`revise\` changes a line that has text on it`;
+  return Object.assign(new Error(message), { code });
 }
 
 /**
@@ -69,8 +75,9 @@ export function documentFull(
  * until the result is at most `max` characters. Text that does not fit even
  * alone is refused rather than cut, so the document is never left holding part
  * of what the agent wrote. With `whenFull` "refuse", text that would need any
- * line dropped is refused instead, with the code `<key>_full`, and the document
- * is unchanged: the agent decides what to give up, with `revise` or `forget`.
+ * line with something on it dropped is refused instead, with the code
+ * `<key>_full`, and the document is unchanged: the agent decides what to give
+ * up, with `revise`, `forget` or `put`. Blank lines at its head still go.
  *
  * `dropped` is the lines that said something, oldest first, without a CRLF
  * document's `\r`: a blank line carries nothing to save again, and counting it
@@ -97,8 +104,15 @@ export function appendLines(
   const lines = before.split("\n");
   // The length of `lines.slice(i).join("\n") + eol + text`, kept as `i` moves.
   let length = before.length + eol.length + text.length;
-  if (length > max && whenFull === "refuse") throw documentFull(key, size, length, max);
   let i = 0;
+  if (length > max && whenFull === "refuse") {
+    // Blank lines at the head say nothing, so giving them up loses nothing and is not the loss refusing prevents:
+    // they go for free, and only content that would still have to go is refused. `revise` could not remove them.
+    let free = length;
+    while (free > max && i < lines.length && blank(lines[i]!)) { free -= lines[i]!.length + 1; i++; }
+    if (free > max) throw documentFull(key, size, length, max, "remember", free - max);
+    length = free;
+  }
   while (length > max && i < lines.length) {
     // The line and the newline that followed it.
     length -= lines[i]!.length + 1;

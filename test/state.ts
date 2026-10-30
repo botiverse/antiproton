@@ -535,8 +535,13 @@ await check("remember on a full memory or todo is refused on both stores, writes
       const r = await refusal(() => plugin.invoke("remember", { key, text: C }, ctx));
       if (r.code !== `${key}_full`) throw new Error(`${name}: ${key}: not refused as ${key}_full: ${JSON.stringify(r)}`);
       const said = r.threw ?? "";
+      // The code opens the sentence: the gateway shows the model every plugin error as `tool_error`.
+      if (!said.startsWith(`${key}_full: `)) throw new Error(`${name}: ${key}: the refusal does not open with its code: ${said}`);
+      const budget = WORKING_SET.find((d) => d.key === key)!.budget;
       for (const want of [`\`${key}\` is full: it is 33 characters, this line adds 30 to make it 63, and it holds at most 50`,
-        "nothing was written", "free at least 13 characters first", "`revise`", "`forget`", "then remember this again"]) {
+        "nothing was written", "free at least 13 characters first", "`revise`", "`forget`", "then remember this again",
+        "blank lines or layout, `put` the document again within 50 characters",
+        `The prompt shows only the first and last part of \`${key}\` past ${budget} characters`, "`get` reads all of it"]) {
         if (!said.includes(want)) throw new Error(`${name}: ${key}: the refusal does not say ${JSON.stringify(want)}: ${said}`);
       }
       const after = await store.getState("t", "a", key);
@@ -561,6 +566,30 @@ await check("remember on a full memory or todo is refused on both stores, writes
   }
 });
 
+await check("a full memory whose head is blank lines gives them up for a remember, and refuses only when content would go", async () => {
+  // `revise` cannot remove a blank line (its match cannot be empty or span lines), so refusing over one would ask for
+  // something the agent cannot do; and a blank line is no loss.
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(50);
+    const head = "\n\n\n\n\n\n\n\n\n\n";
+    for (const key of ["memory", "todo"]) {
+      await store.putState("t", "a", key, { value: `${head}${A}\n${B}`, ref: null, bytes: 0 });
+      // 43 characters; C adds 30, to 73: the ten blank lines cover 10 of the 23 over, so 13 of content would still go.
+      const r = await refusal(() => plugin.invoke("remember", { key, text: C }, ctx));
+      if (r.code !== `${key}_full` || !(r.threw ?? "").includes("free at least 13 characters first")) throw new Error(`${name}: ${key}: ${JSON.stringify(r)}`);
+      if ((await store.getState("t", "a", key))?.value !== `${head}${A}\n${B}`) throw new Error(`${name}: ${key}: a refusal changed the document`);
+      // A shorter line fits once the blank head goes: written, nothing with text on it lost, no receipt.
+      const ok = await plugin.invoke("remember", { key, text: "x".repeat(10) }, ctx) as any;
+      const value = (await store.getState("t", "a", key))?.value;
+      if ("dropped" in ok || "note" in ok || value !== `${A}\n${B}\n${"x".repeat(10)}`) throw new Error(`${name}: ${key}: ${JSON.stringify(ok)} / ${JSON.stringify(value)}`);
+    }
+  }
+  const { remember, store, dropped } = await traced(50);
+  await store.putState("t", "a", "memory", { value: `\n\n\n\n\n\n\n\n\n\n${A}\n${B}`, ref: null, bytes: 0 });
+  await remember("memory", "x".repeat(10));
+  if (dropped().length !== 0) throw new Error(`giving up blank lines was traced as a drop: ${JSON.stringify(dropped())}`);
+});
+
 await check("a refused remember writes no state.dropped row, and the failed call is recorded with the code", async () => {
   const { failures, remember, raw, dropped } = await traced(40);
   await remember("memory", A);
@@ -577,7 +606,7 @@ await check("put of text past the cap to memory or todo is refused with the same
     for (const key of ["memory", "todo"]) {
       await plugin.invoke("remember", { key, text: A }, ctx);
       const r = await refusal(() => plugin.invoke("put", { key, value: "p".repeat(41) }, ctx));
-      if (r.code !== `${key}_full` || !(r.threw ?? "").includes(`\`${key}\` holds at most 40 characters, and this put is 41, so nothing was written; it is 16 now`)) {
+      if (r.code !== `${key}_full` || !(r.threw ?? "").startsWith(`${key}_full: \`${key}\` holds at most 40 characters, and this put is 41, so nothing was written; it is 16 now`)) {
         throw new Error(`${name}: ${key}: ${JSON.stringify(r)}`);
       }
       if ((await store.getState("t", "a", key))?.value !== A) throw new Error(`${name}: ${key}: a refused put changed the document`);
