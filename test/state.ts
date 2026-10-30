@@ -446,7 +446,7 @@ async function traced(maxDocumentBytes: number) {
   return { store, rows, remember, dropped: () => rows.filter((r) => r.kind === "state.dropped") };
 }
 
-await check("a remember that drops lines writes one state.dropped row with the key and the counts; one that fits writes none", async () => {
+await check("a remember that drops lines writes one state.dropped row with the key (or other) and the counts; one that fits writes none", async () => {
   const { remember, dropped } = await traced(40);
   await remember("memory", A);
   await remember("memory", B);
@@ -465,11 +465,11 @@ await check("a remember that drops lines writes one state.dropped row with the k
   }
   await remember("memory", "delta");
   if (dropped().length !== 1) throw new Error(`a later write that fit was traced: ${JSON.stringify(dropped())}`);
-  // Any key, not only the conventional ones.
-  await remember("notes/2026", A);
-  await remember("notes/2026", C);
+  // Any key is traced, but a name the agent chose is recorded only as "other": it may itself be note text.
+  await remember("owner-said-call-me-sam", A);
+  await remember("owner-said-call-me-sam", C);
   const other = dropped().slice(1);
-  if (other.length !== 1 || other[0].attrs.key !== "notes/2026" || other[0].attrs.lines !== 1 || other[0].attrs.characters !== A.length) {
+  if (other.length !== 1 || other[0].attrs.key !== "other" || other[0].attrs.lines !== 1 || other[0].attrs.characters !== A.length) {
     throw new Error(`another key's drop: ${JSON.stringify(other)}`);
   }
 });
