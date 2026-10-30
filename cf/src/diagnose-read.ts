@@ -52,6 +52,16 @@ export interface DiagnosisDeps {
   env?: Record<string, unknown>;
 }
 
+/**
+ * A `trace_drops` line's `kinds` (written by cf/src/trace-r2.ts `flushTrace`): its object; `not recorded` for a line
+ * without one (written before the column, or when the column could not be added), never `{}`, which would read as
+ * "no kinds"; `unreadable` for a value that is not one.
+ */
+const dropKinds = (v: unknown): Record<string, number> | "not recorded" | "unreadable" => {
+  if (v === null || v === undefined) return "not recorded";
+  try { const o = JSON.parse(String(v)); return o !== null && typeof o === "object" && !Array.isArray(o) ? o : "unreadable"; } catch { return "unreadable"; }
+};
+
 const rows = (sql: Sql, table: string, query: string, ...bindings: unknown[]): any[] =>
   hasTable(sql, table) ? (sql.exec(query, ...bindings).toArray() as any[]) : [];
 
@@ -215,9 +225,11 @@ export async function readDiagnosis(
     alarmErrors: rows(sql, "alarm_errors", "SELECT at, message FROM alarm_errors ORDER BY at DESC LIMIT 3")
       .map((r) => r.message),
     // Trace rows the drain refused (cf/src/trace-r2.ts): the number's place to
-    // be seen, beside what else this object has had go wrong.
-    traceDrops: rows(sql, "trace_drops", "SELECT at, dropped FROM trace_drops ORDER BY at DESC LIMIT 3")
-      .map((r) => ({ at: Number(r.at), dropped: Number(r.dropped) })),
+    // be seen, beside what else this object has had go wrong, with which kinds and
+    // the first seq. `*`, not the columns: a table older than `kinds` and
+    // `first_seq` gains them only at the next drop, and reading adds nothing.
+    traceDrops: rows(sql, "trace_drops", "SELECT * FROM trace_drops ORDER BY at DESC LIMIT 3")
+      .map((r) => ({ at: Number(r.at), dropped: Number(r.dropped), kinds: dropKinds(r.kinds), firstSeq: r.first_seq == null ? null : Number(r.first_seq) })),
     // The forward's lanes (cf/src/trace-forward.ts): each null while it has never run here (forwarding is off until
     // configured, and makes no table until then); otherwise what waits, the backoff, and its last counted outcomes.
     // Whether forwarding is on, off, or misconfigured and why (an http URL is refused: the token would go in the clear),

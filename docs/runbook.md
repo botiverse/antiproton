@@ -172,10 +172,10 @@ marked), `interrupted-before` (a renewal in this object stopped part-way; the ne
 `tenantId`, `agentId`, `connectorId`, `why` (`expiring`, `rejected`, `adopt`) and GitHub's error as `reason`. Never a
 token. A renewal reaching a mount whose reference names a key that is not its own (another mount's, or a name no
 mount can have) writes nothing and logs `github.refresh.skipped` instead: `mount` (the alias), `key`, `why` (`adopt`,
-`reconnect`, `rejected`) and `reason` `mount_key_foreign:shared` or `mount_key_foreign:not_a_mount_key`. It is a line
-only, not a trace row (cf/src/runtime.ts `#renewalSkipped`). Each connect also writes `connect.exchange` with the
-**names** of the keys GitHub's answer carried: one with `expires_in` and `refresh_token` is an expiring token
-(`expiring: true`).
+`reconnect`, `rejected`) and `reason` `mount_key_foreign:shared` or `mount_key_foreign:not_a_mount_key`, and writes a
+`github.refresh_skipped` trace row too (below, "In the trace"; cf/src/runtime.ts `#renewalSkipped`). Each connect
+also writes `connect.exchange` with the **names** of the keys GitHub's answer carried: one with `expires_in` and
+`refresh_token` is an expiring token (`expiring: true`).
 
 **In the trace.** The renewal runs in the agent's object, whose lines Workers Logs can drop (above, "Logs and what an
 object did"): on 2026-10-18 a connector rotated at 18:38:04Z with no `github.refresh` line, while the R2 trace export
@@ -186,7 +186,11 @@ the outcome, `verdict` `ok` for `rotated` and `adopted`, `attrs.scope` `connecto
 OAuth error code (`oauth:bad_refresh_token`; `oauth:other` for a code not known to be GitHub's), `http-<status>`,
 `no-answer`, `no-refresh-token`, `d1-write-failed`, `propagate-error`, `no-app`, `lease-timeout`, `connector-gone`,
 `nothing-to-renew`, `refused` or `other` (`reasonCode` in cf/src/github-refresh.ts). The reason's own text stays in
-the log line only.
+the log line only. A skipped renewal (a foreign key, above) is a row of its own kind, `github.refresh_skipped`:
+`status` `skipped`, `verdict` `blocked`, `attrs` `mount` (the alias), `why` and `reasonCode` (the line's `reason`); the
+key's name is on the line only. It is its own kind, not a `github.refresh` outcome, because that kind is forwarded
+with a fixed list of outcomes and its lane drops a batch the receiver refuses whole; `github.refresh_skipped` is not
+forwarded.
 
 **Mending it** is the person's: reconnect from the agent's page. Raft sends the broken connector's id with the
 connect (`connectorId`, [`agent-surface.md`](agent-surface.md#reconnecting-a-connector-in-place)), so the connector

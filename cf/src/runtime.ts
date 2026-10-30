@@ -1907,8 +1907,12 @@ export class AgentRuntime {
   /**
    * Whether a renewal reaching `mount` (`why`: an adopt, a reconnect in place, a 401) must not write, because the key
    * its reference names is not its own (`#foreignKey`): null to go ahead; otherwise the key, why, and the code
-   * (`mount_key_foreign:<reason>`), said on a `github.refresh.skipped` line. A line and not a `github.refresh` trace
-   * row: those rows are forwarded with a fixed outcome vocabulary (cf/src/trace-forward.ts, docs/runbook.md).
+   * (`mount_key_foreign:<reason>`). Said twice: a `github.refresh.skipped` line, with the key's name, and a
+   * `github.refresh_skipped` trace row with the alias, why and the code only, which the R2 export keeps when Workers
+   * Logs drops the object's line (docs/runbook.md). Its own kind, not a status of `github.refresh`: that kind's rows
+   * go to their own receiver whose outcomes are a fixed list (test/trace-forward.ts `OUTCOMES`), and on that lane a
+   * batch the receiver refuses is dropped whole (cf/src/trace-forward.ts `GITHUB_REFRESH_LANE`, which has no
+   * per-row rejections). This kind is on no lane, so it is not forwarded at all.
    * Renewing a key from its own record before it is read (`GithubRefresher.beforeUse`) is not asked this.
    */
   async #renewalSkipped(tenantId: string, agentId: string, mount: { alias: string; secretRef: string | null },
@@ -1917,6 +1921,11 @@ export class AgentRuntime {
     if (!foreign) return null;
     const code = `mount_key_foreign:${foreign.reason}`;
     logEvent("github.refresh.skipped", { tenantId, agentId, mount: mount.alias, key: foreign.name, why, reason: code });
+    const at = Date.now();
+    try {
+      appendTrace(this.#deps.ctx.storage.sql, [{ at, tenantId, agentId, kind: "github.refresh_skipped",
+        spanId: `refresh_skip_${crypto.randomUUID()}`, status: "skipped", verdict: "blocked", attrs: { mount: mount.alias, why, reasonCode: code } }]);
+    } catch (e) { console.error("github: tracing a skipped renewal failed:", String((e as Error)?.message ?? e).slice(0, 200)); }
     return { ...foreign, code };
   }
 

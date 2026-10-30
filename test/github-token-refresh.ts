@@ -2227,6 +2227,15 @@ await check("a mount whose reference names an inbound hook's signing secret: an 
 /** The `github.refresh.skipped` lines logged for one agent (`AgentRuntime#renewalSkipped`). */
 const skipsOf = (agentId: string) => logged.filter((l) => l.includes('"evt":"github.refresh.skipped"'))
   .map((l) => JSON.parse(l) as Record<string, string>).filter((l) => l.agentId === agentId);
+/**
+ * The `github.refresh_skipped` rows in one agent's trace outbox, as `why:mount:reasonCode`, after checking each carries
+ * those three attrs and nothing else (the key's name is the log line's only), as `skipped`, `blocked`.
+ */
+const skipRowsOf = (host: { sql: unknown }) => pendingTrace(host.sql as any, 0).rows.filter((r) => r.kind === "github.refresh_skipped").map((r) => {
+  must(JSON.stringify(Object.keys(r.attrs).sort()) === JSON.stringify(["mount", "reasonCode", "why"]) && r.status === "skipped" && r.verdict === "blocked"
+    && r.spanId.startsWith("refresh_skip_"), `a skip's trace row: ${JSON.stringify(r)}`);
+  return `${r.attrs.why}:${r.attrs.mount}:${r.attrs.reasonCode}`;
+});
 /** A second github mount (`gh-b` unless named), whose reference names the first mount's key, `gh`. */
 const addGhB = async (a: { rt: AgentRuntime; agentId: string }, alias = "gh-b") => a.rt.store.addMount({
   tenantId: TENANT, agentId: a.agentId, alias, plugin: "github",
@@ -2260,12 +2269,15 @@ await check("a renewal reaching a mount whose reference names another mount's ke
   must(rows() === before, "the adopt wrote b's gh or oauth:gh");
   must(skipsOf(b.agentId).some((l) => l.why === "adopt" && l.mount === "gh-b" && l.key === "gh" && l.reason === "mount_key_foreign:shared"),
     `the adopt's skip was not recorded: ${JSON.stringify(skipsOf(b.agentId))}`);
+  must(skipRowsOf(host).includes("adopt:gh-b:mount_key_foreign:shared"), `the adopt's skip has no trace row: ${JSON.stringify(skipRowsOf(host))}`);
   const adopted = await b.rt.adoptConnection(TENANT, b.agentId, "github", id);
   must(adopted.adopted === false && adopted.renewalSkipped === "mount_key_foreign:shared", `the adopt's answer: ${JSON.stringify(adopted)}`);
   // Another connector: nothing would be written, so nothing is said to be skipped.
-  const n = skipsOf(b.agentId).length;
+  const n = skipsOf(b.agentId).length, traced = skipRowsOf(host).length;
+  must(traced === n, `a skip line without its trace row, or a row without its line: ${n} lines, ${traced} rows`);
   const other = await b.rt.adoptConnection(TENANT, b.agentId, "github", "con_not_this_one");
-  must(other.adopted === false && other.renewalSkipped === undefined && skipsOf(b.agentId).length === n, `another connector's adopt: ${JSON.stringify(other)}`);
+  must(other.adopted === false && other.renewalSkipped === undefined && skipsOf(b.agentId).length === n && skipRowsOf(host).length === traced,
+    `another connector's adopt: ${JSON.stringify(other)}`);
   // A reconnect in place from a: b is listed as failed with why, and its rows are as they were.
   const re = await w.reconnect(a, id);
   await w.settle();
@@ -2273,6 +2285,7 @@ await check("a renewal reaching a mount whose reference names another mount's ke
   must(rows() === before, "the reconnect wrote b's gh or oauth:gh");
   must(skipsOf(b.agentId).some((l) => l.why === "reconnect" && l.mount === "gh-b" && l.key === "gh" && l.reason === "mount_key_foreign:shared"),
     `the reconnect's skip was not recorded: ${JSON.stringify(skipsOf(b.agentId))}`);
+  must(skipRowsOf(host).includes("reconnect:gh-b:mount_key_foreign:shared"), `the reconnect's skip has no trace row: ${JSON.stringify(skipRowsOf(host))}`);
   const direct = await b.rt.reconnectConnection(TENANT, b.agentId, "github", id, await seal(kek, "ghu_" + "w".repeat(36)), await seal(kek, "ghu_" + "n".repeat(36)), null);
   must(!direct.ok && direct.renewalSkipped === "mount_key_foreign:shared" && direct.error.startsWith("mount_key_foreign:shared:"), `the reconnect's answer: ${JSON.stringify(direct)}`);
   must(rows() === before, "the direct reconnect wrote b's gh or oauth:gh");
@@ -2296,9 +2309,49 @@ await check("a 401 through a mount whose reference names another mount's key ren
   must(w.gh.s.refreshes === renewals && rows() === before, `the 401 through ghb renewed gh: ${w.gh.s.refreshes - renewals} ${rows() === before}`);
   must(skipsOf(a.agentId).some((l) => l.why === "rejected" && l.mount === "ghb" && l.key === "gh" && l.reason === "mount_key_foreign:shared"),
     `the 401's skip was not recorded: ${JSON.stringify(skipsOf(a.agentId))}`);
-  const n = skipsOf(a.agentId).length;
-  must(succeeded(await w.tool(a)) && w.gh.s.refreshes === renewals + 1 && rows() !== before && skipsOf(a.agentId).length === n,
+  must(skipRowsOf(host).includes("rejected:ghb:mount_key_foreign:shared"), `the 401's skip has no trace row: ${JSON.stringify(skipRowsOf(host))}`);
+  const n = skipsOf(a.agentId).length, traced = skipRowsOf(host).length;
+  must(succeeded(await w.tool(a)) && w.gh.s.refreshes === renewals + 1 && rows() !== before && skipsOf(a.agentId).length === n && skipRowsOf(host).length === traced,
     `control: the 401 through gh did not renew its own key: ${w.gh.s.refreshes - renewals}`);
+  w.dispose();
+});
+
+await check("a renewal reaching a mount whose reference names a key no mount can have (an adopt, a 401) writes nothing and says why (mount_key_foreign:not_a_mount_key); a trace row that cannot be written changes none of that", async () => {
+  const w = await world();
+  const { hookSecretName } = await import("../src/runtime/inbound.ts");
+  const a = await w.agent("FN");
+  const id = await w.connect(a);
+  const host = w.hostOf(a.agentId);
+  const token = (await w.stored(a)).token!;
+  // The mount's key and its renewal record copied under an inbound hook's name, and the reference pointed there: an
+  // adopt reads that record (it names the connector) and a call sends that key, so both reach the skip.
+  const hook = hookSecretName("h-2");
+  await a.rt.store.putSecret(TENANT, a.agentId, hook, (await a.rt.store.getSecret(TENANT, a.agentId, "gh"))!);
+  await a.rt.store.putSecret(TENANT, a.agentId, `${OAUTH_PREFIX}${hook}`, (await a.rt.store.getSecret(TENANT, a.agentId, `${OAUTH_PREFIX}gh`))!);
+  await a.rt.store.setMountSecretRef(TENANT, a.agentId, "gh", `agent:${hook}`);
+  const rows = () => JSON.stringify(host.sql.exec("SELECT name, ciphertext, iv FROM secrets ORDER BY name").toArray());
+  const before = rows(), renewals = w.gh.s.refreshes;
+  const skipped = (why: string) => skipsOf(a.agentId).filter((l) => l.why === why && l.mount === "gh" && l.key === hook && l.reason === "mount_key_foreign:not_a_mount_key").length;
+  const adopted = await a.rt.adoptConnection(TENANT, a.agentId, "github", id);
+  must(adopted.adopted === false && adopted.renewalSkipped === "mount_key_foreign:not_a_mount_key", `the adopt's answer: ${JSON.stringify(adopted)}`);
+  must(skipped("adopt") === 1 && skipRowsOf(host).join() === "adopt:gh:mount_key_foreign:not_a_mount_key",
+    `the adopt's skip: ${JSON.stringify(skipsOf(a.agentId))} ${JSON.stringify(skipRowsOf(host))}`);
+  w.gh.live.delete(token);
+  const refusals = w.gh.s.unauthorized;
+  const r = await a.rt.gateway().invoke({ tenantId: TENANT, agentId: a.agentId, taskId: "t1" }, "gh.auth_status", {} as any);
+  must(w.gh.s.unauthorized > refusals, `control: GitHub did not answer 401: ${JSON.stringify(r).slice(0, 300)}`);
+  must(skipped("rejected") === 1 && skipRowsOf(host).join() === "adopt:gh:mount_key_foreign:not_a_mount_key,rejected:gh:mount_key_foreign:not_a_mount_key",
+    `the 401's skip: ${JSON.stringify(skipsOf(a.agentId))} ${JSON.stringify(skipRowsOf(host))}`);
+  // The trace refuses the row: the skip is still logged and answered as before, and nothing throws out of it.
+  host.sql.exec("CREATE TRIGGER no_skip_rows BEFORE INSERT ON trace_outbox WHEN NEW.kind = 'github.refresh_skipped' BEGIN SELECT RAISE(ABORT, 'trace refused'); END");
+  const errors: string[] = []; const orig = console.error;
+  console.error = (...x: unknown[]) => { errors.push(x.map(String).join(" ")); };
+  let again: Awaited<ReturnType<AgentRuntime["adoptConnection"]>>;
+  try { again = await a.rt.adoptConnection(TENANT, a.agentId, "github", id); } finally { console.error = orig; }
+  must(again.adopted === false && again.renewalSkipped === "mount_key_foreign:not_a_mount_key", `the adopt's answer with the trace refusing: ${JSON.stringify(again)}`);
+  must(skipped("adopt") === 2 && skipRowsOf(host).length === 2, `with the trace refusing: ${skipped("adopt")} lines, ${skipRowsOf(host).length} rows`);
+  must(errors.some((e) => e.includes("tracing a skipped renewal failed") && e.includes("trace refused")), `the trace's failure was not said: ${JSON.stringify(errors)}`);
+  must(w.gh.s.refreshes === renewals && rows() === before, `a skip renewed or wrote: ${w.gh.s.refreshes - renewals} ${rows() === before}`);
   w.dispose();
 });
 

@@ -92,6 +92,10 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // `kept-unstored`, `interrupted-before`, `propagate-failed`), `attrs` only ids and fixed codes (`scope`, `connectorId`,
 // `mount`, `why`, `attempt`, `stored`, `reasonCode`), never a token or GitHub's own words. It is here because an object's
 // log lines can be dropped from Workers Logs (docs/runbook.md) and this export is what is left. Activity and status skip it.
+// `github.refresh_skipped` is a renewal that did not write because the mount's reference names a key that is not its
+// own (cf/src/runtime.ts `#renewalSkipped`): `status` `skipped`, `attrs` the mount's alias, `why` (`adopt`,
+// `reconnect`, `rejected`) and `reasonCode` (`mount_key_foreign:shared`, `mount_key_foreign:not_a_mount_key`), never
+// the key's name. Not forwarded: it is on neither lane. Activity and status skip it.
 // Once configured it is forwarded outside the account as fixed columns (cf/src/trace-forward.ts, its own lane); so are
 // model.call, model.attempt, tool.call, tool.refused, turn.timing, turn.stop, turn.end_unrecorded, rebuild.outcome,
 // raft.assistant_wake, raft.assistant_notify, raft.assistant_check, raft.assistant_chat_told, raft.assistant_rules,
@@ -103,7 +107,7 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open",
   "turn.stop", "js.run", "tool.refused", "model.attempt",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "turn.end_unrecorded", "import.hold", "model.prewarm",
-  "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "github.refresh", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call",
+  "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "github.refresh", "github.refresh_skipped", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call",
   "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check", "raft.session_unsealable",
   "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner", "stamp.agent_login", "state.dropped"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
@@ -255,6 +259,17 @@ export interface PendingTrace {
   /** Rows read but left out because kind or verdict was not the contract's vocabulary. */
   dropped: number;
   /**
+   * Those rows by what was wrong, with how many of each: `kind:<stored kind>` for a kind not in TRACE_KINDS, or
+   * `verdict:<kind>:<stored verdict>` for a known kind whose verdict is not in TRACE_VERDICTS (a row wrong in both is a
+   * `kind:` one). What was wrong comes first so that the cut keeps it: each key is cut to DROPPED_KIND_MAX characters,
+   * since the values came from storage and could be anything, and past DROPPED_KINDS_MAX distinct keys the rest are
+   * counted under `…`. Empty when nothing was dropped. A dropped row's attrs are never read, so they cannot reach a log
+   * through this.
+   */
+  droppedKinds: Record<string, number>;
+  /** The first dropped row's seq, to find it in the outbox before the export prunes it; null when none was dropped. */
+  firstDroppedSeq: number | null;
+  /**
    * The last seq this read examined (`afterSeq` when it examined none), so a
    * drain can move its cursor past rows that were dropped: a batch made only
    * of damaged rows would otherwise be read, dropped and warned about on every
@@ -262,6 +277,11 @@ export interface PendingTrace {
    */
   through: number;
 }
+
+/** How much of a dropped row's key is said (`PendingTrace.droppedKinds`). */
+export const DROPPED_KIND_MAX = 60;
+/** How many distinct dropped keys are said by name in one read; the rest are counted under `…`. */
+export const DROPPED_KINDS_MAX = 10;
 
 const isMember = <T extends string>(table: readonly T[], s: string): s is T =>
   (table as readonly string[]).includes(s);
@@ -272,6 +292,9 @@ const isVerdict = (s: string): s is TraceVerdict => isMember(TRACE_VERDICTS, s);
 export function pendingTrace(sql: Sql, afterSeq: number, limit = 1000): PendingTrace {
   ensureTraceOutbox(sql);
   let dropped = 0;
+  // A Map, not an object: a stored kind such as `__proto__` or `constructor` is a key like any other.
+  const droppedKinds = new Map<string, number>();
+  let firstDroppedSeq: number | null = null;
   let through = afterSeq;
   const rows = sql.exec(
     "SELECT seq, at, tenant_id, agent_id, kind, span_id, parent_id, status, verdict, ms, attrs " +
@@ -284,7 +307,14 @@ export function pendingTrace(sql: Sql, afterSeq: number, limit = 1000): PendingT
     through = Math.max(through, Number(r.seq));
     const kind = String(r.kind);
     const verdict = String(r.verdict);
-    if (!isKind(kind) || !isVerdict(verdict)) { dropped++; return []; }
+    if (!isKind(kind) || !isVerdict(verdict)) {
+      dropped++;
+      firstDroppedSeq ??= Number(r.seq);
+      const named = (isKind(kind) ? `verdict:${kind}:${verdict}` : `kind:${kind}`).slice(0, DROPPED_KIND_MAX);
+      const key = droppedKinds.has(named) || droppedKinds.size < DROPPED_KINDS_MAX ? named : "…";
+      droppedKinds.set(key, (droppedKinds.get(key) ?? 0) + 1);
+      return [];
+    }
     const parsed = (() => { try { return JSON.parse(String(r.attrs)); } catch { return undefined; } })();
     return [{
       seq: Number(r.seq),
@@ -303,7 +333,7 @@ export function pendingTrace(sql: Sql, afterSeq: number, limit = 1000): PendingT
       attrs: (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) ? parsed : { unparseable: true },
     }];
   });
-  return { rows, dropped, through };
+  return { rows, dropped, droppedKinds: Object.fromEntries(droppedKinds), firstDroppedSeq, through };
 }
 
 /** Forget rows the drain already took. */

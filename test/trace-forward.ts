@@ -104,6 +104,20 @@ await check("the allowlist is one kind, github.refresh, and only its rows are fo
   must(sent(e).map((r) => r.seq).join(",") === "2,5", `forwarded seqs: ${sent(e).map((r) => r.seq)}`);
 });
 
+await check("a row the outbox refuses is not staged, and the lane says which, in the export's words", async () => {
+  const { sql } = sqliteHost();
+  appendTrace(sql, [refresh(1)]);
+  sql.exec("INSERT INTO trace_outbox(at, tenant_id, agent_id, kind, span_id, parent_id, status, verdict, ms, attrs) VALUES (?,?,?,?,?,?,?,?,?,?)",
+    T0, OWNER.tenantId, OWNER.agentId, "not.a.kind", "x", null, "s", "ok", null, "{}");
+  const warned: string[] = []; const orig = console.warn;
+  console.warn = (...a: unknown[]) => { warned.push(a.map(String).join(" ")); };
+  let through: number;
+  try { through = stageForward(sql, CFG, OWNER.tenantId, OWNER.agentId, () => T0); } finally { console.warn = orig; }
+  must(through === 2, `the cursor: ${through}`);
+  must(warned.length === 1 && warned[0]!.includes("github.refresh")
+    && warned[0]!.includes(`1 row(s) outside the contract's vocabulary were dropped, first seq 2, kinds {"kind:not.a.kind":1}`), `warned: ${JSON.stringify(warned)}`);
+});
+
 await check("a forwarded row is exactly the receiver's columns, built from the row, and carries nothing else it held", async () => {
   const { sql } = sqliteHost(); const e = endpoint();
   withMounts(sql, [["gh", "github"]]);
