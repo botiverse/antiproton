@@ -15,7 +15,7 @@ import { PUSH_KEY, PUSH_STORE, raftPlugin, wakeInstruction } from "../src/plugin
 import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import {
   ASSISTANT_STORE, CHAT_TOOLS, CHECK_KEY, CHECK_TOOLS, SEND_AS_OWNER_TOOL, SEND_LIMITED_HOLD_MS, COUNTS_KEY, DEFERRED_KEY, DM_ITEMS_MAX, INBOX_LAG_RETRY_MS, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, SETTLE_MS, SUMMARY_MAX, UNREADABLE_KEY,
-  assistantCheckPrompt, assistantPrecedence, assistantMountOf, assistantPrompt, assistantWake, assistantWakeInstruction, compose, confirmRef, FAILED_TURN_LINE, isQuietHours, itemOf, localDay, nextBriefAt, noteDoorbell, sendAsOwner, zoneOf,
+  MEMORY_TOOLS, assistantCheckPrompt, assistantTools, memoryGuidance, memoryMountOf, assistantPrecedence, assistantMountOf, assistantPrompt, assistantWake, assistantWakeInstruction, compose, confirmRef, FAILED_TURN_LINE, isQuietHours, itemOf, localDay, nextBriefAt, noteDoorbell, sendAsOwner, zoneOf,
 } from "../src/plugins/raft-assistant.ts";
 import { confirmLine, matches, ruleLine, rulesOf, winningRule, type ContactRule } from "../src/plugins/raft-assistant-rules.ts";
 import { setLogSink } from "../src/core/log.ts";
@@ -25,6 +25,7 @@ import { INTEGRATION_SESSIONS_STORE, REMINDER_TOOL, REMINDER_TOOL_SCHEMA, integr
 import { withheld } from "../src/plugins/raft-agent-login.ts";
 import { recordedEngine } from "../src/runtime/durable-agent.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
+import { statePlugin } from "../src/plugins/state.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
 import { fromResponse } from "../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../src/model/types.ts";
@@ -2422,6 +2423,49 @@ const usage = { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cached
 const say = (text: string): ModelResponse => ({ text, finishReason: "stop", truncated: false, usage });
 
 /** A zone where it is 14:00 now: daytime, outside the brief's window, whenever the suite runs. */
+/**
+ * What an assistant the runtime made has for memory: the seeded state mount and the memory tools its plugin lists, so
+ * a tool the allow-list names before the plugin has it is not expected here. Its prompts, with nothing written yet.
+ */
+const MEMORY = { alias: "state", offered: statePlugin(null as never, null, "b").tools.map((t) => t.name).filter((n) => MEMORY_TOOLS.includes(n)) };
+const CHAT_PROMPT = assistantPrompt("raft", CHAT_TOOLS, MEMORY);
+const CHECK_PROMPT = assistantCheckPrompt("raft", CHECK_TOOLS, { memory: MEMORY });
+
+await check("assistantTools offers the memory tools on the memory mount alone, a listed name with no tool as nothing, and no secret tool", () => {
+  const tools = (names: string[]) => names.map((address) => ({ address }));
+  const all = tools(["raft.messages_send", "raft.assistant_notify_owner", "state.remember", "state.get", "state.secret_get", "state.secret_put", "other.remember", "web.fetch"]);
+  const chat = assistantTools(all, "raft", "chat", "state").map((t) => t.address);
+  must(show(chat) === show(["raft.messages_send", "state.remember", "state.get"]), `chat: ${show(chat)}`);
+  const check = assistantTools(all, "raft", "check", "state").map((t) => t.address);
+  must(show(check) === show(["raft.assistant_notify_owner", "state.remember", "state.get"]), `check: ${show(check)}`);
+  must(show(assistantTools(all, "raft", "chat").map((t) => t.address)) === show(["raft.messages_send"]), "no memory mount, no memory tools");
+  // `revise` is offered once the mount lists it.
+  must(assistantTools([...all, ...tools(["state.revise"])], "raft", "check", "state").some((t) => t.address === "state.revise"), "revise once listed");
+  must(MEMORY_TOOLS.includes("revise") && !MEMORY_TOOLS.some((n) => n.startsWith("secret_")), show(MEMORY_TOOLS));
+  must(memoryMountOf([{ alias: "raft", plugin: "raft" }, { alias: "notes", plugin: "state" }, { alias: "state", plugin: "state" }]) === "notes", "the first state mount");
+});
+
+await check("the memory guidance names only the tools offered, the same in a chat and a check, and nothing without remember", () => {
+  const m = (offered: string[]) => ({ alias: "state", offered });
+  must(memoryGuidance(null, "chat") === null && memoryGuidance(m(["get", "list"]), "chat") === null, "without remember");
+  const full = memoryGuidance(m([...MEMORY_TOOLS]), "chat")!;
+  for (const s of ["`state__remember`", "`state__revise`", "`memory`", "`journal`", "standing preferences", "how they like to be addressed", "decisions and why", "conclusions, not what you read"]) {
+    must(full.includes(s), `chat guidance lacks ${s}: ${full}`);
+  }
+  must(!memoryGuidance(m(["remember", "forget"]), "chat")!.includes("revise"), "revise named without the tool");
+  const check = memoryGuidance(m([...MEMORY_TOOLS]), "check")!;
+  must(check.includes("not output") && check.endsWith(full.slice(full.indexOf("Keep what will matter later"))), `check guidance: ${check}`);
+  must(assistantPrompt("raft", CHAT_TOOLS, m([...MEMORY_TOOLS])).includes(full) && !assistantPrompt("raft").includes("You keep notes"), "the chat's code part");
+  must(assistantCheckPrompt("raft", CHECK_TOOLS, { memory: m([...MEMORY_TOOLS]) }).endsWith(check) && !assistantCheckPrompt("raft").includes("You keep notes"), "the check's prompt");
+  must(assistantCheckPrompt("raft", CHECK_TOOLS, { raftCheck: true, memory: m([...MEMORY_TOOLS]) }).endsWith(check), "Raft's check's prompt");
+  // What it knows: between Raft's instructions and the code part in the chat, after the check's prompt in a check.
+  const known = ["\n\n# What you already know\nKNOWN"];
+  must(assistantSystemPrompt({ name: "A", description: "I" }, "raft", "chat", undefined, null, m([...MEMORY_TOOLS]), known) ===
+    `You are A.\n\nI\n\n# What you already know\nKNOWN\n\n${assistantPrompt("raft", CHAT_TOOLS, m([...MEMORY_TOOLS]))}`, "chat order");
+  must(assistantSystemPrompt({}, "raft", "check", undefined, null, m([...MEMORY_TOOLS]), known) ===
+    `${assistantCheckPrompt("raft", CHECK_TOOLS, { memory: m([...MEMORY_TOOLS]) })}\n\n# What you already know\nKNOWN`, "check order");
+});
+
 function afternoonZone(): string {
   const offset = ((14 - new Date().getUTCHours()) % 24 + 24) % 24;
   const k = offset > 12 ? offset - 24 : offset;
@@ -2493,7 +2537,7 @@ await check("an assistant's chat is offered its owner DM, the reads and its pref
   try {
     must(assistantMountOf(await w.rt.store.listMounts("t", "a")) === "raft", "control: the snapshot makes it an assistant");
     const offered = (await w.rt.offeredTools("t", "a"))!.tools.map((t) => t.name);
-    const allowed = new Set([...CHAT_TOOLS.map((n: string) => `raft__${n}`), "resume"]);
+    const allowed = new Set([...CHAT_TOOLS.map((n: string) => `raft__${n}`), ...MEMORY.offered.map((n) => `state__${n}`), "resume"]);
     must(offered.every((n) => allowed.has(n)), `offered beyond the chat's: ${offered.filter((n) => !allowed.has(n))}`);
     for (const n of ["raft__assistant_preferences", "raft__assistant_send_as_owner", "raft__assistant_reminder", "raft__assistant_owner_inbox", "raft__messages_send", "raft__receive_events", "resume"]) must(offered.includes(n), `missing ${n}: ${offered}`);
     // Reacting on the owner's messages is the model's, in its chat (a status emoji while it works, say): never a check's.
@@ -2501,7 +2545,7 @@ await check("an assistant's chat is offered its owner DM, the reads and its pref
     for (const n of ["raft__assistant_notify_owner", "run_js", "jobs", "send_to_agent", "raft__tasks_list", "raft__enable_push"]) must(!offered.includes(n), `offered ${n}`);
     await w.turn("anything for me?");
     const prompt = w.calls[0]!.systemPrompt;
-    must(prompt === `You are Ada's assistant.\n\nASSISTANT-PERSONA\n\n${assistantPrompt("raft")}`, `prompt: ${prompt.slice(0, 200)}`);
+    must(prompt === `You are Ada's assistant.\n\nASSISTANT-PERSONA\n\n${CHAT_PROMPT}`, `prompt: ${prompt.slice(0, 200)}`);
     // The timer was armed at the open, and its first wake (outside the brief's window) re-armed it for the next 08:00.
     const wakes = w.host.sql.exec("SELECT alias, at FROM plugin_wakes").toArray() as Array<{ alias: string; at: number }>;
     must(wakes.length === 1 && wakes[0]!.alias === "raft" && wakes[0]!.at === nextBriefAt(wakes[0]!.at - 1, w.zone), `wakes: ${show(wakes)} in ${w.zone}`);
@@ -2567,11 +2611,11 @@ await check("a doorbell with candidates runs in a fresh short session: the check
     const check = w.calls.slice(chatCalls);
     must(check.length === 1, `model calls for the check: ${check.length}`);
     const c = check[0]!;
-    must(c.systemPrompt === assistantCheckPrompt("raft") && !c.systemPrompt.includes("ASSISTANT-PERSONA"), `check prompt: ${c.systemPrompt.slice(0, 200)}`);
+    must(c.systemPrompt === CHECK_PROMPT && !c.systemPrompt.includes("ASSISTANT-PERSONA"), `check prompt: ${c.systemPrompt.slice(0, 200)}`);
     must(!JSON.stringify(c.messages).includes("CHAT-ONLY-LINE") && JSON.stringify(c.messages).includes("@ada can you approve?"), `the check's input: ${JSON.stringify(c.messages).slice(0, 400)}`);
     // The check's tools, and the parked-result reader every assistant session keeps.
     const tools = c.tools.map((t) => t.name).sort();
-    must(show(tools) === show([...CHECK_TOOLS.map((n: string) => `raft__${n}`), "artifacts__read"].sort()), `check tools: ${show(tools)}`);
+    must(show(tools) === show([...CHECK_TOOLS.map((n: string) => `raft__${n}`), ...MEMORY.offered.map((n) => `state__${n}`), "artifacts__read"].sort()), `check tools: ${show(tools)}`);
     // Nothing of the check reached the chat, and the short session is gone.
     const main = (w.host.sql.exec("SELECT body FROM pi_entries").toArray() as any[]).map((x) => String(x.body)).join("\n");
     must(main.includes("CHAT-ONLY-LINE") && !main.includes("can you approve"), "the check reached the chat");
@@ -2582,9 +2626,103 @@ await check("a doorbell with candidates runs in a fresh short session: the check
   } finally { w.host.dispose(); }
 });
 
+// ---- an assistant's memory: the state tools in every session, and what it wrote at the start of each -----------------
+
+/** A note as the state mount keeps it, written straight to the agent's store, as an earlier session's `remember` leaves it. */
+const note = (w: { rt: AgentRuntime }, text: string) => w.rt.store.putState("t", "a", "memory", { value: text, ref: null, bytes: text.length });
+const remembering = (id: string, text: string): ModelResponse => ({ text: "", finishReason: "tool_calls", truncated: false, usage,
+  toolCalls: [{ id, name: "state__remember", arguments: { key: "memory", text } }] } as ModelResponse);
+/** A doorbell for conversation `n`, unread a minute ago, so a check is started for it. */
+const ringFor = (w: Awaited<ReturnType<typeof runtimeWith>>, n: number) => {
+  w.r.unread = [conv(n, { latestAt: new Date(Date.now() - 60_000).toISOString(), latestPreview: `@ada look at ${n}` })];
+  w.doorbell();
+};
+const isCheck = (c: Ctx) => c.systemPrompt.startsWith(CHECK_PROMPT);
+
+await check("an assistant's chat and its checks are offered its memory tools on the state mount, never the secret ones", async () => {
+  const w = await runtimeWith(true);
+  try {
+    must(MEMORY.offered.includes("remember") && MEMORY.offered.includes("forget"), `control: the state plugin lists the memory tools: ${show(MEMORY.offered)}`);
+    // After a turn: the default mounts, the state mount among them, are seeded as the first one starts.
+    await w.turn("hello");
+    const chat = w.calls[0]!.tools.map((t) => t.name);
+    for (const n of MEMORY.offered) must(chat.includes(`state__${n}`), `the chat lacks state__${n}: ${show(chat)}`);
+    must(!chat.some((n) => n.startsWith("state__secret_")), `the chat is offered a secret tool: ${show(chat)}`);
+    ringFor(w, 1);
+    await w.drive();
+    const c = w.calls.find(isCheck);
+    must(c, `no check ran: ${show(w.calls.map((x) => x.systemPrompt.slice(0, 60)))}`);
+    const tools = c!.tools.map((t) => t.name);
+    for (const n of MEMORY.offered) must(tools.includes(`state__${n}`), `the check lacks state__${n}: ${show(tools)}`);
+    must(!tools.some((n) => n.startsWith("state__secret_")), `the check is offered a secret tool: ${show(tools)}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("an assistant's chat and its checks start with a note written earlier, above the chat's code part and after the check's", async () => {
+  const w = await runtimeWith(true);
+  try {
+    await note(w, "Ada wants to be called Ada. EARLIER-NOTE");
+    await w.turn("hello");
+    const chat = w.calls[0]!.systemPrompt;
+    const at = chat.indexOf("EARLIER-NOTE");
+    must(at > 0 && chat.includes("# What you already know") && at < chat.indexOf(CHAT_PROMPT) && chat.endsWith(CHAT_PROMPT),
+      `the chat's prompt: ${chat.slice(0, 600)}`);
+    must(chat.startsWith("You are Ada's assistant.\n\nASSISTANT-PERSONA\n\n"), `the persona first: ${chat.slice(0, 200)}`);
+    ringFor(w, 1);
+    await w.drive();
+    const c = w.calls.find(isCheck);
+    must(c && c.systemPrompt.slice(CHECK_PROMPT.length).includes("EARLIER-NOTE"), `the check's prompt: ${c?.systemPrompt.slice(-600)}`);
+    // Only the memory's paragraph: nothing another mount says, which describes tools an assistant is not offered.
+    must(!/run_js|sandbox/i.test(chat) && !/run_js|sandbox/i.test(c!.systemPrompt), "another mount's paragraph reached an assistant's prompt");
+    // Kept apart from the agent's own snapshot, which every mount's paragraphs are taken into.
+    const owners = (w.host.sql.exec("SELECT DISTINCT owner FROM prompt_context").toArray() as any[]).map((x) => String(x.owner));
+    must(show(owners) === show(["t/a#assistant"]), `snapshots: ${show(owners)}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("a note one wake writes is in the next wake's prompt, and told to the chat, whose prompt stays as it began", async () => {
+  let wrote = false;
+  const w = await runtimeWith(true, (c) => isCheck(c) && !wrote ? (wrote = true, remembering("m1", "Ada leads the Friday launch. CHECK-NOTE")) : say("done"));
+  try {
+    await w.turn("hello");
+    const before = w.calls[0]!.systemPrompt;
+    ringFor(w, 1);
+    await w.drive();
+    must(wrote, "control: the first check wrote its note");
+    const first = w.calls.filter(isCheck);
+    must(!first[0]!.systemPrompt.includes("CHECK-NOTE"), "control: the note was there before it was written");
+    must(first.some((c) => c.messages.some((m: any) => m.role === "toolResult" && !JSON.stringify(m).includes("isError\":true"))), `the write was answered: ${show(first.at(-1)!.messages.at(-1))}`);
+    const n = w.calls.length;
+    ringFor(w, 2);
+    await w.drive();
+    const next = w.calls.slice(n).find(isCheck);
+    must(next && next.systemPrompt.includes("CHECK-NOTE"), `the next check's prompt: ${next?.systemPrompt.slice(-400)}`);
+    await w.turn("anything new?");
+    const chat = w.calls.filter((c) => !isCheck(c)).at(-1)!;
+    must(chat.systemPrompt === before, "the chat's prompt moved under a conversation already begun");
+    const userText = JSON.stringify(chat.messages.filter((m: any) => m.role === "user").at(-1));
+    must(userText.includes("CHECK-NOTE") && userText.includes("has changed since you"), `the chat's message: ${userText.slice(0, 400)}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("an ordinary agent is unchanged: every mount's paragraph and tool, the secret ones too, and nothing of an assistant's", async () => {
+  const w = await runtimeWith(false);
+  try {
+    must(assistantMountOf(await w.rt.store.listMounts("t", "a")) === null, "control: not an assistant");
+    await note(w, "ORDINARY-NOTE");
+    await w.turn("hello");
+    const offered = w.calls[0]!.tools.map((t) => t.name);
+    for (const n of ["state__remember", "state__secret_put", "run_js"]) must(offered.includes(n), `missing ${n}: ${show(offered)}`);
+    const p = w.calls[0]!.systemPrompt;
+    must(p.includes("ORDINARY-NOTE") && !p.includes(CHAT_PROMPT) && !p.includes("You keep notes with"), `prompt: ${p.slice(0, 300)}`);
+    const owners = (w.host.sql.exec("SELECT owner FROM prompt_context").toArray() as any[]).map((x) => String(x.owner));
+    must(show(owners) === show(["t/a"]), `snapshots: ${show(owners)}`);
+  } finally { w.host.dispose(); }
+});
+
 await check("a check's notify call that sends nothing: the gateway keeps its raft.assistant_notify row on the tool.call's span", async () => {
   let notified = false;
-  const w = await runtimeWith(true, (c) => !notified && c.systemPrompt.endsWith(assistantCheckPrompt("raft"))
+  const w = await runtimeWith(true, (c) => !notified && c.systemPrompt.endsWith(CHECK_PROMPT)
     ? (notified = true, { text: "", finishReason: "tool_calls", truncated: false, usage, toolCalls: [{ id: "n1", name: "raft__assistant_notify_owner",
       arguments: { items: [{ ref: "#ch1:aaaaaaa1", summary: "Bob asks you to pick a date", kind: "question" }] } }] } as ModelResponse)
     : say("done"));
@@ -2611,7 +2749,7 @@ await check("send as owner end to end: the chat's call posts; a check's call nev
   const toolResults = (c: Ctx) => JSON.stringify(c.messages.filter((m: any) => m.role === "toolResult"));
   // The chat: the owner asked, the call goes through.
   let chatAsked = false;
-  const chat = await runtimeWith(true, (c) => !chatAsked && !c.systemPrompt.endsWith(assistantCheckPrompt("raft")) ? (chatAsked = true, sendCall("s1")) : say("ok"));
+  const chat = await runtimeWith(true, (c) => !chatAsked && !c.systemPrompt.endsWith(CHECK_PROMPT) ? (chatAsked = true, sendCall("s1")) : say("ok"));
   try {
     await chat.turn("tell #ch1 Friday works for me");
     must(chatAsked && chat.r.asOwner.length === 1 && chat.r.asOwner[0].content === "Friday works for me.", `control: the chat's call posted: ${show(chat.r.asOwner)}`);
@@ -2621,7 +2759,7 @@ await check("send as owner end to end: the chat's call posts; a check's call nev
   // check never sees and which change nothing.
   for (const description of ["ASSISTANT-PERSONA", ADVERSARIAL]) for (const widened of [false, true]) {
     let tried = false;
-    const w = await runtimeWith(true, (c) => !tried && c.systemPrompt === assistantCheckPrompt("raft") ? (tried = true, sendCall("s2")) : say("done"), description);
+    const w = await runtimeWith(true, (c) => !tried && c.systemPrompt === CHECK_PROMPT ? (tried = true, sendCall("s2")) : say("done"), description);
     const list = CHECK_TOOLS as string[];
     if (widened) list.push(SEND_AS_OWNER_TOOL);
     try {
@@ -2629,7 +2767,7 @@ await check("send as owner end to end: the chat's call posts; a check's call nev
       w.doorbell();
       await w.drive();
       must(tried, `${widened}: control: the check's model called the tool`);
-      const checkCall = w.calls.find((c) => c.systemPrompt === assistantCheckPrompt("raft") && toolResults(c) !== "[]");
+      const checkCall = w.calls.find((c) => c.systemPrompt === CHECK_PROMPT && toolResults(c) !== "[]");
       must(checkCall, `${widened}: the call was answered`);
       must(checkCall!.tools.some((t) => t.name === "raft__assistant_send_as_owner") === widened, `${widened}: offered: ${show(checkCall!.tools.map((t) => t.name))}`);
       must(w.r.asOwner.length === 0, `${widened}: a check sent as the owner: ${show(w.r.asOwner)}`);
@@ -2651,7 +2789,7 @@ await check("send as owner end to end: an owner dropped after the turn was offer
   let drop = false, called = 0;
   let dropOwner = () => {};
   const w = await runtimeWith(true, (c) => {
-    if (c.systemPrompt === assistantCheckPrompt("raft") || (c.messages.at(-1) as any)?.role === "toolResult") return say("done");
+    if (c.systemPrompt === CHECK_PROMPT || (c.messages.at(-1) as any)?.role === "toolResult") return say("done");
     called++;
     if (drop) dropOwner();
     return sendCall(`n${called}`, drop ? "Second." : "First.");
@@ -2665,7 +2803,7 @@ await check("send as owner end to end: an owner dropped after the turn was offer
     must(called === 1 && w.r.asOwner.length === 1 && w.r.asOwner[0].content === "First.", `control: ${called} ${show(w.r.asOwner)}`);
     drop = true;
     await w.turn("tell #ch1: Second.");
-    const turn = w.calls.filter((c) => c.systemPrompt !== assistantCheckPrompt("raft")).at(-1)!;
+    const turn = w.calls.filter((c) => c.systemPrompt !== CHECK_PROMPT).at(-1)!;
     must(called === 2 && turn.tools.some((t) => t.name === "raft__assistant_send_as_owner"), `control: the second turn was offered it and called it: ${called}`);
     must(w.db.read(ASSISTANT_STORE, OWNER_KEY) === undefined, `control: the owner record is back: ${show(w.db.read(ASSISTANT_STORE, OWNER_KEY))}`);
     must(w.r.asOwner.length === 1, `sent as an owner no longer there: ${show(w.r.asOwner)}`);
@@ -2680,7 +2818,7 @@ await check("send as owner end to end: a chat turn that calls it twice with the 
   const sendCall = (id: string): ModelResponse => ({ text: "", finishReason: "tool_calls", truncated: false, usage,
     toolCalls: [{ id, name: "raft__assistant_send_as_owner", arguments: { target: conv(1).channelId, content: "sounds good" } }] } as ModelResponse);
   let n = 0;
-  const w = await runtimeWith(true, (c) => c.systemPrompt !== assistantCheckPrompt("raft") && n < 2 ? sendCall(`d${++n}`) : say("done"), DEFAULT_ASSISTANT_INSTRUCTIONS);
+  const w = await runtimeWith(true, (c) => c.systemPrompt !== CHECK_PROMPT && n < 2 ? sendCall(`d${++n}`) : say("done"), DEFAULT_ASSISTANT_INSTRUCTIONS);
   try {
     await w.turn("reply in #ch1 for me: sounds good");
     must(n === 2, `control: the model called it twice: ${n}`);
@@ -3502,9 +3640,9 @@ await check("Raft's check end to end: a narrowed short session under Raft's prom
     await w.drive();
     const c = w.calls.find((x) => x.systemPrompt.includes("exactly one call"));
     must(c, `no check turn: ${show(w.calls.map((x) => x.systemPrompt.slice(0, 60)))}`);
-    must(c!.systemPrompt === assistantCheckPrompt("raft", ["assistant_owner_messages", "assistant_notify_owner"], { raftCheck: true }), `prompt: ${c!.systemPrompt.slice(0, 200)}`);
+    must(c!.systemPrompt === assistantCheckPrompt("raft", ["assistant_owner_messages", "assistant_notify_owner"], { raftCheck: true, memory: MEMORY }), `prompt: ${c!.systemPrompt.slice(0, 200)}`);
     const tools = c!.tools.map((t) => t.name).sort();
-    must(show(tools) === show(["artifacts__read", "raft__assistant_notify_owner", "raft__assistant_owner_messages"]), `narrowed tools: ${show(tools)}`);
+    must(show(tools) === show(["artifacts__read", "raft__assistant_notify_owner", "raft__assistant_owner_messages", ...MEMORY.offered.map((n) => `state__${n}`)].sort()), `narrowed tools: ${show(tools)}`);
     must(JSON.stringify(c!.messages).includes("RAFT-INSTRUCTION: read with raft__assistant_owner_messages"), "the instruction was not the input");
     must(w.r.notifies.length === 1 && w.r.notifies[0].check_id === CHECK_ID && w.r.sends.length === 0, `notify: ${show(w.r.notifies)} sends: ${show(w.r.sends)}`);
     const rows = w.host.sql.exec("SELECT kind, status, attrs FROM trace_outbox WHERE kind IN ('raft.assistant_check', 'raft.assistant_notify') ORDER BY seq").toArray() as any[];
@@ -3529,7 +3667,7 @@ await check("a narrowed short session refuses a tool of its mount it is not offe
     await w.drive();
     must(w.r.inboxReads.length === 0, `the owner inbox was read from a session not offered it: ${show(w.r.inboxReads)}`);
     const c = w.calls.filter((x) => x.systemPrompt.includes("exactly one call")).at(-1)!;
-    must(show(c.tools.map((t) => t.name).sort()) === show(["artifacts__read", "raft__assistant_notify_owner"]), show(c.tools.map((t) => t.name)));
+    must(show(c.tools.map((t) => t.name).sort()) === show(["artifacts__read", "raft__assistant_notify_owner", ...MEMORY.offered.map((n) => `state__${n}`)].sort()), show(c.tools.map((t) => t.name)));
   } finally { w.host.dispose(); }
 });
 
@@ -3771,7 +3909,7 @@ await check("reminder end to end: the chat's call reaches the app; a check is no
   const call = (id: string): ModelResponse => ({ text: "", finishReason: "tool_calls", truncated: false, usage,
     toolCalls: [{ id, name: "raft__assistant_reminder", arguments: CREATE }] } as ModelResponse);
   let asked = false;
-  const chat = await runtimeWith(true, (c) => !asked && !c.systemPrompt.endsWith(assistantCheckPrompt("raft")) ? (asked = true, call("r1")) : say("ok"));
+  const chat = await runtimeWith(true, (c) => !asked && !c.systemPrompt.endsWith(CHECK_PROMPT) ? (asked = true, call("r1")) : say("ok"));
   try {
     await chat.turn("remind me about the stand-up in an hour");
     must(asked && chat.r.actionCalls.length === 1 && chat.r.actionCalls[0]!.action === "create-reminder", `control: the chat's call ran: ${show(chat.r.actionCalls)}`);
@@ -3783,7 +3921,7 @@ await check("reminder end to end: the chat's call reaches the app; a check is no
   } finally { chat.host.dispose(); }
   for (const widened of [false, true]) {
     let tried = false;
-    const w = await runtimeWith(true, (c) => !tried && c.systemPrompt === assistantCheckPrompt("raft") ? (tried = true, call("r2")) : say("done"));
+    const w = await runtimeWith(true, (c) => !tried && c.systemPrompt === CHECK_PROMPT ? (tried = true, call("r2")) : say("done"));
     const list = CHECK_TOOLS as string[];
     if (widened) list.push(REMINDER_TOOL);
     try {
@@ -3791,7 +3929,7 @@ await check("reminder end to end: the chat's call reaches the app; a check is no
       w.doorbell();
       await w.drive();
       must(tried, `${widened}: control: the check's model called the tool`);
-      const checkCall = w.calls.find((c) => c.systemPrompt === assistantCheckPrompt("raft") && c.messages.some((m: any) => m.role === "toolResult"));
+      const checkCall = w.calls.find((c) => c.systemPrompt === CHECK_PROMPT && c.messages.some((m: any) => m.role === "toolResult"));
       must(checkCall!.tools.some((t) => t.name === "raft__assistant_reminder") === widened, `${widened}: offered: ${show(checkCall!.tools.map((t) => t.name))}`);
       must(w.r.logins.length === 0 && w.r.appRequests.length === 0, `${widened}: a check reached the app: ${show(w.r.appRequests)}`);
       const rows = (w.host.sql.exec("SELECT status FROM trace_outbox WHERE kind = 'raft.assistant_reminder'").toArray() as any[]).map((x) => String(x.status));
