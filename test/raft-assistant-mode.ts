@@ -2672,8 +2672,13 @@ await check("an assistant's chat and its checks start with a note written earlie
     await w.drive();
     const c = w.calls.find(isCheck);
     must(c && c.systemPrompt.slice(CHECK_PROMPT.length).includes("EARLIER-NOTE"), `the check's prompt: ${c?.systemPrompt.slice(-600)}`);
-    // Only the memory's paragraph: nothing another mount says, which describes tools an assistant is not offered.
-    must(!/run_js|sandbox/i.test(chat) && !/run_js|sandbox/i.test(c!.systemPrompt), "another mount's paragraph reached an assistant's prompt");
+    // Only the memory's paragraph, from its heading to the note it ends with: nothing another mount says, which describes
+    // tools an assistant is not offered.
+    const persona = "You are Ada's assistant.\n\nASSISTANT-PERSONA\n\n";
+    const between = chat.slice(persona.length, chat.indexOf(CHAT_PROMPT)), after = c!.systemPrompt.slice(CHECK_PROMPT.length);
+    for (const [where, text] of [["chat", between], ["check", after]]) {
+      must(text.trim().startsWith("# What you already know\n") && text.trim().endsWith("EARLIER-NOTE"), `another mount's paragraph in the ${where}: ${text.slice(0, 400)}`);
+    }
     // Kept apart from the agent's own snapshot, which every mount's paragraphs are taken into.
     const owners = (w.host.sql.exec("SELECT DISTINCT owner FROM prompt_context").toArray() as any[]).map((x) => String(x.owner));
     must(show(owners) === show(["t/a#assistant"]), `snapshots: ${show(owners)}`);
