@@ -457,6 +457,13 @@ async function traced(maxDocumentBytes: number) {
   const rows: any[] = [];
   const record = store.recordTrace.bind(store);
   store.recordTrace = async (r) => { rows.push(...r); return record(r); };
+  // Why each failed call failed, as the store is told it: the tool.call trace row is written from this (src/trace/seams.ts).
+  const failures: any[] = [];
+  const complete = store.completeOperation.bind(store);
+  store.completeOperation = async (...args: Parameters<typeof complete>) => {
+    if (args[5]?.failure) failures.push(args[5].failure);
+    return complete(...args);
+  };
   const gw = new ToolGateway(store, [plugin], new Set(["state"]), { async resolve() { return null; } });
   const call = { tenantId: "t", agentId: "a", taskId: "k" };
   const remember = async (key: string, text: string) => {
@@ -464,15 +471,16 @@ async function traced(maxDocumentBytes: number) {
     if (out.status !== "succeeded") throw new Error(`remember: ${JSON.stringify(out)}`);
     return out.result as any;
   };
-  return { store, rows, remember, dropped: () => rows.filter((r) => r.kind === "state.dropped") };
+  const raw = (tool: string, args: Record<string, unknown>) => gw.invoke(call, `notes.${tool}`, args);
+  return { store, rows, failures, remember, raw, dropped: () => rows.filter((r) => r.kind === "state.dropped") };
 }
 
 await check("a remember that drops lines writes one state.dropped row with the key (or other) and the counts; one that fits writes none", async () => {
   const { remember, dropped } = await traced(40);
-  await remember("memory", A);
-  await remember("memory", B);
+  await remember("journal", A);
+  await remember("journal", B);
   if (dropped().length !== 0) throw new Error(`a write that fit was traced: ${JSON.stringify(dropped())}`);
-  const r = await remember("memory", C);
+  const r = await remember("journal", C);
   const rows = dropped();
   if (rows.length !== 1) throw new Error(`${rows.length} rows for one overflow: ${JSON.stringify(rows)}`);
   const [row] = rows;
@@ -480,11 +488,11 @@ await check("a remember that drops lines writes one state.dropped row with the k
     throw new Error(`the row's envelope: ${JSON.stringify(row)}`);
   }
   // The same counts the reply gives the agent, and nothing else but the mount the gateway adds.
-  const want = { mount: "notes", key: "memory", lines: 2, characters: 33 };
+  const want = { mount: "notes", key: "journal", lines: 2, characters: 33 };
   if (JSON.stringify(row.attrs) !== JSON.stringify(want) || r.dropped.lines !== 2 || r.dropped.characters !== 33) {
     throw new Error(`attrs ${JSON.stringify(row.attrs)}, reply ${JSON.stringify(r.dropped)}`);
   }
-  await remember("memory", "delta");
+  await remember("journal", "delta");
   if (dropped().length !== 1) throw new Error(`a later write that fit was traced: ${JSON.stringify(dropped())}`);
   // Any key is traced, but a name the agent chose is recorded only as "other": it may itself be note text.
   await remember("owner-said-call-me-sam", A);
@@ -499,15 +507,109 @@ await check("a state.dropped row carries none of the dropped lines and none of t
   const { store, rows, remember, dropped } = await traced(60);
   const LOST = "SENTINEL-LOST-7f3a owner said call the dentist";
   const KEPT = "SENTINEL-KEPT-91c2";
-  await remember("memory", LOST);
-  const r = await remember("memory", `${KEPT} ${"k".repeat(30)}`);
+  await remember("journal", LOST);
+  const r = await remember("journal", `${KEPT} ${"k".repeat(30)}`);
   if (r.dropped?.lines !== 1 || !r.dropped.text.includes(LOST)) throw new Error(`the overflow did not happen: ${JSON.stringify(r)}`);
-  if (!(await store.getState("t", "a", "memory"))?.value?.includes(KEPT)) throw new Error("the document does not hold the kept line");
+  if (!(await store.getState("t", "a", "journal"))?.value?.includes(KEPT)) throw new Error("the document does not hold the kept line");
   if (dropped().length !== 1) throw new Error(`${dropped().length} rows`);
   // Every row the call wrote, not only the one asked for: no row of the call may carry either.
   const text = JSON.stringify(rows);
   for (const s of ["SENTINEL-LOST", "dentist", "SENTINEL-KEPT", "kkkkkkkk"]) {
     if (text.includes(s)) throw new Error(`a trace row carries ${s}: ${text}`);
+  }
+});
+
+/** A call's refusal, with the code the store gave it, or what it answered instead. */
+const refusal = async (fn: () => Promise<unknown>) => {
+  try { return { ok: await fn() }; } catch (e) { return { threw: String((e as Error).message), code: (e as { code?: unknown }).code }; }
+};
+
+await check("remember on a full memory or todo is refused on both stores, writes nothing, and says how much to free with revise or forget", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(50);
+    for (const key of ["memory", "todo"]) {
+      await plugin.invoke("remember", { key, text: A }, ctx);
+      await plugin.invoke("remember", { key, text: B }, ctx);
+      const before = await store.getState("t", "a", key);
+      // 33 characters now; C and its newline add 30, to 63, past 50 by 13. Without B, 46 would fit.
+      const r = await refusal(() => plugin.invoke("remember", { key, text: C }, ctx));
+      if (r.code !== `${key}_full`) throw new Error(`${name}: ${key}: not refused as ${key}_full: ${JSON.stringify(r)}`);
+      const said = r.threw ?? "";
+      for (const want of [`\`${key}\` is full: it is 33 characters, this line adds 30 to make it 63, and it holds at most 50`,
+        "nothing was written", "free at least 13 characters first", "`revise`", "`forget`", "then remember this again"]) {
+        if (!said.includes(want)) throw new Error(`${name}: ${key}: the refusal does not say ${JSON.stringify(want)}: ${said}`);
+      }
+      const after = await store.getState("t", "a", key);
+      if (after?.value !== `${A}\n${B}` || after.value !== before?.value || after.bytes !== before.bytes) {
+        throw new Error(`${name}: ${key}: a refused remember changed the document: ${JSON.stringify(after)}`);
+      }
+      // Freeing space is the agent's decision, and once it is made the same line goes in.
+      await plugin.invoke("revise", { key, match: "alpha" }, ctx);
+      const ok = await plugin.invoke("remember", { key, text: C }, ctx) as any;
+      if ("dropped" in ok || ok.bytes !== B.length + 1 + C.length || ok.cap !== 50) throw new Error(`${name}: ${key}: after freeing space: ${JSON.stringify(ok)}`);
+      if ((await store.getState("t", "a", key))?.value !== `${B}\n${C}`) throw new Error(`${name}: ${key}: ${(await store.getState("t", "a", key))?.value}`);
+    }
+    // `journal` and a key of the agent's own still drop the oldest lines and quote them.
+    for (const key of ["journal", "notes/plan"]) {
+      await plugin.invoke("remember", { key, text: A }, capped(40));
+      await plugin.invoke("remember", { key, text: B }, capped(40));
+      const r = await plugin.invoke("remember", { key, text: C }, capped(40)) as any;
+      if (r.dropped?.lines !== 2 || r.dropped.text !== `${A}\n${B}` || (await store.getState("t", "a", key))?.value !== C) {
+        throw new Error(`${name}: ${key} no longer drops with a receipt: ${JSON.stringify(r)}`);
+      }
+    }
+  }
+});
+
+await check("a refused remember writes no state.dropped row, and the failed call is recorded with the code", async () => {
+  const { failures, remember, raw, dropped } = await traced(40);
+  await remember("memory", A);
+  await remember("memory", B);
+  const out = await raw("remember", { key: "memory", text: C });
+  if (out.status !== "failed" || !/nothing was written/.test(String((out as any).error?.message))) throw new Error(`not refused: ${JSON.stringify(out)}`);
+  if (dropped().length !== 0) throw new Error(`a refusal was traced as a drop: ${JSON.stringify(dropped())}`);
+  if (failures.length !== 1 || failures[0].code !== "memory_full") throw new Error(`the failed call's record: ${JSON.stringify(failures)}`);
+});
+
+await check("put of text past the cap to memory or todo is refused with the same code; other values and other keys are stored as before", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(40);
+    for (const key of ["memory", "todo"]) {
+      await plugin.invoke("remember", { key, text: A }, ctx);
+      const r = await refusal(() => plugin.invoke("put", { key, value: "p".repeat(41) }, ctx));
+      if (r.code !== `${key}_full` || !(r.threw ?? "").includes(`\`${key}\` holds at most 40 characters, and this put is 41, so nothing was written; it is 16 now`)) {
+        throw new Error(`${name}: ${key}: ${JSON.stringify(r)}`);
+      }
+      if ((await store.getState("t", "a", key))?.value !== A) throw new Error(`${name}: ${key}: a refused put changed the document`);
+      // At the cap is not past it.
+      await plugin.invoke("put", { key, value: "p".repeat(40) }, ctx);
+      if ((await store.getState("t", "a", key))?.value !== "p".repeat(40)) throw new Error(`${name}: ${key}: a put at the cap was refused`);
+      // A value that is not text has no lines to keep or lose: stored as before, whatever its size.
+      const list = Array.from({ length: 20 }, (_, i) => `item ${i}`);
+      await plugin.invoke("put", { key, value: list }, ctx);
+      if (JSON.stringify((await store.getState("t", "a", key))?.value) !== JSON.stringify(list)) throw new Error(`${name}: ${key}: a list was not stored`);
+    }
+    await plugin.invoke("put", { key: "journal", value: "j".repeat(41) }, ctx);
+    if ((await store.getState("t", "a", "journal"))?.value !== "j".repeat(41)) throw new Error(`${name}: a long journal put was refused`);
+  }
+});
+
+await check("remember, revise and get of a text document give its length and the cap in characters", async () => {
+  for (const { name, plugin } of await backends()) {
+    const ctx = capped(4000);
+    const r = await plugin.invoke("remember", { key: "memory", text: "line é \"quoted\"" }, ctx) as any;
+    const v = await plugin.invoke("revise", { key: "memory", match: "line", replace: "line é \"quoted\" 2" }, ctx) as any;
+    const g = await plugin.invoke("get", { key: "memory" }, ctx) as any;
+    const len = 'line é "quoted" 2'.length;
+    if (r.cap !== 4000 || r.bytes !== len - 2 || v.cap !== 4000 || v.bytes !== len || g.cap !== 4000 || g.characters !== len) {
+      throw new Error(`${name}: ${JSON.stringify({ r, v, g })}`);
+    }
+    // Text `put` wrote is stored with its JSON size; `characters` is still the length the cap counts.
+    await plugin.invoke("put", { key: "memory", value: 'a "b"' }, ctx);
+    const p = await plugin.invoke("get", { key: "memory" }, ctx) as any;
+    if (p.characters !== 5 || p.cap !== 4000) throw new Error(`${name}: after put: ${JSON.stringify(p)}`);
+    const o = await plugin.invoke("put", { key: "o", value: { a: 1 } }, ctx).then(() => plugin.invoke("get", { key: "o" }, ctx)) as any;
+    if ("cap" in o || "characters" in o) throw new Error(`${name}: a value that is not text was given a cap: ${JSON.stringify(o)}`);
   }
 });
 
@@ -628,6 +730,9 @@ await check("the sqlite store and the Durable Object store answer the same seque
       ["revise", { key: "journal", match: "charlie", replace: "c" }], ["revise", { key: "journal", match: "c" }],
       ["remember", { key: "journal", text: "z".repeat(51) }], ["put", { key: "o", value: [1] }],
       ["remember", { key: "o", text: "x" }], ["revise", { key: "journal", match: "0123" }],
+      ["remember", { key: "memory", text: A }], ["remember", { key: "memory", text: B }],
+      ["remember", { key: "memory", text: C }], ["revise", { key: "memory", match: "alpha" }],
+      ["remember", { key: "memory", text: C }], ["put", { key: "todo", value: "t".repeat(51) }],
     ];
     for (const [tool, args] of steps) {
       log.push(await attempt(() => plugin.invoke(tool, args, ctx)));

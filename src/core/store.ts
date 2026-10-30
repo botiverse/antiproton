@@ -1,6 +1,7 @@
 import type { SeedNoticeRow, SeedPassResult, SeedPlan, SeedRecord } from "../store/seed-record.ts";
 import type { SealHow, SeedFileMeta, SeedSeal, SeedStoreResult, SeedWrite } from "../store/seed-files.ts";
 import type { ImportedFile, ImportExcerpt } from "../store/workspace-import.ts";
+import type { WhenFull } from "../store/state-lines.ts";
 import type { DecideOutcome, UntoldApproval } from "../store/approvals-schema.ts";
 import type { ToolConfig } from "./tool-config.ts";
 import type {
@@ -291,9 +292,11 @@ export interface StorageAdapter {
   /** The cheap, additive write. A journal the agent has to read, edit and
    *  rewrite to add a line is a journal it will stop writing. Over `maxBytes`
    *  it drops whole lines from the head and answers the non-blank ones in
-   *  `dropped`, oldest first; it refuses a value that is not a string rather than replace it. */
+   *  `dropped`, oldest first, or with `whenFull` "refuse" writes nothing and
+   *  throws `<key>_full` (src/store/state-lines.ts `appendLines`); it refuses a
+   *  value that is not a string rather than replace it. */
   appendState(
-    tenantId: string, agentId: string, key: string, text: string, maxBytes: number,
+    tenantId: string, agentId: string, key: string, text: string, maxBytes: number, whenFull?: WhenFull,
   ): Promise<{ bytes: number; dropped: string[] }>;
   /** Replace the one line of a text document that contains `match`, or remove
    *  it when `replace` is null; `line` is its number from 1 and `was` its text

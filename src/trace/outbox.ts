@@ -155,8 +155,8 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * `recheck`), `first`, the stored `language` tag or null, `language_changed`, `timezone_set` and `raftCheck`; or
  * `dropped` (the context names no owner and a record was there). A read that changes nothing writes none. Never the
  * owner's id, handle or DM target (src/plugins/raft-assistant.ts `traceOwnerKept`). It is not forwarded.
- * `state.dropped` is a `remember` that found its document full and dropped its oldest lines to make room: the document's
- * `key` and how many `lines` and `characters` went, never the lines or the document (src/plugins/state.ts `invoke`).
+ * `state.dropped` is a `remember` that found its document full and dropped its oldest lines to make room (`memory` and
+ * `todo` refuse the line instead, and write none): the document's `key` and how many `lines` and `characters` went, never the lines or the document (src/plugins/state.ts `invoke`).
  * It is not forwarded: the receiver has no such kind (cf/src/trace-forward.ts `AGENT_TRACE_FIELDS`).
  */
 export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake", "raft.assistant_notify",

@@ -36,10 +36,41 @@ export function documentText(key: string, prior: { value: Json; ref: string | nu
 const blank = (line: string) => !line.trim();
 
 /**
+ * What a document does when a line does not fit: give up its oldest lines, or
+ * refuse the line. A log's oldest lines are the ones least worth keeping; a
+ * document of standing facts or open commitments is the other way round, and
+ * losing its head silently is losing what the owner said or what was promised.
+ */
+export type WhenFull = "drop" | "refuse";
+
+/**
+ * The refusal of a write that would take a document that refuses when full
+ * (`WhenFull`) from `size` to `after` characters, past `max`; `size` is null
+ * for a `put` over a value that is not text. Every number is
+ * in the unit the cap is checked in, the text's length, and the shortfall is
+ * given outright, so one `revise` can free enough. `code` is `<key>_full`, for
+ * the call's trace row; the agent reads the sentence.
+ */
+export function documentFull(
+  key: string, size: number | null, after: number, max: number, verb: "remember" | "put" = "remember",
+): Error {
+  const message = verb === "put"
+    ? `\`${key}\` holds at most ${max} characters, and this put is ${after}, so nothing was written`
+      + `${size === null ? "" : `; it is ${size} now`}. Put at most ${max} characters: keep the lines that are still true`
+    : `\`${key}\` is full: it is ${size} characters, this line adds ${after - size!} to make it ${after}, and it holds at `
+      + `most ${max}, so nothing was written. It keeps its oldest lines rather than dropping them: free at least `
+      + `${after - max} characters first, by deleting or shortening a line that is no longer true with \`revise\` or `
+      + "dropping the whole document with `forget`, then remember this again";
+  return Object.assign(new Error(message), { code: `${key}_full` });
+}
+
+/**
  * `text` added as the document's last line, and the oldest whole lines dropped
  * until the result is at most `max` characters. Text that does not fit even
  * alone is refused rather than cut, so the document is never left holding part
- * of what the agent wrote.
+ * of what the agent wrote. With `whenFull` "refuse", text that would need any
+ * line dropped is refused instead, with the code `<key>_full`, and the document
+ * is unchanged: the agent decides what to give up, with `revise` or `forget`.
  *
  * `dropped` is the lines that said something, oldest first, without a CRLF
  * document's `\r`: a blank line carries nothing to save again, and counting it
@@ -49,13 +80,16 @@ const blank = (line: string) => !line.trim();
  * ends with a line break (as a seeded file does) has the text added after it,
  * not after a blank line.
  */
-export function appendLines(before: string, text: string, max: number): { kept: string; dropped: string[] } {
+export function appendLines(
+  key: string, before: string, text: string, max: number, whenFull: WhenFull = "drop",
+): { kept: string; dropped: string[] } {
   if (text.length > max) {
     throw new Error(
       `${/[\r\n]/.test(text) ? "that text" : "that line"} is ${text.length} characters; `
       + `a document holds at most ${max}, so nothing was written`,
     );
   }
+  const size = before.length;
   const eol = before.includes("\r\n") ? "\r\n" : "\n";
   if (before.endsWith(eol)) before = before.slice(0, -eol.length);
   if (!before) return { kept: text, dropped: [] };
@@ -63,6 +97,7 @@ export function appendLines(before: string, text: string, max: number): { kept: 
   const lines = before.split("\n");
   // The length of `lines.slice(i).join("\n") + eol + text`, kept as `i` moves.
   let length = before.length + eol.length + text.length;
+  if (length > max && whenFull === "refuse") throw documentFull(key, size, length, max);
   let i = 0;
   while (length > max && i < lines.length) {
     // The line and the newline that followed it.

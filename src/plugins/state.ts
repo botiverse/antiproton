@@ -7,6 +7,7 @@ import type { Json } from "../core/types.ts";
 import { importKek, KEPT_NAME, KEPT_PREFIX, open, seal } from "../runtime/secrets.ts";
 import { STATE_INLINE_MAX, STATE_KEY } from "./state-key.ts";
 import type { SeedFileMeta, SeedMode } from "../store/seed-files.ts";
+import { documentFull, type WhenFull } from "../store/state-lines.ts";
 
 type SealingKey = Awaited<ReturnType<typeof importKek>>;
 
@@ -99,8 +100,9 @@ interface StateConfig {
   maxTotalBytes?: number;
   /** The largest single value, spilled or not. */
   maxValueBytes?: number;
-  /** Cap on a text document: an append past it drops the oldest whole lines,
-   *  a revision past it is refused. */
+  /** Cap on a text document, in characters: an append past it drops the oldest
+   *  whole lines, or is refused for a document that refuses when full
+   *  (`WORKING_SET`); a revision past it is refused. */
   maxDocumentBytes?: number;
 }
 
@@ -116,11 +118,19 @@ export const WORKING_SET: ReadonlyArray<{
   key: string; budget: number; what: string;
   /** Keep the end rather than the beginning when it does not fit. */
   tail?: boolean;
+  /**
+   * What a `remember` that does not fit does; "drop" when absent. Standing facts and open items refuse: their oldest
+   * lines are what the owner said first and what was promised, and dropping them silently is the loss that matters.
+   */
+  whenFull?: WhenFull;
 }> = [
-  { key: "todo", budget: 2000, what: "open items" },
-  { key: "memory", budget: 4000, what: "durable facts" },
+  { key: "todo", budget: 2000, what: "open items", whenFull: "refuse" },
+  { key: "memory", budget: 4000, what: "durable facts", whenFull: "refuse" },
   { key: "journal", budget: 3000, what: "recent log", tail: true },
 ];
+
+/** What a `remember` on `key` does when it does not fit: a document of the agent's own naming drops, like `journal`. */
+const whenFullOf = (key: string): WhenFull => WORKING_SET.find((d) => d.key === key)?.whenFull ?? "drop";
 
 /** Named once because `workingSet` looks a mount up by it. A second copy of the
  *  string is how the injected text came to name a tool nothing had to provide. */
@@ -218,7 +228,7 @@ export function statePlugin(
       { name: "maxValueBytes", type: "number", default: DEFAULTS.maxValueBytes,
         summary: `Largest single value; anything bigger is refused. Values over ${STATE_INLINE_MAX / 1024} KiB are kept in object storage and handed back as a reference, which is not configurable.` },
       { name: "maxDocumentBytes", type: "number", default: DEFAULTS.maxDocumentBytes,
-        summary: "Largest text document, in characters: a `remember` past it drops the oldest whole lines and says which, a `revise` past it is refused." },
+        summary: "Largest text document, in characters: a `remember` past it drops the oldest whole lines and says which, except on `memory` and `todo`, where it is refused; a `revise` past it is refused, and so is a `put` of text past it to `memory` or `todo`." },
       { name: "maxTotalBytes", type: "number", default: DEFAULTS.maxTotalBytes,
         summary: "How much this agent may keep in total. A write that would pass it is refused." },
     ],
@@ -237,7 +247,9 @@ export function statePlugin(
           "change or delete one line, use `revise`. A full document drops its oldest lines to make " +
           "room, and the reply quotes them. Remembering into it again drops more, so free up space " +
           "first: delete or shorten a line that is no longer true with `revise`, or drop a whole " +
-          "document with `forget`, then remember what you still need.",
+          "document with `forget`, then remember what you still need. `memory` and `todo` never " +
+          "drop a line: one that does not fit is refused and nothing is written, so free up space " +
+          "the same way first.",
         parameters: {
           type: "object",
           properties: {
@@ -471,8 +483,10 @@ export function statePlugin(
         case "remember": {
           const text = String(a.text ?? "").trim();
           if (!text) throw new Error("nothing to remember");
-          const r = await store.appendState(tenantId, agentId, key, text, cfg.maxDocumentBytes);
-          if (!r.dropped.length) return { key, bytes: r.bytes };
+          const r = await store.appendState(tenantId, agentId, key, text, cfg.maxDocumentBytes, whenFullOf(key));
+          // `bytes` is the document's length as the cap counts it, characters, so the two can be read together.
+          const cap = cfg.maxDocumentBytes;
+          if (!r.dropped.length) return { key, bytes: r.bytes, cap };
           // The lines themselves, not only that some went: a note that says the
           // document was full leaves the agent no way to know whether what it
           // lost mattered. Quoted up to a limit, since the reply is part of the
@@ -480,13 +494,13 @@ export function statePlugin(
           const all = r.dropped.join("\n");
           const quoted = memoryExcerpt(all, DROPPED_QUOTE_MAX);
           const n = r.dropped.length;
-          // A full memory loses what its owner said without anyone choosing to, so monitoring is told it happened:
+          // A full document loses lines without anyone choosing to, so monitoring is told it happened:
           // which document and how much, never the lines or the document, which are the agent's own notes.
           // Any other key is the agent's own name and may itself be note text, so it is recorded only as "other".
           const traced = WORKING_SET.some((d) => d.key === key) ? key : "other";
           ctx.trace?.({ kind: "state.dropped", status: "dropped", verdict: "ok", attrs: { key: traced, lines: n, characters: all.length } });
           return {
-            key, bytes: r.bytes,
+            key, bytes: r.bytes, cap,
             dropped: { lines: n, characters: all.length, text: quoted.excerpt },
             note: `the document was full, so its ${n} oldest ${n === 1 ? "line was" : "lines were"} dropped to make room; `
               + (quoted.excerpt.length < all.length
@@ -511,8 +525,8 @@ export function statePlugin(
           const r = await store.reviseState(tenantId, agentId, key, a.match, replace, cfg.maxDocumentBytes);
           const quote = (t: string) => memoryExcerpt(t, REVISED_QUOTE_MAX).excerpt;
           return replace === null
-            ? { key, bytes: r.bytes, line: r.line, deleted: quote(r.was), note: `line ${r.line} was deleted` }
-            : { key, bytes: r.bytes, line: r.line, was: quote(r.was), now: quote(replace), note: `line ${r.line} was replaced` };
+            ? { key, bytes: r.bytes, cap: cfg.maxDocumentBytes, line: r.line, deleted: quote(r.was), note: `line ${r.line} was deleted` }
+            : { key, bytes: r.bytes, cap: cfg.maxDocumentBytes, line: r.line, was: quote(r.was), now: quote(replace), note: `line ${r.line} was replaced` };
         }
 
         case "get": {
@@ -559,7 +573,11 @@ export function statePlugin(
                   + `the artifacts mount: read { ref: "${shown}", from: 0 } — each page's note gives the next`,
             };
           }
-          return { key, found: true, bytes: got.bytes, updatedAt: got.updatedAt, value: got.value, ...seeded };
+          // A text document is also given its length as the cap counts it, characters, beside the cap: `bytes` is the
+          // stored size, which for text that `put` wrote is its JSON, quotes and escapes included, so it is not the
+          // number to hold against the cap.
+          const text = typeof got.value === "string" ? { characters: got.value.length, cap: cfg.maxDocumentBytes } : {};
+          return { key, found: true, bytes: got.bytes, ...text, updatedAt: got.updatedAt, value: got.value, ...seeded };
         }
 
         case "forget":
@@ -569,6 +587,14 @@ export function statePlugin(
           const body = JSON.stringify(a.value ?? null);
           if (body.length > cfg.maxValueBytes) {
             throw new Error(`value is ${body.length} bytes; the limit is ${cfg.maxValueBytes}`);
+          }
+          // Text put to a document that refuses when full is held to the same cap a `remember` is, in the same unit:
+          // past it, the next `remember` would be refused anyway, and on a document that dropped instead it would
+          // silently lose everything above the cap at once. A value that is not text has no lines to keep or lose
+          // and is stored as before.
+          if (typeof a.value === "string" && a.value.length > cfg.maxDocumentBytes && whenFullOf(key) === "refuse") {
+            const now = (await store.getState(tenantId, agentId, key))?.value;
+            throw documentFull(key, typeof now === "string" ? now.length : null, a.value.length, cfg.maxDocumentBytes, "put");
           }
           // Checked before writing, not after: the point is to refuse, not to
           // notice afterwards that the object is full.
