@@ -30,7 +30,7 @@
  * A row the outbox read but refused (`dropped`: kind or verdict outside the
  * contract's vocabulary) is not carried and not silent: the pass warns, naming
  * the refused rows' kinds and the first one's seq (`PendingTrace`), and
- * `trace_drops` keeps one line per pass that /admin/diagnose shows beside
+ * `trace_drops` keeps one line per pass, with the same kinds and seq, that /admin/diagnose shows beside
  * `alarm_errors` — the number has a place that changes because of it, not
  * only a place that reads it.
  *
@@ -54,7 +54,34 @@ type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } }
 export type TraceSink = { put(key: string, body: Uint8Array): Promise<unknown> };
 
 const LOCAL = "CREATE TABLE IF NOT EXISTS trace_sent (id INTEGER PRIMARY KEY CHECK (id = 1), through_seq INTEGER NOT NULL)";
-const DROPS = "CREATE TABLE IF NOT EXISTS trace_drops (at INTEGER NOT NULL, dropped INTEGER NOT NULL)";
+const DROPS = "CREATE TABLE IF NOT EXISTS trace_drops (at INTEGER NOT NULL, dropped INTEGER NOT NULL, kinds TEXT, first_seq INTEGER)";
+/**
+ * Columns added after `trace_drops` was first made. The table is made here, lazily, at the first drop, not with the
+ * store's schema (src/store/durable-object.ts `init`), so it gains them here too: on an object whose table predates
+ * them the CREATE above is a no-op, and a four-column insert into the two-column table would throw out of the export.
+ * Each is added, nullable, where it is missing, so a line written before reads null. `kinds` is the pass's
+ * `PendingTrace.droppedKinds` as JSON and `first_seq` its `firstDroppedSeq`: kept, not only warned, as Workers Logs
+ * can drop the warning.
+ */
+const DROPS_ADDED_COLUMNS = [
+  { column: "kinds", sql: "ALTER TABLE trace_drops ADD COLUMN kinds TEXT" },
+  { column: "first_seq", sql: "ALTER TABLE trace_drops ADD COLUMN first_seq INTEGER" },
+];
+/**
+ * Make `trace_drops` and bring it up to DROPS_ADDED_COLUMNS; true when it has them all. An ALTER that fails is
+ * swallowed and answered false, so the caller writes the two columns it has: losing a pass's kinds is better than
+ * failing the export, which would refuse the same batch on every pass.
+ */
+function ensureDrops(sql: Sql): boolean {
+  sql.exec(DROPS);
+  const has = () => new Set(sql.exec("PRAGMA table_info(trace_drops)").toArray().map((c: any) => String(c.name)));
+  const before = has();
+  for (const a of DROPS_ADDED_COLUMNS) {
+    if (!before.has(a.column)) try { sql.exec(a.sql); } catch { /* answered by the check below */ }
+  }
+  const after = has();
+  return DROPS_ADDED_COLUMNS.every((a) => after.has(a.column));
+}
 /**
  * How long a drop stays on record. A put that keeps failing refuses the same
  * batch on every pass and writes a line each time — honest, and unbounded
@@ -105,10 +132,15 @@ export async function flushTrace(
     // that is left of them. The kinds are as stored (cut to a length), so they are quoted, never spliced in raw.
     console.warn(`trace outbox for ${tenantId}/${agentId}: ${dropped} row(s) outside the contract's vocabulary were dropped, ` +
       `first seq ${firstDroppedSeq}, kinds ${JSON.stringify(droppedKinds)}`);
-    sql.exec(DROPS);
+    const detailed = ensureDrops(sql);
     const at = now();
     sql.exec("DELETE FROM trace_drops WHERE at < ?", at - TRACE_DROPS_KEEP_MS);
-    sql.exec("INSERT INTO trace_drops(at, dropped) VALUES (?, ?)", at, dropped);
+    if (detailed) {
+      sql.exec("INSERT INTO trace_drops(at, dropped, kinds, first_seq) VALUES (?, ?, ?, ?)", at, dropped, JSON.stringify(droppedKinds), firstDroppedSeq);
+    } else {
+      console.warn(`trace outbox for ${tenantId}/${agentId}: trace_drops has no kinds or first_seq column, so this pass's are not kept`);
+      sql.exec("INSERT INTO trace_drops(at, dropped) VALUES (?, ?)", at, dropped);
+    }
   }
   let key: string | null = null;
   if (rows.length) {

@@ -259,9 +259,12 @@ export interface PendingTrace {
   /** Rows read but left out because kind or verdict was not the contract's vocabulary. */
   dropped: number;
   /**
-   * Those rows by their stored kind, with how many of each: the kind cut to DROPPED_KIND_MAX characters, since it came
-   * from storage and could be anything, and past DROPPED_KINDS_MAX distinct kinds the rest counted under `…`. Empty
-   * when nothing was dropped. A dropped row's attrs are never read, so they cannot reach a log through this.
+   * Those rows by what was wrong, with how many of each: `kind:<stored kind>` for a kind not in TRACE_KINDS, or
+   * `verdict:<kind>:<stored verdict>` for a known kind whose verdict is not in TRACE_VERDICTS (a row wrong in both is a
+   * `kind:` one). What was wrong comes first so that the cut keeps it: each key is cut to DROPPED_KIND_MAX characters,
+   * since the values came from storage and could be anything, and past DROPPED_KINDS_MAX distinct keys the rest are
+   * counted under `…`. Empty when nothing was dropped. A dropped row's attrs are never read, so they cannot reach a log
+   * through this.
    */
   droppedKinds: Record<string, number>;
   /** The first dropped row's seq, to find it in the outbox before the export prunes it; null when none was dropped. */
@@ -275,9 +278,9 @@ export interface PendingTrace {
   through: number;
 }
 
-/** How much of a dropped row's kind is said (`PendingTrace.droppedKinds`). */
+/** How much of a dropped row's key is said (`PendingTrace.droppedKinds`). */
 export const DROPPED_KIND_MAX = 60;
-/** How many distinct dropped kinds are said by name in one read; the rest are counted under `…`. */
+/** How many distinct dropped keys are said by name in one read; the rest are counted under `…`. */
 export const DROPPED_KINDS_MAX = 10;
 
 const isMember = <T extends string>(table: readonly T[], s: string): s is T =>
@@ -307,7 +310,7 @@ export function pendingTrace(sql: Sql, afterSeq: number, limit = 1000): PendingT
     if (!isKind(kind) || !isVerdict(verdict)) {
       dropped++;
       firstDroppedSeq ??= Number(r.seq);
-      const named = kind.slice(0, DROPPED_KIND_MAX);
+      const named = (isKind(kind) ? `verdict:${kind}:${verdict}` : `kind:${kind}`).slice(0, DROPPED_KIND_MAX);
       const key = droppedKinds.has(named) || droppedKinds.size < DROPPED_KINDS_MAX ? named : "…";
       droppedKinds.set(key, (droppedKinds.get(key) ?? 0) + 1);
       return [];

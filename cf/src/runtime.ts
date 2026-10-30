@@ -1924,7 +1924,7 @@ export class AgentRuntime {
     const at = Date.now();
     try {
       appendTrace(this.#deps.ctx.storage.sql, [{ at, tenantId, agentId, kind: "github.refresh_skipped",
-        spanId: `refresh_${crypto.randomUUID()}`, status: "skipped", verdict: "blocked", attrs: { mount: mount.alias, why, reasonCode: code } }]);
+        spanId: `refresh_skip_${crypto.randomUUID()}`, status: "skipped", verdict: "blocked", attrs: { mount: mount.alias, why, reasonCode: code } }]);
     } catch (e) { console.error("github: tracing a skipped renewal failed:", String((e as Error)?.message ?? e).slice(0, 200)); }
     return { ...foreign, code };
   }

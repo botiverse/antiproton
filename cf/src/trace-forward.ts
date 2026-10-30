@@ -619,7 +619,13 @@ export function stageForward(sql: Sql, cfg: ForwardConfig, tenantId: string, age
   lane: ForwardLane = GITHUB_REFRESH_LANE): number {
   const t = tablesOf(lane), d = ddl(lane);
   const from = forwardCursor(sql, lane);
-  const { rows, through } = pendingTrace(sql, from, STAGE_READ_MAX);
+  const { rows, dropped, droppedKinds, firstDroppedSeq, through } = pendingTrace(sql, from, STAGE_READ_MAX);
+  // The cursor moves past refused rows, so this lane never stages them: said in the export's words for its own
+  // refusals (cf/src/trace-r2.ts `flushTrace`), so one search finds both, with the lane's name.
+  if (dropped > 0) {
+    console.warn(`trace forward ${lane.name} for ${tenantId}/${agentId}: ${dropped} row(s) outside the contract's vocabulary were dropped, ` +
+      `first seq ${firstDroppedSeq}, kinds ${JSON.stringify(droppedKinds)}`);
+  }
   const mounts = rows.length ? mountsOf(sql, tenantId, agentId) : NO_MOUNTS;
   sql.exec(d.queue);
   let unsendable = 0;

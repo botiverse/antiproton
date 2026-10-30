@@ -254,6 +254,24 @@ await check("trace rows a pd commit failed to write are listed, newest three fir
   host.dispose();
 });
 
+await check("trace drops are listed with their kinds and first seq; a line from before those columns says not recorded, and reading adds no column", async () => {
+  const { host, store } = await agentObject();
+  // The table as builds before `kinds` and `first_seq` made it (cf/src/trace-r2.ts): read as it is, not altered.
+  host.sql.exec("CREATE TABLE trace_drops (at INTEGER NOT NULL, dropped INTEGER NOT NULL)");
+  host.sql.exec("INSERT INTO trace_drops(at, dropped) VALUES (10, 2)");
+  const before = dump(host);
+  const old = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", deps(store)) as any;
+  assert(JSON.stringify(old.traceDrops) === JSON.stringify([{ at: 10, dropped: 2, kinds: "not recorded", firstSeq: null }]), `old shape: ${JSON.stringify(old.traceDrops)}`);
+  assert(dump(host) === before, "reading the old table changed it");
+  host.sql.exec("ALTER TABLE trace_drops ADD COLUMN kinds TEXT");
+  host.sql.exec("ALTER TABLE trace_drops ADD COLUMN first_seq INTEGER");
+  host.sql.exec("INSERT INTO trace_drops(at, dropped, kinds, first_seq) VALUES (20, 1, ?, 5)", '{"kind:not.a.kind":1}');
+  const r = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", deps(store)) as any;
+  assert(JSON.stringify(r.traceDrops) === JSON.stringify([{ at: 20, dropped: 1, kinds: { "kind:not.a.kind": 1 }, firstSeq: 5 }, { at: 10, dropped: 2, kinds: "not recorded", firstSeq: null }]),
+    `traceDrops: ${JSON.stringify(r.traceDrops)}`);
+  host.dispose();
+});
+
 await check("an agent or conversation the object does not hold is null, and an unclaimed object gains no table", async () => {
   const { host, store } = await agentObject();
   const before = dump(host);

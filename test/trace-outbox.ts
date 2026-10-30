@@ -115,7 +115,7 @@ check("and at read: a corrupted row is counted, not passed through as a valid ty
   eq(pending.rows[0].attrs, { unparseable: true }, "and a parseable-but-wrong-shaped attrs is the same one shape of damage");
 });
 
-check("a dropped row is said by its stored kind and seq, the kind cut to a length, the attrs never read", () => {
+check("a dropped row is said by its stored kind, or its kind and verdict, and its seq, cut to a length, the attrs never read", () => {
   const host = sqliteHost();
   ensureTraceOutbox(host.sql);
   appendTrace(host.sql, [row({ spanId: "op_1" })]);
@@ -123,13 +123,17 @@ check("a dropped row is said by its stored kind and seq, the kind cut to a lengt
     "INSERT INTO trace_outbox (at, tenant_id, agent_id, kind, span_id, parent_id, status, verdict, ms, attrs) VALUES (?, 't', 'a', ?, 'x', NULL, 's', ?, NULL, '{\"token\":\"ghu_secret\"}')",
     T0, kind, verdict);
   raw("bogus.kind"); raw("bogus.kind"); raw("x".repeat(500)); raw("__proto__"); raw("tool.call", "weird");
+  // Wrong in both: said as its kind. A bad verdict on a long valid kind still says `verdict:` within the cut.
+  raw("bogus.kind", "weird"); raw("raft.assistant_send_as_owner", "v".repeat(500));
   const pending = pendingTrace(host.sql, 0);
-  eq(pending.dropped, 5, "every refused row counted");
+  eq(pending.dropped, 7, "every refused row counted");
   eq(pending.firstDroppedSeq, 2, "the first refused row's seq");
-  eq(pending.droppedKinds, { "bogus.kind": 2, ["x".repeat(DROPPED_KIND_MAX)]: 1, ["__proto__"]: 1, "tool.call": 1 }, "by kind, with counts");
+  eq(pending.droppedKinds, { "kind:bogus.kind": 3, ["kind:" + "x".repeat(DROPPED_KIND_MAX - 5)]: 1, "kind:__proto__": 1, "verdict:tool.call:weird": 1,
+    ["verdict:raft.assistant_send_as_owner:" + "v".repeat(DROPPED_KIND_MAX - 37)]: 1 },
+    "by what was wrong, with counts: a bad kind apart from a bad verdict");
   must(!JSON.stringify(pending.droppedKinds).includes("ghu_secret"), "attrs leaked");
   eq(pending.rows.map((r) => r.seq), [1], "the good row still read");
-  const clean = pendingTrace(host.sql, 6);
+  const clean = pendingTrace(host.sql, 8);
   eq([clean.droppedKinds, clean.firstDroppedSeq], [{}, null], "nothing dropped, nothing said");
 });
 

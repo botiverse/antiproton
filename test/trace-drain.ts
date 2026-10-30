@@ -94,11 +94,50 @@ await check("a row the outbox refused is warned about, written down, and does no
   const { out, warned } = await quiet(() => flushTrace(b, host.sql, OWNER.tenantId, OWNER.agentId, 500, () => 42));
   must(out.rows === 2 && out.dropped === 1, `flush said ${JSON.stringify(out)}`);
   must(warned.length === 1 && /1 row\(s\)/.test(warned[0]!), `warned: ${JSON.stringify(warned)}`);
-  must(warned[0]!.includes('first seq 2, kinds {"not.a.kind":1}'), `the warning does not say which row: ${warned[0]}`);
+  must(warned[0]!.includes('first seq 2, kinds {"kind:not.a.kind":1}'), `the warning does not say which row: ${warned[0]}`);
   const d = drops(host.sql);
   must(d.length === 1 && Number(d[0].dropped) === 1 && Number(d[0].at) === 42, `trace_drops ${JSON.stringify(d)}`);
+  const detail = host.sql.exec("SELECT kinds, first_seq FROM trace_drops").toArray()[0] as any;
+  must(detail.kinds === '{"kind:not.a.kind":1}' && Number(detail.first_seq) === 2, `trace_drops keeps no detail: ${JSON.stringify(detail)}`);
   must(b.puts.length === 1 && b.puts[0]!.key === "trace/t1/a1/1-3.ndjson", "the good rows were not written");
   must(cursor(host.sql) === 3 && left(host.sql) === 0, "the dropped row was left behind to be dropped again");
+});
+
+/** An object whose `trace_drops` is the two-column table builds before `kinds` and `first_seq` made, with a line of its own, and one refused row waiting. */
+const oldShape = () => {
+  const host = sqliteHost(); ensureTraceOutbox(host.sql);
+  host.sql.exec("CREATE TABLE trace_drops (at INTEGER NOT NULL, dropped INTEGER NOT NULL)");
+  host.sql.exec("INSERT INTO trace_drops(at, dropped) VALUES (7, 3)");
+  appendTrace(host.sql, [row(1)]);
+  host.sql.exec("INSERT INTO trace_outbox(at, tenant_id, agent_id, kind, span_id, parent_id, status, verdict, ms, attrs) VALUES (?,?,?,?,?,?,?,?,?,?)",
+    1, "t1", "a1", "tool.call", "x", null, "s", "weird", null, "{}");
+  return host;
+};
+const dropLines = (sql: any) => (sql.exec("SELECT * FROM trace_drops ORDER BY at").toArray() as any[])
+  .map((r) => [Number(r.at), Number(r.dropped), r.kinds ?? null, r.first_seq == null ? null : Number(r.first_seq)]);
+
+await check("an object whose trace_drops predates kinds and first_seq gains them at its next drop; its old line reads null", async () => {
+  const host = oldShape(); const b = bucket();
+  const { out } = await quiet(() => flushTrace(b, host.sql, OWNER.tenantId, OWNER.agentId, 500, () => 42));
+  must(out.rows === 1 && out.dropped === 1 && b.puts.length === 1, `flush said ${JSON.stringify(out)}`);
+  const cols = (host.sql.exec("PRAGMA table_info(trace_drops)").toArray() as any[]).map((c) => c.name);
+  must(cols.includes("kinds") && cols.includes("first_seq"), `columns: ${cols}`);
+  must(JSON.stringify(dropLines(host.sql)) === JSON.stringify([[7, 3, null, null], [42, 1, '{"verdict:tool.call:weird":1}', 2]]),
+    `trace_drops: ${JSON.stringify(dropLines(host.sql))}`);
+});
+
+await check("columns that cannot be added cost the pass its kinds, not the export: two columns written, a warning, the rows exported", async () => {
+  const host = oldShape(); const b = bucket();
+  // Storage that refuses the ALTERs, as if they failed for a reason of their own.
+  const sql = { exec: (q: string, ...v: unknown[]) => {
+    if (/^ALTER TABLE trace_drops/.test(q)) throw new Error("not this time");
+    return host.sql.exec(q, ...v);
+  } };
+  const { out, warned } = await quiet(() => flushTrace(b, sql as any, OWNER.tenantId, OWNER.agentId, 500, () => 42));
+  must(out.rows === 1 && out.dropped === 1 && b.puts.length === 1, `the export failed: ${JSON.stringify(out)}`);
+  must(warned.some((w) => w.includes("no kinds or first_seq column")), `no warning: ${JSON.stringify(warned)}`);
+  must(JSON.stringify(dropLines(host.sql)) === JSON.stringify([[7, 3, null, null], [42, 1, null, null]]), `trace_drops: ${JSON.stringify(dropLines(host.sql))}`);
+  must(cursor(host.sql) === 2, "the cursor did not move");
 });
 
 await check("a batch that is only refused rows still moves the cursor past them", async () => {
