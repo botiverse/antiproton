@@ -129,6 +129,30 @@ await check("工作集有字节预算，日志最先被裁", async () => {
   if (!jrn.includes("…")) throw new Error("a trimmed document did not say it was trimmed");
 });
 
+await check("a memory over its budget shows its first and its latest lines, and between them how much is left out and how to read it", async () => {
+  const { store, plugin, ctx } = await fixture();
+  await store.addMount({
+    tenantId: "t", agentId: "a", alias: "state", installationId: "i", connectionId: null,
+    plugin: "state", toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
+  } as any);
+  const budget = WORKING_SET.find((d) => d.key === "memory")!.budget;
+  await plugin.invoke("remember", { key: "memory", text: "EARLIEST-NOTE: the owner is Ada" }, ctx());
+  for (let i = 0; i < Math.ceil(budget / 40) * 2; i++) await plugin.invoke("remember", { key: "memory", text: `filler note ${i} ${"x".repeat(20)}` }, ctx());
+  await plugin.invoke("remember", { key: "memory", text: "LATEST-NOTE: Ada prefers mornings" }, ctx());
+  const whole = String((await store.getState("t", "a", "memory"))!.value);
+  if (whole.length <= budget) throw new Error(`control: memory is ${whole.length}, within its budget`);
+  const mem = (await workingSet(store, "t", "a")).split("## memory (durable facts)\n")[1]!;
+  for (const n of ["EARLIEST-NOTE", "LATEST-NOTE"]) if (!mem.includes(n)) throw new Error(`${n} is not shown: ${mem.slice(0, 200)} … ${mem.slice(-200)}`);
+  const marker = /^… (\d+) of (\d+) characters left out here; get `memory` with the `get` tool on the `state` mount to read all of it\.$/m.exec(mem);
+  if (!marker || Number(marker[2]) !== whole.length) throw new Error(`no marker: ${mem.slice(budget / 2 - 100, budget / 2 + 300)}`);
+  if (mem.length - marker[0].length > budget + 2) throw new Error(`shown ${mem.length - marker[0].length} characters of a ${budget} budget`);
+  // Whole lines on both sides of the marker.
+  const [before, after] = mem.split(marker[0]);
+  const lines = new Set(whole.split("\n"));
+  const lastBefore = before!.replace(/\n$/, "").split("\n").at(-1)!, firstAfter = after!.replace(/^\n/, "").split("\n")[0]!;
+  if (!lines.has(lastBefore) || !lines.has(firstAfter)) throw new Error(`cut inside a line: ${JSON.stringify(lastBefore)} | ${JSON.stringify(firstAfter)}`);
+});
+
 await check("错的记忆可以删掉", async () => {
   const { plugin, ctx } = await fixture();
   await plugin.invoke("remember", { key: "memory", text: "错的" }, ctx());

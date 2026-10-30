@@ -58,7 +58,7 @@ import { credentialRedactor, agentSecretValues } from "./eval-read.ts";
 import { logicalMain, physicalSession } from "./fresh-context.ts";
 import { assistantSystemPrompt, profilePrompt, systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { returnToolsChange, takeToolsChange, type ToolsChange } from "../../src/runtime/tools-seen.ts";
-import { assistantMountOf, assistantTools, isOwnerReadAddress } from "../../src/plugins/raft-assistant.ts";
+import { MEMORY_PLUGIN, assistantMountOf, assistantTools, isOwnerReadAddress, memoryMountOf } from "../../src/plugins/raft-assistant.ts";
 import { forgetIsolated, isIsolatedSession, isolatedSession, isolatedSessions, newIsolatedSessionId, recordIsolated } from "../../src/runtime/isolated-session.ts";
 import { profileOf, profileSpec } from "../../src/runtime/agent-profile.ts";
 import {
@@ -1318,6 +1318,16 @@ export type FreshContextResult =
 export type RestartResult =
   | { ok: true; sessionId: string; restartedAt: number }
   | { ok: false; status: 404 | 409; error: string };
+
+/**
+ * Whose snapshot of the prompt's moving parts a conversation is told against (src/runtime/prompt-context.ts): the
+ * agent's, or, for a personal assistant, its own beside it, since an assistant's prompt shows only its memory
+ * (`#promptContextNow`). One taken under the agent's key, of every plugin's paragraph, is never read for it, so an
+ * assistant's conversation already under way takes its parts again once rather than showing paragraphs it was not given.
+ */
+function promptOwner(tenantId: string, agentId: string, assistant: boolean): string {
+  return assistant ? `${tenantId}/${agentId}#assistant` : `${tenantId}/${agentId}`;
+}
 
 /**
  * Whether an Agents API caller declared a function named `send_to_agent`: then the caller's function is offered under
@@ -3709,8 +3719,9 @@ export class AgentRuntime {
     // An agent made with a profile is offered nothing: its mounts are its plugin's code's and provisioning's
     // (src/runtime/agent-profile.ts), and their calls still go through the gateway, which this list does not change.
     // A personal assistant (its raft mount's snapshot says whose, src/plugins/raft-assistant.ts) is offered its owner DM,
-    // the owner reads and its own two tools, and none of the harness's own but `resume`: no run_js, no jobs, no subagents.
+    // the owner reads, its own tools and its memory, and none of the harness's own but `resume`: no run_js, no jobs, no subagents.
     const assistant = profileOf(agentConfig) ? null : assistantMountOf(records);
+    const memory = assistant ? memoryMountOf(records) : null;
     // Its proactive checks run in short sessions of their own (`PluginNext.isolated`), offered only what a check reads
     // and sends with; the main conversation is its chat with its owner.
     const isolated = isIsolatedSession(session);
@@ -3725,7 +3736,7 @@ export class AgentRuntime {
     const tools = narrowed(profileOf(agentConfig) ? []
       : isSubagentSession(session)
       ? (() => { const withheld = this.#childWithheldIn(catalogue); return catalogue.tools.filter((t) => !withheld.has(t.address)); })()
-      : assistant ? assistantTools(catalogue.tools, assistant, isolated ? "check" : "chat")
+      : assistant ? assistantTools(catalogue.tools, assistant, isolated ? "check" : "chat", memory)
       : catalogue.tools);
     const sandbox = this.#deps.sandbox ?? true;
     const store = this.store;
@@ -3863,7 +3874,7 @@ export class AgentRuntime {
         : []),
       ...callerTools,
     ];
-    return { tools, records, unoffered, reader, offered, activityOf, nameOf, host, extras, callerDefs, keeping, extraTools, assistant };
+    return { tools, records, unoffered, reader, offered, activityOf, nameOf, host, extras, callerDefs, keeping, extraTools, assistant, memory };
   }
 
   /**
@@ -3903,7 +3914,7 @@ export class AgentRuntime {
     await this.repinMounts(tenantId, agentId);
     const builtFrom = await this.#harnessKeyFor(tenantId, agentId);
     const agentRef: { current: PiAgent | null } = { current: null };
-    const { records, unoffered, offered, nameOf, host, extras, callerDefs, keeping, extraTools, assistant } =
+    const { records, unoffered, offered, nameOf, host, extras, callerDefs, keeping, extraTools, assistant, memory } =
       await this.#turnTools(tenantId, agentId, session, engine, agentRef);
     // An assistant's morning brief is its raft mount's own timer (`Plugin.wake`, src/plugins/raft-assistant.ts), which
     // re-arms itself every time it runs. Asked for here, at the one moment every agent passes through, only where none is
@@ -3914,13 +3925,13 @@ export class AgentRuntime {
     // conversation began (src/runtime/prompt-context.ts): every later open of a harness for it rebuilds the same bytes,
     // and what moved since is told at the head of a later message (`#takeContextChange`). pd records a changed prompt
     // as an inline patch at its place (src/model/durable-offloaded.ts `jobContext`), so it is given them as they are.
-    const now = await this.#promptContextNow(tenantId, agentId, records, nameOf);
+    const now = await this.#promptContextNow(tenantId, agentId, records, nameOf, assistant !== null);
     let shown = now;
     if (engine !== "pd") {
       // A snapshot that cannot be read or written must not keep the agent from opening: it opens on what is true
       // now, which is what it did before there were snapshots.
       try {
-        shown = promptContextFor(this.#deps.ctx.storage.sql, `${tenantId}/${agentId}`,
+        shown = promptContextFor(this.#deps.ctx.storage.sql, promptOwner(tenantId, agentId, assistant !== null),
           this.#conversationOf(session), now, conversationStarted(this.#deps.ctx.storage.sql, session), Date.now());
       } catch (e) { console.error(`the prompt snapshot of ${key}#${session} could not be used; opening on what is current:`, e); }
     }
@@ -3928,13 +3939,15 @@ export class AgentRuntime {
     // no I/O of its own.
     const record = (await this.store.loadAgent(tenantId, agentId))?.config;
     const profile = profileOf(record);
-    // An assistant's prompt is its own: the persona's name and description, then what it is for. Not the default core,
-    // the sandbox page or the mounts' paragraphs, which describe tools it is not offered.
-    // The assistant's prompt names only the tools on its raft mount this harness offers: a list taken by an older build
-    // lacks what this build's prompt would otherwise send the model to.
-    const onAssistant = assistant ? (offered as MountedTool[]).filter((t) => t.address.startsWith(`${assistant}.`))
-      .map((t) => t.address.slice(assistant.length + 1)) : [];
-    const prompt = profile ? profilePrompt(profile) : assistant ? assistantSystemPrompt(personaOf(record), assistant, isIsolatedSession(session) ? "check" : "chat", onAssistant, isolatedSession(this.#deps.ctx.storage.sql, session)?.turnKey ?? null) : systemPrompt({
+    // An assistant's prompt is its own: the persona's name and description, its memory, then what it is for. Not the
+    // default core, the sandbox page or the other mounts' paragraphs, which describe tools it is not offered.
+    // The assistant's prompt names only the tools on its raft and memory mounts this harness offers: a list taken by an
+    // older build lacks what this build's prompt would otherwise send the model to.
+    const on = (alias: string | null) => alias ? (offered as MountedTool[]).filter((t) => t.address.startsWith(`${alias}.`))
+      .map((t) => t.address.slice(alias.length + 1)) : [];
+    const onAssistant = on(assistant);
+    const prompt = profile ? profilePrompt(profile) : assistant ? assistantSystemPrompt(personaOf(record), assistant, isIsolatedSession(session) ? "check" : "chat",
+      onAssistant, isolatedSession(this.#deps.ctx.storage.sql, session)?.turnKey ?? null, memory ? { alias: memory, offered: on(memory) } : null, shown.contributions) : systemPrompt({
       // The agent's own record: a person named and described it at creation,
       // and that is the first thing the prompt says after the core.
       persona: personaOf(record),
@@ -4040,17 +4053,21 @@ export class AgentRuntime {
 
   /**
    * The system prompt's moving parts as they are now (src/runtime/prompt-context.ts): the plugins' contributions and
-   * one line per held thing, named as `nameOf` resolves a tool against the list the model is offered.
+   * one line per held thing, named as `nameOf` resolves a tool against the list the model is offered. A personal
+   * assistant's prompt shows only its memory's paragraph and nothing held (`assistantSystemPrompt`), so for one
+   * (`assistant`) that is all these are, and what moves in the rest is not told to it either.
    */
   async #promptContextNow(
     tenantId: string, agentId: string, records: Array<{ alias: string; plugin: string }>, nameOf: (alias: string, tool: string) => string | null,
+    assistant = false,
   ): Promise<PromptContext> {
     const activityOf = (alias: string) => this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, alias);
-    const paragraphs = await this.#gateway.promptParagraphs({ tenantId, agentId, taskId: LEGACY_TASK });
+    const paragraphs = (await this.#gateway.promptParagraphs({ tenantId, agentId, taskId: LEGACY_TASK }))
+      .filter((p) => !assistant || p.plugin === MEMORY_PLUGIN);
     return {
       contributions: paragraphs.map((p) => p.text).filter(Boolean),
       parts: paragraphs.flatMap((p) => p.parts),
-      held: heldItems(await heldResources(records, this.#plugins, activityOf), nameOf),
+      held: assistant ? [] : heldItems(await heldResources(records, this.#plugins, activityOf), nameOf),
     };
   }
 
@@ -4068,8 +4085,10 @@ export class AgentRuntime {
     const { tools, records } = await this.#catalogueFor(tenantId, agentId);
     const offered = withLimitNote(tools as MountedTool[], parkedReader(tools as MountedTool[]));
     const nameOf = (alias: string, tool: string) => offeredToolName(offered as MountedTool[], alias, tool);
-    const now = await this.#promptContextNow(tenantId, agentId, records, nameOf);
-    const owner = `${tenantId}/${agentId}`, conversation = this.#conversationOf(session);
+    // Asked as the harness asks it (`#turnTools`); an agent made with a profile is never asked this at all.
+    const assistant = assistantMountOf(records) !== null;
+    const now = await this.#promptContextNow(tenantId, agentId, records, nameOf, assistant);
+    const owner = promptOwner(tenantId, agentId, assistant), conversation = this.#conversationOf(session);
     const change = takeContextChange(this.#deps.ctx.storage.sql, owner, conversation, now, HARNESS_NOTICE);
     return change ? { owner, conversation, change } : null;
   }

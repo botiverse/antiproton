@@ -101,6 +101,26 @@ export const CHAT_TOOLS: readonly string[] = [
 export const CHECK_TOOLS: readonly string[] = [OWNER_INBOX, OWNER_MESSAGES, NOTIFY_TOOL];
 
 /**
+ * The memory tools an assistant is offered on its state mount, in its chat and in every check alike: the notes it keeps
+ * about its owner are loaded at the start of each (`MEMORY_PLUGIN`'s paragraph, cf/src/runtime.ts), and what to keep is
+ * the prompt's guidance (`memoryGuidance`), never a rule here. A name the mount does not list is offered as nothing,
+ * since `assistantTools` keeps only tools the catalogue has. Not the `secret_*` tools: an owner's credentials are not
+ * something an assistant keeps, and nothing it does needs one.
+ */
+export const MEMORY_TOOLS: readonly string[] = ["remember", "put", "get", "list", "forget", "revise"];
+/** The plugin that keeps an agent's memory (src/plugins/state.ts `PLUGIN_ID`), and whose paragraph an assistant's prompts show. */
+export const MEMORY_PLUGIN = "state";
+
+/**
+ * The alias of the mount an assistant keeps its memory on, or null: the first of the state plugin's, the one whose
+ * paragraph speaks for the agent's documents (src/plugins/state.ts `promptContribution`); a second mount reaches the
+ * same documents, so offering it too would only offer every tool twice.
+ */
+export function memoryMountOf(records: ReadonlyArray<Pick<MountRecord, "alias" | "plugin">>): string | null {
+  return records.find((r) => r.plugin === MEMORY_PLUGIN)?.alias ?? null;
+}
+
+/**
  * The alias of the raft mount that makes this agent someone's assistant, or null: a mount of the `raft` plugin whose
  * snapshot lists the owner inbox read, which the listing adds exactly when Raft's context names an owner
  * (`isAssistantOf`). A mount with no snapshot is not one: it never asked Raft.
@@ -116,9 +136,17 @@ export function isOwnerReadAddress(address: string): boolean {
   return address.includes(".") && (tool === OWNER_INBOX || tool === OWNER_MESSAGES);
 }
 
-/** The tools an assistant's model is offered out of the mounts' (`address` is `alias.tool`): `CHAT_TOOLS` or `CHECK_TOOLS`. */
-export function assistantTools<T extends { address: string; reads?: string }>(tools: readonly T[], alias: string, session: "chat" | "check"): T[] {
-  const allowed = new Set((session === "check" ? CHECK_TOOLS : CHAT_TOOLS).map((n) => `${alias}.${n}`));
+/**
+ * The tools an assistant's model is offered out of the mounts' (`address` is `alias.tool`): `CHAT_TOOLS` or
+ * `CHECK_TOOLS` on its raft mount, and `MEMORY_TOOLS` on its memory mount (`memoryMountOf`) when it has one.
+ */
+export function assistantTools<T extends { address: string; reads?: string }>(
+  tools: readonly T[], alias: string, session: "chat" | "check", memory: string | null = null,
+): T[] {
+  const allowed = new Set([
+    ...(session === "check" ? CHECK_TOOLS : CHAT_TOOLS).map((n) => `${alias}.${n}`),
+    ...(memory ? MEMORY_TOOLS.map((n) => `${memory}.${n}`) : []),
+  ]);
   return tools.filter((t) => allowed.has(t.address) || t.reads === "parked-result");
 }
 
@@ -3146,6 +3174,42 @@ function reads(t: (n: string) => string, has: (n: string) => boolean): string | 
  */
 const offeredTest = (offered: Iterable<string>) => { const set = new Set(offered); return (n: string) => set.has(n); };
 
+/** An assistant's memory mount (`memoryMountOf`) and the session's tools on it, bare names. */
+export interface AssistantMemory { alias: string; offered: Iterable<string> }
+
+/** How the chat removes something from its notes, by the tools it has: `revise` an entry, else rewrite or drop the document. */
+const forgetWith = (t: (n: string) => string, has: (n: string) => boolean): string =>
+  has("revise") ? ` with ${t("revise")}`
+  : has("put") && has("forget") ? `, writing the document again without it with ${t("put")}, or dropping a whole one with ${t("forget")}`
+  : has("put") ? `, writing the document again without it with ${t("put")}`
+  : has("forget") ? ` with ${t("forget")}`
+  : "";
+
+/**
+ * What an assistant is told about its notes: what is worth keeping and where, said once and the same in its chat and
+ * its checks, after a line for which one it is in; the chat's alone, what to do when its owner asks it to forget
+ * something or what it remembers. Guidance and nothing more: code never decides what the model keeps,
+ * including what it read in its owner's inbox, or when it writes it. Null without `remember` on the memory mount; the
+ * sentence about correcting an entry only with `revise`.
+ */
+export function memoryGuidance(m: AssistantMemory | null | undefined, session: "chat" | "check"): string | null {
+  if (!m) return null;
+  const t = (n: string) => `\`${modelToolName(m.alias, n)}\``;
+  const has = offeredTest(m.offered);
+  if (!has("remember")) return null;
+  return [
+    session === "chat"
+      ? `You keep notes with ${t("remember")}, and they are shown to you at the start of every chat and every check, under "What you already know".`
+      : `You keep notes with ${t("remember")}, shown to you under "What you already know" in your chat with your owner and in every check. If this check shows you something that will matter later, note it: a note tells no one, so it is not output.`,
+    "Keep what will matter later: your owner's standing preferences, how they like to be addressed, decisions and why they were made, and what you have said you will do. Put lasting facts in `memory` and running notes in `journal`, so routine notes don't push the facts out.",
+    has("revise") ? `When an entry turns out wrong or stops being true, change or remove it with ${t("revise")} rather than adding one that contradicts it.` : null,
+    // The chat's alone, since only the chat talks to the owner: asking it is the owner's only way to see and manage the
+    // notes today.
+    session === "chat" ? `When your owner asks you to forget something, remove it from your notes${forgetWith(t, has)}; when they ask what you remember about them, tell them truthfully from your notes.` : null,
+    "Write conclusions, not what you read: copy as little of anyone's messages as you can.",
+  ].filter((x): x is string => x !== null).join(" ");
+}
+
 /**
  * The first line of the chat's code part: it follows Raft's instructions (or DEFAULT_ASSISTANT_INSTRUCTIONS), and says
  * that where those conflict with what follows, what follows wins. Exported so a test can find it and its order. Its
@@ -3179,8 +3243,11 @@ const hhmm = (h: number) => `${String(h).padStart(2, "0")}:00`;
 const DEFAULT_TOLD = "an @mention of them, a DM to them, a question or decision waiting on them, a task assigned to them, and someone " +
   "asking them in a thread they are in; not general channel chat, talk between other people, or what they already dealt with";
 
-/** `offered` is the chat's tools on the raft mount (bare names); every one of `CHAT_TOOLS` when absent. */
-export function assistantPrompt(alias: string, offered: Iterable<string> = CHAT_TOOLS): string {
+/**
+ * `offered` is the chat's tools on the raft mount (bare names); every one of `CHAT_TOOLS` when absent. `memory` is its
+ * memory mount and the tools on it, none when absent.
+ */
+export function assistantPrompt(alias: string, offered: Iterable<string> = CHAT_TOOLS, memory?: AssistantMemory | null): string {
   const t = (n: string) => `\`${modelToolName(alias, n)}\``;
   const list = [...offered];
   const has = offeredTest(list);
@@ -3198,19 +3265,24 @@ export function assistantPrompt(alias: string, offered: Iterable<string> = CHAT_
         ` Every #channel:msgid you send them counts as told, so a later message unasked does not repeat it.`,
       has(PREFERENCES_TOOL) ? `They can change their settings in one sentence ("mute #random", "tell me right away if @ana needs me", "even at night", "nothing after 10pm", "only put #design in my morning brief"). Record each change with ${t(PREFERENCES_TOOL)}, then send them the tool's confirm line, or your own words for it in one line. Muting a channel stops its general chat, not @mentions of them there; to stop those too, they mute the person. Never say a setting is in place unless the tool recorded it. If they ask what rules you follow or what you will tell them about, call the tool's list and give its defaults, brief and quiet lines in a sentence or two, then its rules one per line, and say how to undo one ("remove r1"). If they ask for something the tool cannot record, say so in one line and offer the closest setting it can.` : null,
     ].filter((x): x is string => x !== null).join("\n"),
+    memoryGuidance(memory, "chat"),
     DELIVERY(t, has),
   ].filter((x): x is string => x !== null).join("\n\n");
 }
 
 /**
  * The system prompt of one proactive check, which runs in a short session of its own and ends with its one result.
- * `offered` is the check's tools on the raft mount (bare names); every one of `CHECK_TOOLS` when absent.
+ * `offered` is the check's tools on the raft mount (bare names); every one of `CHECK_TOOLS` when absent. `o.memory` is
+ * its memory mount and the tools on it, none when absent: its guidance ends either check's prompt.
  */
-export function assistantCheckPrompt(alias: string, offered: Iterable<string> = CHECK_TOOLS, o: { raftCheck?: boolean } = {}): string {
+export function assistantCheckPrompt(
+  alias: string, offered: Iterable<string> = CHECK_TOOLS, o: { raftCheck?: boolean; memory?: AssistantMemory | null } = {},
+): string {
   const t = (n: string) => `\`${modelToolName(alias, n)}\``;
   const has = offeredTest(offered);
   const notify = has(NOTIFY_TOOL);
-  if (o.raftCheck) return raftCheckPrompt(t, has, notify);
+  const notes = memoryGuidance(o.memory, "check");
+  if (o.raftCheck) return [raftCheckPrompt(t, has, notify), notes].filter((x): x is string => x !== null).join("\n\n");
   return [
     `You are a personal assistant in Raft for one person, your owner, making one check of their activity. Nobody is talking to you. Your input lists the conversations to look at, and ` +
       (notify ? `your only output is one call to ${t(NOTIFY_TOOL)}, or none.` : `this check has no tool to tell them with, so end without a call.`),
@@ -3218,5 +3290,6 @@ export function assistantCheckPrompt(alias: string, offered: Iterable<string> = 
     `Code has already removed what your owner muted, what they were already told and what a check already looked at, and applied their contact settings, except any rules about people your input lists, which you apply. Of what is left, report only what is waiting on your owner: ${WAITING}. Chatter and talk between other people is not waiting on them, even in a channel they follow.`,
     notify ? `Each item needs a reference they can click and a summary. The reference is #channel:msgid, using the msg= id from a read; for a task, use the message that is the task, never a bare task #N, which in their DM means the DM's own task. The summary is one short line, at most ${SUMMARY_MAX} characters: start with who, then what they want from your owner, e.g. "@cy needs your OK on the Friday launch date". Don't paste their message, don't add background, and don't give advice.
 Give every item you found in one call. The tool drops what they were already told and what their rules mute, keeps for the brief what their rules or their quiet hours hold, and shows at most ${DM_ITEMS_MAX}, so let it decide. Never message anyone any other way. When nothing is waiting on them, end without a call.` : null,
+    notes,
   ].filter((x): x is string => x !== null).join("\n\n");
 }

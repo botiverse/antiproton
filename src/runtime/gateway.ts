@@ -940,11 +940,11 @@ export class ToolGateway {
    * The same paragraphs with the parts each is told by when it changes (`Plugin.promptParts`): the plugin's own,
    * keyed under its id, or the whole paragraph as one part keyed by its mount. A plugin whose parts cannot be read
    * keeps its paragraph, as one part. Mounts that say nothing still give their parts, so a paragraph that goes
-   * quiet is told as gone.
+   * quiet is told as gone. Each names its plugin, so a prompt that shows only some plugins' paragraphs can pick them.
    */
-  async promptParagraphs(ctx: CallContext): Promise<Array<{ text: string; parts: PromptPart[] }>> {
+  async promptParagraphs(ctx: CallContext): Promise<Array<{ plugin: string; text: string; parts: PromptPart[] }>> {
     const mounts = await this.#store.listMounts(ctx.tenantId, ctx.agentId);
-    const out: Array<{ text: string; parts: PromptPart[] }> = [];
+    const out: Array<{ plugin: string; text: string; parts: PromptPart[] }> = [];
     for (const [id, plugin] of this.#plugins) {
       if (!plugin.promptContribution) continue;
       for (const mount of mounts.filter((m) => m.plugin === id)) {
@@ -981,7 +981,7 @@ export class ToolGateway {
         const parts = own
           ? own.map((p) => ({ ...p, key: `${id}:${p.key}` }))
           : [{ key: `mount:${mount.alias}`, label: `What the \`${mount.alias}\` mount told you`, text: trimmed, by: "plugin" as const }];
-        out.push({ text: trimmed, parts });
+        out.push({ plugin: id, text: trimmed, parts });
       }
     }
     return out;
