@@ -478,6 +478,9 @@ export function statePlugin(
           const all = r.dropped.join("\n");
           const quoted = memoryExcerpt(all, DROPPED_QUOTE_MAX);
           const n = r.dropped.length;
+          // A full memory loses what its owner said without anyone choosing to, so monitoring is told it happened:
+          // which document and how much, never the lines or the document, which are the agent's own notes.
+          ctx.trace?.({ kind: "state.dropped", status: "dropped", verdict: "ok", attrs: { key, lines: n, characters: all.length } });
           return {
             key, bytes: r.bytes,
             dropped: { lines: n, characters: all.length, text: quoted.excerpt },
