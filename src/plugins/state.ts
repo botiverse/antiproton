@@ -12,6 +12,11 @@ type SealingKey = Awaited<ReturnType<typeof importKek>>;
 
 export const SECRET_VALUE_MAX = 8_000;
 
+/** How much of the lines a full document dropped `remember` quotes back, in characters. */
+export const DROPPED_QUOTE_MAX = 1_500;
+/** How much of the line `revise` changed, before and after, it quotes back, in characters. */
+export const REVISED_QUOTE_MAX = 500;
+
 /*
  * Kept secrets, one set of rules for both ways in: the agent's own `secret_*`
  * tools below, under `kept:`, and the owner's console (`/ui/secret`), under
@@ -94,7 +99,8 @@ interface StateConfig {
   maxTotalBytes?: number;
   /** The largest single value, spilled or not. */
   maxValueBytes?: number;
-  /** Cap on an appended document before its head is dropped. */
+  /** Cap on a text document: an append past it drops the oldest whole lines,
+   *  a revision past it is refused. */
   maxDocumentBytes?: number;
 }
 
@@ -212,7 +218,7 @@ export function statePlugin(
       { name: "maxValueBytes", type: "number", default: DEFAULTS.maxValueBytes,
         summary: `Largest single value; anything bigger is refused. Values over ${STATE_INLINE_MAX / 1024} KiB are kept in object storage and handed back as a reference, which is not configurable.` },
       { name: "maxDocumentBytes", type: "number", default: DEFAULTS.maxDocumentBytes,
-        summary: "Largest working-set document before its head is trimmed." },
+        summary: "Largest text document, in characters: a `remember` past it drops the oldest whole lines and says which, a `revise` past it is refused." },
       { name: "maxTotalBytes", type: "number", default: DEFAULTS.maxTotalBytes,
         summary: "How much this agent may keep in total. A write that would pass it is refused." },
     ],
@@ -227,7 +233,9 @@ export function statePlugin(
           "when a task starts, so anything you put there you will see again without looking it " +
           "up. Write the fact, not the story. Never write a credential. A document is a key in " +
           "the same store `put`, `get`, `list` and `forget` use, so `get` on `journal` returns it " +
-          "and a `put` to that key replaces the whole document rather than appending to it.",
+          "and a `put` to that key replaces the whole document rather than appending to it. To " +
+          "change or delete one line, use `revise`. A full document drops its oldest lines to make " +
+          "room, and the reply quotes them, so you can save again whatever you still need.",
         parameters: {
           type: "object",
           properties: {
@@ -237,6 +245,31 @@ export function statePlugin(
           required: ["key", "text"],
         },
         sideEffects: "write",
+        idempotency: "none",
+      },
+      {
+        name: "revise",
+        summary:
+          "Change or delete one line of a document you keep with `remember`. `match` is a piece of " +
+          "that line, as it is now, which must occur exactly once in the whole document; if it " +
+          "occurs in no line or more than once nothing is changed and you are told how many times " +
+          "it matched, so give a longer piece. With `replace` the whole line becomes that text, " +
+          "leading spaces included; " +
+          "without it the line is deleted. The reply quotes the line as it was. Use it when " +
+          "something you wrote turns out to be wrong or stops being true: stale memory is worse " +
+          "than none, because you will act on it.",
+        parameters: {
+          type: "object",
+          properties: {
+            key: { type: "string", description: "the document, e.g. memory | todo | journal" },
+            match: { type: "string", description: "a piece of the one line to change, unique in the document" },
+            replace: { type: "string", description: "the line's new text, in full; omit to delete the line" },
+          },
+          required: ["key", "match"],
+        },
+        sideEffects: "write",
+        // Not replayable: a deletion run twice is refused the second time, and
+        // a replacement that still contains `match` would be applied again.
         idempotency: "none",
       },
       {
@@ -343,8 +376,8 @@ export function statePlugin(
       {
         name: "forget",
         summary:
-          "Delete a key. Use it when something you wrote down turned out to be wrong — stale " +
-          "memory is worse than none, because you will act on it.",
+          "Delete a key: a whole document, every line in it. Use it when all of it turned out to be " +
+          "wrong — stale memory is worse than none, because you will act on it. For one line, use `revise`.",
         parameters: {
           type: "object",
           properties: { key: { type: "string" } },
@@ -358,7 +391,9 @@ export function statePlugin(
     async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
       const cfg = { ...DEFAULTS, ...(ctx.publicConfig as StateConfig) };
       const { tenantId, agentId } = ctx.caller;
-      const a = (args ?? {}) as { key?: string; text?: string; value?: Json; prefix?: string; limit?: number };
+      const a = (args ?? {}) as {
+        key?: string; text?: string; value?: Json; prefix?: string; limit?: number; match?: unknown; replace?: unknown;
+      };
 
       if (tool.startsWith("secret_")) {
         const s = (args ?? {}) as { name?: unknown; value?: unknown };
@@ -435,10 +470,39 @@ export function statePlugin(
           const text = String(a.text ?? "").trim();
           if (!text) throw new Error("nothing to remember");
           const r = await store.appendState(tenantId, agentId, key, text, cfg.maxDocumentBytes);
+          if (!r.dropped.length) return { key, bytes: r.bytes };
+          // The lines themselves, not only that some went: a note that says the
+          // document was full leaves the agent no way to know whether what it
+          // lost mattered. Quoted up to a limit, since the reply is part of the
+          // conversation and a document's head can be most of 64 KiB.
+          const all = r.dropped.join("\n");
+          const quoted = memoryExcerpt(all, DROPPED_QUOTE_MAX);
+          const n = r.dropped.length;
           return {
             key, bytes: r.bytes,
-            ...(r.truncated ? { note: "the document was full; its oldest lines were dropped" } : {}),
+            dropped: { lines: n, characters: all.length, text: quoted.excerpt },
+            note: `the document was full, so its ${n} oldest ${n === 1 ? "line was" : "lines were"} dropped to make room; `
+              + (quoted.excerpt.length < all.length
+                ? `\`dropped.text\` quotes the first ${quoted.excerpt.length} of their ${all.length} characters. `
+                : "`dropped.text` quotes them. ")
+              + "They are gone from the document: remember again anything there you still need.",
           };
+        }
+
+        case "revise": {
+          if (typeof a.match !== "string") throw new Error("`match` must be a string: a piece of the one line to change");
+          if (a.replace !== undefined && a.replace !== null && typeof a.replace !== "string") {
+            throw new Error("`replace` must be a string, or left out to delete the line");
+          }
+          // Only the end is trimmed: leading spaces are how a nested list item
+          // says where it belongs.
+          const replace = typeof a.replace === "string" ? a.replace.trimEnd() : null;
+          if (replace !== null && !replace.trim()) throw new Error("`replace` is empty; leave it out to delete the line");
+          const r = await store.reviseState(tenantId, agentId, key, a.match, replace, cfg.maxDocumentBytes);
+          const quote = (t: string) => memoryExcerpt(t, REVISED_QUOTE_MAX).excerpt;
+          return replace === null
+            ? { key, bytes: r.bytes, line: r.line, deleted: quote(r.was), note: `line ${r.line} was deleted` }
+            : { key, bytes: r.bytes, line: r.line, was: quote(r.was), now: quote(replace), note: `line ${r.line} was replaced` };
         }
 
         case "get": {
@@ -607,8 +671,9 @@ export async function workingSetParts(
   // whole mounted set, so a plugin cannot know it — the mount and the tool it
   // belongs to are the two facts that stay true under either.
   const correcting = alias
-    ? `They are kept by the \`${alias}\` mount: correct one with its \`remember\` tool when it ` +
-      "turns out to be wrong, and drop one with `forget` when it stops being true."
+    ? `They are kept by the \`${alias}\` mount: when a line in one turns out to be wrong or stops ` +
+      "being true, correct or delete that line with its `revise` tool; `remember` adds a line, and " +
+      "`forget` drops a whole document."
     : "You have no tool mounted for changing it, so treat it as read-only and say so if it is wrong.";
   const intro = "Written by you on earlier tasks, and shown here so you do not have to go and look. " + correcting;
   return {

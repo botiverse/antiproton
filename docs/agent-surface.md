@@ -1313,7 +1313,7 @@ A seeded file has two copies, written together in one transaction: a **snapshot*
 can call reads or changes, and a **working copy**, the agent's ordinary state key `path` (its
 `get` reads it; `state/{path}` in the workspace reads above). `mode` is `writable` (default) or
 `readonly`. The state plugin refuses every tool of its own that writes a key — `put`, `remember`,
-`forget` — on a `readonly` path, with a reason naming the path; a `writable` one is an ordinary key
+`revise`, `forget` — on a `readonly` path, with a reason naming the path; a `writable` one is an ordinary key
 the agent may change or remove. Its `get` and `list` mark a seeded path with `seed: "writable"` or
 `seed: "readonly"`, and its first mount puts a "Workspace files provided at setup" paragraph in the
 system prompt ahead of the working set: `MEMORY.md`'s working copy (its first 4,000 characters, in a

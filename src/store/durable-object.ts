@@ -1,4 +1,5 @@
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
+import { appendLines, documentText, reviseLines } from "./state-lines.ts";
 import type { PluginChoice, ToolSnapshot } from "../plugins/types.ts";
 import { AGENT_SCOPE_ALIAS, PluginDbTables } from "./plugin-db.ts";
 import { appendUsage, type UsageRow } from "../usage/outbox.ts";
@@ -579,6 +580,10 @@ export class DurableObjectStore implements StorageAdapter {
   // ------------------------------------------------------------ agent state
 
   async putState(tenantId: string, agentId: string, key: string, entry: StateEntry) {
+    this.#putStateRow(tenantId, agentId, key, entry);
+  }
+
+  #putStateRow(tenantId: string, agentId: string, key: string, entry: StateEntry) {
     this.#sql.exec(
       `INSERT INTO agent_state(tenant_id, agent_id, key, value, ref, bytes, updated_at)
          VALUES (?,?,?,?,?,?,?)
@@ -592,20 +597,36 @@ export class DurableObjectStore implements StorageAdapter {
   async appendState(
     tenantId: string, agentId: string, key: string, text: string, maxBytes: number,
   ) {
-    const prior = await this.getState(tenantId, agentId, key);
-    // Appending to something that was spilled would mean fetching it back and
-    // rewriting it, which is exactly the read-modify-write this exists to avoid.
-    if (prior?.ref) throw new Error(`${key} is too large to append to; read it and put a new one`);
-    const before = typeof prior?.value === "string" ? prior.value : "";
-    const joined = before ? `${before}\n${text}` : text;
-    // Keep the tail: a journal's recent end is the part worth having.
-    const truncated = joined.length > maxBytes;
-    const kept = truncated ? joined.slice(joined.length - maxBytes) : joined;
-    await this.putState(tenantId, agentId, key, { value: kept, ref: null, bytes: kept.length });
-    return { bytes: kept.length, truncated };
+    // What the text becomes is decided in state-lines.ts, the same for both stores.
+    // Read and written in one synchronous transaction: an await between the two
+    // lets a parallel call on the same key read the same text, and the later
+    // write discards the earlier one.
+    return this.#tx(() => {
+      const before = documentText(key, this.#getStateRow(tenantId, agentId, key), "append to");
+      const { kept, dropped } = appendLines(before, text, maxBytes);
+      this.#putStateRow(tenantId, agentId, key, { value: kept, ref: null, bytes: kept.length });
+      return { bytes: kept.length, dropped };
+    });
+  }
+
+  async reviseState(
+    tenantId: string, agentId: string, key: string, match: string, replace: string | null, maxBytes: number,
+  ) {
+    // One transaction, as in appendState.
+    return this.#tx(() => {
+      const prior = this.#getStateRow(tenantId, agentId, key);
+      if (!prior) throw new Error(`there is no \`${key}\` to revise`);
+      const { kept, line, was } = reviseLines(key, documentText(key, prior, "revise"), match, replace, maxBytes);
+      this.#putStateRow(tenantId, agentId, key, { value: kept, ref: null, bytes: kept.length });
+      return { bytes: kept.length, line, was };
+    });
   }
 
   async getState(tenantId: string, agentId: string, key: string) {
+    return this.#getStateRow(tenantId, agentId, key);
+  }
+
+  #getStateRow(tenantId: string, agentId: string, key: string) {
     const r = this.#one("SELECT * FROM agent_state WHERE tenant_id=? AND agent_id=? AND key=?", tenantId, agentId, key) as any;
     if (!r) return null;
     return {

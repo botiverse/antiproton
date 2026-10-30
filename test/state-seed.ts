@@ -53,7 +53,8 @@ async function seed(store: SqliteStore, ...files: SeedWrite[]) {
 function keyWriters(plugin: ReturnType<typeof statePlugin>) {
   return plugin.tools.filter((t) => t.sideEffects === "write" && "key" in (((t.parameters as any)?.properties) ?? {})).map((t) => t.name);
 }
-const argsFor = (key: string) => ({ key, value: "changed by the agent", text: "a line added by the agent" });
+// `match` is a piece of the one line both control documents below share, so `revise` has a line to change.
+const argsFor = (key: string) => ({ key, value: "changed by the agent", text: "a line added by the agent", match: "Learn the repo", replace: "a line revised by the agent" });
 const row = async (store: SqliteStore, key: string) => show(await store.getState("t", "a", key));
 const REFUSAL = /was provided at setup as read-only; it cannot be changed or removed\. Keep your own notes under another key\./;
 
@@ -63,7 +64,7 @@ await check("every tool declared as a write that takes a key is refused on a rea
   const { store, plugin, ctx } = await fixture();
   const writers = keyWriters(plugin);
   // Not vacuous: the enumeration finds the three that exist today.
-  for (const name of ["put", "remember", "forget"]) must(writers.includes(name), `the enumeration missed ${name}: ${show(writers)}`);
+  for (const name of ["put", "remember", "forget", "revise"]) must(writers.includes(name), `the enumeration missed ${name}: ${show(writers)}`);
   await seed(store, file("policy/rules.md", "Never push to main.\n", "readonly"));
   const before = await row(store, "policy/rules.md");
   for (const tool of writers) {
@@ -74,12 +75,28 @@ await check("every tool declared as a write that takes a key is refused on a rea
   }
 });
 
+await check("revise is refused on a readonly path even where its match is there, and changes a line of a writable one", async () => {
+  const { store, plugin, ctx } = await fixture();
+  await seed(store, file("policy/rules.md", "Never push to main.\nReview before merge.\n", "readonly"), file("notes/plan.md", "1. Learn the repo\n2. Ship the fix\n"));
+  const before = await row(store, "policy/rules.md");
+  // The match occurs exactly once, so only the read-only guard stands between this call and the line.
+  for (const args of [{ match: "push to main", replace: "Push anywhere." }, { match: "push to main" }]) {
+    let threw = "";
+    try { await plugin.invoke("revise", { key: "policy/rules.md", ...args }, ctx); } catch (e) { threw = String((e as Error).message); }
+    must(REFUSAL.test(threw), `revise ${show(args)} on a readonly path: ${threw ? `threw ${show(threw)}` : "succeeded"}`);
+    must(await row(store, "policy/rules.md") === before, `revise changed the readonly working copy: ${await row(store, "policy/rules.md")}`);
+  }
+  const r = await plugin.invoke("revise", { key: "notes/plan.md", match: "Ship", replace: "2. Ship the fix (done)" }, ctx) as any;
+  must(r.line === 2, show(r));
+  must((await store.getState("t", "a", "notes/plan.md"))?.value === "1. Learn the repo\n2. Ship the fix (done)\n", await row(store, "notes/plan.md"));
+});
+
 await check("controls: the same tools succeed on a writable seeded path and on an unseeded key; get and list work on a readonly one", async () => {
   for (const key of ["notes/onboarding_objectives.md", "scratch"]) {
     for (const tool of keyWriters((await fixture()).plugin)) {
       const { store, plugin, ctx } = await fixture();
       await seed(store, file("notes/onboarding_objectives.md", "1. Learn the repo\n"), file("policy/rules.md", "x", "readonly"));
-      if (key === "scratch") await store.putState("t", "a", key, { value: "before", ref: null, bytes: 8 });
+      if (key === "scratch") await store.putState("t", "a", key, { value: "1. Learn the repo", ref: null, bytes: 19 });
       const before = await row(store, key);
       const r = await plugin.invoke(tool, argsFor(key), ctx);
       must(await row(store, key) !== before, `${tool} on ${key} changed nothing: ${show(r)}`);
@@ -139,9 +156,10 @@ await check("get and list carry seed on a seeded path, and no seed field on any 
 
 // ---- the prompt -------------------------------------------------------------
 
-/** What master's `promptContribution` answered for this fixture, before seeds existed, byte for byte. */
+/** What `promptContribution` answered for this fixture before seeds existed, byte for byte, but for the sentence on correcting a
+ *  document, which now names `revise` (src/plugins/state.ts `workingSetParts`). */
 const MASTER = {
-  mounted: "\n\n# What you already know\nWritten by you on earlier tasks, and shown here so you do not have to go and look. They are kept by the `notes` mount: correct one with its `remember` tool when it turns out to be wrong, and drop one with `forget` when it stops being true.\n\n## todo (open items)\nconfirm web-02\n\n## memory (durable facts)\nthe deploy window is Tuesday 02:00 UTC\n\n## journal (recent log)\n2026-10-01 rolled back web-01",
+  mounted: "\n\n# What you already know\nWritten by you on earlier tasks, and shown here so you do not have to go and look. They are kept by the `notes` mount: when a line in one turns out to be wrong or stops being true, correct or delete that line with its `revise` tool; `remember` adds a line, and `forget` drops a whole document.\n\n## todo (open items)\nconfirm web-02\n\n## memory (durable facts)\nthe deploy window is Tuesday 02:00 UTC\n\n## journal (recent log)\n2026-10-01 rolled back web-01",
   unmounted: "\n\n# What you already know\nWritten by you on earlier tasks, and shown here so you do not have to go and look. You have no tool mounted for changing it, so treat it as read-only and say so if it is wrong.\n\n## todo (open items)\nconfirm web-02\n\n## memory (durable facts)\nthe deploy window is Tuesday 02:00 UTC\n\n## journal (recent log)\n2026-10-01 rolled back web-01",
 };
 async function writeWorkingSet(plugin: ReturnType<typeof statePlugin>, ctx: PluginContext) {
