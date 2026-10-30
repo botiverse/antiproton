@@ -608,9 +608,13 @@ export function statePlugin(
           // Text put to a document that refuses when full is held to the cap a `remember` is, in the same unit: past
           // it, the next `remember` would be refused anyway. And it must stay inline: moved to object storage, the
           // document could no longer be appended to or revised (src/store/state-lines.ts `putRefusal`). A value that
-          // is not text has no lines to keep or lose and is stored as before.
-          if (typeof a.value === "string" && whenFullOf(key) === "refuse") {
-            const refused = putRefusal(key, a.value, cfg.maxDocumentBytes, spills ? { encoded: body.length, inlineMax: STATE_INLINE_MAX } : null);
+          // is not text has no lines and no character cap, but moved it would still leave the document unable to be
+          // appended to or revised, so it is held to the inline limit too.
+          if (whenFullOf(key) === "refuse") {
+            const spilt = spills ? { encoded: body.length, inlineMax: STATE_INLINE_MAX } : null;
+            const refused = typeof a.value === "string"
+              ? putRefusal(key, a.value, cfg.maxDocumentBytes, spilt)
+              : putRefusal(key, "", Number.POSITIVE_INFINITY, spilt);
             if (refused) throw refused;
           }
           // Checked before writing, not after: the point is to refuse, not to

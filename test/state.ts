@@ -772,6 +772,13 @@ await check("a text put to memory or todo that put would move to object storage 
         }
         if ((await store.getState("t", "a", key))?.value !== A) throw new Error(`${name}: ${key}: ${shape}: a refused put changed the document`);
       }
+      // A value that is not text is held to the same inline limit: moved, the document could not be appended to either.
+      const big = { notes: "n".repeat(33_000) };
+      const obj = await refusal(() => plugin.invoke("put", { key, value: big }, ctx));
+      if (obj.code !== `${key}_full` || !(obj.threw ?? "").includes(`this one encodes to ${JSON.stringify(big).length}`)) {
+        throw new Error(`${name}: ${key}: object: ${JSON.stringify(obj).slice(0, 400)}`);
+      }
+      if ((await store.getState("t", "a", key))?.value !== A) throw new Error(`${name}: ${key}: a refused object put changed the document`);
       // Just inside the row: stored inline, and it can still be remembered into and revised.
       const fits = "m\n".repeat(10_000);
       const ok = await plugin.invoke("put", { key, value: fits }, ctx) as any;
