@@ -14,7 +14,7 @@ export const SECRET_VALUE_MAX = 8_000;
 
 /** How much of the lines a full document dropped `remember` quotes back, in characters. */
 export const DROPPED_QUOTE_MAX = 1_500;
-/** How much of the line `revise` changed it quotes back, in characters. */
+/** How much of the line `revise` changed, before and after, it quotes back, in characters. */
 export const REVISED_QUOTE_MAX = 500;
 
 /*
@@ -253,7 +253,8 @@ export function statePlugin(
           "Change or delete one line of a document you keep with `remember`. `match` is a piece of " +
           "that line, as it is now, which must occur exactly once in the whole document; if it " +
           "occurs in no line or more than once nothing is changed and you are told how many times " +
-          "it matched, so give a longer piece. With `replace` the whole line becomes that text; " +
+          "it matched, so give a longer piece. With `replace` the whole line becomes that text, " +
+          "leading spaces included; " +
           "without it the line is deleted. The reply quotes the line as it was. Use it when " +
           "something you wrote turns out to be wrong or stops being true: stale memory is worse " +
           "than none, because you will act on it.",
@@ -493,13 +494,15 @@ export function statePlugin(
           if (a.replace !== undefined && a.replace !== null && typeof a.replace !== "string") {
             throw new Error("`replace` must be a string, or left out to delete the line");
           }
-          const replace = typeof a.replace === "string" ? a.replace.trim() : null;
-          if (replace === "") throw new Error("`replace` is empty; leave it out to delete the line");
+          // Only the end is trimmed: leading spaces are how a nested list item
+          // says where it belongs.
+          const replace = typeof a.replace === "string" ? a.replace.trimEnd() : null;
+          if (replace !== null && !replace.trim()) throw new Error("`replace` is empty; leave it out to delete the line");
           const r = await store.reviseState(tenantId, agentId, key, a.match, replace, cfg.maxDocumentBytes);
-          const was = memoryExcerpt(r.was, REVISED_QUOTE_MAX).excerpt;
+          const quote = (t: string) => memoryExcerpt(t, REVISED_QUOTE_MAX).excerpt;
           return replace === null
-            ? { key, bytes: r.bytes, line: r.line, deleted: was, note: `line ${r.line} was deleted` }
-            : { key, bytes: r.bytes, line: r.line, was, now: replace, note: `line ${r.line} was replaced` };
+            ? { key, bytes: r.bytes, line: r.line, deleted: quote(r.was), note: `line ${r.line} was deleted` }
+            : { key, bytes: r.bytes, line: r.line, was: quote(r.was), now: quote(replace), note: `line ${r.line} was replaced` };
         }
 
         case "get": {

@@ -32,28 +32,47 @@ export function documentText(key: string, prior: { value: Json; ref: string | nu
   return prior.value;
 }
 
+/** Whether a line says nothing: empty, or only spaces and a `\r`. */
+const blank = (line: string) => !line.trim();
+
 /**
  * `text` added as the document's last line, and the oldest whole lines dropped
- * until the result is at most `max` characters. A line that does not fit even
+ * until the result is at most `max` characters. Text that does not fit even
  * alone is refused rather than cut, so the document is never left holding part
- * of the line the agent wrote.
+ * of what the agent wrote.
+ *
+ * `dropped` is the lines that said something, oldest first, without a CRLF
+ * document's `\r`: a blank line carries nothing to save again, and counting it
+ * would make "3 lines were dropped" mean fewer. Once anything is dropped, blank
+ * lines that would now open the document go too, so it does not begin with a
+ * gap. A document written with CRLF is appended to with CRLF, and one that
+ * ends with a line break (as a seeded file does) has the text added after it,
+ * not after a blank line.
  */
 export function appendLines(before: string, text: string, max: number): { kept: string; dropped: string[] } {
   if (text.length > max) {
-    throw new Error(`that line is ${text.length} characters; a document holds at most ${max}, so nothing was written`);
+    throw new Error(
+      `${/[\r\n]/.test(text) ? "that text" : "that line"} is ${text.length} characters; `
+      + `a document holds at most ${max}, so nothing was written`,
+    );
   }
+  const eol = before.includes("\r\n") ? "\r\n" : "\n";
+  if (before.endsWith(eol)) before = before.slice(0, -eol.length);
   if (!before) return { kept: text, dropped: [] };
+  // Split on `\n` alone, so a CRLF line keeps its `\r` and the lengths below stay exact.
   const lines = before.split("\n");
-  // The length of `lines.slice(i).join("\n") + "\n" + text`, kept as `i` moves.
-  let length = before.length + 1 + text.length;
+  // The length of `lines.slice(i).join("\n") + eol + text`, kept as `i` moves.
+  let length = before.length + eol.length + text.length;
   let i = 0;
   while (length > max && i < lines.length) {
     // The line and the newline that followed it.
     length -= lines[i]!.length + 1;
     i++;
   }
+  if (i > 0) while (i < lines.length && blank(lines[i]!)) i++;
   const rest = lines.slice(i);
-  return { kept: rest.length ? `${rest.join("\n")}\n${text}` : text, dropped: lines.slice(0, i) };
+  const dropped = lines.slice(0, i).filter((l) => !blank(l)).map((l) => l.replace(/\r$/, ""));
+  return { kept: rest.length ? `${rest.join("\n")}${eol}${text}` : text, dropped };
 }
 
 /**
@@ -67,6 +86,10 @@ export function appendLines(before: string, text: string, max: number): { kept: 
  * touched, and the line as it was is handed back, so the wrong one would be
  * visible. Occurrences are counted overlapping, so `aa` in `aaa` is two and is
  * refused: an occurrence count that depends on how it was scanned is not one.
+ *
+ * The cap refuses only growth: a document already past it (a lower cap set
+ * since, or a `put`) can still lose a line or have one shortened. A CRLF line
+ * keeps its `\r` when replaced, and `was` is given without it.
  */
 export function reviseLines(
   key: string, doc: string, match: string, replace: string | null, max: number,
@@ -96,12 +119,13 @@ export function reviseLines(
   }
   const index = hits[0]! - 1;
   const was = lines[index]!;
+  const cr = was.endsWith("\r") ? "\r" : "";
   const next = replace === null
     ? [...lines.slice(0, index), ...lines.slice(index + 1)]
-    : [...lines.slice(0, index), replace, ...lines.slice(index + 1)];
+    : [...lines.slice(0, index), replace + cr, ...lines.slice(index + 1)];
   const kept = next.join("\n");
-  if (kept.length > max) {
+  if (kept.length > max && kept.length > doc.length) {
     throw new Error(`that would make \`${key}\` ${kept.length} characters; a document holds at most ${max}, so nothing was changed`);
   }
-  return { kept, line: hits[0]!, was };
+  return { kept, line: hits[0]!, was: was.slice(0, was.length - cr.length) };
 }

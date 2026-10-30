@@ -868,6 +868,10 @@ export class SqliteStore implements StorageAdapter {
   // ------------------------------------------------------------ agent state
 
   async putState(tenantId: string, agentId: string, key: string, entry: StateEntry) {
+    this.#putStateRow(tenantId, agentId, key, entry);
+  }
+
+  #putStateRow(tenantId: string, agentId: string, key: string, entry: StateEntry) {
     this.#db.prepare(
       `INSERT INTO agent_state(tenant_id, agent_id, key, value, ref, bytes, updated_at)
          VALUES (?,?,?,?,?,?,?)
@@ -882,23 +886,35 @@ export class SqliteStore implements StorageAdapter {
     tenantId: string, agentId: string, key: string, text: string, maxBytes: number,
   ) {
     // What the text becomes is decided in state-lines.ts, the same for both stores.
-    const before = documentText(key, await this.getState(tenantId, agentId, key), "append to");
-    const { kept, dropped } = appendLines(before, text, maxBytes);
-    await this.putState(tenantId, agentId, key, { value: kept, ref: null, bytes: kept.length });
-    return { bytes: kept.length, dropped };
+    // Read and written in one synchronous transaction: an await between the two
+    // lets a parallel call on the same key read the same text, and the later
+    // write discards the earlier one.
+    return this.#tx(() => {
+      const before = documentText(key, this.#getStateRow(tenantId, agentId, key), "append to");
+      const { kept, dropped } = appendLines(before, text, maxBytes);
+      this.#putStateRow(tenantId, agentId, key, { value: kept, ref: null, bytes: kept.length });
+      return { bytes: kept.length, dropped };
+    });
   }
 
   async reviseState(
     tenantId: string, agentId: string, key: string, match: string, replace: string | null, maxBytes: number,
   ) {
-    const prior = await this.getState(tenantId, agentId, key);
-    if (!prior) throw new Error(`there is no \`${key}\` to revise`);
-    const { kept, line, was } = reviseLines(key, documentText(key, prior, "revise"), match, replace, maxBytes);
-    await this.putState(tenantId, agentId, key, { value: kept, ref: null, bytes: kept.length });
-    return { bytes: kept.length, line, was };
+    // One transaction, as in appendState.
+    return this.#tx(() => {
+      const prior = this.#getStateRow(tenantId, agentId, key);
+      if (!prior) throw new Error(`there is no \`${key}\` to revise`);
+      const { kept, line, was } = reviseLines(key, documentText(key, prior, "revise"), match, replace, maxBytes);
+      this.#putStateRow(tenantId, agentId, key, { value: kept, ref: null, bytes: kept.length });
+      return { bytes: kept.length, line, was };
+    });
   }
 
   async getState(tenantId: string, agentId: string, key: string) {
+    return this.#getStateRow(tenantId, agentId, key);
+  }
+
+  #getStateRow(tenantId: string, agentId: string, key: string) {
     const r = this.#db.prepare("SELECT * FROM agent_state WHERE tenant_id=? AND agent_id=? AND key=?").get(tenantId, agentId, key) as any;
     if (!r) return null;
     return {

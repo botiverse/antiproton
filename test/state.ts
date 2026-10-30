@@ -503,7 +503,9 @@ await check("revise refuses a value that is not text, one kept in object storage
   }
 });
 
-/** One sequence on both stores: every reply, refusal and value the same, character for character. */
+/** One sequence on both stores: every reply, refusal and value the same, character for character. Both call the rules in
+ *  state-lines.ts, so this catches a store that stops calling them; the concurrency check is the one that tells the
+ *  stores' own reads and writes apart. */
 await check("the sqlite store and the Durable Object store answer the same sequence identically", async () => {
   const runs: string[] = [];
   for (const { store, plugin } of await backends()) {
@@ -523,6 +525,119 @@ await check("the sqlite store and the Durable Object store answer the same seque
     runs.push(JSON.stringify(log));
   }
   if (runs[0] !== runs[1]) throw new Error(`the stores differ:\nsqlite ${runs[0]}\ndurable ${runs[1]}`);
+});
+
+await check("concurrent remember and revise calls on one key lose no write, and each revise reply is true of the final document", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(64 * 1024);
+    const seeded = Array.from({ length: 8 }, (_, i) => `seeded ${i}`);
+    await store.putState("t", "a", "memory", { value: seeded.join("\n"), ref: null, bytes: 0 });
+    // One turn's tool calls run in parallel, and run_js runs several at once: every call below is in flight together.
+    const calls = [
+      ...Array.from({ length: 8 }, (_, i) => plugin.invoke("remember", { key: "memory", text: `added ${i}` }, ctx)),
+      ...[0, 2, 4, 6].map((i) => plugin.invoke("revise", { key: "memory", match: `seeded ${i}`, replace: `revised ${i}` }, ctx)),
+      ...[1, 3, 5, 7].map((i) => plugin.invoke("revise", { key: "memory", match: `seeded ${i}` }, ctx)),
+    ];
+    const replies = await Promise.all(calls) as any[];
+    const final = String((await store.getState("t", "a", "memory"))?.value).split("\n");
+    for (let i = 0; i < 8; i++) {
+      if (!final.includes(`added ${i}`)) throw new Error(`${name}: remember of "added ${i}" was lost: ${JSON.stringify(final)}`);
+    }
+    for (const r of replies.slice(8)) {
+      if ("now" in r && (!final.includes(r.now) || final.includes(r.was))) throw new Error(`${name}: a replace the document does not show: ${JSON.stringify(r)} / ${JSON.stringify(final)}`);
+      if ("deleted" in r && final.includes(r.deleted)) throw new Error(`${name}: a deletion the document does not show: ${JSON.stringify(r)} / ${JSON.stringify(final)}`);
+    }
+    if (final.length !== 12) throw new Error(`${name}: ${final.length} lines, not 4 revised and 8 added: ${JSON.stringify(final)}`);
+    // The last call to finish wrote the document; its byte count is the final one.
+    if (!replies.some((r) => r.bytes === final.join("\n").length)) throw new Error(`${name}: no reply's size is the final document's`);
+  }
+});
+
+await check("revise keeps a replacement's leading spaces, so a nested list item can be restored, and trims only its end", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(64 * 1024);
+    await store.putState("t", "a", "todo", { value: "- deploy\n  - web-01\n  - web-02", ref: null, bytes: 0 });
+    const r = await plugin.invoke("revise", { key: "todo", match: "web-02", replace: "  - web-02 (done)  \n" }, ctx) as any;
+    const value = (await store.getState("t", "a", "todo"))?.value;
+    if (value !== "- deploy\n  - web-01\n  - web-02 (done)") throw new Error(`${name}: ${JSON.stringify(value)}`);
+    if (r.now !== "  - web-02 (done)" || r.was !== "  - web-02") throw new Error(`${name}: the reply: ${JSON.stringify(r)}`);
+  }
+});
+
+await check("a document already past the cap can lose or shorten a line, and only growth past it is refused", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(20);
+    const over = "first line is long\nsecond line is long\nthird";
+    await store.putState("t", "a", "memory", { value: over, ref: null, bytes: 0 });
+    const grow = await attempt(() => plugin.invoke("revise", { key: "memory", match: "third", replace: "third, and longer" }, ctx));
+    if (!/a document holds at most 20, so nothing was changed/.test(grow.threw ?? "")) throw new Error(`${name}: growth: ${JSON.stringify(grow)}`);
+    // The same length is not growth.
+    await plugin.invoke("revise", { key: "memory", match: "third", replace: "THIRD" }, ctx);
+    await plugin.invoke("revise", { key: "memory", match: "second", replace: "second" }, ctx);
+    await plugin.invoke("revise", { key: "memory", match: "first" }, ctx);
+    const value = (await store.getState("t", "a", "memory"))?.value;
+    if (value !== "second\nTHIRD") throw new Error(`${name}: ${JSON.stringify(value)}`);
+  }
+});
+
+await check("deleting the only line leaves an empty document, and the next remember starts it again", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(64 * 1024);
+    await plugin.invoke("remember", { key: "todo", text: "the only item" }, ctx);
+    const r = await plugin.invoke("revise", { key: "todo", match: "only" }, ctx) as any;
+    if (r.bytes !== 0 || r.line !== 1 || r.deleted !== "the only item") throw new Error(`${name}: ${JSON.stringify(r)}`);
+    if ((await store.getState("t", "a", "todo"))?.value !== "") throw new Error(`${name}: not empty`);
+    await plugin.invoke("remember", { key: "todo", text: "a new item" }, ctx);
+    if ((await store.getState("t", "a", "todo"))?.value !== "a new item") throw new Error(`${name}: ${(await store.getState("t", "a", "todo"))?.value}`);
+  }
+});
+
+await check("dropping from a document that ends with a newline leaves no blank first line, and blank lines are not counted as dropped", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(30);
+    // Without a drop: the text follows the last line, not a blank one after it.
+    await store.putState("t", "a", "plan.md", { value: "1. Learn the repo\n", ref: null, bytes: 0 });
+    await plugin.invoke("remember", { key: "plan.md", text: "2. Ship" }, ctx);
+    if ((await store.getState("t", "a", "plan.md"))?.value !== "1. Learn the repo\n2. Ship") throw new Error(`${name}: ${(await store.getState("t", "a", "plan.md"))?.value}`);
+    // Dropping `alpha` alone makes room; the blank line after it would then open the document, so it goes too, uncounted.
+    await store.putState("t", "a", "journal", { value: "alpha 0123456789\n\nbravo\n", ref: null, bytes: 0 });
+    const r = await plugin.invoke("remember", { key: "journal", text: "charlie 0123456789 0123" }, ctx) as any;
+    const value = (await store.getState("t", "a", "journal"))?.value;
+    if (value !== "bravo\ncharlie 0123456789 0123") throw new Error(`${name}: kept ${JSON.stringify(value)}`);
+    if (r.dropped.lines !== 1 || r.dropped.text !== "alpha 0123456789" || !/1 oldest line was dropped/.test(r.note)) {
+      throw new Error(`${name}: ${JSON.stringify(r)}`);
+    }
+  }
+});
+
+await check("a CRLF document stays CRLF: append and revise keep its line ends, and the replies quote lines without the \\r", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(40);
+    await store.putState("t", "a", "notes.md", { value: "one 0123456789\r\ntwo 0123456789\r\nthree", ref: null, bytes: 0 });
+    const r = await plugin.invoke("revise", { key: "notes.md", match: "two", replace: "TWO" }, ctx) as any;
+    if (r.was !== "two 0123456789" || r.now !== "TWO") throw new Error(`${name}: revise reply: ${JSON.stringify(r)}`);
+    const value = () => store.getState("t", "a", "notes.md").then((g) => g?.value);
+    if (await value() !== "one 0123456789\r\nTWO\r\nthree") throw new Error(`${name}: after revise ${JSON.stringify(await value())}`);
+    const a = await plugin.invoke("remember", { key: "notes.md", text: "four 0123456789 01234" }, ctx) as any;
+    if (await value() !== "TWO\r\nthree\r\nfour 0123456789 01234") throw new Error(`${name}: after remember ${JSON.stringify(await value())}`);
+    if (a.dropped.text !== "one 0123456789" || a.dropped.lines !== 1) throw new Error(`${name}: remember reply: ${JSON.stringify(a)}`);
+    await plugin.invoke("revise", { key: "notes.md", match: "three" }, ctx);
+    if (await value() !== "TWO\r\nfour 0123456789 01234") throw new Error(`${name}: after delete ${JSON.stringify(await value())}`);
+  }
+});
+
+await check("the refusal of over-long text says text when it spans lines, and revise quotes a long replacement up to its limit", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(10);
+    const multi = await attempt(() => plugin.invoke("remember", { key: "j", text: "line one\nline two" }, ctx));
+    if (!/^that text is 17 characters/.test(multi.threw ?? "")) throw new Error(`${name}: ${JSON.stringify(multi)}`);
+    const one = await attempt(() => plugin.invoke("remember", { key: "j", text: "a single long line" }, ctx));
+    if (!/^that line is 18 characters/.test(one.threw ?? "")) throw new Error(`${name}: ${JSON.stringify(one)}`);
+    await store.putState("t", "a", "k", { value: "old", ref: null, bytes: 0 });
+    const r = await plugin.invoke("revise", { key: "k", match: "old", replace: "n".repeat(900) }, capped(64 * 1024)) as any;
+    if (r.now !== "n".repeat(500)) throw new Error(`${name}: now is ${r.now.length} characters`);
+    if ((await store.getState("t", "a", "k"))?.value !== "n".repeat(900)) throw new Error(`${name}: the stored line was cut`);
+  }
 });
 
 console.log(`\n  Agent state\n  ${"─".repeat(56)}`);

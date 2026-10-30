@@ -290,8 +290,8 @@ export interface StorageAdapter {
   ): Promise<void>;
   /** The cheap, additive write. A journal the agent has to read, edit and
    *  rewrite to add a line is a journal it will stop writing. Over `maxBytes`
-   *  it drops whole lines from the head and answers them in `dropped`, oldest
-   *  first; it refuses a value that is not a string rather than replace it. */
+   *  it drops whole lines from the head and answers the non-blank ones in
+   *  `dropped`, oldest first; it refuses a value that is not a string rather than replace it. */
   appendState(
     tenantId: string, agentId: string, key: string, text: string, maxBytes: number,
   ): Promise<{ bytes: number; dropped: string[] }>;
@@ -299,7 +299,7 @@ export interface StorageAdapter {
    *  it when `replace` is null; `line` is its number from 1 and `was` its text
    *  before. Refuses unless `match` occurs exactly once (src/store/state-lines.ts
    *  `reviseLines`), and refuses a document that is absent, not a string, kept
-   *  in object storage, or would pass `maxBytes`. */
+   *  in object storage, or would grow past `maxBytes`. */
   reviseState(
     tenantId: string, agentId: string, key: string, match: string, replace: string | null, maxBytes: number,
   ): Promise<{ bytes: number; line: number; was: string }>;
