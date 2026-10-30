@@ -1201,6 +1201,15 @@ preferences, send-as-owner and the Reminder app (plus `resume` and the parked-re
 or subagents, under a prompt of its own (`assistantSystemPrompt`,
 `src/runtime/pi-prompt.ts`, the one entry point for it).
 
+Both the chat and every check are also offered the assistant's memory: `remember`, `put`, `get`, `list`,
+`forget` and `revise` on its state mount (`MEMORY_TOOLS`, `memoryMountOf`), never the `secret_*` tools. Raft's
+`allowed_tools` narrows only the raft mount's tools in a check it runs, so it does not remove these. The state
+plugin's paragraph ("What you already know") is in both prompts, so every session starts with the notes, and is
+the only mount paragraph an assistant's prompts show; it is fixed per conversation like every agent's
+(`src/runtime/prompt-context.ts`), under a snapshot key of the assistant's own, and a note written since reaches
+the chat as a notice on its next message. What to keep, and what to do when the owner asks it to forget something
+or what it remembers, is guidance in the prompt (`memoryGuidance`), never a rule in code.
+
 That prompt is split by who owns each part. Raft owns the stable part: how the assistant talks
 (voice), and that it follows its owner's contact settings and answers from them, with no concrete
 default in it (no brief time, quiet hours or list of what is reported). It sends that as the agent's `instructions`
@@ -1218,13 +1227,15 @@ the same facts for the owner's settings (`quiet`, `brief`, `defaults`, then the 
 the assistant answers "what rules do you follow" from.
 The chat's prompt is the name line, then Raft's instructions verbatim, or
 `DEFAULT_ASSISTANT_INSTRUCTIONS` (`src/plugins/raft-assistant-instructions.ts`) when they are empty
-or blank, then the code part, whose first line (`assistantPrecedence`) says it wins over anything
-above it that conflicts: the instructions can change how the assistant sounds, not what it may do,
-and the tool guards (no send-as-owner from a check, refused in code) hold whatever they say. A
-check's prompt is `assistantCheckPrompt` alone, with no name and no instructions: what a check
-reports is decided by code and the owner's rules. Nothing in the system prompt is generated per
+or blank, then the notes, then the code part, whose first line (`assistantPrecedence`) says it wins over anything
+above it that conflicts: the instructions and the notes can change how the assistant sounds and what it
+knows, not what it may do, and the tool guards (no send-as-owner from a check, refused in code) hold whatever they
+say. A check's prompt is the notes, then `CHECK_PRECEDENCE` (the same "the rules win" line), then
+`assistantCheckPrompt`, with no name and no instructions: what a check reports is decided by code and the owner's
+rules, never by a note, which may carry words first read in someone else's message. With no notes it is
+`assistantCheckPrompt` alone. Nothing in the system prompt is generated per
 turn (the owner's current rules reach the chat through the preferences tool and a check or brief
-through its input), so each agent's prompt is one stable, cacheable prefix.
+through its input; the notes are fixed per conversation), so each agent's prompt is one stable, cacheable prefix.
 `docs/assistant-default-instructions.md` is the default text exactly, for handing to Raft (a test
 holds it equal to the constant). What not to put in Raft's instructions: tool names, limits,
 reference formats, or any rule about sending as the owner, treating read content as instructions,

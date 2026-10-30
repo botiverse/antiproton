@@ -630,6 +630,9 @@ export async function workingSetParts(
 ): Promise<{ text: string; parts: PromptPart[] }> {
   const parts: string[] = [];
   const docs: PromptPart[] = [];
+  // The mount, asked once and only when there is something to say it with (below).
+  let mount: Promise<string | undefined> | null = null;
+  const aliasOf = () => mount ??= store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID).then((m) => m[0]?.alias);
   for (const doc of WORKING_SET) {
     if (skip.has(doc.key)) continue;
     const got = await store.getState(tenantId, agentId, doc.key);
@@ -639,7 +642,7 @@ export async function workingSetParts(
       ? text
       : doc.tail
         ? `…\n${text.slice(text.length - doc.budget)}`
-        : `${text.slice(0, doc.budget)}\n…`;
+        : headAndTail(text, doc.budget, doc.key, await aliasOf());
     parts.push(`## ${doc.key} (${doc.what})\n${kept}`);
     docs.push({ key: `doc:${doc.key}`, label: `\`${doc.key}\` (${doc.what})`, text: kept, by: "agent" });
   }
@@ -660,7 +663,7 @@ export async function workingSetParts(
   // an agent with nothing written pays nothing for the lookup. Asked by plugin
   // id, the way the gateway resolves one; the first mount if an operator has
   // made two, since either name reaches the same store.
-  const alias = (await store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID))[0]?.alias;
+  const alias = await aliasOf();
   // Still injected when there is no mount: memory you can read but not edit is
   // worth reading. What is dropped is only the sentence that would tell the
   // agent to call something it has not got.
@@ -680,6 +683,26 @@ export async function workingSetParts(
     text: "\n\n# What you already know\n" + intro + "\n\n" + parts.join("\n\n"),
     parts: [{ key: "working-set", label: "What you already know (how your documents are kept)", text: intro, by: "plugin" }, ...docs],
   };
+}
+
+/**
+ * A document kept from its start that is over its budget, as the prompt shows it: its first lines and its last, and
+ * between them a line saying how much is left out and how to read it all. A line is added at the end, so a document
+ * shown from its start alone stops showing what is written to it once it is full, with nothing saying more is there.
+ * Cut at a line where one falls inside each half, else at a character (never inside a surrogate pair).
+ */
+function headAndTail(text: string, budget: number, key: string, alias: string | undefined): string {
+  const half = Math.floor(budget / 2);
+  let headEnd = text.lastIndexOf("\n", half);
+  if (headEnd <= 0) headEnd = /[\uD800-\uDBFF]/.test(text[half - 1] ?? "") ? half - 1 : half;
+  let tailStart = text.indexOf("\n", text.length - (budget - half));
+  tailStart = tailStart < 0 || tailStart >= text.length - 1
+    ? (/[\uDC00-\uDFFF]/.test(text[text.length - (budget - half)] ?? "") ? text.length - (budget - half) + 1 : text.length - (budget - half))
+    : tailStart + 1;
+  const head = text.slice(0, headEnd).replace(/\n$/, ""), tail = text.slice(tailStart);
+  const left = text.length - head.length - tail.length;
+  const read = alias ? `get \`${key}\` with the \`get\` tool on the \`${alias}\` mount to read all of it.` : "the rest is not shown.";
+  return `${head}\n… ${left} of ${text.length} characters left out here; ${read}\n${tail}`;
 }
 
 /** The seeded file whose text is shown in the prompt, not only named. */
