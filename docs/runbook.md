@@ -656,3 +656,125 @@ still be listed and revoked.
 
 All of these are operator-only. Preview has one tenant-scoped provider token under `raft_`, `raft_pu-verify-1013`. The
 admin route issued it before the refusal existed, and it is revoked.
+
+## Canary environment
+
+`antiproton-canary` (cf/wrangler.canary.jsonc, `https://canary.antiproton.ai`) runs one reviewed branch commit of
+the RaftBench plugin against **staging Raft** before that commit is merged. It is modelled on preview and has its own
+of everything: the `AgentDO` namespace (it is a separate Worker), the D1 database `antiproton-canary-control`, the R2
+bucket `antiproton-canary-artifacts`, the queues `antiproton-canary-model` and `antiproton-canary-model-dlq`, the AI
+Gateway `antiproton-canary`, and `HOOK_ORIGIN=https://canary.antiproton.ai`. It holds no production data and no
+production credential. `test/canary-config.ts` fails if the config names any resource, host or id that
+cf/wrangler.jsonc, cf/wrangler.preview.jsonc or cf/wrangler.conformance.jsonc declares. It also fails if the config
+differs from preview in anything except those names.
+
+What makes it staging-only on this side is the provider token. A provider token is issued for one `raftOrigin`,
+and `POST /provision/agents` refuses any other origin with `422 origin_mismatch` (cf/src/provision/handlers.ts). The
+canary's one provider token is issued for staging Raft, `https://api-aws-staging.botiverse.dev`, which is the origin
+preview's `raft-staging-platform` token carries. No token for production Raft is ever issued on the canary.
+
+### One-time setup
+
+The resources below did not exist when this section was written. Creating them needs approval first. Run the
+commands from `cf/` with the operator's credentials loaded (`set -a; . ~/.secrets/antiproton.env; set +a`):
+
+```sh
+npx wrangler d1 create antiproton-canary-control
+npx wrangler r2 bucket create antiproton-canary-artifacts
+npx wrangler queues create antiproton-canary-model
+npx wrangler queues create antiproton-canary-model-dlq
+# The AI Gateway, with preview's settings (authenticated, logs kept, no cache, no rate limit).
+curl -fsS -X POST "https://api.cloudflare.com/client/v4/accounts/a084c4564dfdce5a7775b08ece638a79/ai-gateway/gateways" \
+  -H "Authorization: Bearer $CF_API_TOKEN" -H "content-type: application/json" \
+  -d '{"id":"antiproton-canary","authentication":true,"collect_logs":true,"cache_ttl":0,"cache_invalidate_on_update":false,"rate_limiting_interval":0,"rate_limiting_limit":0,"rate_limiting_technique":"fixed","log_management":10000000,"log_management_strategy":"DELETE_OLDEST"}' \
+  -o /dev/null -w '%{http_code}\n'
+```
+
+`d1 create` prints the new `database_id`. Replace `PLACEHOLDER-fill-in-after-d1-create` in
+cf/wrangler.canary.jsonc with it and merge that through a PR. `deploy-canary.sh` refuses a commit whose config still
+has the placeholder, so the branch under test must be rebased onto that master.
+
+The custom domain is the `routes` entry, so the first deploy (below) attaches `canary.antiproton.ai` if the deploy
+token has permission on the zone. If it does not, the account owner adds it under Workers & Pages > antiproton-canary >
+Settings > Domains & Routes > Add > Custom domain. Until then the Worker answers on its workers.dev URL, and
+`CANARY_ORIGIN=<that URL>` tells the deploy script where to check.
+
+Set the secrets after the first deploy, because that deploy creates the Worker. A Cloudflare secret cannot be read
+back, so "copied from preview" means the same source preview's value came from, and a new value is saved before it
+is put. Each one goes in through stdin, never on the command line:
+`printf '%s' "$VALUE" | npx wrangler secret put NAME --config wrangler.canary.jsonc`.
+
+| Secret | Value | Why |
+|---|---|---|
+| `DEEPSEEK_API_KEY` | copied: `DEEPSEEK_API_KEY` in ~/.secrets/antiproton.env, the dev/testing key | The default model. Never `DEEPSEEK_API_KEY_DEPLOY`, which is production's. |
+| `AI_GATEWAY_TOKEN` | copied: `AI_GATEWAY_TOKEN` | Only for GPT-5.6 Luna through the `antiproton-canary` gateway. Unset, the cloudflare provider is listed as unavailable. |
+| `EXA_API_KEY` | copied: `EXA_API_KEY` | Web search, as on preview. |
+| `AUTOMATION_TOKEN` | new: `openssl rand -hex 32`, saved as `CANARY_AUTOMATION_TOKEN` | The operator token. Preview's value would open preview's operator routes to anyone who holds the canary's. |
+| `SESSION_SECRET` | new: `openssl rand -hex 32`, saved as `CANARY_SESSION_SECRET` | Signs sessions and connect links. A value of its own means nothing signed by preview verifies here. |
+| `SECRET_KEK` | new: `openssl rand -base64 32` (32 bytes), saved as `CANARY_SECRET_KEK` | Seals per-agent credentials. Losing it makes them unreadable, so save it before putting it. |
+| `UI_ORIGIN` | `https://canary.antiproton.ai` | Set as a secret, as on preview. Never preview's value. |
+
+Not set: `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`, because preview's OAuth App calls back to preview's host
+(GitHub sign-in on the canary would need an OAuth App of its own, and RaftBench does not use it), and
+`REMINDER_APP_ORIGIN` and `REMINDER_APP_CREDENTIAL` (without them the reminder plugin is not seeded). Save the new
+values to the env file with `>>`, not `>`.
+
+Then register the provider token Raft staging will hold, **by hash**, so the plaintext never reaches us. The Raft
+side's admin makes the token on their own machine, keeps it, and sends us only its hash:
+
+```sh
+# On the Raft admin's machine: the token, in the shape newProviderToken makes (pt- and 43 base64url characters).
+TOKEN="pt-$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
+# Write $TOKEN to the Raft side's secret store for the canary provider target; then the hash, exactly as
+# hashProviderToken computes it (SHA-256 of the UTF-8 bytes, lowercase hex, 64 characters):
+printf %s "$TOKEN" | sha256sum | cut -d' ' -f1
+```
+
+On a Mac without `sha256sum`, `printf %s "$TOKEN" | shasum -a 256 | cut -d' ' -f1` gives the same value.
+`test/provider-tokens.ts` runs the `sha256sum` line above against `hashProviderToken`. We register the hash with it:
+
+`curl -fsS -X POST https://canary.antiproton.ai/admin/provider-tokens -H "x-harness-token: $CANARY_AUTOMATION_TOKEN" -H 'content-type: application/json' -d '{"label":"raft-staging-canary","scope":"platform","raftOrigin":"https://api-aws-staging.botiverse.dev","hash":"<the 64 hex>"}'`
+
+The answer is `201 {hash, label, scope, raftOrigin}` and carries no token. A hash that is not 64 lowercase hex is
+`400`, and so is a body that also carries a `token`. A hash already registered, live or revoked, is `409`. This works
+only where `PROVIDER_TOKEN_HASH_REGISTRATION` is `"1"`, which is preview and the canary. Production's
+cf/wrangler.jsonc does not set it, and there a `hash` gets `403 hash_registration_disabled` and nothing is written.
+Without `hash`, the route mints a token as before and shows it once in the answer.
+
+### Deploying a commit
+
+```sh
+bash cf/scripts/deploy-canary.sh <sha>
+```
+
+The sha must be on a branch of origin. The script makes a worktree of its own at that commit under ~/tmp, never the
+shared checkout, and runs `npm ci` there. It refuses if that left a tracked file changed. Then it waits while the
+host's load is above 12 and runs the whole branch gate (cf/scripts/gate.sh). After that, cf/scripts/deploy.sh applies
+cf/migrations to `antiproton-canary-control` and deploys with `GIT_COMMIT=<sha:7>`. Last, the script checks that
+`/ui/whoami` reports that build. Every step prints a `STEP` line, and the worktree is removed on exit. Do not use
+`verify-and-deploy.sh --config wrangler.canary.jsonc`. That is production's path, and it refuses anything but
+origin/master. Logs: `node cf/scripts/logs.mjs --canary --agent <id>`.
+
+### Pointing the Raft canary agent at it (Raft side)
+
+Raft staging's `canary` provider target is staging-only and is set up on the Raft side. It needs base URL
+`https://canary.antiproton.ai` and the platform provider token above as `Authorization: Bearer`. The RaftBench service
+agent is created through it with `POST /provision/agents` and `profile: "raftbench_service"`
+(docs/agent-surface.md). Check that a run reached the canary and not preview: the agent appears in the canary's
+`provisioned_agents`, and `raftbench.run` lines appear under `logs.mjs --canary`.
+
+### Tearing it down
+
+The order matters. Queues cannot be deleted while a Worker consumes them, and a bucket cannot be deleted while it
+holds objects.
+
+1. Raft removes the canary provider target. Then revoke the token on the canary with
+   `DELETE /admin/provider-tokens?hash=<hash from GET /admin/provider-tokens>`.
+2. `npx wrangler delete --config wrangler.canary.jsonc` removes the Worker, its custom domain and its objects.
+3. `npx wrangler queues delete antiproton-canary-model`, then `npx wrangler queues delete antiproton-canary-model-dlq`.
+4. Empty `antiproton-canary-artifacts` (dashboard: R2 > the bucket > Settings), then
+   `npx wrangler r2 bucket delete antiproton-canary-artifacts`.
+5. `npx wrangler d1 delete antiproton-canary-control`.
+6. `curl -fsS -X DELETE -H "Authorization: Bearer $CF_API_TOKEN" https://api.cloudflare.com/client/v4/accounts/a084c4564dfdce5a7775b08ece638a79/ai-gateway/gateways/antiproton-canary`.
+7. Put the placeholder back as `database_id` in cf/wrangler.canary.jsonc (a PR), so the deploy script refuses again,
+   and delete the `CANARY_*` lines from ~/.secrets/antiproton.env.

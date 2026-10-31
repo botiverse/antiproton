@@ -326,6 +326,20 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
       `provisioned_agents ${await cols("provisioned_agents")}`);
   });
 
+  add("a second provider token row for a hash, live or revoked, fails as isDuplicateHash reads it (the 409 of register-by-hash)", async () => {
+    const { isDuplicateHash } = await import("../../cf/src/admin-provider-tokens.ts");
+    await provider.issue({ hash: "dup1", label: "first", scope: "platform", raftOrigin: "https://api-aws-staging.botiverse.dev" });
+    let err: unknown = null;
+    try { await provider.issue({ hash: "dup1", label: "second", scope: "platform", raftOrigin: "https://api-aws-staging.botiverse.dev" }); } catch (e) { err = e; }
+    assert(err !== null && isDuplicateHash(err), `a duplicate did not fail as expected: ${String((err as Error)?.message ?? err)}`);
+    await provider.revoke("dup1");
+    err = null;
+    try { await provider.issue({ hash: "dup1", label: "third", scope: "platform", raftOrigin: "https://api-aws-staging.botiverse.dev" }); } catch (e) { err = e; }
+    assert(err !== null && isDuplicateHash(err), `a revoked hash was issued again: ${String((err as Error)?.message ?? err)}`);
+    // Another failure is not read as a duplicate.
+    assert(!isDuplicateHash(new Error("D1_ERROR: no such table: provider_tokens")), "an unrelated error read as a duplicate");
+  });
+
   add("a provider token resolves to its tenant and origin until it is revoked; touch writes once an hour", async () => {
     clock = 1_800_000_000_000;
     await provider.issue({ hash: "p1", label: "raft-prod", scope: "tenant", tenantId: "t-raft", raftOrigin: "https://api.raft.build" });

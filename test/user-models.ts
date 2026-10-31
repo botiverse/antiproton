@@ -90,7 +90,7 @@ function varsOf(file: string): Record<string, unknown> {
 }
 
 await check("config: each deployment offers exactly DeepSeek Flash and GPT-5.6 Luna, accepted against its own providers, and DeepSeek stays the default", () => {
-  for (const file of ["wrangler.jsonc", "wrangler.preview.jsonc"]) {
+  for (const file of ["wrangler.jsonc", "wrangler.preview.jsonc", "wrangler.canary.jsonc"]) {
     const vars = varsOf(file);
     const ps = { configs: parseProviders(vars.MODEL_PROVIDERS), secrets: {} };
     must(show(parseUserModels(vars.USER_MODELS, ps)) === show([FLASH, LUNA]), `${file}: ${show(vars.USER_MODELS)}`);

@@ -1,0 +1,76 @@
+{
+  // The canary: the same code as preview (cf/wrangler.preview.jsonc), on its own hostname, with its own objects, database,
+  // bucket, queues and AI Gateway. It runs a reviewed branch commit of the RaftBench plugin against STAGING Raft
+  // before that commit is merged, so it holds no production data and no production credential. Deployed by
+  // cf/scripts/deploy-canary.sh <sha>; set up and torn down as docs/runbook.md "Canary environment" says.
+  // test/canary-config.ts fails if anything here names a preview or production resource.
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "antiproton-canary",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-05",
+  "compatibility_flags": ["nodejs_compat"],
+  // workers.dev as on preview, so the Worker answers before canary.antiproton.ai is attached: attaching it needs
+  // zone permission the deploy token may not hold, and then the account owner adds it in the dashboard
+  // (Settings > Domains & Routes).
+  "workers_dev": true,
+  "routes": [{ "pattern": "canary.antiproton.ai", "custom_domain": true }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AgentDO"] }],
+  "durable_objects": { "bindings": [{ "name": "AGENT", "class_name": "AgentDO" }] },
+  // database_id is a PLACEHOLDER until `wrangler d1 create antiproton-canary-control` has run: put the id it prints
+  // here. cf/scripts/deploy-canary.sh refuses to deploy while the placeholder is still in the commit.
+  "d1_databases": [
+    { "binding": "CONTROL_DB", "database_name": "antiproton-canary-control", "database_id": "PLACEHOLDER-fill-in-after-d1-create", "migrations_dir": "migrations" }
+  ],
+  "worker_loaders": [{ "binding": "LOADER" }],
+  // Which version is running: a harness opened after a deploy is told from one opened after an eviction
+  // (src/runtime/harness-open.ts).
+  "version_metadata": { "binding": "CF_VERSION_METADATA" },
+  "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "antiproton-canary-artifacts" }],
+  "queues": {
+    "producers": [{ "binding": "MODEL_QUEUE", "queue": "antiproton-canary-model" }],
+    "consumers": [
+      { "queue": "antiproton-canary-model", "max_batch_size": 1, "max_batch_timeout": 0, "max_retries": 3, "dead_letter_queue": "antiproton-canary-model-dlq" },
+      { "queue": "antiproton-canary-model-dlq", "max_batch_size": 10, "max_batch_timeout": 5 }
+    ]
+  },
+  "vars": {
+    "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
+    "HARNESS_MODEL": "deepseek-flash",
+    // The providers the operator's account reaches (src/model/providers.ts). Each credential is named by
+    // its Worker secret, never written here. `cloudflare` is offered once AI_GATEWAY_TOKEN is set; until
+    // then it is listed as unavailable. The gateway holds the other vendors' keys, so DeepSeek's is passed
+    // through only for deepseek/ models.
+    "MODEL_PROVIDERS": [
+      { "id": "deepseek", "baseUrl": "https://api.deepseek.com",
+        "auth": { "secret": "DEEPSEEK_API_KEY", "header": "authorization" } },
+      { "id": "cloudflare", "baseUrl": "https://gateway.ai.cloudflare.com/v1/a084c4564dfdce5a7775b08ece638a79/antiproton-canary/compat",
+        "auth": { "secret": "AI_GATEWAY_TOKEN", "header": "cf-aig-authorization" },
+        "modelFormat": "vendor/model", "passKeys": { "deepseek/": "DEEPSEEK_API_KEY" } }
+    ],
+    // What an owner may pick for their own agent (src/model/user-models.ts): an id and a label over a provider
+    // above and its model. DeepSeek Flash is the default as well as an option, so an owner can return to it by
+    // name; GPT-5.6 Luna is offered only while the cloudflare provider is available (AI_GATEWAY_TOKEN set).
+    "USER_MODELS": [
+      { "id": "deepseek-flash", "label": "DeepSeek Flash", "provider": "deepseek", "model": "deepseek-flash" },
+      { "id": "gpt-5.6-luna", "label": "GPT-5.6 Luna", "provider": "cloudflare", "model": "openai/gpt-5.6-luna" }
+    ],
+    "ARTIFACT_BUCKET": "antiproton-canary-artifacts",
+    "HOOK_ORIGIN": "https://canary.antiproton.ai",
+    // Open to look at until the Access application exists; the write routes
+    // refuse the anonymous viewer regardless, and there are no keys to spend.
+    "UI_ALLOW_ANONYMOUS": "1",
+    // Same container lease as production (cf/wrangler.jsonc says why).
+    "RUN9_WARN_MINUTES": "5",
+    "RUN9_MAX_IDLE_MINUTES": "30",
+    // An evaluation's setup routes under /provision (seeded workspace files, fresh context, model-input evidence;
+    // cf/src/provision/handlers.ts). As on preview: test/eval-seed.ts fails if cf/wrangler.jsonc sets it.
+    "EVAL_SEED_ROUTES": "1",
+    // POST /admin/provider-tokens may register a token by its hash, so its holder keeps the plaintext
+    // (cf/src/admin-provider-tokens.ts). Not production: test/provider-tokens.ts fails if cf/wrangler.jsonc sets it.
+    "PROVIDER_TOKEN_HASH_REGISTRATION": "1"
+  },
+  // Once a day, 03:17 UTC: the usage ledger's retention, whole days of
+  // hours past KEEP_HOURLY_DAYS folded into usage_daily (`scheduled` in src/index.ts). The canary has its own database, so it folds its own.
+  "triggers": { "crons": ["17 3 * * *"] },
+  "observability": { "enabled": true }
+}
