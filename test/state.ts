@@ -1203,6 +1203,22 @@ await check("with two state mounts, the store's total and the largest value are 
   if ((await store.stateUsage("t", "a")).bytes > 200) throw new Error("the store passed the smaller total");
 });
 
+await check("a mount's row is the one source of its settings: a call carrying less config does not pull a limit back to the default", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  const plugin = statePlugin(store, null, "local");
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "notes", plugin: "state", installationId: "notes", connectionId: null,
+    toolVersion: plugin.version, publicConfig: { memoryMaxCharacters: 20_000, maxValueBytes: 300 }, secretRef: null, policy: null });
+  await store.putState("t", "a", "memory", { value: "m".repeat(9000), ref: null, bytes: 9002 });
+  const ctx = { caller: { tenantId: "t", agentId: "a" }, alias: "notes", publicConfig: {} } as any;
+  const r = await plugin.invoke("remember", { key: "memory", text: "one more" }, ctx) as any;
+  if (r.cap !== 20_000) throw new Error(`the row's 20000 was pulled back: ${JSON.stringify(r)}`);
+  // And a value past the row's maxValueBytes is refused with its own code.
+  const e = await plugin.invoke("put", { key: "big", value: { v: "w".repeat(400) } }, ctx).then(() => null, (x) => x as any);
+  if (e?.code !== "value_too_large" || !String(e.message).startsWith("value_too_large: value is")) throw new Error(`value refusal: ${e?.code} ${e?.message}`);
+});
+
 await check("configOf takes a limit only as a finite number of at least 1, floored; 0, a negative or a fraction under 1 is the default", async () => {
   const d = configOf({});
   for (const bad of [0, -5, 0.5, Number.NaN, Number.POSITIVE_INFINITY, "100", null]) {

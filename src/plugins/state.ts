@@ -595,10 +595,12 @@ export function statePlugin(
 
     async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
       const { tenantId, agentId } = ctx.caller;
-      // This call's settings and every other state mount's, as one (`sharedSettings`): what each write below is held to,
-      // and what its refusals say, is what the prompt shows and any other mount's write is held to.
-      const cfg = sharedSettings([configOf(ctx.publicConfig),
-        ...(await store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID)).map((m) => configOf(m.publicConfig))]);
+      // Every state mount's settings, as one (`sharedSettings`): what each write below is held to, and what its refusals
+      // say, is what the prompt shows and any other mount's write is held to.
+      // The mounts' rows are the one source of their settings; the call's own config only stands in when there is no row,
+      // so a call that carries less than its row cannot pull a limit back to the default.
+      const rows = await store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID);
+      const cfg = sharedSettings(rows.length ? rows.map((m) => configOf(m.publicConfig)) : [configOf(ctx.publicConfig)]);
       const a = (args ?? {}) as {
         key?: string; text?: string; value?: Json; prefix?: string; limit?: number;
         old?: unknown; new?: unknown; after_line?: unknown; match?: unknown; replace?: unknown;
@@ -808,7 +810,7 @@ export function statePlugin(
         case "put": {
           const body = JSON.stringify(a.value ?? null);
           if (body.length > cfg.maxValueBytes) {
-            throw new Error(`value is ${body.length} bytes; the limit is ${cfg.maxValueBytes}`);
+            throw Object.assign(new Error(`value_too_large: value is ${body.length} bytes; the limit is ${cfg.maxValueBytes}`), { code: "value_too_large" });
           }
           // The one test of whether this value is moved to object storage, used both by the refusal below and by
           // the write at the end, so the two cannot disagree about what is moved.
