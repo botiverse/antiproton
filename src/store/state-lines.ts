@@ -79,6 +79,23 @@ export function documentFull(
   ), { code, size, ...listing(key, lines) });
 }
 
+/**
+ * The refusal of a write that would grow a document already past its cap before it, `size` characters to `max`: a
+ * cap lowered since it was written (`memory`'s to 8,000, from 64 KiB) leaves such a document, and no write that adds
+ * to it can fit however little it adds. Coded `<key>_over_cap`, apart from `<key>_full`'s ordinary filling, so the
+ * record can count the documents left there without opening any. It says what still works, so the agent is not left
+ * thinking the document is stuck: a `revise` that does not lengthen it, a `forget`, or a shorter `put`. `size` and
+ * the listing are as on `documentFull`'s.
+ */
+export function documentOverCap(key: string, size: number, max: number, lines: readonly string[]): Error {
+  const code = `${key}_over_cap`;
+  return Object.assign(new Error(
+    `${code}: \`${key}\` is ${size} characters; its cap is ${max}, and it was already over before this write, so `
+    + "nothing was written. What still works: `revise` and `forget` can shrink it (on a document over its cap, a "
+    + "`revise` is refused only if it makes it longer), and so can a `put` of a shorter one",
+  ), { code, size, ...listing(key, lines) });
+}
+
 /** How many of a full document's lines its refusal lists, and how much of each. */
 export const LISTED_LINES_MAX = 50;
 export const LISTED_LINE_CHARS = 200;
@@ -148,7 +165,8 @@ export function putRefusal(
   key: string,
   // A value that is not text has no lines and no character cap: it was never appendable, and the only thing to
   // protect is that it can still be replaced in place.
-  value: { text: string; max: number; current: number; editable: boolean } | { notText: true; editable: boolean },
+  // `lines`, the current text's, for the listing of an over-cap refusal.
+  value: { text: string; max: number; current: number; editable: boolean; lines?: readonly string[] } | { notText: true; editable: boolean },
   spills: { encoded: number; inlineMax: number } | null,
 ): Error | null {
   const code = `${key}_full`;
@@ -157,13 +175,13 @@ export function putRefusal(
     ? ` To shrink the \`${key}\` kept now where it is, delete or shorten text in it with \`revise\`, or drop it with \`forget\`.`
     : "";
   if (textual && value.text.length > value.max && value.text.length > value.current) {
-    const past = value.current > value.max && Number.isFinite(value.current)
-      ? ` It is ${value.current} now, already past that, so a \`put\` may leave it past the cap only by making it shorter.`
-      : "";
+    if (value.current > value.max && Number.isFinite(value.current)) {
+      return documentOverCap(key, value.current, value.max, value.lines ?? []);
+    }
     return Object.assign(new Error(
-      `${code}: \`${key}\` holds at most ${value.max} characters, and this put is ${value.text.length}, so nothing was written.${past} `
+      `${code}: \`${key}\` holds at most ${value.max} characters, and this put is ${value.text.length}, so nothing was written. `
       + "Put a shorter document: keep the lines that are still true",
-    ), { code });
+    ), { code, size: Number.isFinite(value.current) ? value.current : value.text.length });
   }
   if (!spills) return null;
   const why = !textual
@@ -225,6 +243,8 @@ export function appendLines(
   if (before.endsWith(eol)) before = before.slice(0, -eol.length);
   // Split on `\n` alone, so a CRLF line keeps its `\r` and the lengths below stay exact.
   const lines = before.split("\n");
+  // Past its cap already, nothing added can fit, whatever its length: that is what the agent has to be told first.
+  if (whenFull === "refuse" && size > max) throw documentOverCap(key, size, max, lines);
   if (text.length > max) throw tooLong(key, size, text, max, whenFull === "refuse" ? "remember" : null, lines);
   if (!before) return { kept: text, dropped: [] };
   // The length of `lines.slice(i).join("\n") + eol + text`, kept as `i` moves.
@@ -315,7 +335,11 @@ export function reviseText(
   }
   const kept = doc.slice(0, from) + n + doc.slice(to);
   if (kept.length > max && kept.length > doc.length) {
-    throw new Error(`that would make \`${key}\` ${kept.length} characters; a document holds at most ${max}, so nothing was changed`);
+    if (doc.length > max) throw documentOverCap(key, doc.length, max, doc.split("\n"));
+    throw Object.assign(
+      new Error(`that would make \`${key}\` ${kept.length} characters; a document holds at most ${max}, so nothing was changed`),
+      { size: doc.length },
+    );
   }
   const at = starts[0]!;
   return {
@@ -352,6 +376,7 @@ export function insertLines(
   // Only the inserted text and the one line break it adds take the document's `eol`: every character already there is
   // kept as it is, the break after line `afterLine` included.
   const t = withEol(text, eol);
+  if (before.length > max) throw documentOverCap(key, before.length, max, lines);
   if (t.length > max) throw tooLong(key, before.length, text, max, "insert", lines);
   const head = lines.slice(0, afterLine).join("\n");
   const kept = (afterLine === 0
@@ -388,8 +413,8 @@ export function storeFull(max: number, current: number, alias?: string): Error {
  * Whether a document written as `next` bytes over a row of `own` bytes would take a store of `total` past `max`; only
  * growth is refused, so a document can always be shrunk in a full store.
  */
-export function totalRefusal(total: number, own: number, next: number, max: number): Error | null {
-  return next > own && total - own + next > max ? storeFull(max, total) : null;
+export function totalRefusal(total: number, own: number, next: number, max: number, alias?: string): Error | null {
+  return next > own && total - own + next > max ? storeFull(max, total, alias) : null;
 }
 
 /** The marker, in `counters`, that a store's rows have had their `bytes` made `storedBytes`. */

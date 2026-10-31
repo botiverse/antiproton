@@ -103,15 +103,11 @@ interface StateConfig {
   /** Cap on a text document, in characters: an append past it drops the oldest
    *  whole lines, or is refused for a document that refuses when full
    *  (`whenFullOf`); a revision or an insert past it is refused. `memory`'s
-   *  cap is the lower of this and MEMORY_MAX (`capOf`). */
+   *  cap is the lower of this and `memoryMaxCharacters` (`capOf`). */
   maxDocumentBytes?: number;
+  /** `memory`'s cap and its budget in the prompt, one number (`memoryBudgetOf`). */
+  memoryMaxCharacters?: number;
 }
-
-const DEFAULTS: Required<Omit<StateConfig, "account">> = {
-  maxTotalBytes: 64 * 1024 * 1024,
-  maxValueBytes: 4 * 1024 * 1024,
-  maxDocumentBytes: 64 * 1024,
-};
 
 /**
  * `memory`'s cap and its budget in the prompt, in characters: one number, so a `memory` within its cap is always shown
@@ -120,6 +116,16 @@ const DEFAULTS: Required<Omit<StateConfig, "account">> = {
  * shrinks it is not (src/store/state-lines.ts `reviseText`, `putRefusal`).
  */
 export const MEMORY_MAX = 8_000;
+
+const DEFAULTS: Required<Omit<StateConfig, "account">> = {
+  maxTotalBytes: 64 * 1024 * 1024,
+  maxValueBytes: 4 * 1024 * 1024,
+  maxDocumentBytes: 64 * 1024,
+  memoryMaxCharacters: MEMORY_MAX,
+};
+
+/** A mount's settings with the defaults filled in (`configOf`). */
+export type StateSettings = Required<Omit<StateConfig, "account">>;
 
 /** The documents the harness injects when it opens. Named here so the tool
  *  summaries, the injection and the operator view cannot drift apart. */
@@ -170,13 +176,18 @@ export function whenFullSentence(key: string, seed: SeedMode | undefined): strin
  * limit that is not a finite number is the default's, so a stored config the console would refuse today cannot make
  * a comparison always false (NaN) or the smallest of several caps meaningless.
  */
-function configOf(publicConfig: unknown): Required<Omit<StateConfig, "account">> {
+export function configOf(publicConfig: unknown): StateSettings {
   const given = (publicConfig && typeof publicConfig === "object" ? publicConfig : {}) as Record<string, unknown>;
   const limit = (name: keyof typeof DEFAULTS) => {
     const v = given[name];
     return typeof v === "number" && Number.isFinite(v) ? v : DEFAULTS[name];
   };
-  return { maxTotalBytes: limit("maxTotalBytes"), maxValueBytes: limit("maxValueBytes"), maxDocumentBytes: limit("maxDocumentBytes") };
+  // A cap of no characters, or fewer, would leave `memory` unwritable and unshown: that is a bad value, not a setting.
+  const memory = limit("memoryMaxCharacters");
+  return {
+    maxTotalBytes: limit("maxTotalBytes"), maxValueBytes: limit("maxValueBytes"), maxDocumentBytes: limit("maxDocumentBytes"),
+    memoryMaxCharacters: memory >= 1 ? Math.floor(memory) : MEMORY_MAX,
+  };
 }
 
 /**
@@ -209,33 +220,56 @@ export function seedFitProblem(
   return null;
 }
 
-/** The cap on `key`, in characters: `maxDocumentBytes`, and for `memory` no more than MEMORY_MAX. */
-export const capOf = (key: string, maxDocumentBytes: number): number =>
-  key === "memory" ? Math.min(maxDocumentBytes, MEMORY_MAX) : maxDocumentBytes;
+/**
+ * `memory`'s cap and its budget in the prompt, in characters: the one function every reader of either asks, so the
+ * longest `memory` a write may leave, the most of it the prompt shows and the number a refusal names cannot differ.
+ * MEMORY_MAX unless the mount sets `memoryMaxCharacters`, which an operator can raise for an agent that needs more.
+ */
+export const memoryBudgetOf = (cfg: StateSettings): number => cfg.memoryMaxCharacters;
+
+/** The cap on `key`, in characters: `maxDocumentBytes`, and for `memory` no more than its budget (`memoryBudgetOf`). */
+export const capOf = (key: string, cfg: StateSettings): number =>
+  key === "memory" ? Math.min(cfg.maxDocumentBytes, memoryBudgetOf(cfg)) : cfg.maxDocumentBytes;
+
+/** How much of a working-set document the prompt shows, in characters: `memory`'s from the mount, the others' own. */
+const budgetOf = (doc: { key: string; budget: number }, cfg: StateSettings): number =>
+  doc.key === "memory" ? memoryBudgetOf(cfg) : doc.budget;
 
 /**
- * A `<key>_full` refusal with one sentence added on how much of the document the prompt shows: an agent deciding what
- * to free has to know that the copy in front of it may be missing part of it. Each budget is the one the prompt is
- * built with, so the sentence cannot name a number the injection does not use: a working-set document's own, kept as
- * its first and last part (`workingSetParts`), and a seeded `MEMORY.md`'s SEEDED_MEMORY_BUDGET, kept as its first
- * part (`seededFilesParts`). Only when the document is past it (`size`, its length as the refusal measured it): one
- * the prompt shows whole is not missing anything. Any other error is returned as it is.
+ * What a refused write to `memory` adds, whatever the refusal: it is the document the prompt always shows, so what it
+ * cannot hold is better moved than lost.
  */
-function withShown(e: unknown, key: string, seed: SeedMode | undefined): unknown {
-  const { code, size } = (e ?? {}) as { code?: unknown; size?: unknown };
-  if (code !== `${key}_full` || typeof size !== "number") return e;
+const MOVE_DETAILS = ". To keep what you know, move details rather than deleting them: `put` them into a document of their "
+  + "own, such as `notes/<topic>`, which is not shown to you automatically, so `get` reads it when you need it; keep "
+  + "only the key points in `memory`, and say there where the details are";
+
+/**
+ * A refusal of a write that would grow a text document, with one sentence added on how much of the document the
+ * prompt shows: an agent deciding what to free has to know that the copy in front of it may be missing part of it.
+ * Each budget is the one the prompt is built with, so the sentence cannot name a number the injection does not use: a
+ * working-set document's (`budgetOf`, `memory`'s from the same settings), kept as its first and last part
+ * (`workingSetParts`) or as its end, and a seeded `MEMORY.md`'s SEEDED_MEMORY_BUDGET, kept as its first part
+ * (`seededFilesParts`). Decided on facts, never on the code, which is for the record: the refusal carries `size`, the
+ * document's length as it measured it, and only past its budget is it missing anything, `<key>_over_cap` above all.
+ * A refusal on `memory` then says how to move details out (`MOVE_DETAILS`). Any other error is returned as it is.
+ */
+function withShown(e: unknown, key: string, seed: SeedMode | undefined, cfg: StateSettings): unknown {
+  const { size } = (e ?? {}) as { size?: unknown };
+  if (!(e instanceof Error) || typeof size !== "number") return e;
   const doc = WORKING_SET.find((d) => d.key === key);
   if (doc) {
-    if (size <= doc.budget) return e;
-    // `journal` is refused only by `insert`, and is shown from its end.
-    (e as Error).message += doc.tail
-      ? `. The prompt shows only the last ${doc.budget} characters of \`${key}\`; \`get\` reads all of it`
-      : `. The prompt shows only the first and last part of \`${key}\` past ${doc.budget} characters, `
-        + "saying how much is left out between them; `get` reads all of it";
+    const budget = budgetOf(doc, cfg);
+    if (size > budget) {
+      e.message += doc.tail
+        ? `. The prompt shows only the last ${budget} characters of \`${key}\`; \`get\` reads all of it`
+        : `. The prompt shows only the first and last part of \`${key}\` past ${budget} characters, `
+          + "saying how much is left out between them; `get` reads all of it";
+    }
   } else if (seed && key === SEEDED_MEMORY && size > SEEDED_MEMORY_BUDGET) {
-    (e as Error).message += `. The prompt shows only the first ${SEEDED_MEMORY_BUDGET} characters of \`${key}\`, `
+    e.message += `. The prompt shows only the first ${SEEDED_MEMORY_BUDGET} characters of \`${key}\`, `
       + "saying where it is cut; `get` reads all of it";
   }
+  if (key === "memory") e.message += MOVE_DETAILS;
   return e;
 }
 
@@ -341,7 +375,9 @@ export function statePlugin(
       { name: "maxValueBytes", type: "number", default: DEFAULTS.maxValueBytes,
         summary: `Largest single value; anything bigger is refused. Values over ${STATE_INLINE_MAX / 1024} KiB are kept in object storage and handed back as a reference, which is not configurable.` },
       { name: "maxDocumentBytes", type: "number", default: DEFAULTS.maxDocumentBytes,
-        summary: `Largest text document, in characters; \`memory\` holds at most ${MEMORY_MAX} whatever this says, the most the prompt shows of it. A \`remember\` past it drops the oldest whole lines and says which, except on \`memory\`, \`todo\` and a seeded \`MEMORY.md\`, where it is refused; a \`revise\` or an \`insert\` that grows a document past it is refused, and so is a \`put\` of text past it to one of those.` },
+        summary: `Largest text document, in characters; \`memory\` holds no more than \`memoryMaxCharacters\` either. A \`remember\` past it drops the oldest whole lines and says which, except on \`memory\`, \`todo\` and a seeded \`MEMORY.md\`, where it is refused; a \`revise\` or an \`insert\` that grows a document past it is refused, and so is a \`put\` of text past it to one of those.` },
+      { name: "memoryMaxCharacters", type: "number", default: DEFAULTS.memoryMaxCharacters,
+        summary: "`memory`'s cap and how much of it the prompt shows, in characters: one number, so a `memory` within its cap is shown whole. Raise it for an agent that needs more standing facts; a value that is not a number of at least 1 is the default's." },
       { name: "maxTotalBytes", type: "number", default: DEFAULTS.maxTotalBytes,
         summary: "How much this agent may keep in total. A write that would pass it is refused." },
     ],
@@ -620,9 +656,9 @@ export function statePlugin(
         case "remember": {
           const text = String(a.text ?? "").trim();
           if (!text) throw new Error("nothing to remember");
-          const cap = capOf(key, cfg.maxDocumentBytes);
+          const cap = capOf(key, cfg);
           const r = await store.appendState(tenantId, agentId, key, text, cap, whenFullOf(key, seed), cfg.maxTotalBytes)
-            .catch((e) => { throw withShown(withMount(e, ctx.alias), key, seed); });
+            .catch((e) => { throw withShown(withMount(e, ctx.alias), key, seed, cfg); });
           // `characters` is the document's length as the cap counts it, so the two can be read together; the stored
           // size, in another unit (`storedBytes`), is not in the reply, so neither is read against the other.
           if (!r.dropped.length) return { key, characters: r.characters, cap };
@@ -669,9 +705,9 @@ export function statePlugin(
           }
           // Exactly what was given: in a piece of a line, a space at either end is part of the text it replaces.
           const next = typeof a.new === "string" && a.new !== "" ? a.new : null;
-          const cap = capOf(key, cfg.maxDocumentBytes);
+          const cap = capOf(key, cfg);
           const r = await store.reviseState(tenantId, agentId, key, a.old, next, cap, cfg.maxTotalBytes)
-            .catch((e) => { throw withMount(e, ctx.alias); });
+            .catch((e) => { throw withShown(withMount(e, ctx.alias), key, seed, cfg); });
           const quote = (t: string) => memoryExcerpt(t, REVISED_QUOTE_MAX).excerpt;
           const where = r.line === r.lastLine ? `line ${r.line}` : `lines ${r.line}–${r.lastLine}`;
           return r.now === null
@@ -687,9 +723,9 @@ export function statePlugin(
           // Only the end is trimmed: leading spaces are how a nested list item says where it belongs.
           const text = a.text.trimEnd();
           if (!text.trim()) throw new Error("nothing to insert");
-          const cap = capOf(key, cfg.maxDocumentBytes);
+          const cap = capOf(key, cfg);
           const r = await store.insertState(tenantId, agentId, key, a.after_line, text, cap, cfg.maxTotalBytes)
-            .catch((e) => { throw withShown(withMount(e, ctx.alias), key, seed); });
+            .catch((e) => { throw withShown(withMount(e, ctx.alias), key, seed, cfg); });
           return { key, characters: r.characters, cap, line: r.line, note: `inserted at line ${r.line}` };
         }
 
@@ -740,7 +776,7 @@ export function statePlugin(
           // A text document is also given its length as the cap counts it, characters, beside the cap: `bytes` is the
           // stored size, which for text that `put` wrote is its JSON, quotes and escapes included, so it is not the
           // number to hold against the cap.
-          const text = typeof got.value === "string" ? { characters: got.value.length, cap: capOf(key, cfg.maxDocumentBytes) } : {};
+          const text = typeof got.value === "string" ? { characters: got.value.length, cap: capOf(key, cfg) } : {};
           return { key, found: true, bytes: got.bytes, ...text, updatedAt: got.updatedAt, value: got.value, ...seeded };
         }
 
@@ -770,9 +806,12 @@ export function statePlugin(
             // value that stays inline, and one that is not text is no document to be smaller than.
             const current = !cur ? 0 : cur.ref ? Number.POSITIVE_INFINITY : typeof cur.value === "string" ? cur.value.length : 0;
             const refused = typeof a.value === "string"
-              ? putRefusal(key, { text: a.value, max: capOf(key, cfg.maxDocumentBytes), current, editable }, spilt)
+              ? putRefusal(key, {
+                text: a.value, max: capOf(key, cfg), current, editable,
+                ...(editable ? { lines: (cur!.value as string).split("\n") } : {}),
+              }, spilt)
               : putRefusal(key, { notText: true, editable }, spilt);
-            if (refused) throw refused;
+            if (refused) throw withShown(refused, key, seed, cfg);
           }
           // Checked before writing, not after: the point is to refuse, not to
           // notice afterwards that the object is full.
@@ -796,7 +835,8 @@ export function statePlugin(
           // Only growth is refused, as for the other writes: a store over its total (the bytes backfill can put one
           // there) can still be brought back by a `put` that shrinks a value. `prior` is the row's stored size, the
           // total's unit, a different question from whether a document is shorter in characters (above).
-          if (totalRefusal(usage.bytes, prior, body.length, cfg.maxTotalBytes)) throw storeFull(cfg.maxTotalBytes, usage.bytes, ctx.alias);
+          const overTotal = totalRefusal(usage.bytes, prior, body.length, cfg.maxTotalBytes, ctx.alias);
+          if (overTotal) throw overTotal;
           if (!spills) {
             await store.putState(tenantId, agentId, key, {
               value: a.value ?? null, ref: null, bytes: body.length,
@@ -842,19 +882,22 @@ export async function workingSetParts(
 ): Promise<{ text: string; parts: PromptPart[] }> {
   const parts: string[] = [];
   const docs: PromptPart[] = [];
-  // The mount, asked once and only when there is something to say it with (below).
-  let mount: Promise<string | undefined> | null = null;
-  const aliasOf = () => mount ??= store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID).then((m) => m[0]?.alias);
+  // The mount, asked once and only when there is something to say with it (below): its alias, and its settings, for
+  // `memory`'s budget (`budgetOf`), the same settings its writes are capped by. No mount is the defaults'.
+  let mount: Promise<{ alias: string; publicConfig: unknown } | undefined> | null = null;
+  const mountOf = () => mount ??= store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID).then((m) => m[0]);
+  const aliasOf = async () => (await mountOf())?.alias;
   for (const doc of WORKING_SET) {
     if (skip.has(doc.key)) continue;
     const got = await store.getState(tenantId, agentId, doc.key);
     const text = typeof got?.value === "string" ? got.value : got?.value ? JSON.stringify(got.value) : "";
     if (!text.trim()) continue;
-    const kept = text.length <= doc.budget
+    const budget = doc.key === "memory" ? budgetOf(doc, configOf((await mountOf())?.publicConfig)) : doc.budget;
+    const kept = text.length <= budget
       ? text
       : doc.tail
-        ? `…\n${text.slice(text.length - doc.budget)}`
-        : headAndTail(text, doc.budget, doc.key, await aliasOf());
+        ? `…\n${text.slice(text.length - budget)}`
+        : headAndTail(text, budget, doc.key, await aliasOf());
     parts.push(`## ${doc.key} (${doc.what})\n${kept}`);
     docs.push({ key: `doc:${doc.key}`, label: `\`${doc.key}\` (${doc.what})`, text: kept, by: "agent" });
   }

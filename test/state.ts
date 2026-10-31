@@ -8,7 +8,7 @@
  * can read and correct.
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
-import { capOf, MEMORY_MAX, statePlugin, workingSet, WORKING_SET } from "../src/plugins/state.ts";
+import { capOf, configOf, MEMORY_MAX, memoryBudgetOf, statePlugin, workingSet, WORKING_SET } from "../src/plugins/state.ts";
 import { STATE_BYTES_MARKER } from "../src/store/state-lines.ts";
 import { DatabaseSync } from "node:sqlite";
 import { rmSync } from "node:fs";
@@ -556,7 +556,8 @@ await check("remember on a full memory or todo is refused on both stores, writes
       const big = capped(budget * 2);
       await store.putState("t", "a", key, { value: Array.from({ length: Math.ceil((budget + 1) / 100) }, (_, i) => `${i}`.padEnd(99, "q")).join("\n"), ref: null, bytes: 0 });
       const cut = await refusal(() => plugin.invoke("remember", { key, text: "z".repeat(budget) }, big));
-      if (cut.code !== `${key}_full` || !String(cut.threw).endsWith(`. The prompt shows only the first and last part of \`${key}\` past ${budget} characters, saying how much is left out between them; \`get\` reads all of it`)) {
+      // `memory`'s cap is its budget, so a `memory` past its budget was already past its cap: refused as over it.
+      if (cut.code !== `${key}_${key === "memory" ? "over_cap" : "full"}` || !String(cut.threw).includes(`. The prompt shows only the first and last part of \`${key}\` past ${budget} characters, saying how much is left out between them; \`get\` reads all of it`)) {
         throw new Error(`${name}: ${key}: past the budget: ${JSON.stringify(cut).slice(-300)}`);
       }
       await store.putState("t", "a", key, { value: before!.value, ref: null, bytes: before!.bytes });
@@ -1012,7 +1013,7 @@ await check("insert past the cap is refused as <key>_full with the listing, on m
   for (const { name, store, plugin } of await backends()) {
     const budget = WORKING_SET.find((d) => d.key === "journal")!.budget;
     await store.putState("t", "a", "journal", { value: Array.from({ length: 40 }, (_, i) => `${i}`.padEnd(79, "j")).join("\n"), ref: null, bytes: 0 });
-    const r = await refusal(() => plugin.invoke("insert", { key: "journal", after_line: 0, text: "x".repeat(100) }, capped(budget + 100)));
+    const r = await refusal(() => plugin.invoke("insert", { key: "journal", after_line: 0, text: "x".repeat(150) }, capped(budget + 300)));
     if (r.code !== "journal_full" || !String(r.threw).endsWith(`. The prompt shows only the last ${budget} characters of \`journal\`; \`get\` reads all of it`)) {
       throw new Error(`${name}: journal past its budget: ${JSON.stringify(r).slice(-300)}`);
     }
@@ -1031,7 +1032,8 @@ await check("insert past the cap is refused as <key>_full with the listing, on m
 
 await check("memory's cap is MEMORY_MAX, 8000, the same number as its prompt budget; other keys keep maxDocumentBytes", async () => {
   if (MEMORY_MAX !== 8000 || WORKING_SET.find((d) => d.key === "memory")!.budget !== MEMORY_MAX) throw new Error(`cap ${MEMORY_MAX}, budget ${WORKING_SET.find((d) => d.key === "memory")!.budget}`);
-  if (capOf("memory", 64 * 1024) !== MEMORY_MAX || capOf("memory", 100) !== 100 || capOf("todo", 64 * 1024) !== 64 * 1024) throw new Error("capOf");
+  if (capOf("memory", configOf({})) !== MEMORY_MAX || capOf("memory", configOf({ maxDocumentBytes: 100 })) !== 100
+    || capOf("todo", configOf({})) !== 64 * 1024) throw new Error("capOf");
   for (const { name, store, plugin } of await backends()) {
     // The deployment's default config: no maxDocumentBytes.
     const ctx = { ...capped(0), publicConfig: { account: "agent memory" } } as unknown as PluginContext;
@@ -1054,7 +1056,10 @@ await check("memory's cap is MEMORY_MAX, 8000, the same number as its prompt bud
   }
 });
 
-await check("a memory already past its cap is still shown, refuses every write that grows it, and takes any that shrinks it, put included", async () => {
+await check("a memory already past its cap is still shown, refuses every write that grows it as memory_over_cap with the move-details hint, and takes any that shrinks it: put, revise and forget", async () => {
+  const HINT = ". To keep what you know, move details rather than deleting them: `put` them into a document of their own, such as `notes/<topic>`, "
+    + "which is not shown to you automatically, so `get` reads it when you need it; keep only the key points in `memory`, and say there where the details are";
+  const SHOWN = ". The prompt shows only the first and last part of `memory` past 8000 characters, saying how much is left out between them; `get` reads all of it";
   for (const { name, store, plugin } of await backends()) {
     const ctx = capped(64 * 1024);
     // Escape-heavy, so its stored size is far more than its characters: what is smaller is judged in characters.
@@ -1066,15 +1071,18 @@ await check("a memory already past its cap is still shown, refuses every write t
     const shown = (await workingSet(store, "t", "a")).split("## memory (durable facts)\n")[1]!;
     if (!shown.includes("FIRST fact") || !shown.includes("LAST fact") || !/characters left out here/.test(shown)) throw new Error(`${name}: not shown by head and tail`);
     const value = () => store.getState("t", "a", "memory").then((g) => g?.value);
-    for (const [tool, args, want] of [
-      ["remember", { text: "one more" }, /^memory_full: `memory` is full: it is \d+ characters/],
-      ["insert", { after_line: 0, text: "one more" }, /^memory_full: `memory` is full/],
-      ["revise", { old: "LAST fact", new: "LAST fact, longer" }, /a document holds at most 8000, so nothing was changed/],
-      ["put", { value: `${legacy}!` }, new RegExp(`^memory_full: \`memory\` holds at most 8000 characters, and this put is ${over + 1}, so nothing was written\\. It is ${over} now, already past that, so a \`put\` may leave it past the cap only by making it shorter\\.`)],
-    ] as const) {
-      const r = await refusal(() => plugin.invoke(tool, { key: "memory", ...args }, ctx));
-      if (!want.test(r.threw ?? "")) throw new Error(`${name}: ${tool}: ${JSON.stringify(r).slice(0, 400)}`);
+    const head = `memory_over_cap: \`memory\` is ${over} characters; its cap is 8000, and it was already over before this write, so nothing was written. `
+      + "What still works: `revise` and `forget` can shrink it (on a document over its cap, a `revise` is refused only if it makes it longer), and so can a `put` of a shorter one";
+    for (const [tool, args] of [["remember", { text: "one more" }], ["insert", { after_line: 0, text: "one more" }],
+      ["revise", { old: "LAST fact", new: "LAST fact, longer" }], ["put", { value: `${legacy}!` }]] as const) {
+      const r = await refusal(() => plugin.invoke(tool, { key: "memory", ...args }, ctx)) as any;
+      if (r.code !== "memory_over_cap" || r.threw !== head + SHOWN + HINT) throw new Error(`${name}: ${tool}: ${JSON.stringify(r).slice(0, 600)}`);
       if (await value() !== legacy) throw new Error(`${name}: a refused ${tool} changed it`);
+    }
+    // The listing too, to the model only, so it can choose what to move.
+    const listed = await (async () => { try { await plugin.invoke("remember", { key: "memory", text: "x" }, ctx); return null; } catch (e) { return e as any; } })();
+    if (!String(listed?.modelOnlyText).startsWith("`memory` now, by line number:\n1: FIRST fact\n2: she said") || String(listed?.message).includes("FIRST fact")) {
+      throw new Error(`${name}: the listing: ${String(listed?.modelOnlyText).slice(0, 100)}`);
     }
     // Shrinking is allowed though still past the cap: by revise, and by one put with fewer characters, even though
     // the row it replaces is stored larger and this put encodes to more than its own length.
@@ -1083,6 +1091,15 @@ await check("a memory already past its cap is still shown, refuses every write t
     if (shorter.length <= MEMORY_MAX) throw new Error(`control: ${shorter.length}`);
     const p = await plugin.invoke("put", { key: "memory", value: shorter }, ctx) as any;
     if (p.stored !== "inline" || await value() !== shorter) throw new Error(`${name}: a shorter put was refused: ${JSON.stringify(p)}`);
+    // The move the hint describes: details out with put, then the key points back in, under the cap.
+    await plugin.invoke("put", { key: "notes/sam", value: shorter }, ctx);
+    await plugin.invoke("put", { key: "memory", value: "Sam: how they like to be addressed; details in notes/sam" }, ctx);
+    await plugin.invoke("remember", { key: "memory", text: "a new fact fits again" }, ctx);
+    if (!String(await value()).endsWith("a new fact fits again") || (await store.getState("t", "a", "notes/sam"))?.value !== shorter) throw new Error(`${name}: the move`);
+    // And forget always works.
+    await store.putState("t", "a", "memory", { value: legacy, ref: null, bytes: JSON.stringify(legacy).length });
+    const f = await plugin.invoke("forget", { key: "memory" }, ctx) as any;
+    if (f.deleted !== true || await value() !== undefined) throw new Error(`${name}: forget: ${JSON.stringify(f)}`);
     // A put that would move it to object storage is refused however short it is beside a document kept there.
     await store.putState("t", "a", "memory", { value: null, ref: "r2://b/t/t/a/state/memory.json", bytes: 90_000 });
     const spill = await refusal(() => plugin.invoke("put", { key: "memory", value: "x".repeat(33_000) }, ctx));
@@ -1097,9 +1114,81 @@ await check("a memory already past its cap is still shown, refuses every write t
   }
 });
 
-/** One sequence on both stores: every reply, refusal and value the same, character for character. Both call the rules in
- *  state-lines.ts, so this catches a store that stops calling them; the concurrency check is the one that tells the
- *  stores' own reads and writes apart. */
+await check("memoryMaxCharacters sets memory's cap and its prompt budget as one number: the longest write allowed, the budget shown and the number refused all agree", async () => {
+  for (const [given, want] of [[12_000, 12_000], [undefined, 8000], ["12000", 8000], [-5, 8000], [0, 8000], [Number.NaN, 8000]] as const) {
+    const store = new SqliteStore(":memory:");
+    await store.init();
+    await store.createAgent("t", "a");
+    const plugin = statePlugin(store, null, "local");
+    const publicConfig = given === undefined ? {} : { memoryMaxCharacters: given };
+    await store.addMount({ tenantId: "t", agentId: "a", alias: "state", plugin: "state", installationId: "i", connectionId: null,
+      toolVersion: plugin.version, publicConfig, secretRef: null, policy: null });
+    if (memoryBudgetOf(configOf(publicConfig)) !== want) throw new Error(`${String(given)}: ${memoryBudgetOf(configOf(publicConfig))}`);
+    const ctx = { ...capped(64 * 1024), publicConfig } as unknown as PluginContext;
+    const doc = (n: number) => Array.from({ length: Math.ceil(n / 100) }, (_, i) => `${i}`.padEnd(99, "m")).join("\n").slice(0, n);
+    // The longest write allowed.
+    await plugin.invoke("put", { key: "memory", value: doc(want) }, ctx);
+    const past = await refusal(() => plugin.invoke("put", { key: "memory", value: doc(want + 1) }, ctx));
+    if (past.code !== "memory_full" || !String(past.threw).includes(`holds at most ${want} characters`)) throw new Error(`${String(given)}: put past: ${JSON.stringify(past).slice(0, 200)}`);
+    const filled = await refusal(() => plugin.invoke("remember", { key: "memory", text: "x" }, ctx));
+    if (filled.code !== "memory_full" || !String(filled.threw).includes(`it holds at most ${want}`)) throw new Error(`${String(given)}: remember: ${JSON.stringify(filled).slice(0, 200)}`);
+    if ((await plugin.invoke("get", { key: "memory" }, ctx) as any).cap !== want) throw new Error(`${String(given)}: get's cap`);
+    // The budget shown: a memory at the cap is shown whole, one character more is cut.
+    const shown = async () => (await workingSet(store, "t", "a")).split("## memory (durable facts)\n")[1]!.split("\n\n## ")[0]!;
+    if (await shown() !== doc(want)) throw new Error(`${String(given)}: at the cap it is not shown whole`);
+    await store.putState("t", "a", "memory", { value: doc(want + 1), ref: null, bytes: 0 });
+    if (!/characters left out here/.test(await shown())) throw new Error(`${String(given)}: past the cap it is shown whole`);
+    // The number the refusal states.
+    const over = await refusal(() => plugin.invoke("remember", { key: "memory", text: "x" }, ctx));
+    if (over.code !== "memory_over_cap" || !String(over.threw).includes(`its cap is ${want}`) || !String(over.threw).includes(`past ${want} characters`)) {
+      throw new Error(`${String(given)}: over: ${JSON.stringify(over).slice(0, 300)}`);
+    }
+  }
+});
+
+await check("memory_over_cap on a 65,536-character memory says the prompt shows only part of it, and reaches the record as its code", async () => {
+  const { store, failures, raw } = await traced(64 * 1024);
+  const big = Array.from({ length: 656 }, (_, i) => `fact ${i} `.padEnd(99, "f")).join("\n").slice(0, 65_536);
+  if (big.length !== 65_536) throw new Error(`control: ${big.length}`);
+  await store.putState("t", "a", "memory", { value: big, ref: null, bytes: JSON.stringify(big).length });
+  const out = await raw("remember", { key: "memory", text: "one more" }) as any;
+  const said = String(out.error?.message);
+  if (out.status !== "failed" || !said.startsWith("memory_over_cap: `memory` is 65536 characters; its cap is 8000")
+    || !said.includes(". The prompt shows only the first and last part of `memory` past 8000 characters")) throw new Error(`refusal: ${said.slice(0, 400)}`);
+  if (failures.length !== 1 || failures[0].code !== "memory_over_cap") throw new Error(`the record: ${JSON.stringify(failures).slice(0, 300)}`);
+});
+
+await check("text too long for any document, on a document past its prompt budget, says the prompt shows only part of it", async () => {
+  // `size` rides on the too-long refusal as on the full one, so the sentence is decided the same way for both.
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(4000);
+    const doc = Array.from({ length: 31 }, (_, i) => `${i}`.padEnd(99, "t")).join("\n");
+    for (const [key, tool, args, sentence] of [
+      ["todo", "remember", { text: "y".repeat(4001) }, ". The prompt shows only the first and last part of `todo` past 2000 characters"],
+      ["journal", "insert", { after_line: 0, text: "y".repeat(4001) }, ". The prompt shows only the last 3000 characters of `journal`"],
+    ] as const) {
+      await store.putState("t", "a", key, { value: doc, ref: null, bytes: 0 });
+      const r = await refusal(() => plugin.invoke(tool, { key, ...args }, ctx));
+      if (r.code !== `${key}_full` || !String(r.threw).includes("that line is 4001 characters") || !String(r.threw).includes(sentence)) {
+        throw new Error(`${name}: ${key}: ${JSON.stringify(r).slice(0, 400)}`);
+      }
+    }
+  }
+});
+
+await check("a memory filling up is refused as memory_full with the move-details hint; todo's refusal has no hint", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(50);
+    for (const key of ["memory", "todo"]) {
+      await store.putState("t", "a", key, { value: `${A}\n${B}`, ref: null, bytes: 0 });
+      for (const [tool, args] of [["remember", { text: C }], ["insert", { after_line: 0, text: C }], ["revise", { old: A, new: C + C }], ["put", { value: "p".repeat(51) }]] as const) {
+        const r = await refusal(() => plugin.invoke(tool, { key, ...args }, ctx)) as any;
+        const hinted = (r.threw ?? "").endsWith("keep only the key points in `memory`, and say there where the details are");
+        if (!r.threw || (key === "memory") !== hinted || (r.code !== undefined && r.code !== `${key}_full`)) throw new Error(`${name}: ${key}: ${tool}: ${JSON.stringify(r)}`);
+      }
+    }
+  }
+});
 await check("a text put to todo that put would move to object storage is refused by its JSON length, never its character count; to memory, its cap comes first", async () => {
   // Moved there, the document could no longer be appended to or revised, and the 64 KiB character cap does not stop it:
   // the move is decided on the JSON, past 32 KiB. Two shapes, since they prove different things. `memory`'s cap is
@@ -1193,13 +1282,16 @@ await check("refusals on a document ending with a newline, on one already past t
     const over = `${"o".repeat(30)}\n${"p".repeat(29)}`;
     await store.putState("t", "a", "todo", { value: over, ref: null, bytes: 0 });
     const past = await refusal(() => plugin.invoke("remember", { key: "todo", text: "q" }, ctx));
-    if (past.code !== "todo_full" || !(past.threw ?? "").includes("it is 60 characters, this line adds 2 to make it 62, and it holds at most 50")
-      || !(past.threw ?? "").includes("free at least 12 characters first")) throw new Error(`${name}: past the cap: ${JSON.stringify(past)}`);
+    // Over its cap before this write, it is refused as that, a code of its own, saying what still works.
+    if (past.code !== "todo_over_cap" || !(past.threw ?? "").startsWith("todo_over_cap: `todo` is 60 characters; its cap is 50, and it was already over before this write, so nothing was written. What still works: `revise` and `forget` can shrink it")
+      || (past.threw ?? "").includes("notes/<topic>")) throw new Error(`${name}: past the cap: ${JSON.stringify(past)}`);
     if ((await store.getState("t", "a", "todo"))?.value !== over) throw new Error(`${name}: past the cap changed`);
     // Several lines are text, not a line.
     const many = await refusal(() => plugin.invoke("remember", { key: "memory", text: "first line here\nsecond line" }, ctx));
     if (!(many.threw ?? "").includes("this text adds 27 to make it 61")) throw new Error(`${name}: several lines: ${JSON.stringify(many)}`);
-    // Too long for any document: on memory and todo it carries the code; on journal it does not.
+    // Too long for any document: on memory and todo it carries the code; on journal it does not. (`todo` is put back
+    // under its cap first: over it, the over-cap refusal comes first.)
+    await store.putState("t", "a", "todo", { value: "short", ref: null, bytes: 0 });
     for (const key of ["memory", "todo", "journal"]) {
       const long = await refusal(() => plugin.invoke("remember", { key, text: "y".repeat(51) }, ctx));
       const want = key === "journal" ? undefined : `${key}_full`;
@@ -1294,7 +1386,7 @@ await check("a document already past the cap can lose or shorten a line, and onl
     const over = "first line is long\nsecond line is long\nthird";
     await store.putState("t", "a", "memory", { value: over, ref: null, bytes: 0 });
     const grow = await attempt(() => plugin.invoke("revise", { key: "memory", old: "third", new: "third, and longer" }, ctx));
-    if (!/a document holds at most 20, so nothing was changed/.test(grow.threw ?? "")) throw new Error(`${name}: growth: ${JSON.stringify(grow)}`);
+    if (!/^memory_over_cap: `memory` is 44 characters; its cap is 20, and it was already over before this write/.test(grow.threw ?? "")) throw new Error(`${name}: growth: ${JSON.stringify(grow)}`);
     // The same length is not growth.
     await plugin.invoke("revise", { key: "memory", old: "third", new: "THIRD" }, ctx);
     await plugin.invoke("revise", { key: "memory", old: "second line is long", new: "second" }, ctx);
