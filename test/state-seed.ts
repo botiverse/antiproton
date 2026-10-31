@@ -384,9 +384,14 @@ await check("two mounts with seeds: the block is contributed once", async () => 
 
 // ---- a seeded MEMORY.md when full -----------------------------------------
 
-/** A plugin context with a small document cap, and the trace rows it was handed. */
-function capped(ctx: PluginContext, maxDocumentBytes: number) {
+/**
+ * A small document cap on the fixture's mount, and a plugin context carrying it, with the trace rows it was handed.
+ * The cap goes on the mount's row, where the plugin reads its settings from (src/plugins/state.ts `invoke`), and in
+ * the context too, as the gateway passes a call the row's own config: the two agree, as they do in a deployment.
+ */
+async function capped(store: SqliteStore, ctx: PluginContext, maxDocumentBytes: number) {
   const traced: any[] = [];
+  must(await store.updateMountConfig("t", "a", ctx.alias, { maxDocumentBytes }), `the cap on the ${ctx.alias} mount's row`);
   return { ctx: { ...ctx, publicConfig: { maxDocumentBytes }, trace: (r: unknown) => { traced.push(r); } } as unknown as PluginContext, traced };
 }
 const thrown = async (fn: () => Promise<unknown>): Promise<any> => {
@@ -397,7 +402,7 @@ const thrown = async (fn: () => Promise<unknown>): Promise<any> => {
 await check("a full writable seeded MEMORY.md refuses remember with MEMORY.md_full and its lines to the model, and is unchanged", async () => {
   const { store, plugin, ctx: base } = await fixture();
   await seed(store, file("MEMORY.md", "the owner is Ilse\nship on Tuesdays\n"));
-  const { ctx, traced } = capped(base, 50);
+  const { ctx, traced } = await capped(store, base, 50);
   const before = await row(store, "MEMORY.md");
   const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, ctx));
   must(e.code === "MEMORY.md_full" && String(e.message).startsWith("MEMORY.md_full: `MEMORY.md` is full: it is 35 characters"), `the refusal: ${show({ code: e.code, message: e.message })}`);
@@ -426,7 +431,8 @@ await check(`a full seeded MEMORY.md past ${SEEDED_MEMORY_BUDGET} characters say
     const text = ("m".repeat(99) + "\n").repeat(39) + "x".repeat(size - 3900 - 1) + "\n";
     must(text.length === size, `${size}: built ${text.length}`);
     await seed(store, file("MEMORY.md", text));
-    const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(1500) }, capped(base, 5000).ctx));
+    const { ctx } = await capped(store, base, 5000);
+    const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(1500) }, ctx));
     const sentence = `. The prompt shows only the first ${SEEDED_MEMORY_BUDGET} characters of \`MEMORY.md\`, saying where it is cut; \`get\` reads all of it`;
     must(e.code === "MEMORY.md_full" && String(e.message).endsWith(sentence) === says && (says || !String(e.message).includes("The prompt shows only")),
       `${size}: ${show({ code: e.code, message: String(e.message).slice(-200) })}`);
@@ -444,7 +450,8 @@ await check("the seeded block says a writable MEMORY.md refuses when full, and a
     must(mode === "writable" ? said : !text.includes(REFUSES), `${mode}: ${text}`);
     must(!text.includes(DROPS), `${mode} says it drops: ${text}`);
     if (mode === "writable") {
-      const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, capped(base, 50).ctx));
+      const { ctx } = await capped(store, base, 50);
+      const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, ctx));
       must(e.code === "MEMORY.md_full", `the remember: ${show({ code: e.code, message: e.message })}`);
     }
   }
@@ -453,7 +460,7 @@ await check("the seeded block says a writable MEMORY.md refuses when full, and a
 await check("a full read-only seeded MEMORY.md is refused by the seed guard first, not as full", async () => {
   const { store, plugin, ctx: base } = await fixture();
   await seed(store, file("MEMORY.md", "the owner is Ilse\nship on Tuesdays\n", "readonly"));
-  const { ctx } = capped(base, 50);
+  const { ctx } = await capped(store, base, 50);
   const before = await row(store, "MEMORY.md");
   const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, ctx));
   must(REFUSAL.test(String(e.message)) && e.code === undefined && e.modelOnlyText === undefined, `the refusal: ${show({ code: e.code, message: e.message })}`);
@@ -465,7 +472,7 @@ await check("an agent-named key, a seeded path not named MEMORY.md and an unseed
   await seed(store, file("notes/plan.md", "the owner is Ilse\nship on Tuesdays\n"));
   for (const key of ["notes", "notes/plan.md", "MEMORY.md"]) {
     if (key !== "notes/plan.md") await store.putState("t", "a", key, { value: "the owner is Ilse\nship on Tuesdays\n", ref: null, bytes: 0 });
-    const { ctx, traced } = capped(base, 50);
+    const { ctx, traced } = await capped(store, base, 50);
     const r = await plugin.invoke("remember", { key, text: "z".repeat(30) }, ctx) as any;
     must(r.dropped?.lines === 1 && r.dropped.text === "the owner is Ilse", `${key}: ${show(r)}`);
     must(traced.length === 1 && traced[0].kind === "state.dropped" && traced[0].attrs.key === "other", `${key}: ${show(traced)}`);

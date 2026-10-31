@@ -1203,6 +1203,25 @@ await check("with two state mounts, the store's total and the largest value are 
   if ((await store.stateUsage("t", "a")).bytes > 200) throw new Error("the store passed the smaller total");
 });
 
+await check("with no state mount row, the call's own config is the settings: its cap applies; once a row exists, the row's does", async () => {
+  // The one path where the call's config is read: an agent with no state mount row (src/plugins/state.ts `invoke`).
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  const plugin = statePlugin(store, null, "local");
+  const ctx = capped(50);
+  if ((await store.findMountsByPlugin("t", "a", "state")).length !== 0) throw new Error("control: a row exists");
+  await plugin.invoke("remember", { key: "memory", text: A }, ctx);
+  const r = await refusal(() => plugin.invoke("remember", { key: "memory", text: `${B} ${C}` }, ctx));
+  if (r.code !== "memory_full" || !String(r.threw).includes("it holds at most 50")) throw new Error(`the call's cap: ${JSON.stringify(r).slice(0, 300)}`);
+  if ((await plugin.invoke("get", { key: "memory" }, ctx) as any).cap !== 50) throw new Error("get's cap is not the call's");
+  // A row with no cap set: its defaults, not the call's 50.
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "state", plugin: "state", installationId: "i", connectionId: null,
+    toolVersion: plugin.version, publicConfig: {}, secretRef: null, policy: null });
+  const ok = await plugin.invoke("remember", { key: "memory", text: `${B} ${C}` }, ctx) as any;
+  if (ok.cap !== MEMORY_MAX) throw new Error(`with a row: ${JSON.stringify(ok)}`);
+});
+
 await check("a mount's row is the one source of its settings: a call carrying less config does not pull a limit back to the default", async () => {
   const store = new SqliteStore(":memory:");
   await store.init();
