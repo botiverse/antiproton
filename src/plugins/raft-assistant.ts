@@ -107,7 +107,7 @@ export const CHECK_TOOLS: readonly string[] = [OWNER_INBOX, OWNER_MESSAGES, NOTI
  * since `assistantTools` keeps only tools the catalogue has. Not the `secret_*` tools: an owner's credentials are not
  * something an assistant keeps, and nothing it does needs one.
  */
-export const MEMORY_TOOLS: readonly string[] = ["remember", "put", "get", "list", "forget", "revise"];
+export const MEMORY_TOOLS: readonly string[] = ["remember", "put", "get", "list", "forget", "revise", "insert"];
 /** The plugin that keeps an agent's memory (src/plugins/state.ts `PLUGIN_ID`), and whose paragraph an assistant's prompts show. */
 export const MEMORY_PLUGIN = "state";
 
@@ -3177,6 +3177,23 @@ const offeredTest = (offered: Iterable<string>) => { const set = new Set(offered
 /** An assistant's memory mount (`memoryMountOf`) and the session's tools on it, bare names. */
 export interface AssistantMemory { alias: string; offered: Iterable<string> }
 
+/**
+ * How `memory` is edited, by the tools offered: one document, a piece of whose text `revise` replaces and `insert` adds
+ * lines to, `put` rewrites and `get` reads, as Letta's core memory and Anthropic's memory tool keep one. Null with none
+ * of the four.
+ */
+function memoryEdits(t: (n: string) => string, has: (n: string) => boolean): string | null {
+  const how = [
+    has("revise") ? `edit it with ${t("revise")} (replace a piece of its text)` : null,
+    has("insert") ? `${has("revise") ? "" : "edit it with "}${t("insert")} (add lines at a line number)` : null,
+    has("put") ? `rewrite it whole with ${t("put")}` : null,
+    has("get") ? `read it with ${t("get")}` : null,
+  ].filter((x): x is string => x !== null);
+  if (!how.length) return null;
+  const list = how.length > 1 ? `${how.slice(0, -1).join(", ")} and ${how.at(-1)}` : how[0]!;
+  return `\`memory\` is one document: ${list}.`;
+}
+
 /** How the chat removes something from its notes, by the tools it has: `revise` an entry, else rewrite or drop the document. */
 const forgetWith = (t: (n: string) => string, has: (n: string) => boolean): string =>
   has("revise") ? ` with ${t("revise")}`
@@ -3190,7 +3207,7 @@ const forgetWith = (t: (n: string) => string, has: (n: string) => boolean): stri
  * its checks, after a line for which one it is in; the chat's alone, what to do when its owner asks it to forget
  * something or what it remembers. Guidance and nothing more: code never decides what the model keeps,
  * including what it read in its owner's inbox, or when it writes it. Null without `remember` on the memory mount; the
- * sentence about correcting an entry only with `revise`.
+ * sentence about correcting an entry only with `revise`, and how `memory` is edited only by the tools offered.
  */
 export function memoryGuidance(m: AssistantMemory | null | undefined, session: "chat" | "check"): string | null {
   if (!m) return null;
@@ -3202,6 +3219,7 @@ export function memoryGuidance(m: AssistantMemory | null | undefined, session: "
       ? `You keep notes with ${t("remember")}, and they are shown to you at the start of every chat and every check, under "What you already know".`
       : `You keep notes with ${t("remember")}, shown to you under "What you already know" in your chat with your owner and in every check. If this check shows you something that will matter later, note it: a note tells no one, so it is not output.`,
     "Keep what will matter later: your owner's standing preferences, how they like to be addressed, decisions and why they were made, and what you have said you will do. Put lasting facts in `memory` and running notes in `journal`, so routine notes don't push the facts out.",
+    memoryEdits(t, has),
     has("revise") ? `When an entry turns out wrong or stops being true, change or remove it with ${t("revise")} rather than adding one that contradicts it.` : null,
     // The chat's alone, since only the chat talks to the owner: asking it is the owner's only way to see and manage the
     // notes today.

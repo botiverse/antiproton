@@ -560,7 +560,7 @@ SWE-bench rows below say which environment produced them.
 | `pi-loop` | 3 | pi's harness on our storage, and a rebuilt harness finding the transcript again |
 | `pi-bridge` | 11 | pi's request shape against our provider client, both ways |
 | `executor` · `http-plugin` | 46 | sandbox contract in-process (`executor` 11 runs the `spec/executor-spec` rows including script syntax errors), fetch and HTML extraction (`http-plugin` 10) |
-| `state` | 36 | memory that survives a task, byte budgets, `memory` over its budget shown by its first and latest lines with a marker naming `get`, per-agent isolation, a full document dropping whole oldest lines and `remember` quoting them back, CRLF documents kept CRLF, `remember` refusing a value that is not text, `revise` changing or deleting the one line its match is in and refusing zero or several matches and only growth past the cap, parallel `remember` and `revise` on one key losing no write on either store, both stores answering the same, `remember` and `put` sharing one namespace, every row `list` returns carrying the `ref` it is read back by, parked notes pointing to read calls, path segment traversal refusal, and stale unreadable rows offering `forget` |
+| `state` | 59 | memory that survives a task, byte budgets, `memory` capped at its 8,000-character prompt budget and one over it from before shown by its first and latest lines with a marker naming `get`, growing writes to it refused and shrinking ones taken, per-agent isolation, a full document dropping whole oldest lines and `remember` quoting them back, CRLF documents kept CRLF, `remember` refusing a value that is not text, `revise` replacing exactly the one occurrence of its `old` text (within a line or across lines) and refusing zero or several matches with their lines, the old `match`/`replace` names, and only growth past the cap, `insert` at a line number refusing a line out of range and a full document with its listing, a put over an inline todo past 32 KiB told to shrink it with `revise` or `forget`, every row's `bytes` the JSON's length (with a once-per-store backfill) and `maxTotalBytes` holding for every write, parallel `remember`, `revise` and `insert` on one key losing no write on either store, both stores answering the same, `remember` and `put` sharing one namespace, every row `list` returns carrying the `ref` it is read back by, parked notes pointing to read calls, path segment traversal refusal, and stale unreadable rows offering `forget` |
 | `markdown` | 11 | the console renders the agent's markdown and never its HTML |
 | `model-binding` | 6 | whose key an agent spends |
 
@@ -746,7 +746,7 @@ them:
   of arbitrary plugins at runtime are not supported: plugins are registered at
   build time in `cf/src/runtime.ts`. Revoking or removing a mount must preserve
   prompt resolution integrity: the system prompt names the mount and tool
-  (e.g. "kept by the `state` mount, … correct or delete that line with its `revise` tool") rather
+  (e.g. "kept by the `state` mount, … its `revise` tool replaces a piece of text") rather
   than the underlying dispatch address, and drops the instruction when the mount
   is absent.
 - **OAuth mounts.** An operator configures a credential by pasting it — a token,
