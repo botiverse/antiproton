@@ -52,7 +52,8 @@ export type WhenFull = "drop" | "refuse";
  *
  * The code is `<key>_full`, on the error for the call's record and also at the
  * start of the sentence: the gateway shows the model every plugin error as
- * `tool_error`, so the sentence is the only place the model can read it.
+ * `tool_error`, so the sentence is the only place the model can read it. `size`
+ * is on the error too, so a caller can say whether the prompt shows all of it.
  *
  * The `put` it suggests for blank lines and layout has no number: what binds a
  * `put` is not this cap but `putRefusal`'s, in another unit.
@@ -67,7 +68,7 @@ export function documentFull(
     + `dropping them: free at least ${short} characters first, by deleting or shortening a line that is no longer true `
     + "with `revise` or dropping the whole document with `forget`, then remember this again. If what has to go is blank "
     + "lines or layout, `put` the document again, shorter, instead: `revise` changes a line that has text on it",
-  ), { code, ...listing(key, lines) });
+  ), { code, size, ...listing(key, lines) });
 }
 
 /** How many of a full document's lines its refusal lists, and how much of each. */
@@ -184,7 +185,7 @@ export function appendLines(
       + `a document holds at most ${max}, so nothing was written`
       + (code ? ". Shorten this, or add it in several smaller pieces, one `remember` per line"
         : ": it is too long; shorten it, or add it in smaller pieces"),
-    ), code ? { code, ...listing(key, lines) } : {});
+    ), code ? { code, size, ...listing(key, lines) } : {});
   }
   if (!before) return { kept: text, dropped: [] };
   // The length of `lines.slice(i).join("\n") + eol + text`, kept as `i` moves.

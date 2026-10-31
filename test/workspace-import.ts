@@ -17,7 +17,8 @@ import { d1ProviderTokens, d1ProvisionedAgents } from "../cf/src/control-plane.t
 import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts";
 import { sha256Hex } from "../src/store/seed-files.ts";
 import { IMPORT_HOLD_MAX_MS } from "../src/store/workspace-import.ts";
-import { IMPORTED_MEMORY_BUDGET, importedFilesParts } from "../src/plugins/state.ts";
+import { IMPORTED_MEMORY_BUDGET, importedFilesParts, statePlugin } from "../src/plugins/state.ts";
+import type { PluginContext } from "../src/plugins/types.ts";
 import { ApStore } from "../src/store/ap-store.ts";
 import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { d1ServiceTokens } from "../cf/src/control-plane.ts";
@@ -561,6 +562,19 @@ await check(`an imported MEMORY.md is shown whole up to ${IMPORTED_MEMORY_BUDGET
     }
   }
   must(IMPORTED_MEMORY_BUDGET === 16_000, `the budget is ${IMPORTED_MEMORY_BUDGET}`);
+});
+
+await check("an imported MEMORY.md's paragraph says a full one drops its oldest lines, and a remember on a full one does", async () => {
+  const w = await world();
+  const text = "the owner is Ilse\nship on Tuesdays\n";
+  must((await imp(w, body(uuid(), [{ path: "MEMORY.md", bytes: text }]))).status === 201, "import");
+  const shown = (await importedFilesParts(w.rt.store, T, A, new Set())).text;
+  must(shown.includes("in your workspace when you were created\nWhen it is full, a `remember` to it drops its oldest lines to make room. Its current content is the text inside the fence below:"), `the paragraph: ${shown}`);
+  must(!shown.includes("is refused"), `the paragraph says it refuses: ${shown}`);
+  const plugin = statePlugin(w.rt.store, null, "local");
+  const ctx = { publicConfig: { maxDocumentBytes: 50 }, credential: null, caller: { tenantId: T, agentId: A, taskId: "k" }, alias: "state" } as unknown as PluginContext;
+  const r = await plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, ctx) as any;
+  must(r.dropped?.lines === 1 && r.dropped.text === "the owner is Ilse", `the remember: ${show(r)}`);
 });
 
 await check("a path shaped like a credential is refused (credential_in_path) on the import and the check, named null, and never repeated in any answer", async () => {

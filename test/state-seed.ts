@@ -195,7 +195,7 @@ await check("seeds: the block comes first, names every path literally with its s
   const at = text.indexOf("# Workspace files provided at setup");
   must(at === 2 && text.startsWith("\n\n"), `the block is not first: ${show(text.slice(0, 80))}`);
   must(text.includes("- The customer is Acme; their deploy window is Tuesday 02:00 UTC."), "MEMORY.md's text is not shown");
-  must(text.includes("## `MEMORY.md` (75 bytes, writable)\nA working file handed to you to maintain. Its current content is the text inside the fence below:\n\n```\n# Memory\n- The customer is Acme; their deploy window is Tuesday 02:00 UTC.\n```\n\n## Other files\n"), show(text));
+  must(text.includes("## `MEMORY.md` (75 bytes, writable)\nA working file handed to you to maintain. When it is full, a `remember` to it is refused and nothing is written: free space first with `revise` or `forget`. Its current content is the text inside the fence below:\n\n```\n# Memory\n- The customer is Acme; their deploy window is Tuesday 02:00 UTC.\n```\n\n## Other files\n"), show(text));
   must(text.includes("- `notes/onboarding_objectives.md` (34 bytes, writable): a working file handed to you to maintain; open it with the `get` tool on the `notes` mount."), show(text));
   must(text.includes("- `policy/rules.md` (20 bytes, readonly): it can be read with the `get` tool on the `notes` mount but not changed or removed."), show(text));
   for (const f of SAMPLE) must(text.includes(f.path), `${f.path} is not named literally`);
@@ -397,8 +397,8 @@ await check("a full writable seeded MEMORY.md refuses remember with MEMORY.md_fu
   const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, ctx));
   must(e.code === "MEMORY.md_full" && String(e.message).startsWith("MEMORY.md_full: `MEMORY.md` is full: it is 35 characters"), `the refusal: ${show({ code: e.code, message: e.message })}`);
   must(e.modelOnlyText === "`MEMORY.md` now, by line number:\n1: the owner is Ilse\n2: ship on Tuesdays", `the listing: ${show(e.modelOnlyText)}`);
-  // How much of it the prompt shows, by the budget the seeded block is built with.
-  must(String(e.message).endsWith(`. The prompt shows only the first ${SEEDED_MEMORY_BUDGET} characters of \`MEMORY.md\`, saying where it is cut; \`get\` reads all of it`), `the shown sentence: ${e.message}`);
+  // Shown whole in the prompt at 35 characters, so the refusal does not say it is cut.
+  must(!String(e.message).includes("The prompt shows only"), `a cut claimed of a document shown whole: ${e.message}`);
   // The message is what the record keeps; the lines are only in the listing.
   must(!String(e.message).includes("Ilse"), `the message carries a line: ${e.message}`);
   // A code the trace row keeps as one (src/trace/seams.ts ERROR_CODE), not left out as malformed.
@@ -412,6 +412,37 @@ await check("a full writable seeded MEMORY.md refuses remember with MEMORY.md_fu
   // Control: a line that fits is appended.
   const ok = await plugin.invoke("remember", { key: "MEMORY.md", text: "ok" }, ctx) as any;
   must(ok.bytes === 37 && !ok.dropped, `a line that fits: ${show(ok)}`);
+});
+
+await check(`a full seeded MEMORY.md past ${SEEDED_MEMORY_BUDGET} characters says the prompt shows only its first ${SEEDED_MEMORY_BUDGET}; exactly at it, nothing`, async () => {
+  for (const [size, says] of [[SEEDED_MEMORY_BUDGET + 1, true], [SEEDED_MEMORY_BUDGET, false]] as const) {
+    const { store, plugin, ctx: base } = await fixture();
+    // 39 lines of 100 characters and one of the rest, so the document is exactly `size` long with its final newline.
+    const text = ("m".repeat(99) + "\n").repeat(39) + "x".repeat(size - 3900 - 1) + "\n";
+    must(text.length === size, `${size}: built ${text.length}`);
+    await seed(store, file("MEMORY.md", text));
+    const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(1500) }, capped(base, 5000).ctx));
+    const sentence = `. The prompt shows only the first ${SEEDED_MEMORY_BUDGET} characters of \`MEMORY.md\`, saying where it is cut; \`get\` reads all of it`;
+    must(e.code === "MEMORY.md_full" && String(e.message).endsWith(sentence) === says && (says || !String(e.message).includes("The prompt shows only")),
+      `${size}: ${show({ code: e.code, message: String(e.message).slice(-200) })}`);
+  }
+});
+
+await check("the seeded block says a writable MEMORY.md refuses when full, and a remember on a full one is refused; a read-only one says neither", async () => {
+  const REFUSES = "When it is full, a `remember` to it is refused and nothing is written: free space first with `revise` or `forget`.";
+  const DROPS = "When it is full, a `remember` to it drops its oldest lines to make room.";
+  for (const mode of ["writable", "readonly"] as const) {
+    const { store, plugin, ctx: base } = await fixture();
+    await seed(store, file("MEMORY.md", "the owner is Ilse\nship on Tuesdays\n", mode));
+    const text = (await plugin.promptContribution!(base))!;
+    const said = text.includes(`maintain. ${REFUSES} Its current content`);
+    must(mode === "writable" ? said : !text.includes(REFUSES), `${mode}: ${text}`);
+    must(!text.includes(DROPS), `${mode} says it drops: ${text}`);
+    if (mode === "writable") {
+      const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, capped(base, 50).ctx));
+      must(e.code === "MEMORY.md_full", `the remember: ${show({ code: e.code, message: e.message })}`);
+    }
+  }
 });
 
 await check("a full read-only seeded MEMORY.md is refused by the seed guard first, not as full", async () => {

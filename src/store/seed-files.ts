@@ -227,8 +227,8 @@ export function priorActivity(sql: Sql): string | null {
 
 /**
  * Write both copies, or neither, inside the caller's transaction. Refused once sealed, and an agent that has already
- * run (`priorActivity`) is sealed here, as `prior-activity`, and refused; then refused when the caller found the file
- * does not fit (`misfit`), and when the agent's files would pass
+ * run (`priorActivity`) is sealed here, as `prior-activity`, and refused; past a repeat, refused when the caller
+ * found the file does not fit (`misfit`), and when the agent's files would pass
  * `SEED_AGENT_MAX_BYTES` together. The same bytes and mode as the file already holds is no write at all, so a retried
  * setup changes nothing, not even the time; anything different replaces both copies. Whether that repeat is one is
  * decided here, in the transaction: a caller that sent a large text inline because it looked like a repeat is told
@@ -240,11 +240,12 @@ export function writeSeedFile(sql: Sql, tenantId: string, agentId: string, w: Se
   if (sealed) {
     return { ok: false, code: "sealed", message: `the workspace was sealed (${sealed.how}) at ${new Date(sealed.sealedAt).toISOString()}; seeded files can no longer change` };
   }
-  // After the seal: a sealed workspace takes no file, so being told to seed this one shorter could not help.
-  if (w.misfit) return { ok: false, code: "document_cap", message: w.misfit };
   const file: SeedFileMeta = { path: w.path, mode: w.mode, bytes: w.bytes, sha256: w.sha256 };
   const prior = sql.exec("SELECT mode, sha256 FROM seed_files WHERE tenant_id=? AND agent_id=? AND path=?", tenantId, agentId, w.path).toArray()[0];
   if (prior && prior.mode === w.mode && prior.sha256 === w.sha256) return { ok: true, changed: false, file };
+  // After the seal, which takes no file, so being told to seed this one shorter could not help; and after a repeat,
+  // which writes nothing, so a retried setup of a file seeded before this rule answers as it did then.
+  if (w.misfit) return { ok: false, code: "document_cap", message: w.misfit };
   if ((w.content !== null && !seedInline(w.content)) || (w.working.value !== null && w.working.value.length > STATE_INLINE_MAX)) {
     return { ok: false, code: "spill", message: `${w.path} is too large to keep in its row and is no longer a repeat; spill it` };
   }

@@ -146,6 +146,17 @@ function whenFullOf(key: string, seed?: SeedMode): WhenFull {
 }
 
 /**
+ * What the prompt says a `remember` on a full `key` does, from `whenFullOf` itself, so what the agent is told about
+ * its `MEMORY.md` and what a write to it does cannot disagree. Static for a given file, so it does not move the
+ * prompt's cached prefix.
+ */
+export function whenFullSentence(key: string, seed: SeedMode | undefined): string {
+  return whenFullOf(key, seed) === "refuse"
+    ? "When it is full, a `remember` to it is refused and nothing is written: free space first with `revise` or `forget`."
+    : "When it is full, a `remember` to it drops its oldest lines to make room.";
+}
+
+/**
  * A mount's settings with the defaults filled in: what `invoke` holds a call to, and what seeding checks against. A
  * limit that is not a finite number is the default's, so a stored config the console would refuse today cannot make
  * a comparison always false (NaN) or the smallest of several caps meaningless.
@@ -194,15 +205,18 @@ export function seedFitProblem(
  * to free has to know that the copy in front of it may be missing part of it. Each budget is the one the prompt is
  * built with, so the sentence cannot name a number the injection does not use: a working-set document's own, kept as
  * its first and last part (`workingSetParts`), and a seeded `MEMORY.md`'s SEEDED_MEMORY_BUDGET, kept as its first
- * part (`seededFilesParts`). Any other error is returned as it is.
+ * part (`seededFilesParts`). Only when the document is past it (`size`, its length as the refusal measured it): one
+ * the prompt shows whole is not missing anything. Any other error is returned as it is.
  */
 function withShown(e: unknown, key: string, seed: SeedMode | undefined): unknown {
-  if ((e as { code?: unknown })?.code !== `${key}_full`) return e;
+  const { code, size } = (e ?? {}) as { code?: unknown; size?: unknown };
+  if (code !== `${key}_full` || typeof size !== "number") return e;
   const doc = WORKING_SET.find((d) => d.key === key);
   if (doc) {
+    if (size <= doc.budget) return e;
     (e as Error).message += `. The prompt shows only the first and last part of \`${key}\` past ${doc.budget} characters, `
       + "saying how much is left out between them; `get` reads all of it";
-  } else if (seed && key === SEEDED_MEMORY) {
+  } else if (seed && key === SEEDED_MEMORY && size > SEEDED_MEMORY_BUDGET) {
     (e as Error).message += `. The prompt shows only the first ${SEEDED_MEMORY_BUDGET} characters of \`${key}\`, `
       + "saying where it is cut; `get` reads all of it";
   }
@@ -1035,7 +1049,10 @@ export async function seededFilesParts(
       body = `${what} It is too large to show here and is kept in object storage; ` +
         (getTool ? `read it with ${getTool}.` : "you have no tool mounted for reading it.");
     } else {
-      body = `${what} Its current content is the text inside the fence below:\n\n` + fencedMemory(got.value, getTool, SEEDED_MEMORY_BUDGET);
+      // What a full one does, said only where it can be written and is kept in its row: one in object storage cannot
+      // be appended to at all.
+      const full = mode === "writable" ? ` ${whenFullSentence(memory.path, mode)}` : "";
+      body = `${what}${full} Its current content is the text inside the fence below:\n\n` + fencedMemory(got.value, getTool, SEEDED_MEMORY_BUDGET);
     }
     parts.push(`${seedLine(memory.path, sizeOf(memory, got), mode)}\n${body}`);
   }
@@ -1124,7 +1141,10 @@ export async function importedFilesParts(
           ? "Its current content is the text inside the fence below:\n\n" + fencedExcerpt(spilled, getTool)
           : "It is too large to show here and is kept in object storage; " +
             (getTool ? `read it with ${getTool}.` : "you have no tool mounted for reading it.")
-        : "Its current content is the text inside the fence below:\n\n" + fencedMemory(got.value, getTool, IMPORTED_MEMORY_BUDGET);
+        // Not seeded (the seeded block shows a seeded one), so the rule is an unseeded key's. Said only of a copy kept
+        // in its row: one in object storage cannot be appended to at all.
+        : `${whenFullSentence(SEEDED_MEMORY, undefined)} Its current content is the text inside the fence below:\n\n`
+          + fencedMemory(got.value, getTool, IMPORTED_MEMORY_BUDGET);
     parts.push(`## \`${SEEDED_MEMORY}\`, in your workspace when you were created\n${body}`);
   }
   const memoryPart: PromptPart[] = memory
