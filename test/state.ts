@@ -1146,6 +1146,56 @@ await check("memoryMaxCharacters sets memory's cap and its prompt budget as one 
   }
 });
 
+await check("with two state mounts, memory's cap and prompt budget are the smaller memoryMaxCharacters, whichever mount writes and whichever comes first", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  const plugin = statePlugin(store, null, "local");
+  // The larger first, so reading the first mount's alone would show it.
+  for (const [alias, memoryMaxCharacters] of [["big", 20_000], ["small", 8000]] as const) {
+    await store.addMount({ tenantId: "t", agentId: "a", alias, plugin: "state", installationId: alias, connectionId: null,
+      toolVersion: plugin.version, publicConfig: { memoryMaxCharacters }, secretRef: null, policy: null });
+  }
+  if ((await store.findMountsByPlugin("t", "a", "state"))[0]?.alias !== "big") throw new Error("control: the larger mount is not first");
+  const doc = Array.from({ length: 151 }, (_, i) => `${i}`.padEnd(99, "m")).join("\n").slice(0, 15_000);
+  await store.putState("t", "a", "memory", { value: doc, ref: null, bytes: JSON.stringify(doc).length });
+  const gw = new ToolGateway(store, [plugin], new Set(["state"]), { async resolve() { return null; } });
+  const call = { tenantId: "t", agentId: "a", taskId: "k" };
+  for (const alias of ["big", "small"]) {
+    for (const [tool, args] of [["remember", { key: "memory", text: "x" }], ["insert", { key: "memory", after_line: 0, text: "x" }],
+      ["put", { key: "memory", value: `${doc}x` }], ["revise", { key: "memory", old: "\n149m", new: "\n149mm" }]] as const) {
+      const out = await gw.invoke(call, `${alias}.${tool}`, args) as any;
+      const said = String(out.error?.message);
+      if (out.status !== "failed" || !said.startsWith("memory_over_cap: `memory` is 15000 characters; its cap is 8000")
+        || !said.includes("The prompt shows only the first and last part of `memory` past 8000 characters")) {
+        throw new Error(`${alias}.${tool}: ${said.slice(0, 300)}`);
+      }
+    }
+    const got = await gw.invoke(call, `${alias}.get`, { key: "memory" }) as any;
+    if (got.result?.cap !== 8000) throw new Error(`${alias}.get cap: ${JSON.stringify(got.result?.cap)}`);
+  }
+  const shown = (await workingSet(store, "t", "a")).split("## memory (durable facts)\n")[1]!;
+  if (!/^… \d+ of 15000 characters left out here;/m.test(shown)) throw new Error(`the prompt does not cut it at 8000: ${shown.slice(3900, 4200)}`);
+  // Under the smaller cap, a write through the larger mount is held to it too.
+  await store.putState("t", "a", "memory", { value: "short", ref: null, bytes: 0 });
+  const past = await gw.invoke(call, "big.put", { key: "memory", value: "p".repeat(8001) }) as any;
+  if (past.status !== "failed" || !String(past.error?.message).includes("holds at most 8000 characters")) throw new Error(`big.put past 8000: ${JSON.stringify(past).slice(0, 300)}`);
+});
+
+await check("configOf takes a limit only as a finite number of at least 1, floored; 0, a negative or a fraction under 1 is the default", async () => {
+  const d = configOf({});
+  for (const bad of [0, -5, 0.5, Number.NaN, Number.POSITIVE_INFINITY, "100", null]) {
+    const c = configOf({ maxDocumentBytes: bad, maxTotalBytes: bad, maxValueBytes: bad, memoryMaxCharacters: bad });
+    if (JSON.stringify(c) !== JSON.stringify(d)) throw new Error(`${String(bad)}: ${JSON.stringify(c)}`);
+  }
+  const c = configOf({ maxDocumentBytes: 100.7, maxTotalBytes: 1, maxValueBytes: 2000.2, memoryMaxCharacters: 12_000.9 });
+  if (c.maxDocumentBytes !== 100 || c.maxTotalBytes !== 1 || c.maxValueBytes !== 2000 || c.memoryMaxCharacters !== 12_000) throw new Error(JSON.stringify(c));
+  // And the plugin is held to it: a 0 maxDocumentBytes does not refuse every remember.
+  const { plugin } = (await backends())[0]!;
+  const r = await plugin.invoke("remember", { key: "notes", text: "fits" }, capped(0)) as any;
+  if (r.cap !== 64 * 1024) throw new Error(`capped(0): ${JSON.stringify(r)}`);
+});
+
 await check("memory_over_cap on a 65,536-character memory says the prompt shows only part of it, and reaches the record as its code", async () => {
   const { store, failures, raw } = await traced(64 * 1024);
   const big = Array.from({ length: 656 }, (_, i) => `fact ${i} `.padEnd(99, "f")).join("\n").slice(0, 65_536);

@@ -173,20 +173,21 @@ export function whenFullSentence(key: string, seed: SeedMode | undefined): strin
 
 /**
  * A mount's settings with the defaults filled in: what `invoke` holds a call to, and what seeding checks against. A
- * limit that is not a finite number is the default's, so a stored config the console would refuse today cannot make
- * a comparison always false (NaN) or the smallest of several caps meaningless.
+ * limit that is not a finite number of at least 1 is the default's, so a stored config the console would refuse today
+ * cannot make a comparison always false (NaN), every write refused (0 or less), or the smallest of several caps
+ * meaningless.
  */
 export function configOf(publicConfig: unknown): StateSettings {
   const given = (publicConfig && typeof publicConfig === "object" ? publicConfig : {}) as Record<string, unknown>;
+  // A limit of nothing, or less, would leave every write refused (and `memory` unshown): that is a bad value, not a
+  // setting, so it is the default's too. A fraction is floored, so every limit is a whole count.
   const limit = (name: keyof typeof DEFAULTS) => {
     const v = given[name];
-    return typeof v === "number" && Number.isFinite(v) ? v : DEFAULTS[name];
+    return typeof v === "number" && Number.isFinite(v) && v >= 1 ? Math.floor(v) : DEFAULTS[name];
   };
-  // A cap of no characters, or fewer, would leave `memory` unwritable and unshown: that is a bad value, not a setting.
-  const memory = limit("memoryMaxCharacters");
   return {
     maxTotalBytes: limit("maxTotalBytes"), maxValueBytes: limit("maxValueBytes"), maxDocumentBytes: limit("maxDocumentBytes"),
-    memoryMaxCharacters: memory >= 1 ? Math.floor(memory) : MEMORY_MAX,
+    memoryMaxCharacters: limit("memoryMaxCharacters"),
   };
 }
 
@@ -205,7 +206,7 @@ export function seedFitProblem(
   path: string, mode: SeedMode, text: string, mounts: ReadonlyArray<{ publicConfig: unknown }>,
 ): string | null {
   if (mode !== "writable" || whenFullOf(path, mode) !== "refuse") return null;
-  const cap = Math.min(...(mounts.length ? mounts : [{ publicConfig: {} }]).map((m) => configOf(m.publicConfig).maxDocumentBytes));
+  const cap = sharedSettings(mounts.map((m) => configOf(m.publicConfig))).maxDocumentBytes;
   const why = `a writable ${path} refuses a \`remember\` that does not fit rather than dropping its oldest lines`;
   if (text.length > cap) {
     return `${path} is ${text.length} characters, and the agent's state mount holds a document of at most ${cap} `
@@ -223,15 +224,31 @@ export function seedFitProblem(
 /**
  * `memory`'s cap and its budget in the prompt, in characters: the one function every reader of either asks, so the
  * longest `memory` a write may leave, the most of it the prompt shows and the number a refusal names cannot differ.
- * MEMORY_MAX unless the mount sets `memoryMaxCharacters`, which an operator can raise for an agent that needs more.
+ * Read from the agent's shared settings (`sharedSettings`), the smallest `memoryMaxCharacters` of its `state` mounts:
+ * MEMORY_MAX unless every mount sets more, which an operator can for an agent that needs it.
  */
 export const memoryBudgetOf = (cfg: StateSettings): number => cfg.memoryMaxCharacters;
+
+/**
+ * The settings an agent's documents are held to, from the settings of each of its `state` mounts (`configOf`), the
+ * calling one first: the smallest `maxDocumentBytes` and the smallest `memoryMaxCharacters`, since the mounts share
+ * one store, so a write through any of them, the prompt (`workingSetParts`) and seeding (`seedFitProblem`) hold a
+ * document to one number. The other limits are the first's, the call's own. None is the defaults'.
+ */
+export function sharedSettings(cfgs: readonly StateSettings[]): StateSettings {
+  const all = cfgs.length ? cfgs : [configOf({})];
+  return {
+    ...all[0]!,
+    maxDocumentBytes: Math.min(...all.map((c) => c.maxDocumentBytes)),
+    memoryMaxCharacters: Math.min(...all.map((c) => c.memoryMaxCharacters)),
+  };
+}
 
 /** The cap on `key`, in characters: `maxDocumentBytes`, and for `memory` no more than its budget (`memoryBudgetOf`). */
 export const capOf = (key: string, cfg: StateSettings): number =>
   key === "memory" ? Math.min(cfg.maxDocumentBytes, memoryBudgetOf(cfg)) : cfg.maxDocumentBytes;
 
-/** How much of a working-set document the prompt shows, in characters: `memory`'s from the mount, the others' own. */
+/** How much of a working-set document the prompt shows, in characters: `memory`'s `memoryBudgetOf`, the others' own. */
 const budgetOf = (doc: { key: string; budget: number }, cfg: StateSettings): number =>
   doc.key === "memory" ? memoryBudgetOf(cfg) : doc.budget;
 
@@ -575,8 +592,11 @@ export function statePlugin(
     ],
 
     async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
-      const cfg = configOf(ctx.publicConfig);
       const { tenantId, agentId } = ctx.caller;
+      // This call's settings and every other state mount's, as one (`sharedSettings`): what each write below is held to,
+      // and what its refusals say, is what the prompt shows and any other mount's write is held to.
+      const cfg = sharedSettings([configOf(ctx.publicConfig),
+        ...(await store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID)).map((m) => configOf(m.publicConfig))]);
       const a = (args ?? {}) as {
         key?: string; text?: string; value?: Json; prefix?: string; limit?: number;
         old?: unknown; new?: unknown; after_line?: unknown; match?: unknown; replace?: unknown;
@@ -882,17 +902,17 @@ export async function workingSetParts(
 ): Promise<{ text: string; parts: PromptPart[] }> {
   const parts: string[] = [];
   const docs: PromptPart[] = [];
-  // The mount, asked once and only when there is something to say with it (below): its alias, and its settings, for
-  // `memory`'s budget (`budgetOf`), the same settings its writes are capped by. No mount is the defaults'.
-  let mount: Promise<{ alias: string; publicConfig: unknown } | undefined> | null = null;
-  const mountOf = () => mount ??= store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID).then((m) => m[0]);
-  const aliasOf = async () => (await mountOf())?.alias;
+  // The mounts, asked once and only when there is something to say with them (below): the first one's alias, and all
+  // their settings, for `memory`'s budget (`memoryBudgetOf`), the number every write to it is capped by.
+  let mounts: Promise<Array<{ alias: string; publicConfig: unknown }>> | null = null;
+  const mountsOf = () => mounts ??= store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID);
+  const aliasOf = async () => (await mountsOf())[0]?.alias;
   for (const doc of WORKING_SET) {
     if (skip.has(doc.key)) continue;
     const got = await store.getState(tenantId, agentId, doc.key);
     const text = typeof got?.value === "string" ? got.value : got?.value ? JSON.stringify(got.value) : "";
     if (!text.trim()) continue;
-    const budget = doc.key === "memory" ? budgetOf(doc, configOf((await mountOf())?.publicConfig)) : doc.budget;
+    const budget = budgetOf(doc, sharedSettings((await mountsOf()).map((m) => configOf(m.publicConfig))));
     const kept = text.length <= budget
       ? text
       : doc.tail

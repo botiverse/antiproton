@@ -181,7 +181,7 @@ export function putRefusal(
     return Object.assign(new Error(
       `${code}: \`${key}\` holds at most ${value.max} characters, and this put is ${value.text.length}, so nothing was written. `
       + "Put a shorter document: keep the lines that are still true",
-    ), { code, size: Number.isFinite(value.current) ? value.current : value.text.length });
+    ), { code, size: value.current });
   }
   if (!spills) return null;
   const why = !textual
