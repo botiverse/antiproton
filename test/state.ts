@@ -962,6 +962,30 @@ await check("insert puts text at the top, in the middle and at the end, keeps a 
   }
 });
 
+await check("insert on a document whose lines end differently lands where the listing numbers it, and keeps every existing line end", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(64 * 1024);
+    const value = () => store.getState("t", "a", "mixed").then((g) => g?.value);
+    // Three lines as the listing counts them, on `\n`; the CRLF on one line makes the document's own line end CRLF.
+    const mixed = "alpha\nbeta\r\ngamma";
+    await store.putState("t", "a", "mixed", { value: mixed, ref: null, bytes: 0 });
+    // The listing's numbers, from a refused remember on a small cap: the same split insert must use.
+    const listed = await refusal(() => plugin.invoke("insert", { key: "mixed", after_line: 0, text: "z".repeat(10) }, capped(20))) as any;
+    const rows = String((await (async () => { try { await plugin.invoke("insert", { key: "mixed", after_line: 0, text: "z".repeat(10) }, capped(20)); return null; } catch (e) { return e as any; } })())?.modelOnlyText);
+    if (listed.code !== "mixed_full" || rows !== "`mixed` now, by line number:\n1: alpha\n2: beta\n3: gamma") throw new Error(`${name}: the listing: ${JSON.stringify(rows)}`);
+    const one = await plugin.invoke("insert", { key: "mixed", after_line: 1, text: "after alpha" }, ctx) as any;
+    if (await value() !== "alpha\nafter alpha\r\nbeta\r\ngamma" || one.line !== 2) throw new Error(`${name}: after line 1: ${JSON.stringify(await value())}`);
+    await store.putState("t", "a", "mixed", { value: mixed, ref: null, bytes: 0 });
+    const three = await plugin.invoke("insert", { key: "mixed", after_line: 3, text: "after gamma" }, ctx) as any;
+    if (await value() !== "alpha\nbeta\r\ngamma\r\nafter gamma" || three.line !== 4) throw new Error(`${name}: after line 3: ${JSON.stringify(await value())}`);
+    await store.putState("t", "a", "mixed", { value: mixed, ref: null, bytes: 0 });
+    const two = await plugin.invoke("insert", { key: "mixed", after_line: 2, text: "after beta" }, ctx) as any;
+    if (await value() !== "alpha\nbeta\r\nafter beta\r\ngamma" || two.line !== 3) throw new Error(`${name}: after line 2: ${JSON.stringify(await value())}`);
+    const past = await attempt(() => plugin.invoke("insert", { key: "mixed", after_line: 5, text: "x" }, ctx));
+    if (!/`mixed` has 4 lines/.test(past.threw ?? "")) throw new Error(`${name}: ${JSON.stringify(past)}`);
+  }
+});
+
 await check("insert past the cap is refused as <key>_full with the listing, on memory, todo and journal alike, and drops nothing", async () => {
   for (const { name, store, plugin } of await backends()) {
     const ctx = capped(50);
@@ -1388,6 +1412,25 @@ await check("remember, insert and revise that grow the store past maxTotalBytes 
     // A full store can still be tidied: a revise that shrinks a document goes through.
     await plugin.invoke("revise", { key: "notes", old: "0123456789" }, ctx);
     if ((await store.getState("t", "a", "notes"))?.value !== "abcdefghij") throw new Error(`${name}: a shrinking revise was refused`);
+  }
+});
+
+await check("a put to a store already past maxTotalBytes may shrink a value, and one that grows a value is refused", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = { ...capped(64 * 1024), alias: "memo", publicConfig: { account: "x", maxDocumentBytes: 64 * 1024, maxTotalBytes: 100 } } as unknown as PluginContext;
+    // Past the limit as the bytes backfill can leave a store: written under no limit, then held to one.
+    await plugin.invoke("put", { key: "data", value: "d".repeat(150) }, capped(64 * 1024));
+    const usage = (await store.stateUsage("t", "a")).bytes;
+    if (usage <= 100) throw new Error(`control: ${usage}`);
+    const grow = await refusal(() => plugin.invoke("put", { key: "data", value: "d".repeat(151) }, ctx));
+    if (grow.code !== "store_full" || grow.threw !== `this would take the store past 100 bytes (currently ${usage}); delete something with the \`forget\` tool on \`memo\``) {
+      throw new Error(`${name}: growth: ${JSON.stringify(grow)}`);
+    }
+    const other = await refusal(() => plugin.invoke("put", { key: "new", value: 1 }, ctx));
+    if (other.code !== "store_full") throw new Error(`${name}: a new key: ${JSON.stringify(other)}`);
+    // Smaller, though the store is still past the limit after it.
+    const p = await plugin.invoke("put", { key: "data", value: "d".repeat(120) }, ctx) as any;
+    if (p.stored !== "inline" || (await store.getState("t", "a", "data"))?.value !== "d".repeat(120)) throw new Error(`${name}: a shrinking put: ${JSON.stringify(p)}`);
   }
 });
 

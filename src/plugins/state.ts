@@ -7,7 +7,7 @@ import type { Json } from "../core/types.ts";
 import { importKek, KEPT_NAME, KEPT_PREFIX, open, seal } from "../runtime/secrets.ts";
 import { STATE_INLINE_MAX, STATE_KEY } from "./state-key.ts";
 import { seedInline, type SeedFileMeta, type SeedMode } from "../store/seed-files.ts";
-import { putRefusal, storeFull, type WhenFull } from "../store/state-lines.ts";
+import { putRefusal, storeFull, totalRefusal, type WhenFull } from "../store/state-lines.ts";
 
 type SealingKey = Awaited<ReturnType<typeof importKek>>;
 
@@ -793,7 +793,10 @@ export function statePlugin(
           }
           const usage = await store.stateUsage(tenantId, agentId);
           const prior = cur?.bytes ?? 0;
-          if (usage.bytes - prior + body.length > cfg.maxTotalBytes) throw storeFull(cfg.maxTotalBytes, usage.bytes, ctx.alias);
+          // Only growth is refused, as for the other writes: a store over its total (the bytes backfill can put one
+          // there) can still be brought back by a `put` that shrinks a value. `prior` is the row's stored size, the
+          // total's unit, a different question from whether a document is shorter in characters (above).
+          if (totalRefusal(usage.bytes, prior, body.length, cfg.maxTotalBytes)) throw storeFull(cfg.maxTotalBytes, usage.bytes, ctx.alias);
           if (!spills) {
             await store.putState(tenantId, agentId, key, {
               value: a.value ?? null, ref: null, bytes: body.length,

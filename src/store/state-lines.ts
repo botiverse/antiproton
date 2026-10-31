@@ -340,20 +340,27 @@ export function insertLines(
   const eol = before.includes("\r\n") ? "\r\n" : "\n";
   const trailing = before.endsWith(eol);
   const body = trailing ? before.slice(0, -eol.length) : before;
-  const lines = before ? body.split(eol) : [];
+  // Split on `\n` alone, as the listing and `revise`'s line numbers are, so a line number means the same line to all
+  // three in a document whose lines end differently; each line keeps its own `\r`.
+  const lines = before ? body.split("\n") : [];
   if (!Number.isInteger(afterLine) || afterLine < 0 || afterLine > lines.length) {
     throw new Error(
       `\`after_line\` is ${afterLine}, and \`${key}\` has ${lines.length} ${lines.length === 1 ? "line" : "lines"}, so it must be `
       + `a whole number from 0 (the top) to ${lines.length} (the end); nothing was written`,
     );
   }
-  // The listing splits on `\n` alone, as `appendLines` does, so a CRLF line keeps its `\r` there and is quoted without it.
-  const listed = body.split("\n");
+  // Only the inserted text and the one line break it adds take the document's `eol`: every character already there is
+  // kept as it is, the break after line `afterLine` included.
   const t = withEol(text, eol);
-  if (t.length > max) throw tooLong(key, before.length, text, max, "insert", listed);
-  const kept = [...lines.slice(0, afterLine), t, ...lines.slice(afterLine)].join(eol) + (trailing ? eol : "");
+  if (t.length > max) throw tooLong(key, before.length, text, max, "insert", lines);
+  const head = lines.slice(0, afterLine).join("\n");
+  const kept = (afterLine === 0
+    ? (lines.length ? t + eol + body : t)
+    : afterLine === lines.length
+      ? head + eol + t
+      : head + "\n" + t + eol + lines.slice(afterLine).join("\n")) + (trailing ? eol : "");
   if (kept.length > max && kept.length > before.length) {
-    throw documentFull(key, before.length, kept.length, max, kept.length - max, text, listed, "insert");
+    throw documentFull(key, before.length, kept.length, max, kept.length - max, text, lines, "insert");
   }
   return { kept, line: afterLine + 1 };
 }
