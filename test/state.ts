@@ -606,15 +606,60 @@ await check("a remember refusal lists the document's lines, numbered, to the mod
   }
 });
 
+await check("a text too long for any document says to shorten or split it, never to free space; memory lists its lines to the model only, an empty one and journal list none", async () => {
+  const host = sqliteHost();
+  const store = new DurableObjectStore({ storage: { sql: host.sql, transactionSync: host.transactionSync } } as any);
+  await store.init();
+  await store.createAgent("t", "a");
+  const plugin = statePlugin(store as StorageAdapter, null, "local");
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "notes", plugin: "state", installationId: "i", connectionId: null,
+    toolVersion: plugin.version, publicConfig: { maxDocumentBytes: 120 }, secretRef: null, policy: null });
+  const failures: any[] = [];
+  const complete = store.completeOperation.bind(store);
+  store.completeOperation = async (...args: Parameters<typeof complete>) => {
+    if (args[5]?.failure) failures.push(args[5].failure);
+    return complete(...args);
+  };
+  const gw = new ToolGateway(store as StorageAdapter, [plugin], new Set(["state"]), { async resolve() { return null; } });
+  const call = { tenantId: "t", agentId: "a", taskId: "k" };
+  const SENTINEL = "SENTINEL-LONG-77c0 the owner banks with Fjord";
+  const tooLong = (key: string) => gw.invoke(call, "notes.remember", { key, text: "z".repeat(121) }) as Promise<any>;
+
+  // Empty: nothing to list, and the refusal still says what to do.
+  const empty = String((await tooLong("memory")).error?.message);
+  if (!empty.startsWith("memory_full: that line is 121 characters; a document holds at most 120, so nothing was written. "
+    + "Shorten this, or add it in several smaller pieces, one `remember` per line") || empty.includes("by line number")) throw new Error(`empty memory: ${empty}`);
+
+  await store.putState("t", "a", "memory", { value: `${SENTINEL}\nsecond fact\n`, ref: null, bytes: 0 });
+  const shown = String((await tooLong("memory")).error?.message);
+  if (!shown.includes("Shorten this, or add it in several smaller pieces") || !shown.includes(`\`memory\` now, by line number:\n1: ${SENTINEL}\n2: second fact`)) {
+    throw new Error(`the model is not shown the lines: ${shown}`);
+  }
+  if (failures.length !== 2 || JSON.stringify(failures).includes("SENTINEL") || !failures.every((f) => f.code === "memory_full")) {
+    throw new Error(`the record: ${JSON.stringify(failures)}`);
+  }
+  if (JSON.stringify(pendingTrace(host.sql as any, 0).rows).includes("SENTINEL")) throw new Error("a trace row carries the sentinel");
+  // A document that drops lists nothing and gives no next step: it is the agent's own, and nothing changed there.
+  await store.putState("t", "a", "journal", { value: SENTINEL, ref: null, bytes: 0 });
+  const journal = String((await tooLong("journal")).error?.message);
+  if (journal !== "that line is 121 characters; a document holds at most 120, so nothing was written: it is too long; shorten it, or add it in smaller pieces") {
+    throw new Error(`journal: ${journal}`);
+  }
+  // Freeing space cannot make a text past the whole cap fit, so no form of this refusal suggests it.
+  for (const [what, said] of [["empty memory", empty], ["memory", shown.split("\n\n")[0]!], ["journal", journal]]) {
+    if (/revise|forget/.test(said!)) throw new Error(`${what}: the too-long refusal suggests freeing space: ${said}`);
+  }
+});
+
 await check("the listing stops at 50 lines and 200 characters a line, and says how many more there are", async () => {
   for (const { name, store, plugin } of await backends()) {
     const ctx = capped(20_000);
     const lines = Array.from({ length: 60 }, (_, i) => i === 0 ? `L0 ${"w".repeat(300)}` : `L${i} ${"v".repeat(200)}`);
     await store.putState("t", "a", "todo", { value: lines.join("\n"), ref: null, bytes: 0 });
     const r = await (async () => { try { await plugin.invoke("remember", { key: "todo", text: "y".repeat(8000) }, ctx); return null; } catch (e) { return e as any; } })();
-    const listed = String(r?.modelOnly ?? "");
+    const listed = String(r?.modelOnlyText ?? "");
     const rows = listed.split("\n");
-    if (r?.code !== "todo_full" || rows[0] !== "`todo` now, by line number:" || rows.length !== 52) throw new Error(`${name}: ${rows.length} rows: ${listed.slice(0, 300)}`);
+    if (r?.code !== "todo_full" || rows[0] !== "`todo` now, by line number (a line ending in … is cut; a part of it without the … still works as a `revise` match):" || rows.length !== 52) throw new Error(`${name}: ${rows.length} rows: ${listed.slice(0, 300)}`);
     if (rows[1] !== `1: L0 ${"w".repeat(197)}…` || rows[50] !== `50: ${lines[49]!.slice(0, 200)}…`) throw new Error(`${name}: ${rows[1]} / ${rows[50]}`);
     if (rows[51] !== "… and 10 more lines; `get` reads all of it") throw new Error(`${name}: ${rows[51]}`);
     if (String(r.message).includes("L0 ") || String(r.message).includes("vvvv")) throw new Error(`${name}: the message carries the lines`);

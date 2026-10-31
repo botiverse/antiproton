@@ -764,9 +764,9 @@ export interface PluginErrorFields {
    * puts it in the call's record (`ToolFailure`), from which the trace row and its export are written
    * (src/trace/seams.ts `failureAttrs`). For what the agent itself wrote, such as the lines of its own notes, which
    * must reach the model to act on and must not leave the agent's object. `message` is still recorded: keep it free of
-   * such text.
+   * such text. Not `ToolSchema.modelOnly`, which is about who may call a tool.
    */
-  modelOnly?: string;
+  modelOnlyText?: string;
   /**
    * Which identity the call was made with. Same value as `credentialState`, so
    * a reader badging a failure does not derive it from the sentence.

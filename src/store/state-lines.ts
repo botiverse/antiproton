@@ -67,7 +67,7 @@ export function documentFull(
     + `dropping them: free at least ${short} characters first, by deleting or shortening a line that is no longer true `
     + "with `revise` or dropping the whole document with `forget`, then remember this again. If what has to go is blank "
     + "lines or layout, `put` the document again, shorter, instead: `revise` changes a line that has text on it",
-  ), { code, modelOnly: numberedEntries(key, lines) });
+  ), { code, ...listing(key, lines) });
 }
 
 /** How many of a full document's lines its refusal lists, and how much of each. */
@@ -78,17 +78,22 @@ export const LISTED_LINE_CHARS = 200;
  * A full document's lines as its refusal lists them, so the agent can choose what to free without reading the
  * document first: numbered as `revise` counts them, blank lines left out (but still counted), each cut to
  * LISTED_LINE_CHARS, the first LISTED_LINES_MAX that say something, then how many more there are. This is the agent's
- * own writing, so it goes in `modelOnly`, never in the message, which the trace records.
+ * own writing, so it goes in `modelOnlyText`, never in the message, which the trace records. A document with no line
+ * that says something lists nothing. A cut line still gives a `revise` match, as the header says: `match` is a piece
+ * of a line, so the part shown matches without the `…`.
  */
-function numberedEntries(key: string, lines: readonly string[]): string {
+function listing(key: string, lines: readonly string[]): { modelOnlyText?: string } {
   const said = lines.map((l, n) => ({ n: n + 1, l: l.replace(/\r$/, "") })).filter((x) => !blank(x.l));
+  if (!said.length) return {};
   const shown = said.slice(0, LISTED_LINES_MAX).map(({ n, l }) => {
     const cut = l.length > LISTED_LINE_CHARS ? `${l.slice(0, /[\uD800-\uDBFF]/.test(l[LISTED_LINE_CHARS - 1]!) ? LISTED_LINE_CHARS - 1 : LISTED_LINE_CHARS)}…` : l;
     return `${n}: ${cut}`;
   });
   const more = said.length - shown.length;
-  return [`\`${key}\` now, by line number:`, ...shown,
-    ...(more > 0 ? [`… and ${more} more ${more === 1 ? "line" : "lines"}; \`get\` reads all of it`] : [])].join("\n");
+  const header = `\`${key}\` now, by line number`
+    + (shown.some((x) => x.endsWith("…")) ? " (a line ending in … is cut; a part of it without the … still works as a `revise` match):" : ":");
+  return { modelOnlyText: [header, ...shown,
+    ...(more > 0 ? [`… and ${more} more ${more === 1 ? "line" : "lines"}; \`get\` reads all of it`] : [])].join("\n") };
 }
 
 /**
@@ -162,10 +167,14 @@ export function appendLines(
   if (text.length > max) {
     // A document that refuses when full says so by its code here too: the model reads the code only in the sentence.
     const code = whenFull === "refuse" ? `${key}_full` : null;
+    // `max` is the whole document's cap, so no freeing of space can make this fit: the only next step is to shorten
+    // it or split it. The lines are listed as for a full document, so the agent sees what is already kept.
     throw Object.assign(new Error(
       `${code ? `${code}: ` : ""}${multiline(text) ? "that text" : "that line"} is ${text.length} characters; `
-      + `a document holds at most ${max}, so nothing was written`,
-    ), code ? { code } : {});
+      + `a document holds at most ${max}, so nothing was written`
+      + (code ? ". Shorten this, or add it in several smaller pieces, one `remember` per line"
+        : ": it is too long; shorten it, or add it in smaller pieces"),
+    ), code ? { code, ...listing(key, before.replace(/\r?\n$/, "").split("\n")) } : {});
   }
   const size = before.length;
   const eol = before.includes("\r\n") ? "\r\n" : "\n";
