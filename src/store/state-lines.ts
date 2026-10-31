@@ -85,13 +85,17 @@ export const LISTED_LINE_CHARS = 200;
 function listing(key: string, lines: readonly string[]): { modelOnlyText?: string } {
   const said = lines.map((l, n) => ({ n: n + 1, l: l.replace(/\r$/, "") })).filter((x) => !blank(x.l));
   if (!said.length) return {};
+  // Whether a line was cut is recorded where it is cut, not read back from the text: a line the agent wrote may itself
+  // end in "…".
+  let cut = false;
   const shown = said.slice(0, LISTED_LINES_MAX).map(({ n, l }) => {
-    const cut = l.length > LISTED_LINE_CHARS ? `${l.slice(0, /[\uD800-\uDBFF]/.test(l[LISTED_LINE_CHARS - 1]!) ? LISTED_LINE_CHARS - 1 : LISTED_LINE_CHARS)}…` : l;
-    return `${n}: ${cut}`;
+    if (l.length <= LISTED_LINE_CHARS) return `${n}: ${l}`;
+    cut = true;
+    return `${n}: ${l.slice(0, /[\uD800-\uDBFF]/.test(l[LISTED_LINE_CHARS - 1]!) ? LISTED_LINE_CHARS - 1 : LISTED_LINE_CHARS)}…`;
   });
   const more = said.length - shown.length;
   const header = `\`${key}\` now, by line number`
-    + (shown.some((x) => x.endsWith("…")) ? " (a line ending in … is cut; a part of it without the … still works as a `revise` match):" : ":");
+    + (cut ? " (a line ending in … is cut; a part of it without the … still works as a `revise` match):" : ":");
   return { modelOnlyText: [header, ...shown,
     ...(more > 0 ? [`… and ${more} more ${more === 1 ? "line" : "lines"}; \`get\` reads all of it`] : [])].join("\n") };
 }
@@ -164,6 +168,12 @@ const multiline = (text: string) => /[\r\n]/.test(text);
 export function appendLines(
   key: string, before: string, text: string, max: number, whenFull: WhenFull,
 ): { kept: string; dropped: string[] } {
+  // How the document splits into lines is worked out once, here, for every branch below.
+  const size = before.length;
+  const eol = before.includes("\r\n") ? "\r\n" : "\n";
+  if (before.endsWith(eol)) before = before.slice(0, -eol.length);
+  // Split on `\n` alone, so a CRLF line keeps its `\r` and the lengths below stay exact.
+  const lines = before.split("\n");
   if (text.length > max) {
     // A document that refuses when full says so by its code here too: the model reads the code only in the sentence.
     const code = whenFull === "refuse" ? `${key}_full` : null;
@@ -174,14 +184,9 @@ export function appendLines(
       + `a document holds at most ${max}, so nothing was written`
       + (code ? ". Shorten this, or add it in several smaller pieces, one `remember` per line"
         : ": it is too long; shorten it, or add it in smaller pieces"),
-    ), code ? { code, ...listing(key, before.replace(/\r?\n$/, "").split("\n")) } : {});
+    ), code ? { code, ...listing(key, lines) } : {});
   }
-  const size = before.length;
-  const eol = before.includes("\r\n") ? "\r\n" : "\n";
-  if (before.endsWith(eol)) before = before.slice(0, -eol.length);
   if (!before) return { kept: text, dropped: [] };
-  // Split on `\n` alone, so a CRLF line keeps its `\r` and the lengths below stay exact.
-  const lines = before.split("\n");
   // The length of `lines.slice(i).join("\n") + eol + text`, kept as `i` moves.
   let length = before.length + eol.length + text.length;
   let i = 0;

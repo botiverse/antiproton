@@ -666,6 +666,18 @@ await check("the listing stops at 50 lines and 200 characters a line, and says h
   }
 });
 
+await check("a line the agent wrote ending in … is listed whole, and the header does not call it cut", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(30);
+    await store.putState("t", "a", "memory", { value: "xxxxxxxxxx…\nsecond", ref: null, bytes: 0 });
+    const r = await (async () => { try { await plugin.invoke("remember", { key: "memory", text: "a third line here" }, ctx); return null; } catch (e) { return e as any; } })();
+    const listed = String(r?.modelOnlyText ?? "");
+    if (r?.code !== "memory_full" || listed !== "`memory` now, by line number:\n1: xxxxxxxxxx…\n2: second") {
+      throw new Error(`${name}: ${JSON.stringify(listed)}`);
+    }
+  }
+});
+
 await check("a full memory whose head is blank lines gives them up for a remember, and refuses only when content would go", async () => {
   // `revise` cannot remove a blank line (its match cannot be empty or span lines), so refusing over one would ask for
   // something the agent cannot do; and a blank line is no loss.
