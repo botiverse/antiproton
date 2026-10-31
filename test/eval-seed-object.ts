@@ -408,6 +408,10 @@ await check("a writable MEMORY.md that would start over the state mount's cap, o
   await refused("x".repeat(101), "MEMORY.md is 101 characters, and the agent's state mount holds a document of at most 100 (maxDocumentBytes)");
   must((await seed(w, "MEMORY.md", "x".repeat(40 * 1024), "readonly")).status === 200, "a large read-only MEMORY.md");
   must((await seed(w, "MEMORY.md", "x".repeat(100))).status === 200, "a writable one exactly at the cap");
+  // Sealed, the answer is that: seeding it shorter would not help.
+  must((await call(w, "POST", `${A}/seed/seal`)).status === 200, "seal");
+  const late = await seed(w, "MEMORY.md", "x".repeat(101));
+  must(late.status === 409 && late.body.error.code === "sealed", `sealed and over the cap: ${late.status} ${late.text.slice(0, 300)}`);
 });
 
 // ---- spill -----------------------------------------------------------------

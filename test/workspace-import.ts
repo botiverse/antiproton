@@ -312,6 +312,8 @@ await check("happy path: every file reads back through workspace-files exactly a
   must(((await w.rt.store.loadAgent(T, A))?.config as any)?.description === "You migrated here from a laptop.", "the agent's record");
   // Through the state plugin the agent itself uses, too.
   must((await w.rt.store.getState(T, A, "MEMORY.md"))?.value === "# Memory\nthe user prefers short answers\n", "state get");
+  // An imported file is the agent's own: no seed row, so the state plugin treats its MEMORY.md as unseeded.
+  must((await w.rt.store.listSeedFiles(T, A)).length === 0, `seed rows: ${show(await w.rt.store.listSeedFiles(T, A))}`);
 });
 
 await check("GET /provision/import-limits answers the bounds Raft's exporter applies", async () => {
@@ -595,6 +597,8 @@ await check("an imported MEMORY.md kept in object storage is shown from the exce
     // The row's bound is 32 KiB of JSON characters: past it the copy is in the bucket and the row holds only its name.
     const spilled = JSON.stringify(text).length > 32 * 1024;
     must(spilled === (row?.value == null && !!row?.ref), `${n}: spilled ${spilled}, row ${show({ value: typeof row?.value, ref: row?.ref })}`);
+    // Accepted and kept in object storage with no seed row: an import takes a MEMORY.md past the inline limit.
+    must((await w.rt.store.listSeedFiles(T, A)).length === 0, `${n}: seed rows`);
     const reads: string[] = [];
     const { get, head } = w.R2;
     w.R2.get = async (k: string) => { reads.push(k); return get(k); };

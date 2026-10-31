@@ -397,6 +397,8 @@ await check("a full writable seeded MEMORY.md refuses remember with MEMORY.md_fu
   const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, ctx));
   must(e.code === "MEMORY.md_full" && String(e.message).startsWith("MEMORY.md_full: `MEMORY.md` is full: it is 35 characters"), `the refusal: ${show({ code: e.code, message: e.message })}`);
   must(e.modelOnlyText === "`MEMORY.md` now, by line number:\n1: the owner is Ilse\n2: ship on Tuesdays", `the listing: ${show(e.modelOnlyText)}`);
+  // How much of it the prompt shows, by the budget the seeded block is built with.
+  must(String(e.message).endsWith(`. The prompt shows only the first ${SEEDED_MEMORY_BUDGET} characters of \`MEMORY.md\`, saying where it is cut; \`get\` reads all of it`), `the shown sentence: ${e.message}`);
   // The message is what the record keeps; the lines are only in the listing.
   must(!String(e.message).includes("Ilse"), `the message carries a line: ${e.message}`);
   // A code the trace row keeps as one (src/trace/seams.ts ERROR_CODE), not left out as malformed.
@@ -434,6 +436,16 @@ await check("an agent-named key, a seeded path not named MEMORY.md and an unseed
   }
 });
 
+await check("an agent-written MEMORY.md of 33,000 characters, past the inline limit as JSON but under the cap, still takes a remember: appending never spills", async () => {
+  const { store, plugin, ctx } = await fixture();
+  for (let i = 0; i < 33; i++) await plugin.invoke("remember", { key: "MEMORY.md", text: `${i}`.padEnd(999, "m") }, ctx);
+  const grown = await store.getState("t", "a", "MEMORY.md");
+  must(typeof grown?.value === "string" && grown.value.length === 32_999 && JSON.stringify(grown.value).length > STATE_INLINE_MAX && !grown.ref, `grown: ${show({ chars: (grown?.value as string)?.length, ref: grown?.ref })}`);
+  const r = await plugin.invoke("remember", { key: "MEMORY.md", text: "one more" }, ctx) as any;
+  const after = await store.getState("t", "a", "MEMORY.md");
+  must(!r.dropped && r.bytes === 33_008 && !after?.ref && (after?.value as string).endsWith("\none more"), `the remember: ${show(r)} ref ${after?.ref}`);
+});
+
 await check("seeding: a writable MEMORY.md over the state mounts' smallest cap, or one that would be kept in object storage, is refused; read-only and other paths are not", async () => {
   const one = [{ publicConfig: {} }];
   must(seedFitProblem("MEMORY.md", "writable", "x".repeat(100), [{ publicConfig: { maxDocumentBytes: 100 } }]) === null, "exactly at the cap");
@@ -448,6 +460,12 @@ await check("seeding: a writable MEMORY.md over the state mounts' smallest cap, 
   const edge = "x".repeat(STATE_INLINE_MAX - 2);
   must(seedFitProblem("MEMORY.md", "writable", edge, one) === null, "exactly the inline limit");
   must(seedFitProblem("MEMORY.md", "writable", edge + "x", one) !== null, "one past the inline limit");
+  // A cap that is not a finite number is the default's, never NaN or a string compared as one.
+  for (const bad of ["100", null, Number.NaN, Number.POSITIVE_INFINITY, {}]) {
+    const cfg = [{ publicConfig: { maxDocumentBytes: bad } }];
+    must(seedFitProblem("MEMORY.md", "writable", "x".repeat(101), cfg) === null, `${show(bad)}: 101 characters refused`);
+    must(seedFitProblem("MEMORY.md", "writable", "\n".repeat(65_537), cfg)?.includes("at most 65536 (maxDocumentBytes)"), `${show(bad)}: the default was not used`);
+  }
   for (const [path, mode] of [["MEMORY.md", "readonly"], ["notes/MEMORY.md", "writable"], ["memory.md", "writable"], ["notes/plan.md", "writable"]] as const) {
     must(seedFitProblem(path, mode, big, one) === null, `${path} ${mode} was refused`);
   }

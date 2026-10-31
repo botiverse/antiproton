@@ -4199,7 +4199,7 @@ export class AgentRuntime {
 
   /**
    * Seed one workspace file: its snapshot and its working copy at key = path, both or neither, refused once sealed
-   * (src/store/seed-files.ts), or when a file that refuses when full would start where it cannot be written
+   * (src/store/seed-files.ts), then when a file that refuses when full would start where it cannot be written
    * (src/plugins/state.ts `seedFitProblem`). The request was checked by the route (cf/src/provision/handlers.ts). A
    * file too large for its row is spilled the way the state plugin spills a value, under a name made from its hash
    * rather than its key: an object written for a write the seal then refuses must not have replaced one a stored row
@@ -4209,23 +4209,23 @@ export class AgentRuntime {
     Promise<SeedWriteResult | { ok: false; code: "not_found"; message: string }> {
     await this.ready();
     if (!(await this.store.loadAgent(tenantId, agentId))) return { ok: false, code: "not_found", message: `no agent ${agentId}` };
-    // Against the mounts' own settings, which only this object has; before anything is uploaded.
+    // Against the mounts' own settings, which the store's write does not read; the store answers it after the seal.
     const misfit = seedFitProblem(file.path, file.mode, file.text, await this.store.findMountsByPlugin(tenantId, agentId, "state"));
-    if (misfit) return { ok: false, code: "document_cap", message: misfit };
     const bytes = new TextEncoder().encode(file.text);
     const sha256 = sha256Hex(bytes);
     const json = JSON.stringify(file.text);
     const write = { path: file.path, mode: file.mode, bytes: bytes.byteLength, sha256 };
-    const inline = { ...write, content: file.text, ref: null, working: { value: json, ref: null, bytes: json.length } };
+    const inline = { ...write, misfit, content: file.text, ref: null, working: { value: json, ref: null, bytes: json.length } };
     const spilled = async () => {
       const base = `t/${tenantId}/${agentId}/seed/${sha256}`;
       const ref = (await this.#artifacts.put(`${base}.txt`, bytes)).ref;
-      return { ...write, content: null, ref, working: { value: null, ref: (await this.#artifacts.put(`${base}.json`, json)).ref, bytes: json.length } };
+      return { ...write, misfit, content: null, ref, working: { value: null, ref: (await this.#artifacts.put(`${base}.json`, json)).ref, bytes: json.length } };
     };
-    // Asked first so a refusal or a repeat uploads nothing. Only a guess: the store decides both inside its
-    // transaction, and a large text sent inline as a repeat that is no longer one comes back as `spill`.
+    // Asked first so a refusal or a repeat uploads nothing; a misfit is sent inline, since the store refuses it before
+    // it looks at the size. Only a guess: the store decides both inside its transaction, and a large text sent inline
+    // as a repeat that is no longer one comes back as `spill`.
     const same = (await this.store.listSeedFiles(tenantId, agentId)).find((f) => f.path === file.path);
-    const guessInline = seedInline(file.text) || (await this.store.isSealed(tenantId, agentId))
+    const guessInline = misfit !== null || seedInline(file.text) || (await this.store.isSealed(tenantId, agentId))
       || (same !== undefined && same.sha256 === sha256 && same.mode === file.mode);
     const first = await this.store.seedWrite(tenantId, agentId, guessInline ? inline : await spilled());
     if (first.ok || first.code !== "spill") return first;

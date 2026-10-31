@@ -183,6 +183,12 @@ export interface SeedWrite {
   content: string | null; ref: string | null;
   /** The working copy, an `agent_state` row as the state plugin writes one: `value` the value's JSON text, or null with `ref`. */
   working: { value: string | null; ref: string | null; bytes: number };
+  /**
+   * Why the file may not be seeded where the agent would have to write to it (src/plugins/state.ts `seedFitProblem`),
+   * judged by the caller against the agent's mounts, which this module does not read; answered here, after the seal,
+   * as `document_cap`.
+   */
+  misfit?: string | null;
 }
 
 export type SeedWriteResult =
@@ -221,7 +227,8 @@ export function priorActivity(sql: Sql): string | null {
 
 /**
  * Write both copies, or neither, inside the caller's transaction. Refused once sealed, and an agent that has already
- * run (`priorActivity`) is sealed here, as `prior-activity`, and refused; refused when the agent's files would pass
+ * run (`priorActivity`) is sealed here, as `prior-activity`, and refused; then refused when the caller found the file
+ * does not fit (`misfit`), and when the agent's files would pass
  * `SEED_AGENT_MAX_BYTES` together. The same bytes and mode as the file already holds is no write at all, so a retried
  * setup changes nothing, not even the time; anything different replaces both copies. Whether that repeat is one is
  * decided here, in the transaction: a caller that sent a large text inline because it looked like a repeat is told
@@ -233,6 +240,8 @@ export function writeSeedFile(sql: Sql, tenantId: string, agentId: string, w: Se
   if (sealed) {
     return { ok: false, code: "sealed", message: `the workspace was sealed (${sealed.how}) at ${new Date(sealed.sealedAt).toISOString()}; seeded files can no longer change` };
   }
+  // After the seal: a sealed workspace takes no file, so being told to seed this one shorter could not help.
+  if (w.misfit) return { ok: false, code: "document_cap", message: w.misfit };
   const file: SeedFileMeta = { path: w.path, mode: w.mode, bytes: w.bytes, sha256: w.sha256 };
   const prior = sql.exec("SELECT mode, sha256 FROM seed_files WHERE tenant_id=? AND agent_id=? AND path=?", tenantId, agentId, w.path).toArray()[0];
   if (prior && prior.mode === w.mode && prior.sha256 === w.sha256) return { ok: true, changed: false, file };

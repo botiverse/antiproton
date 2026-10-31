@@ -514,6 +514,18 @@ await check("both stores: the agent's files together stop at 2 MiB, counting a r
   }
 });
 
+await check("both stores: a file found not to fit is refused as document_cap with nothing written, but a sealed workspace answers sealed first", async () => {
+  for (const [name, store] of await stores()) {
+    const misfit = { ...file("MEMORY.md", "too long"), misfit: "MEMORY.md is 8 characters, and the agent's state mount holds a document of at most 4" };
+    const refused = await store.seedWrite("t", "a", misfit);
+    must(!refused.ok && refused.code === "document_cap" && refused.message === misfit.misfit, `${name}: ${show(refused)}`);
+    must((await store.getState("t", "a", "MEMORY.md")) === null && (await store.listSeedFiles("t", "a")).length === 0, `${name}: something was written`);
+    await store.seal("t", "a", "explicit");
+    const sealed = await store.seedWrite("t", "a", misfit);
+    must(!sealed.ok && sealed.code === "sealed", `${name}: sealed: ${show(sealed)}`);
+  }
+});
+
 await check("both stores: sealed is final and idempotent; the manifest is sorted, hashed canonically, and the same whatever order the files came in", async () => {
   const hashes: string[] = [];
   for (const [i, [name, store]] of (await stores()).entries()) {

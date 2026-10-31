@@ -133,9 +133,11 @@ export const WORKING_SET: ReadonlyArray<{
  * What a `remember` on `key` does when it does not fit. A working-set document says (`WORKING_SET`). A seeded
  * `MEMORY.md` refuses, as `memory` does: it is the setup's standing facts, shown in the prompt as the memory file
  * (`seededFilesParts`), and its oldest lines are what the setup gave. Judged by the seed row (`seed`), not by the key
- * alone: an imported `MEMORY.md` has the same key, but no seeding checked it against the cap (`seedFitProblem`), so
- * one over it would refuse every `remember` and every `put` too. A document of the agent's own naming drops, like
- * `journal`.
+ * alone. An imported `MEMORY.md` has the same key and no seed row, and an import takes one up to IMPORT_FILE_MAX_BYTES
+ * (src/store/workspace-import.ts), kept in object storage past the inline limit: refusing, one over the cap would
+ * take no `remember` and no `put` that does not cut it below the inline limit at once. One the agent wrote fits the cap
+ * by construction, but not the inline limit (`appendState` never spills, so it can be inline past it), and nothing
+ * marks it apart from an imported one. Both drop, as a document of the agent's own naming does, like `journal`.
  */
 function whenFullOf(key: string, seed?: SeedMode): WhenFull {
   const set = WORKING_SET.find((d) => d.key === key)?.whenFull;
@@ -143,9 +145,19 @@ function whenFullOf(key: string, seed?: SeedMode): WhenFull {
   return seed && key === SEEDED_MEMORY ? "refuse" : "drop";
 }
 
-/** A mount's settings with the defaults filled in: what `invoke` holds a call to, and what seeding checks against. */
-const configOf = (publicConfig: unknown): Required<Omit<StateConfig, "account">> =>
-  ({ ...DEFAULTS, ...(publicConfig as StateConfig) });
+/**
+ * A mount's settings with the defaults filled in: what `invoke` holds a call to, and what seeding checks against. A
+ * limit that is not a finite number is the default's, so a stored config the console would refuse today cannot make
+ * a comparison always false (NaN) or the smallest of several caps meaningless.
+ */
+function configOf(publicConfig: unknown): Required<Omit<StateConfig, "account">> {
+  const given = (publicConfig && typeof publicConfig === "object" ? publicConfig : {}) as Record<string, unknown>;
+  const limit = (name: keyof typeof DEFAULTS) => {
+    const v = given[name];
+    return typeof v === "number" && Number.isFinite(v) ? v : DEFAULTS[name];
+  };
+  return { maxTotalBytes: limit("maxTotalBytes"), maxValueBytes: limit("maxValueBytes"), maxDocumentBytes: limit("maxDocumentBytes") };
+}
 
 /**
  * Why a file may not be seeded as it is, or null. A writable file that refuses when full (`whenFullOf`) must start
@@ -179,14 +191,21 @@ export function seedFitProblem(
 
 /**
  * A `<key>_full` refusal with one sentence added on how much of the document the prompt shows: an agent deciding what
- * to free has to know that the copy in front of it may be missing its middle. The budget is the working set's own, so
- * the sentence cannot name a number the injection does not use. Any other error is returned as it is.
+ * to free has to know that the copy in front of it may be missing part of it. Each budget is the one the prompt is
+ * built with, so the sentence cannot name a number the injection does not use: a working-set document's own, kept as
+ * its first and last part (`workingSetParts`), and a seeded `MEMORY.md`'s SEEDED_MEMORY_BUDGET, kept as its first
+ * part (`seededFilesParts`). Any other error is returned as it is.
  */
-function withShown(e: unknown, key: string): unknown {
+function withShown(e: unknown, key: string, seed: SeedMode | undefined): unknown {
+  if ((e as { code?: unknown })?.code !== `${key}_full`) return e;
   const doc = WORKING_SET.find((d) => d.key === key);
-  if (!doc || (e as { code?: unknown })?.code !== `${key}_full`) return e;
-  (e as Error).message += `. The prompt shows only the first and last part of \`${key}\` past ${doc.budget} characters, `
-    + "saying how much is left out between them; `get` reads all of it";
+  if (doc) {
+    (e as Error).message += `. The prompt shows only the first and last part of \`${key}\` past ${doc.budget} characters, `
+      + "saying how much is left out between them; `get` reads all of it";
+  } else if (seed && key === SEEDED_MEMORY) {
+    (e as Error).message += `. The prompt shows only the first ${SEEDED_MEMORY_BUDGET} characters of \`${key}\`, `
+      + "saying where it is cut; `get` reads all of it";
+  }
   return e;
 }
 
@@ -542,7 +561,7 @@ export function statePlugin(
           const text = String(a.text ?? "").trim();
           if (!text) throw new Error("nothing to remember");
           const r = await store.appendState(tenantId, agentId, key, text, cfg.maxDocumentBytes, whenFullOf(key, seed))
-            .catch((e) => { throw withShown(e, key); });
+            .catch((e) => { throw withShown(e, key, seed); });
           // `bytes` is the document's length as the cap counts it, characters, so the two can be read together.
           const cap = cfg.maxDocumentBytes;
           if (!r.dropped.length) return { key, bytes: r.bytes, cap };
