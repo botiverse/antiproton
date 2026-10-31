@@ -6,7 +6,7 @@ import type { R2Artifacts } from "../store/artifacts.ts";
 import type { Json } from "../core/types.ts";
 import { importKek, KEPT_NAME, KEPT_PREFIX, open, seal } from "../runtime/secrets.ts";
 import { STATE_INLINE_MAX, STATE_KEY } from "./state-key.ts";
-import type { SeedFileMeta, SeedMode } from "../store/seed-files.ts";
+import { seedInline, type SeedFileMeta, type SeedMode } from "../store/seed-files.ts";
 import { putRefusal, type WhenFull } from "../store/state-lines.ts";
 
 type SealingKey = Awaited<ReturnType<typeof importKek>>;
@@ -102,7 +102,7 @@ interface StateConfig {
   maxValueBytes?: number;
   /** Cap on a text document, in characters: an append past it drops the oldest
    *  whole lines, or is refused for a document that refuses when full
-   *  (`WORKING_SET`); a revision past it is refused. */
+   *  (`whenFullOf`); a revision past it is refused. */
   maxDocumentBytes?: number;
 }
 
@@ -129,8 +129,53 @@ export const WORKING_SET: ReadonlyArray<{
   { key: "journal", budget: 3000, what: "recent log", tail: true },
 ];
 
-/** What a `remember` on `key` does when it does not fit: a document of the agent's own naming drops, like `journal`. */
-const whenFullOf = (key: string): WhenFull => WORKING_SET.find((d) => d.key === key)?.whenFull ?? "drop";
+/**
+ * What a `remember` on `key` does when it does not fit. A working-set document says (`WORKING_SET`). A seeded
+ * `MEMORY.md` refuses, as `memory` does: it is the setup's standing facts, shown in the prompt as the memory file
+ * (`seededFilesParts`), and its oldest lines are what the setup gave. Judged by the seed row (`seed`), not by the key
+ * alone: an imported `MEMORY.md` has the same key, but no seeding checked it against the cap (`seedFitProblem`), so
+ * one over it would refuse every `remember` and every `put` too. A document of the agent's own naming drops, like
+ * `journal`.
+ */
+function whenFullOf(key: string, seed?: SeedMode): WhenFull {
+  const set = WORKING_SET.find((d) => d.key === key)?.whenFull;
+  if (set) return set;
+  return seed && key === SEEDED_MEMORY ? "refuse" : "drop";
+}
+
+/** A mount's settings with the defaults filled in: what `invoke` holds a call to, and what seeding checks against. */
+const configOf = (publicConfig: unknown): Required<Omit<StateConfig, "account">> =>
+  ({ ...DEFAULTS, ...(publicConfig as StateConfig) });
+
+/**
+ * Why a file may not be seeded as it is, or null. A writable file that refuses when full (`whenFullOf`) must start
+ * where the agent can still write to it: over its cap, its first `remember` would be refused and the only way out
+ * would be deleting what the setup gave. And a seed's working copy is bound by STATE_INLINE_MAX (`seedInline`, the
+ * measure `put` spills by): past it the copy is kept in object storage, as a reference, and a document with a reference
+ * cannot be appended to or revised (src/store/state-lines.ts `documentText`). One grown by `remember` has no such
+ * bound, since `appendState` never spills, so the seed is held to a stricter one: it must not start in a state the
+ * agent's own tools could not have left it in. The cap is the smallest of the agent's `state` mounts'
+ * `maxDocumentBytes`, since they share one store, or the default when it has none yet, which is what a mount added
+ * later starts with. A read-only file cannot be written, so it is not asked.
+ */
+export function seedFitProblem(
+  path: string, mode: SeedMode, text: string, mounts: ReadonlyArray<{ publicConfig: unknown }>,
+): string | null {
+  if (mode !== "writable" || whenFullOf(path, mode) !== "refuse") return null;
+  const cap = Math.min(...(mounts.length ? mounts : [{ publicConfig: {} }]).map((m) => configOf(m.publicConfig).maxDocumentBytes));
+  const why = `a writable ${path} refuses a \`remember\` that does not fit rather than dropping its oldest lines`;
+  if (text.length > cap) {
+    return `${path} is ${text.length} characters, and the agent's state mount holds a document of at most ${cap} `
+      + `(maxDocumentBytes): ${why}, so seeded over the cap the agent could add nothing to it without deleting what `
+      + "the setup gave. Seed it shorter, or seed it read-only";
+  }
+  if (!seedInline(text)) {
+    return `${path} encodes to ${JSON.stringify(text).length} as JSON, and a seeded file past ${STATE_INLINE_MAX} is kept in `
+      + `object storage, where a document cannot be appended to or revised: ${why}, so seeded there the agent could add `
+      + "nothing to it. Seed it shorter, or seed it read-only";
+  }
+  return null;
+}
 
 /**
  * A `<key>_full` refusal with one sentence added on how much of the document the prompt shows: an agent deciding what
@@ -241,7 +286,7 @@ export function statePlugin(
       { name: "maxValueBytes", type: "number", default: DEFAULTS.maxValueBytes,
         summary: `Largest single value; anything bigger is refused. Values over ${STATE_INLINE_MAX / 1024} KiB are kept in object storage and handed back as a reference, which is not configurable.` },
       { name: "maxDocumentBytes", type: "number", default: DEFAULTS.maxDocumentBytes,
-        summary: "Largest text document, in characters: a `remember` past it drops the oldest whole lines and says which, except on `memory` and `todo`, where it is refused; a `revise` past it is refused, and so is a `put` of text past it to `memory` or `todo`." },
+        summary: "Largest text document, in characters: a `remember` past it drops the oldest whole lines and says which, except on `memory`, `todo` and a seeded `MEMORY.md`, where it is refused; a `revise` past it is refused, and so is a `put` of text past it to one of those." },
       { name: "maxTotalBytes", type: "number", default: DEFAULTS.maxTotalBytes,
         summary: "How much this agent may keep in total. A write that would pass it is refused." },
     ],
@@ -416,7 +461,7 @@ export function statePlugin(
     ],
 
     async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
-      const cfg = { ...DEFAULTS, ...(ctx.publicConfig as StateConfig) };
+      const cfg = configOf(ctx.publicConfig);
       const { tenantId, agentId } = ctx.caller;
       const a = (args ?? {}) as {
         key?: string; text?: string; value?: Json; prefix?: string; limit?: number; match?: unknown; replace?: unknown;
@@ -496,7 +541,7 @@ export function statePlugin(
         case "remember": {
           const text = String(a.text ?? "").trim();
           if (!text) throw new Error("nothing to remember");
-          const r = await store.appendState(tenantId, agentId, key, text, cfg.maxDocumentBytes, whenFullOf(key))
+          const r = await store.appendState(tenantId, agentId, key, text, cfg.maxDocumentBytes, whenFullOf(key, seed))
             .catch((e) => { throw withShown(e, key); });
           // `bytes` is the document's length as the cap counts it, characters, so the two can be read together.
           const cap = cfg.maxDocumentBytes;
@@ -610,7 +655,7 @@ export function statePlugin(
           // document could no longer be appended to or revised (src/store/state-lines.ts `putRefusal`). A value that
           // is not text has no lines and no character cap, but moved it would still leave the document unable to be
           // appended to or revised, so it is held to the inline limit too.
-          if (whenFullOf(key) === "refuse") {
+          if (whenFullOf(key, seed) === "refuse") {
             const spilt = spills ? { encoded: body.length, inlineMax: STATE_INLINE_MAX } : null;
             const refused = typeof a.value === "string"
               ? putRefusal(key, { text: a.value, max: cfg.maxDocumentBytes }, spilt)

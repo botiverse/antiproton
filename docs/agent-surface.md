@@ -1335,6 +1335,12 @@ the system prompt (`src/runtime/prompt-context.ts`). Rules for `PUT …/seed`:
   kind named and none of the text). All of an agent's files together are at most 2,097,152 bytes
   (`413`). A file larger than 32 KiB as a state value is kept in object storage, both copies, as the
   state plugin keeps a large value; it reads back the same.
+- A writable `MEMORY.md` refuses a `remember` that does not fit, with `MEMORY.md_full`, as `memory`
+  does, instead of dropping its oldest lines. So it must start where the agent can still write to it:
+  at most the agent's `state` mounts' smallest `maxDocumentBytes` in characters (the default, 65,536,
+  when it has none), and at most 32 KiB as a state value, past which a seeded file is kept in object
+  storage, where a document cannot be appended to or revised; else `413`, `code: "too_large"`, naming
+  the file, its size and the limit. A read-only one is not held to this.
 - The answer is `{ path, mode, bytes, sha256, changed }`: `bytes` the body's length and `sha256` the
   hex SHA-256 of the body, both as sent. The same bytes and mode again change nothing (`200`,
   `changed: false`); different bytes or mode before the seal replace both copies.

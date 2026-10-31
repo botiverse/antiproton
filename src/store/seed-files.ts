@@ -187,7 +187,7 @@ export interface SeedWrite {
 
 export type SeedWriteResult =
   | { ok: true; changed: boolean; file: SeedFileMeta }
-  | { ok: false; code: "sealed" | "agent_cap"; message: string };
+  | { ok: false; code: "sealed" | "agent_cap" | "document_cap"; message: string };
 
 /**
  * What the store may answer besides: the write came with its text inline, too large for a row, on the strength of

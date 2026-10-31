@@ -421,7 +421,7 @@ import { stampPlugin } from "../../src/plugins/stamp.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
 import { exaPlugin } from "../../src/plugins/exa.ts";
-import { IMPORTED_MEMORY_BUDGET, keptDelete, keptList, keptNameProblem, keptPut, keptValueProblem, memoryExcerpt, SEEDED_MEMORY, statePlugin } from "../../src/plugins/state.ts";
+import { IMPORTED_MEMORY_BUDGET, keptDelete, keptList, keptNameProblem, keptPut, keptValueProblem, memoryExcerpt, SEEDED_MEMORY, seedFitProblem, statePlugin } from "../../src/plugins/state.ts";
 import { sandboxPlugin, SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/artifacts.ts";
@@ -4199,14 +4199,19 @@ export class AgentRuntime {
 
   /**
    * Seed one workspace file: its snapshot and its working copy at key = path, both or neither, refused once sealed
-   * (src/store/seed-files.ts). The request was checked by the route (cf/src/provision/handlers.ts). A file too large
-   * for its row is spilled the way the state plugin spills a value, under a name made from its hash rather than its
-   * key: an object written for a write the seal then refuses must not have replaced one a stored row still names.
+   * (src/store/seed-files.ts), or when a file that refuses when full would start where it cannot be written
+   * (src/plugins/state.ts `seedFitProblem`). The request was checked by the route (cf/src/provision/handlers.ts). A
+   * file too large for its row is spilled the way the state plugin spills a value, under a name made from its hash
+   * rather than its key: an object written for a write the seal then refuses must not have replaced one a stored row
+   * still names.
    */
   async seedWrite(tenantId: string, agentId: string, file: { path: string; mode: SeedMode; text: string }):
     Promise<SeedWriteResult | { ok: false; code: "not_found"; message: string }> {
     await this.ready();
     if (!(await this.store.loadAgent(tenantId, agentId))) return { ok: false, code: "not_found", message: `no agent ${agentId}` };
+    // Against the mounts' own settings, which only this object has; before anything is uploaded.
+    const misfit = seedFitProblem(file.path, file.mode, file.text, await this.store.findMountsByPlugin(tenantId, agentId, "state"));
+    if (misfit) return { ok: false, code: "document_cap", message: misfit };
     const bytes = new TextEncoder().encode(file.text);
     const sha256 = sha256Hex(bytes);
     const json = JSON.stringify(file.text);

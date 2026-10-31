@@ -8,7 +8,9 @@
  * and they leave together with it. The setup route itself is test/eval-seed.ts.
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
-import { SEEDED_MEMORY_BUDGET, statePlugin, workingSet, WORKING_SET } from "../src/plugins/state.ts";
+import { SEEDED_MEMORY_BUDGET, seedFitProblem, statePlugin, workingSet, WORKING_SET } from "../src/plugins/state.ts";
+import { STATE_INLINE_MAX } from "../src/plugins/state-key.ts";
+import { failureAttrs } from "../src/trace/seams.ts";
 import type { PluginContext } from "../src/plugins/types.ts";
 import { importKek } from "../src/runtime/secrets.ts";
 import { sha256Hex, type SeedWrite } from "../src/store/seed-files.ts";
@@ -373,6 +375,82 @@ await check("two mounts with seeds: the block is contributed once", async () => 
   const spoke = [];
   for (const alias of ["state", "zz"]) if (await plugin.promptContribution!({ ...ctx, alias } as PluginContext)) spoke.push(alias);
   must(show(spoke) === show(["state"]), `spoke: ${show(spoke)}`);
+});
+
+// ---- a seeded MEMORY.md when full -----------------------------------------
+
+/** A plugin context with a small document cap, and the trace rows it was handed. */
+function capped(ctx: PluginContext, maxDocumentBytes: number) {
+  const traced: any[] = [];
+  return { ctx: { ...ctx, publicConfig: { maxDocumentBytes }, trace: (r: unknown) => { traced.push(r); } } as unknown as PluginContext, traced };
+}
+const thrown = async (fn: () => Promise<unknown>): Promise<any> => {
+  try { await fn(); } catch (e) { return e; }
+  throw new Error("did not throw");
+};
+
+await check("a full writable seeded MEMORY.md refuses remember with MEMORY.md_full and its lines to the model, and is unchanged", async () => {
+  const { store, plugin, ctx: base } = await fixture();
+  await seed(store, file("MEMORY.md", "the owner is Ilse\nship on Tuesdays\n"));
+  const { ctx, traced } = capped(base, 50);
+  const before = await row(store, "MEMORY.md");
+  const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, ctx));
+  must(e.code === "MEMORY.md_full" && String(e.message).startsWith("MEMORY.md_full: `MEMORY.md` is full: it is 35 characters"), `the refusal: ${show({ code: e.code, message: e.message })}`);
+  must(e.modelOnlyText === "`MEMORY.md` now, by line number:\n1: the owner is Ilse\n2: ship on Tuesdays", `the listing: ${show(e.modelOnlyText)}`);
+  // The message is what the record keeps; the lines are only in the listing.
+  must(!String(e.message).includes("Ilse"), `the message carries a line: ${e.message}`);
+  // A code the trace row keeps as one (src/trace/seams.ts ERROR_CODE), not left out as malformed.
+  must(failureAttrs({ code: e.code, message: e.message } as never).errorCode === "MEMORY.md_full", show(failureAttrs({ code: e.code, message: e.message } as never)));
+  must(await row(store, "MEMORY.md") === before, `the document changed: ${await row(store, "MEMORY.md")}`);
+  must(!traced.some((r) => r.kind === "state.dropped"), `a refusal wrote a state.dropped row: ${show(traced)}`);
+  // The put limits apply too: text past the cap is refused with the same code, and the document is still unchanged.
+  const put = await thrown(() => plugin.invoke("put", { key: "MEMORY.md", value: "y".repeat(51) }, ctx));
+  must(put.code === "MEMORY.md_full", `put: ${show({ code: put.code, message: put.message })}`);
+  must(await row(store, "MEMORY.md") === before, "the put changed the document");
+  // Control: a line that fits is appended.
+  const ok = await plugin.invoke("remember", { key: "MEMORY.md", text: "ok" }, ctx) as any;
+  must(ok.bytes === 37 && !ok.dropped, `a line that fits: ${show(ok)}`);
+});
+
+await check("a full read-only seeded MEMORY.md is refused by the seed guard first, not as full", async () => {
+  const { store, plugin, ctx: base } = await fixture();
+  await seed(store, file("MEMORY.md", "the owner is Ilse\nship on Tuesdays\n", "readonly"));
+  const { ctx } = capped(base, 50);
+  const before = await row(store, "MEMORY.md");
+  const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, ctx));
+  must(REFUSAL.test(String(e.message)) && e.code === undefined && e.modelOnlyText === undefined, `the refusal: ${show({ code: e.code, message: e.message })}`);
+  must(await row(store, "MEMORY.md") === before, "the read-only document changed");
+});
+
+await check("an agent-named key, a seeded path not named MEMORY.md and an unseeded MEMORY.md still drop their oldest lines", async () => {
+  const { store, plugin, ctx: base } = await fixture();
+  await seed(store, file("notes/plan.md", "the owner is Ilse\nship on Tuesdays\n"));
+  for (const key of ["notes", "notes/plan.md", "MEMORY.md"]) {
+    if (key !== "notes/plan.md") await store.putState("t", "a", key, { value: "the owner is Ilse\nship on Tuesdays\n", ref: null, bytes: 0 });
+    const { ctx, traced } = capped(base, 50);
+    const r = await plugin.invoke("remember", { key, text: "z".repeat(30) }, ctx) as any;
+    must(r.dropped?.lines === 1 && r.dropped.text === "the owner is Ilse", `${key}: ${show(r)}`);
+    must(traced.length === 1 && traced[0].kind === "state.dropped" && traced[0].attrs.key === "other", `${key}: ${show(traced)}`);
+  }
+});
+
+await check("seeding: a writable MEMORY.md over the state mounts' smallest cap, or one that would be kept in object storage, is refused; read-only and other paths are not", async () => {
+  const one = [{ publicConfig: {} }];
+  must(seedFitProblem("MEMORY.md", "writable", "x".repeat(100), [{ publicConfig: { maxDocumentBytes: 100 } }]) === null, "exactly at the cap");
+  const over = seedFitProblem("MEMORY.md", "writable", "x".repeat(101), [{ publicConfig: { maxDocumentBytes: 200 } }, { publicConfig: { maxDocumentBytes: 100 } }]);
+  must(over?.startsWith("MEMORY.md is 101 characters, and the agent's state mount holds a document of at most 100 (maxDocumentBytes)"), `over the smallest cap: ${over}`);
+  // No mount yet: the default, which a mount added later starts with.
+  must(seedFitProblem("MEMORY.md", "writable", "x".repeat(65_537), [])?.includes("at most 65536"), "no mount: the default cap");
+  // Under 64K characters, but past what a row keeps inline, measured as `put` measures it.
+  const big = "x".repeat(40 * 1024);
+  const spills = seedFitProblem("MEMORY.md", "writable", big, one);
+  must(spills?.startsWith(`MEMORY.md encodes to ${big.length + 2} as JSON, and a seeded file past ${STATE_INLINE_MAX} is kept in object storage`), `spills: ${spills}`);
+  const edge = "x".repeat(STATE_INLINE_MAX - 2);
+  must(seedFitProblem("MEMORY.md", "writable", edge, one) === null, "exactly the inline limit");
+  must(seedFitProblem("MEMORY.md", "writable", edge + "x", one) !== null, "one past the inline limit");
+  for (const [path, mode] of [["MEMORY.md", "readonly"], ["notes/MEMORY.md", "writable"], ["memory.md", "writable"], ["notes/plan.md", "writable"]] as const) {
+    must(seedFitProblem(path, mode, big, one) === null, `${path} ${mode} was refused`);
+  }
 });
 
 for (const r of results) {

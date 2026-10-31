@@ -394,6 +394,22 @@ await check("POST seal is idempotent and answers the manifest it closed on, with
   must((await seed(w, "MEMORY.md", "changed")).status === 409, "a write after the seal");
 });
 
+await check("a writable MEMORY.md that would start over the state mount's cap, or in object storage, is refused at setup with nothing written; read-only ones are seeded", async () => {
+  const w = await world();
+  const refused = async (text: string, says: string) => {
+    const r = await seed(w, "MEMORY.md", text);
+    must(r.status === 413 && r.body.error.code === "too_large" && String(r.body.error.message).startsWith(says), `${says}: ${r.status} ${r.text.slice(0, 300)}`);
+    must((await w.rt.store.getState(T, A, "MEMORY.md")) === null && (await w.rt.store.listSeedFiles(T, A)).length === 0, `${says}: something was written`);
+  };
+  // The mount as made, with the default cap: under it in characters, but past what a row keeps inline.
+  await refused("x".repeat(40 * 1024), `MEMORY.md encodes to ${40 * 1024 + 2} as JSON, and a seeded file past 32768 is kept in object storage`);
+  // The mount's own setting, not the default.
+  must(await w.rt.store.updateMountConfig(T, A, "state", { maxDocumentBytes: 100 }), "config");
+  await refused("x".repeat(101), "MEMORY.md is 101 characters, and the agent's state mount holds a document of at most 100 (maxDocumentBytes)");
+  must((await seed(w, "MEMORY.md", "x".repeat(40 * 1024), "readonly")).status === 200, "a large read-only MEMORY.md");
+  must((await seed(w, "MEMORY.md", "x".repeat(100))).status === 200, "a writable one exactly at the cap");
+});
+
 // ---- spill -----------------------------------------------------------------
 
 await check("a file over 32 KiB is spilled, both copies, and reads back through workspace-files/read with the sha256 it was seeded with", async () => {
