@@ -115,6 +115,22 @@ check("a suite that passes is untouched, and is not made to wait for the limit",
   if (r.seconds > 10) throw new Error(`a suite that ends at once took ${r.seconds}s under a 30 s limit`);
 });
 
+check("a process that ended but was never reaped is not a process left running", () => {
+  // The group leader is waited for, so what it started is what suite_stop sees. A child that has
+  // exited keeps its pid until its parent reaps it, and `pgrep -g` lists it — so where nothing reaps
+  // (pid 1 is a shell: `docker run` without --init, and the sandbox this repository is developed in),
+  // every suite that started anything ends with zombies in its group and reads as
+  // "left processes running that could not be killed" while the assertions passed. `alive()` above
+  // already decides that a zombie has ended; this asks the gate the same question.
+  const f = fake('( sleep 300 & )\necho "  3 passed, 0 failed"');
+  const r = bounded(30, f.script);
+  if (r.said !== "status=0 timed_out=0 err=") {
+    throw new Error(`a suite whose leftovers ended read as ${r.said} (a zombie in its group is not a process still running)`);
+  }
+  if (!r.out.includes("3 passed")) throw new Error(`its output was not kept: ${JSON.stringify(r.out)}`);
+  noneLeft(f.pids, "the suite");
+});
+
 check("a suite that fails keeps its own status, and a 124 of its own is not a TIMEOUT", () => {
   const r3 = bounded(30, fake("exit 3").script);
   if (r3.said !== "status=3 timed_out=0 err=") throw new Error(`a failing suite read as ${r3.said}`);
