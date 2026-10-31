@@ -7,7 +7,7 @@ import type { Json } from "../core/types.ts";
 import { importKek, KEPT_NAME, KEPT_PREFIX, open, seal } from "../runtime/secrets.ts";
 import { STATE_INLINE_MAX, STATE_KEY } from "./state-key.ts";
 import { seedInline, type SeedFileMeta, type SeedMode } from "../store/seed-files.ts";
-import { putRefusal, type WhenFull } from "../store/state-lines.ts";
+import { putRefusal, storeFull, totalRefusal, type WhenFull } from "../store/state-lines.ts";
 
 type SealingKey = Awaited<ReturnType<typeof importKek>>;
 
@@ -15,7 +15,7 @@ export const SECRET_VALUE_MAX = 8_000;
 
 /** How much of the lines a full document dropped `remember` quotes back, in characters. */
 export const DROPPED_QUOTE_MAX = 1_500;
-/** How much of the line `revise` changed, before and after, it quotes back, in characters. */
+/** How much of the text `revise` changed, before and after, it quotes back, in characters. */
 export const REVISED_QUOTE_MAX = 500;
 
 /*
@@ -102,15 +102,30 @@ interface StateConfig {
   maxValueBytes?: number;
   /** Cap on a text document, in characters: an append past it drops the oldest
    *  whole lines, or is refused for a document that refuses when full
-   *  (`whenFullOf`); a revision past it is refused. */
+   *  (`whenFullOf`); a revision or an insert past it is refused. `memory`'s
+   *  cap is the lower of this and `memoryMaxCharacters` (`capOf`). */
   maxDocumentBytes?: number;
+  /** `memory`'s cap and its budget in the prompt, one number (`memoryBudgetOf`). */
+  memoryMaxCharacters?: number;
 }
+
+/**
+ * `memory`'s cap and its budget in the prompt, in characters: one number, so a `memory` within its cap is always shown
+ * whole and the agent's copy of it is the document it edits. A `memory` written past it before the cap was lowered to
+ * it is kept and shown by its head and tail (`headAndTail`); the next write that grows it is refused, and one that
+ * shrinks it is not (src/store/state-lines.ts `reviseText`, `putRefusal`).
+ */
+export const MEMORY_MAX = 8_000;
 
 const DEFAULTS: Required<Omit<StateConfig, "account">> = {
   maxTotalBytes: 64 * 1024 * 1024,
   maxValueBytes: 4 * 1024 * 1024,
   maxDocumentBytes: 64 * 1024,
+  memoryMaxCharacters: MEMORY_MAX,
 };
+
+/** A mount's settings with the defaults filled in (`configOf`). */
+export type StateSettings = Required<Omit<StateConfig, "account">>;
 
 /** The documents the harness injects when it opens. Named here so the tool
  *  summaries, the injection and the operator view cannot drift apart. */
@@ -125,7 +140,7 @@ export const WORKING_SET: ReadonlyArray<{
   whenFull?: WhenFull;
 }> = [
   { key: "todo", budget: 2000, what: "open items", whenFull: "refuse" },
-  { key: "memory", budget: 4000, what: "durable facts", whenFull: "refuse" },
+  { key: "memory", budget: MEMORY_MAX, what: "durable facts", whenFull: "refuse" },
   { key: "journal", budget: 3000, what: "recent log", tail: true },
 ];
 
@@ -158,16 +173,22 @@ export function whenFullSentence(key: string, seed: SeedMode | undefined): strin
 
 /**
  * A mount's settings with the defaults filled in: what `invoke` holds a call to, and what seeding checks against. A
- * limit that is not a finite number is the default's, so a stored config the console would refuse today cannot make
- * a comparison always false (NaN) or the smallest of several caps meaningless.
+ * limit that is not a finite number of at least 1 is the default's, so a stored config the console would refuse today
+ * cannot make a comparison always false (NaN), every write refused (0 or less), or the smallest of several caps
+ * meaningless.
  */
-function configOf(publicConfig: unknown): Required<Omit<StateConfig, "account">> {
+export function configOf(publicConfig: unknown): StateSettings {
   const given = (publicConfig && typeof publicConfig === "object" ? publicConfig : {}) as Record<string, unknown>;
+  // A limit of nothing, or less, would leave every write refused (and `memory` unshown): that is a bad value, not a
+  // setting, so it is the default's too. A fraction is floored, so every limit is a whole count.
   const limit = (name: keyof typeof DEFAULTS) => {
     const v = given[name];
-    return typeof v === "number" && Number.isFinite(v) ? v : DEFAULTS[name];
+    return typeof v === "number" && Number.isFinite(v) && v >= 1 ? Math.floor(v) : DEFAULTS[name];
   };
-  return { maxTotalBytes: limit("maxTotalBytes"), maxValueBytes: limit("maxValueBytes"), maxDocumentBytes: limit("maxDocumentBytes") };
+  return {
+    maxTotalBytes: limit("maxTotalBytes"), maxValueBytes: limit("maxValueBytes"), maxDocumentBytes: limit("maxDocumentBytes"),
+    memoryMaxCharacters: limit("memoryMaxCharacters"),
+  };
 }
 
 /**
@@ -185,7 +206,7 @@ export function seedFitProblem(
   path: string, mode: SeedMode, text: string, mounts: ReadonlyArray<{ publicConfig: unknown }>,
 ): string | null {
   if (mode !== "writable" || whenFullOf(path, mode) !== "refuse") return null;
-  const cap = Math.min(...(mounts.length ? mounts : [{ publicConfig: {} }]).map((m) => configOf(m.publicConfig).maxDocumentBytes));
+  const cap = sharedSettings(mounts.map((m) => configOf(m.publicConfig))).maxDocumentBytes;
   const why = `a writable ${path} refuses a \`remember\` that does not fit rather than dropping its oldest lines`;
   if (text.length > cap) {
     return `${path} is ${text.length} characters, and the agent's state mount holds a document of at most ${cap} `
@@ -201,26 +222,80 @@ export function seedFitProblem(
 }
 
 /**
- * A `<key>_full` refusal with one sentence added on how much of the document the prompt shows: an agent deciding what
- * to free has to know that the copy in front of it may be missing part of it. Each budget is the one the prompt is
- * built with, so the sentence cannot name a number the injection does not use: a working-set document's own, kept as
- * its first and last part (`workingSetParts`), and a seeded `MEMORY.md`'s SEEDED_MEMORY_BUDGET, kept as its first
- * part (`seededFilesParts`). Only when the document is past it (`size`, its length as the refusal measured it): one
- * the prompt shows whole is not missing anything. Any other error is returned as it is.
+ * `memory`'s cap and its budget in the prompt, in characters: the one function every reader of either asks, so the
+ * longest `memory` a write may leave, the most of it the prompt shows and the number a refusal names cannot differ.
+ * Read from the agent's shared settings (`sharedSettings`), the smallest `memoryMaxCharacters` of its `state` mounts:
+ * MEMORY_MAX unless every mount sets more, which an operator can for an agent that needs it.
  */
-function withShown(e: unknown, key: string, seed: SeedMode | undefined): unknown {
-  const { code, size } = (e ?? {}) as { code?: unknown; size?: unknown };
-  if (code !== `${key}_full` || typeof size !== "number") return e;
+export const memoryBudgetOf = (cfg: StateSettings): number => cfg.memoryMaxCharacters;
+
+/**
+ * The settings an agent's documents are held to, from the settings of each of its `state` mounts (`configOf`): the
+ * smallest of every limit, since the mounts share one store, so a write through any of them, the prompt
+ * (`workingSetParts`) and seeding (`seedFitProblem`) hold it to one number, and no mount's alias is a way past
+ * another's limit on that store. With no mount, the defaults.
+ */
+export function sharedSettings(cfgs: readonly StateSettings[]): StateSettings {
+  const all = cfgs.length ? cfgs : [configOf({})];
+  const least = (k: keyof StateSettings) => Math.min(...all.map((c) => c[k]));
+  return {
+    maxTotalBytes: least("maxTotalBytes"),
+    maxValueBytes: least("maxValueBytes"),
+    maxDocumentBytes: least("maxDocumentBytes"),
+    memoryMaxCharacters: least("memoryMaxCharacters"),
+  };
+}
+
+/** The cap on `key`, in characters: `maxDocumentBytes`, and for `memory` no more than its budget (`memoryBudgetOf`). */
+export const capOf = (key: string, cfg: StateSettings): number =>
+  key === "memory" ? Math.min(cfg.maxDocumentBytes, memoryBudgetOf(cfg)) : cfg.maxDocumentBytes;
+
+/** How much of a working-set document the prompt shows, in characters: `memory`'s `memoryBudgetOf`, the others' own. */
+const budgetOf = (doc: { key: string; budget: number }, cfg: StateSettings): number =>
+  doc.key === "memory" ? memoryBudgetOf(cfg) : doc.budget;
+
+/**
+ * What a refused write to `memory` adds, whatever the refusal: it is the document the prompt always shows, so what it
+ * cannot hold is better moved than lost.
+ */
+const MOVE_DETAILS = ". To keep what you know, move details rather than deleting them: `put` them into a document of their "
+  + "own, such as `notes/<topic>`, which is not shown to you automatically, so `get` reads it when you need it; keep "
+  + "only the key points in `memory`, and say there where the details are";
+
+/**
+ * A refusal of a write that would grow a text document, with one sentence added on how much of the document the
+ * prompt shows: an agent deciding what to free has to know that the copy in front of it may be missing part of it.
+ * Each budget is the one the prompt is built with, so the sentence cannot name a number the injection does not use: a
+ * working-set document's (`budgetOf`, `memory`'s from the same settings), kept as its first and last part
+ * (`workingSetParts`) or as its end, and a seeded `MEMORY.md`'s SEEDED_MEMORY_BUDGET, kept as its first part
+ * (`seededFilesParts`). Decided on facts, never on the code, which is for the record: the refusal carries `size`, the
+ * document's length as it measured it, and only past its budget is it missing anything, `<key>_over_cap` above all.
+ * A refusal on `memory` then says how to move details out (`MOVE_DETAILS`). Any other error is returned as it is.
+ */
+function withShown(e: unknown, key: string, seed: SeedMode | undefined, cfg: StateSettings): unknown {
+  const { size } = (e ?? {}) as { size?: unknown };
+  if (!(e instanceof Error) || typeof size !== "number") return e;
   const doc = WORKING_SET.find((d) => d.key === key);
   if (doc) {
-    if (size <= doc.budget) return e;
-    (e as Error).message += `. The prompt shows only the first and last part of \`${key}\` past ${doc.budget} characters, `
-      + "saying how much is left out between them; `get` reads all of it";
+    const budget = budgetOf(doc, cfg);
+    if (size > budget) {
+      e.message += doc.tail
+        ? `. The prompt shows only the last ${budget} characters of \`${key}\`; \`get\` reads all of it`
+        : `. The prompt shows only the first and last part of \`${key}\` past ${budget} characters, `
+          + "saying how much is left out between them; `get` reads all of it";
+    }
   } else if (seed && key === SEEDED_MEMORY && size > SEEDED_MEMORY_BUDGET) {
-    (e as Error).message += `. The prompt shows only the first ${SEEDED_MEMORY_BUDGET} characters of \`${key}\`, `
+    e.message += `. The prompt shows only the first ${SEEDED_MEMORY_BUDGET} characters of \`${key}\`, `
       + "saying where it is cut; `get` reads all of it";
   }
+  if (key === "memory") e.message += MOVE_DETAILS;
   return e;
+}
+
+/** A store's `store_full`, said with the tool on this mount, as `put`'s own refusal says it; any other error as it is. */
+function withMount(e: unknown, alias: string): unknown {
+  const x = e as { code?: unknown; max?: number; current?: number };
+  return x?.code === "store_full" ? storeFull(x.max!, x.current!, alias) : e;
 }
 
 /** Named once because `workingSet` looks a mount up by it. A second copy of the
@@ -319,7 +394,9 @@ export function statePlugin(
       { name: "maxValueBytes", type: "number", default: DEFAULTS.maxValueBytes,
         summary: `Largest single value; anything bigger is refused. Values over ${STATE_INLINE_MAX / 1024} KiB are kept in object storage and handed back as a reference, which is not configurable.` },
       { name: "maxDocumentBytes", type: "number", default: DEFAULTS.maxDocumentBytes,
-        summary: "Largest text document, in characters: a `remember` past it drops the oldest whole lines and says which, except on `memory`, `todo` and a seeded `MEMORY.md`, where it is refused; a `revise` past it is refused, and so is a `put` of text past it to one of those." },
+        summary: `Largest text document, in characters; \`memory\` holds no more than \`memoryMaxCharacters\` either. A \`remember\` past it drops the oldest whole lines and says which, except on \`memory\`, \`todo\` and a seeded \`MEMORY.md\`, where it is refused; a \`revise\` or an \`insert\` that grows a document past it is refused, and so is a \`put\` of text past it to one of those.` },
+      { name: "memoryMaxCharacters", type: "number", default: DEFAULTS.memoryMaxCharacters,
+        summary: "`memory`'s cap and how much of it the prompt shows, in characters: one number, so a `memory` within its cap is shown whole. Raise it for an agent that needs more standing facts; a value that is not a number of at least 1 is the default's." },
       { name: "maxTotalBytes", type: "number", default: DEFAULTS.maxTotalBytes,
         summary: "How much this agent may keep in total. A write that would pass it is refused." },
     ],
@@ -335,7 +412,8 @@ export function statePlugin(
           "up. Write the fact, not the story. Never write a credential. A document is a key in " +
           "the same store `put`, `get`, `list` and `forget` use, so `get` on `journal` returns it " +
           "and a `put` to that key replaces the whole document rather than appending to it. To " +
-          "change or delete one line, use `revise`. A full document drops its oldest lines to make " +
+          "change or delete text in it, use `revise`; to add a line somewhere other than the end, " +
+          "`insert`. A full document drops its oldest lines to make " +
           "room, and the reply quotes them. Remembering into it again drops more, so free up space " +
           "first: delete or shorten a line that is no longer true with `revise`, or drop a whole " +
           "document with `forget`, then remember what you still need. `memory` and `todo` never " +
@@ -355,26 +433,48 @@ export function statePlugin(
       {
         name: "revise",
         summary:
-          "Change or delete one line of a document you keep with `remember`. `match` is a piece of " +
-          "that line, as it is now, which must occur exactly once in the whole document; if it " +
-          "occurs in no line or more than once nothing is changed and you are told how many times " +
-          "it matched, so give a longer piece. With `replace` the whole line becomes that text, " +
-          "leading spaces included; " +
-          "without it the line is deleted. The reply quotes the line as it was. Use it when " +
-          "something you wrote turns out to be wrong or stops being true: stale memory is worse " +
-          "than none, because you will act on it.",
+          "Edit a text document, such as `memory`, `todo` or `journal`, by replacing exact text. `old` " +
+          "is the text as it is now, which may be part of a line or span several lines, and must occur " +
+          "exactly once in the whole document; only that text is replaced by `new`, and the rest of its " +
+          "lines stays as it is. To replace a whole line, pass the whole line as `old`. Without `new`, " +
+          "or with it empty, the text is deleted; a whole line deleted takes its line break with it. If " +
+          "`old` occurs nowhere or more than once nothing is changed, and you are told how many times " +
+          "and on which lines, so give more of the text around it. The reply quotes the text as it " +
+          "was. Use it when something you wrote turns out to be wrong or stops being true: stale " +
+          "memory is worse than none, because you will act on it.",
         parameters: {
           type: "object",
           properties: {
             key: { type: "string", description: "the document, e.g. memory | todo | journal" },
-            match: { type: "string", description: "a piece of the one line to change, unique in the document" },
-            replace: { type: "string", description: "the line's new text, in full; omit to delete the line" },
+            old: { type: "string", description: "the exact text to change, as it is now; unique in the document; may span lines" },
+            new: { type: "string", description: "what replaces exactly that text; omit or leave empty to delete it" },
           },
-          required: ["key", "match"],
+          required: ["key", "old"],
         },
         sideEffects: "write",
         // Not replayable: a deletion run twice is refused the second time, and
-        // a replacement that still contains `match` would be applied again.
+        // a replacement that still contains `old` would be applied again.
+        idempotency: "none",
+      },
+      {
+        name: "insert",
+        summary:
+          "Add text to a document as its own line or lines, at the place you choose: `after_line` 0 " +
+          "puts it at the top, otherwise it goes after that line, numbered from 1 (a refusal's listing " +
+          "numbers lines the same way). For the end, `remember` does the same without a number. A line " +
+          "number past the end is refused. It never drops a line to make room: on a full document it " +
+          "is refused and nothing is written, so free up space first with `revise` or `forget`.",
+        parameters: {
+          type: "object",
+          properties: {
+            key: { type: "string", description: "the document, e.g. memory | todo | journal" },
+            after_line: { type: "integer", description: "0 for the top, else the line it goes after, from 1" },
+            text: { type: "string", description: "one line, or several" },
+          },
+          required: ["key", "after_line", "text"],
+        },
+        sideEffects: "write",
+        // Not replayable: run twice, the text is in the document twice.
         idempotency: "none",
       },
       {
@@ -482,7 +582,7 @@ export function statePlugin(
         name: "forget",
         summary:
           "Delete a key: a whole document, every line in it. Use it when all of it turned out to be " +
-          "wrong — stale memory is worse than none, because you will act on it. For one line, use `revise`.",
+          "wrong — stale memory is worse than none, because you will act on it. For part of one, use `revise`.",
         parameters: {
           type: "object",
           properties: { key: { type: "string" } },
@@ -494,10 +594,16 @@ export function statePlugin(
     ],
 
     async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
-      const cfg = configOf(ctx.publicConfig);
       const { tenantId, agentId } = ctx.caller;
+      // Every state mount's settings, as one (`sharedSettings`): what each write below is held to, and what its refusals
+      // say, is what the prompt shows and any other mount's write is held to.
+      // The mounts' rows are the one source of their settings; the call's own config only stands in when there is no row,
+      // so a call that carries less than its row cannot pull a limit back to the default.
+      const rows = await store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID);
+      const cfg = sharedSettings(rows.length ? rows.map((m) => configOf(m.publicConfig)) : [configOf(ctx.publicConfig)]);
       const a = (args ?? {}) as {
-        key?: string; text?: string; value?: Json; prefix?: string; limit?: number; match?: unknown; replace?: unknown;
+        key?: string; text?: string; value?: Json; prefix?: string; limit?: number;
+        old?: unknown; new?: unknown; after_line?: unknown; match?: unknown; replace?: unknown;
       };
 
       if (tool.startsWith("secret_")) {
@@ -574,11 +680,12 @@ export function statePlugin(
         case "remember": {
           const text = String(a.text ?? "").trim();
           if (!text) throw new Error("nothing to remember");
-          const r = await store.appendState(tenantId, agentId, key, text, cfg.maxDocumentBytes, whenFullOf(key, seed))
-            .catch((e) => { throw withShown(e, key, seed); });
-          // `bytes` is the document's length as the cap counts it, characters, so the two can be read together.
-          const cap = cfg.maxDocumentBytes;
-          if (!r.dropped.length) return { key, bytes: r.bytes, cap };
+          const cap = capOf(key, cfg);
+          const r = await store.appendState(tenantId, agentId, key, text, cap, whenFullOf(key, seed), cfg.maxTotalBytes)
+            .catch((e) => { throw withShown(withMount(e, ctx.alias), key, seed, cfg); });
+          // `characters` is the document's length as the cap counts it, so the two can be read together; the stored
+          // size, in another unit (`storedBytes`), is not in the reply, so neither is read against the other.
+          if (!r.dropped.length) return { key, characters: r.characters, cap };
           // The lines themselves, not only that some went: a note that says the
           // document was full leaves the agent no way to know whether what it
           // lost mattered. Quoted up to a limit, since the reply is part of the
@@ -592,7 +699,7 @@ export function statePlugin(
           const traced = WORKING_SET.some((d) => d.key === key) ? key : "other";
           ctx.trace?.({ kind: "state.dropped", status: "dropped", verdict: "ok", attrs: { key: traced, lines: n, characters: all.length } });
           return {
-            key, bytes: r.bytes, cap,
+            key, characters: r.characters, cap,
             dropped: { lines: n, characters: all.length, text: quoted.excerpt },
             note: `the document was full, so its ${n} oldest ${n === 1 ? "line was" : "lines were"} dropped to make room; `
               + (quoted.excerpt.length < all.length
@@ -606,19 +713,44 @@ export function statePlugin(
         }
 
         case "revise": {
-          if (typeof a.match !== "string") throw new Error("`match` must be a string: a piece of the one line to change");
-          if (a.replace !== undefined && a.replace !== null && typeof a.replace !== "string") {
-            throw new Error("`replace` must be a string, or left out to delete the line");
+          // The names of the line-replacing `revise` are refused rather than read as `old` and `new`: a piece of a
+          // line passed as `match` with the whole new line as `replace` would splice that line into the middle of the
+          // old one, and nothing would say so.
+          if (a.match !== undefined || a.replace !== undefined) {
+            throw Object.assign(new Error(
+              "revise_renamed: `revise` now takes `old` and `new`: `old` is the exact text to change (it may span "
+              + "lines), and only that text is replaced by `new`; to replace a whole line, pass the whole line as "
+              + "`old`. Nothing was changed",
+            ), { code: "revise_renamed" });
           }
-          // Only the end is trimmed: leading spaces are how a nested list item
-          // says where it belongs.
-          const replace = typeof a.replace === "string" ? a.replace.trimEnd() : null;
-          if (replace !== null && !replace.trim()) throw new Error("`replace` is empty; leave it out to delete the line");
-          const r = await store.reviseState(tenantId, agentId, key, a.match, replace, cfg.maxDocumentBytes);
+          if (typeof a.old !== "string") throw new Error("`old` must be a string: the exact text to change, as it is now");
+          if (a.new !== undefined && a.new !== null && typeof a.new !== "string") {
+            throw new Error("`new` must be a string, or left out to delete the text");
+          }
+          // Exactly what was given: in a piece of a line, a space at either end is part of the text it replaces.
+          const next = typeof a.new === "string" && a.new !== "" ? a.new : null;
+          const cap = capOf(key, cfg);
+          const r = await store.reviseState(tenantId, agentId, key, a.old, next, cap, cfg.maxTotalBytes)
+            .catch((e) => { throw withShown(withMount(e, ctx.alias), key, seed, cfg); });
           const quote = (t: string) => memoryExcerpt(t, REVISED_QUOTE_MAX).excerpt;
-          return replace === null
-            ? { key, bytes: r.bytes, cap: cfg.maxDocumentBytes, line: r.line, deleted: quote(r.was), note: `line ${r.line} was deleted` }
-            : { key, bytes: r.bytes, cap: cfg.maxDocumentBytes, line: r.line, was: quote(r.was), now: quote(replace), note: `line ${r.line} was replaced` };
+          const where = r.line === r.lastLine ? `line ${r.line}` : `lines ${r.line}–${r.lastLine}`;
+          return r.now === null
+            ? { key, characters: r.characters, cap, line: r.line, deleted: quote(r.was), note: `the text at ${where} was deleted` }
+            : { key, characters: r.characters, cap, line: r.line, was: quote(r.was), now: quote(r.now), note: `the text at ${where} was replaced` };
+        }
+
+        case "insert": {
+          if (typeof a.after_line !== "number" || !Number.isInteger(a.after_line)) {
+            throw new Error("`after_line` must be a whole number: 0 for the top, else the line the text goes after");
+          }
+          if (typeof a.text !== "string") throw new Error("`text` must be a string");
+          // Only the end is trimmed: leading spaces are how a nested list item says where it belongs.
+          const text = a.text.trimEnd();
+          if (!text.trim()) throw new Error("nothing to insert");
+          const cap = capOf(key, cfg);
+          const r = await store.insertState(tenantId, agentId, key, a.after_line, text, cap, cfg.maxTotalBytes)
+            .catch((e) => { throw withShown(withMount(e, ctx.alias), key, seed, cfg); });
+          return { key, characters: r.characters, cap, line: r.line, note: `inserted at line ${r.line}` };
         }
 
         case "get": {
@@ -668,7 +800,7 @@ export function statePlugin(
           // A text document is also given its length as the cap counts it, characters, beside the cap: `bytes` is the
           // stored size, which for text that `put` wrote is its JSON, quotes and escapes included, so it is not the
           // number to hold against the cap.
-          const text = typeof got.value === "string" ? { characters: got.value.length, cap: cfg.maxDocumentBytes } : {};
+          const text = typeof got.value === "string" ? { characters: got.value.length, cap: capOf(key, cfg) } : {};
           return { key, found: true, bytes: got.bytes, ...text, updatedAt: got.updatedAt, value: got.value, ...seeded };
         }
 
@@ -678,7 +810,7 @@ export function statePlugin(
         case "put": {
           const body = JSON.stringify(a.value ?? null);
           if (body.length > cfg.maxValueBytes) {
-            throw new Error(`value is ${body.length} bytes; the limit is ${cfg.maxValueBytes}`);
+            throw Object.assign(new Error(`value_too_large: value is ${body.length} bytes; the limit is ${cfg.maxValueBytes}`), { code: "value_too_large" });
           }
           // The one test of whether this value is moved to object storage, used both by the refusal below and by
           // the write at the end, so the two cannot disagree about what is moved.
@@ -688,12 +820,22 @@ export function statePlugin(
           // document could no longer be appended to or revised (src/store/state-lines.ts `putRefusal`). A value that
           // is not text has no lines and no character cap, but moved it would still leave the document unable to be
           // appended to or revised, so it is held to the inline limit too.
+          // The document now, read once for both the refusal and the total below.
+          const cur = await store.getState(tenantId, agentId, key);
           if (whenFullOf(key, seed) === "refuse") {
             const spilt = spills ? { encoded: body.length, inlineMax: STATE_INLINE_MAX } : null;
+            // Text kept inline is what `revise` and `forget` can still shrink in place.
+            const editable = !!cur && !cur.ref && typeof cur.value === "string";
+            // In characters, from the text and never from `bytes`: one kept in object storage is larger than any
+            // value that stays inline, and one that is not text is no document to be smaller than.
+            const current = !cur ? 0 : cur.ref ? Number.POSITIVE_INFINITY : typeof cur.value === "string" ? cur.value.length : 0;
             const refused = typeof a.value === "string"
-              ? putRefusal(key, { text: a.value, max: cfg.maxDocumentBytes }, spilt)
-              : putRefusal(key, { notText: true }, spilt);
-            if (refused) throw refused;
+              ? putRefusal(key, {
+                text: a.value, max: capOf(key, cfg), current, editable,
+                ...(editable ? { lines: (cur!.value as string).split("\n") } : {}),
+              }, spilt)
+              : putRefusal(key, { notText: true, editable }, spilt);
+            if (refused) throw withShown(refused, key, seed, cfg);
           }
           // Checked before writing, not after: the point is to refuse, not to
           // notice afterwards that the object is full.
@@ -713,13 +855,12 @@ export function statePlugin(
             throw new Error(`a key names a value, not a path: \`${key}\` moves through it`);
           }
           const usage = await store.stateUsage(tenantId, agentId);
-          const prior = (await store.getState(tenantId, agentId, key))?.bytes ?? 0;
-          if (usage.bytes - prior + body.length > cfg.maxTotalBytes) {
-            throw new Error(
-              `this would take the store past ${cfg.maxTotalBytes} bytes (currently ${usage.bytes}); ` +
-              `delete something with the \`forget\` tool on \`${ctx.alias}\``,
-            );
-          }
+          const prior = cur?.bytes ?? 0;
+          // Only growth is refused, as for the other writes: a store over its total (the bytes backfill can put one
+          // there) can still be brought back by a `put` that shrinks a value. `prior` is the row's stored size, the
+          // total's unit, a different question from whether a document is shorter in characters (above).
+          const overTotal = totalRefusal(usage.bytes, prior, body.length, cfg.maxTotalBytes, ctx.alias);
+          if (overTotal) throw overTotal;
           if (!spills) {
             await store.putState(tenantId, agentId, key, {
               value: a.value ?? null, ref: null, bytes: body.length,
@@ -765,19 +906,22 @@ export async function workingSetParts(
 ): Promise<{ text: string; parts: PromptPart[] }> {
   const parts: string[] = [];
   const docs: PromptPart[] = [];
-  // The mount, asked once and only when there is something to say it with (below).
-  let mount: Promise<string | undefined> | null = null;
-  const aliasOf = () => mount ??= store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID).then((m) => m[0]?.alias);
+  // The mounts, asked once and only when there is something to say with them (below): the first one's alias, and all
+  // their settings, for `memory`'s budget (`memoryBudgetOf`), the number every write to it is capped by.
+  let mounts: Promise<Array<{ alias: string; publicConfig: unknown }>> | null = null;
+  const mountsOf = () => mounts ??= store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID);
+  const aliasOf = async () => (await mountsOf())[0]?.alias;
   for (const doc of WORKING_SET) {
     if (skip.has(doc.key)) continue;
     const got = await store.getState(tenantId, agentId, doc.key);
     const text = typeof got?.value === "string" ? got.value : got?.value ? JSON.stringify(got.value) : "";
     if (!text.trim()) continue;
-    const kept = text.length <= doc.budget
+    const budget = budgetOf(doc, sharedSettings((await mountsOf()).map((m) => configOf(m.publicConfig))));
+    const kept = text.length <= budget
       ? text
       : doc.tail
-        ? `…\n${text.slice(text.length - doc.budget)}`
-        : headAndTail(text, doc.budget, doc.key, await aliasOf());
+        ? `…\n${text.slice(text.length - budget)}`
+        : headAndTail(text, budget, doc.key, await aliasOf());
     parts.push(`## ${doc.key} (${doc.what})\n${kept}`);
     docs.push({ key: `doc:${doc.key}`, label: `\`${doc.key}\` (${doc.what})`, text: kept, by: "agent" });
   }
@@ -809,9 +953,10 @@ export async function workingSetParts(
   // whole mounted set, so a plugin cannot know it — the mount and the tool it
   // belongs to are the two facts that stay true under either.
   const correcting = alias
-    ? `They are kept by the \`${alias}\` mount: when a line in one turns out to be wrong or stops ` +
-      "being true, correct or delete that line with its `revise` tool; `remember` adds a line, and " +
-      "`forget` drops a whole document."
+    ? `They are kept by the \`${alias}\` mount, and each is one document you edit: its \`revise\` tool ` +
+      "replaces a piece of text (or deletes it), `insert` adds lines at a line number, `remember` adds a " +
+      "line at the end, `put` rewrites a whole document, `get` reads one, and `forget` drops one. When " +
+      "something in one turns out to be wrong or stops being true, correct or delete it with `revise`."
     : "You have no tool mounted for changing it, so treat it as read-only and say so if it is wrong.";
   const intro = "Written by you on earlier tasks, and shown here so you do not have to go and look. " + correcting;
   return {
@@ -842,7 +987,10 @@ function headAndTail(text: string, budget: number, key: string, alias: string | 
 
 /** The seeded file whose text is shown in the prompt, not only named. */
 export const SEEDED_MEMORY = "MEMORY.md";
-/** How much of it, in characters: the working set's own `memory` budget. */
+/**
+ * How much of it, in characters. The working set's `memory` budget was this number until it became `memory`'s cap
+ * (MEMORY_MAX); a seeded file is the setup's, held to no cap, so its budget is its own and did not move.
+ */
 export const SEEDED_MEMORY_BUDGET = 4000;
 /**
  * How much of an imported `MEMORY.md` the prompt shows, in characters: the 16 KB Raft tells its agents to keep the

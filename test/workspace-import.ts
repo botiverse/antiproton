@@ -572,6 +572,8 @@ await check("an imported MEMORY.md's paragraph says a full one drops its oldest 
   must(shown.includes("in your workspace when you were created\nWhen it is full, a `remember` to it drops its oldest lines to make room. Its current content is the text inside the fence below:"), `the paragraph: ${shown}`);
   must(!shown.includes("is refused"), `the paragraph says it refuses: ${shown}`);
   const plugin = statePlugin(w.rt.store, null, "local");
+  // The cap on the state mount's row, where the plugin reads its settings from, and in the context as the gateway passes it.
+  must(await w.rt.store.updateMountConfig(T, A, "state", { maxDocumentBytes: 50 }), "the cap on the state mount's row");
   const ctx = { publicConfig: { maxDocumentBytes: 50 }, credential: null, caller: { tenantId: T, agentId: A, taskId: "k" }, alias: "state" } as unknown as PluginContext;
   const r = await plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, ctx) as any;
   must(r.dropped?.lines === 1 && r.dropped.text === "the owner is Ilse", `the remember: ${show(r)}`);

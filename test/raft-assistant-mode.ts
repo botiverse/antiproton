@@ -2441,7 +2441,11 @@ await check("assistantTools offers the memory tools on the memory mount alone, a
   must(show(assistantTools(all, "raft", "chat").map((t) => t.address)) === show(["raft.messages_send"]), "no memory mount, no memory tools");
   // `revise` is offered once the mount lists it.
   must(assistantTools([...all, ...tools(["state.revise"])], "raft", "check", "state").some((t) => t.address === "state.revise"), "revise once listed");
-  must(MEMORY_TOOLS.includes("revise") && !MEMORY_TOOLS.some((n) => n.startsWith("secret_")), show(MEMORY_TOOLS));
+  must(MEMORY_TOOLS.includes("revise") && MEMORY_TOOLS.includes("insert") && !MEMORY_TOOLS.some((n) => n.startsWith("secret_")), show(MEMORY_TOOLS));
+  // Every memory tool is one the state plugin has, so none is offered as nothing.
+  const stateTools = statePlugin(null as never, null, "b").tools.map((t) => t.name);
+  must(MEMORY_TOOLS.every((n) => stateTools.includes(n)), `a memory tool the state plugin lacks: ${show(MEMORY_TOOLS)}`);
+  must(MEMORY.offered.includes("insert") && CHAT_PROMPT.includes("`state__insert`") && CHECK_PROMPT.includes("`state__insert`"), "insert in the prompts");
   must(memoryMountOf([{ alias: "raft", plugin: "raft" }, { alias: "notes", plugin: "state" }, { alias: "state", plugin: "state" }]) === "notes", "the first state mount");
 });
 
@@ -2453,6 +2457,12 @@ await check("the memory guidance names only the tools offered, the same in a cha
     must(full.includes(s), `chat guidance lacks ${s}: ${full}`);
   }
   must(!memoryGuidance(m(["remember", "forget"]), "chat")!.includes("revise"), "revise named without the tool");
+  // `memory` as one document: edited with revise and insert, rewritten with put, read with get, each only when offered.
+  must(full.includes("`memory` is one document: edit it with `state__revise` (replace a piece of its text), `state__insert` (add lines at a line number), rewrite it whole with `state__put` and read it with `state__get`."),
+    `the one-document sentence: ${full}`);
+  must(memoryGuidance(m(["remember", "insert", "get"]), "chat")!.includes("`memory` is one document: edit it with `state__insert` (add lines at a line number) and read it with `state__get`."),
+    `without revise or put: ${memoryGuidance(m(["remember", "insert", "get"]), "chat")}`);
+  must(!memoryGuidance(m(["remember", "forget"]), "chat")!.includes("one document"), "the one-document sentence without any tool it names");
   // Asked to forget, or what it remembers: the chat's alone, removed with the best tool it has.
   const asked = (offered: string[]) => /When your owner asks you to forget something, remove it from your notes[^;]*; when they ask what you remember about them, tell them truthfully from your notes\./
     .exec(memoryGuidance(m(offered), "chat")!)?.[0] ?? "";

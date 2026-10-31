@@ -291,21 +291,38 @@ export interface StorageAdapter {
   ): Promise<void>;
   /** The cheap, additive write. A journal the agent has to read, edit and
    *  rewrite to add a line is a journal it will stop writing. Over `maxBytes`
-   *  it drops whole lines from the head and answers the non-blank ones in
-   *  `dropped`, oldest first, or with `whenFull` "refuse" writes nothing and
-   *  throws `<key>_full` (src/store/state-lines.ts `appendLines`); it refuses a
-   *  value that is not a string rather than replace it. */
+   *  (characters of the text) it drops whole lines from the head and answers
+   *  the non-blank ones in `dropped`, oldest first, or with `whenFull`
+   *  "refuse" writes nothing and throws `<key>_full`
+   *  (src/store/state-lines.ts `appendLines`); it refuses a value that is not
+   *  a string rather than replace it. Each of these three writes stores
+   *  `bytes` as `storedBytes`, the JSON's length `put` stores, answers the
+   *  text's length as `characters`, and refuses growth that would take the
+   *  agent's rows past `maxTotalBytes` in that unit (`store_full`). */
   appendState(
     tenantId: string, agentId: string, key: string, text: string, maxBytes: number, whenFull: WhenFull,
-  ): Promise<{ bytes: number; dropped: string[] }>;
-  /** Replace the one line of a text document that contains `match`, or remove
-   *  it when `replace` is null; `line` is its number from 1 and `was` its text
-   *  before. Refuses unless `match` occurs exactly once (src/store/state-lines.ts
-   *  `reviseLines`), and refuses a document that is absent, not a string, kept
-   *  in object storage, or would grow past `maxBytes`. */
+    maxTotalBytes?: number,
+  ): Promise<{ characters: number; bytes: number; dropped: string[] }>;
+  /** Replace the one occurrence of `old` in a text document, which may span
+   *  lines, with `next`, or remove it when `next` is null; `line` and
+   *  `lastLine` are where it started and ended, from 1, and `was` and `now`
+   *  its text before and after. Refuses unless `old` occurs exactly once
+   *  (src/store/state-lines.ts `reviseText`), and refuses a document that is
+   *  absent, not a string, kept in object storage, or would grow past
+   *  `maxBytes`. */
   reviseState(
-    tenantId: string, agentId: string, key: string, match: string, replace: string | null, maxBytes: number,
-  ): Promise<{ bytes: number; line: number; was: string }>;
+    tenantId: string, agentId: string, key: string, old: string, next: string | null, maxBytes: number,
+    maxTotalBytes?: number,
+  ): Promise<{ characters: number; bytes: number; line: number; lastLine: number; was: string; now: string | null }>;
+  /** Put `text` in a text document after line `afterLine`, 0 for the top;
+   *  `line` is the number its first line now has. Never drops a line: past
+   *  `maxBytes` it is refused as `<key>_full` (src/store/state-lines.ts
+   *  `insertLines`). An absent document is started, as `appendState` starts
+   *  one; one that is not a string or is kept in object storage is refused. */
+  insertState(
+    tenantId: string, agentId: string, key: string, afterLine: number, text: string, maxBytes: number,
+    maxTotalBytes?: number,
+  ): Promise<{ characters: number; bytes: number; line: number }>;
   getState(
     tenantId: string, agentId: string, key: string,
   ): Promise<(StateEntry & { updatedAt: number }) | null>;

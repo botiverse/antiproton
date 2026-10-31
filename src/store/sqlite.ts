@@ -1,7 +1,9 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
-import { appendLines, documentText, reviseLines, type WhenFull } from "./state-lines.ts";
+import {
+  appendLines, backfillStateBytes, documentText, insertLines, reviseText, storedBytes, totalRefusal, type WhenFull,
+} from "./state-lines.ts";
 import type { PluginChoice, ToolSnapshot } from "../plugins/types.ts";
 import { AGENT_SCOPE_ALIAS, PluginDbTables } from "./plugin-db.ts";
 import { appendUsage, pendingUsage, type UsageRow } from "../usage/outbox.ts";
@@ -199,6 +201,9 @@ export class SqliteStore implements StorageAdapter {
       try { this.#db.exec(alter); } catch { /* already present */ }
     }
     migrateApprovals((q) => { this.#db.exec(q); }, (fn) => this.#tx(fn));
+    // Every row's `bytes` in one unit, the JSON's length, once: a text document's used to be its length in characters
+    // (src/store/state-lines.ts `backfillStateBytes`).
+    this.#tx(() => backfillStateBytes((q, ...b) => this.#db.prepare(q).all(...(b as any[])) as any[], (q, ...b) => { this.#db.prepare(q).run(...(b as any[])); }));
 
     // The sandbox plugin was called `run9` until 2026-09-12. See the same pair
     // in durable-object.ts: rows keep the id, so without this a mount goes on
@@ -884,6 +889,7 @@ export class SqliteStore implements StorageAdapter {
 
   async appendState(
     tenantId: string, agentId: string, key: string, text: string, maxBytes: number, whenFull: WhenFull,
+    maxTotalBytes = Number.POSITIVE_INFINITY,
   ) {
     // What the text becomes is decided in state-lines.ts, the same for both stores.
     // Read and written in one synchronous transaction: an await between the two
@@ -893,22 +899,55 @@ export class SqliteStore implements StorageAdapter {
       const before = documentText(key, this.#getStateRow(tenantId, agentId, key), "append to");
       // A refusal throws here, between the read and the write, so nothing is written and no other call can slip in.
       const { kept, dropped } = appendLines(key, before, text, maxBytes, whenFull);
-      this.#putStateRow(tenantId, agentId, key, { value: kept, ref: null, bytes: kept.length });
-      return { bytes: kept.length, dropped };
+      return { ...this.#writeDocument(tenantId, agentId, key, kept, maxTotalBytes), dropped };
     });
   }
 
   async reviseState(
-    tenantId: string, agentId: string, key: string, match: string, replace: string | null, maxBytes: number,
+    tenantId: string, agentId: string, key: string, old: string, next: string | null, maxBytes: number,
+    maxTotalBytes = Number.POSITIVE_INFINITY,
   ) {
     // One transaction, as in appendState.
     return this.#tx(() => {
       const prior = this.#getStateRow(tenantId, agentId, key);
       if (!prior) throw new Error(`there is no \`${key}\` to revise`);
-      const { kept, line, was } = reviseLines(key, documentText(key, prior, "revise"), match, replace, maxBytes);
-      this.#putStateRow(tenantId, agentId, key, { value: kept, ref: null, bytes: kept.length });
-      return { bytes: kept.length, line, was };
+      const { kept, ...r } = reviseText(key, documentText(key, prior, "revise"), old, next, maxBytes);
+      return { ...this.#writeDocument(tenantId, agentId, key, kept, maxTotalBytes), ...r };
     });
+  }
+
+  async insertState(
+    tenantId: string, agentId: string, key: string, afterLine: number, text: string, maxBytes: number,
+    maxTotalBytes = Number.POSITIVE_INFINITY,
+  ) {
+    // One transaction, as in appendState.
+    return this.#tx(() => {
+      const before = documentText(key, this.#getStateRow(tenantId, agentId, key), "insert into");
+      const { kept, line } = insertLines(key, before, afterLine, text, maxBytes);
+      return { ...this.#writeDocument(tenantId, agentId, key, kept, maxTotalBytes), line };
+    });
+  }
+
+  /** A text document's new value, written inside the caller's transaction with `bytes` as `storedBytes`, unless that
+   *  would take the agent's rows past `maxTotalBytes` by growing this one (`totalRefusal`). */
+  #writeDocument(tenantId: string, agentId: string, key: string, kept: string, maxTotalBytes: number) {
+    const bytes = storedBytes(kept);
+    if (Number.isFinite(maxTotalBytes)) {
+      const u = this.#stateBytes(tenantId, agentId, key);
+      const refused = totalRefusal(u.total, u.own, bytes, maxTotalBytes);
+      if (refused) throw refused;
+    }
+    this.#putStateRow(tenantId, agentId, key, { value: kept, ref: null, bytes });
+    return { characters: kept.length, bytes };
+  }
+
+  /** The agent's rows' `bytes` summed, and the one row's, read in the caller's transaction. */
+  #stateBytes(tenantId: string, agentId: string, key: string) {
+    const q = "SELECT COALESCE(SUM(bytes),0) AS total, COALESCE(SUM(CASE WHEN key=? THEN bytes ELSE 0 END),0) AS own "
+      + "FROM agent_state WHERE tenant_id=? AND agent_id=?";
+    const b = [key, tenantId, agentId];
+    const r = this.#db.prepare(q).get(...(b as any[])) as any;
+    return { total: Number(r?.total ?? 0), own: Number(r?.own ?? 0) };
   }
 
   async getState(tenantId: string, agentId: string, key: string) {

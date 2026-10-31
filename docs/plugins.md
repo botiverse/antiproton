@@ -1202,7 +1202,7 @@ or subagents, under a prompt of its own (`assistantSystemPrompt`,
 `src/runtime/pi-prompt.ts`, the one entry point for it).
 
 Both the chat and every check are also offered the assistant's memory: `remember`, `put`, `get`, `list`,
-`forget` and `revise` on its state mount (`MEMORY_TOOLS`, `memoryMountOf`), never the `secret_*` tools. Raft's
+`forget`, `revise` and `insert` on its state mount (`MEMORY_TOOLS`, `memoryMountOf`), never the `secret_*` tools. Raft's
 `allowed_tools` narrows only the raft mount's tools in a check it runs, so it does not remove these. The state
 plugin's paragraph ("What you already know") is in both prompts, so every session starts with the notes, and is
 the only mount paragraph an assistant's prompts show; it is fixed per conversation like every agent's

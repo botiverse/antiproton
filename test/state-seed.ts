@@ -55,8 +55,9 @@ async function seed(store: SqliteStore, ...files: SeedWrite[]) {
 function keyWriters(plugin: ReturnType<typeof statePlugin>) {
   return plugin.tools.filter((t) => t.sideEffects === "write" && "key" in (((t.parameters as any)?.properties) ?? {})).map((t) => t.name);
 }
-// `match` is a piece of the one line both control documents below share, so `revise` has a line to change.
-const argsFor = (key: string) => ({ key, value: "changed by the agent", text: "a line added by the agent", match: "Learn the repo", replace: "a line revised by the agent" });
+// `old` is text both control documents below share, so `revise` has something to change; `after_line` 0 is a place
+// every document has, so `insert` has somewhere to put `text`.
+const argsFor = (key: string) => ({ key, value: "changed by the agent", text: "a line added by the agent", old: "Learn the repo", new: "text revised by the agent", after_line: 0 });
 const row = async (store: SqliteStore, key: string) => show(await store.getState("t", "a", key));
 const REFUSAL = /was provided at setup as read-only; it cannot be changed or removed\. Keep your own notes under another key\./;
 
@@ -65,8 +66,8 @@ const REFUSAL = /was provided at setup as read-only; it cannot be changed or rem
 await check("every tool declared as a write that takes a key is refused on a readonly path, and the working copy is untouched", async () => {
   const { store, plugin, ctx } = await fixture();
   const writers = keyWriters(plugin);
-  // Not vacuous: the enumeration finds the three that exist today.
-  for (const name of ["put", "remember", "forget", "revise"]) must(writers.includes(name), `the enumeration missed ${name}: ${show(writers)}`);
+  // Not vacuous: the enumeration finds the ones that exist today.
+  for (const name of ["put", "remember", "forget", "revise", "insert"]) must(writers.includes(name), `the enumeration missed ${name}: ${show(writers)}`);
   await seed(store, file("policy/rules.md", "Never push to main.\n", "readonly"));
   const before = await row(store, "policy/rules.md");
   for (const tool of writers) {
@@ -77,20 +78,24 @@ await check("every tool declared as a write that takes a key is refused on a rea
   }
 });
 
-await check("revise is refused on a readonly path even where its match is there, and changes a line of a writable one", async () => {
+await check("revise and insert are refused on a readonly path even where their text and line are there, and change a writable one", async () => {
   const { store, plugin, ctx } = await fixture();
   await seed(store, file("policy/rules.md", "Never push to main.\nReview before merge.\n", "readonly"), file("notes/plan.md", "1. Learn the repo\n2. Ship the fix\n"));
   const before = await row(store, "policy/rules.md");
-  // The match occurs exactly once, so only the read-only guard stands between this call and the line.
-  for (const args of [{ match: "push to main", replace: "Push anywhere." }, { match: "push to main" }]) {
+  // `old` occurs exactly once and line 1 exists, so only the read-only guard stands between these calls and the text.
+  for (const [tool, args] of [["revise", { old: "push to main", new: "Push anywhere." }], ["revise", { old: "push to main" }],
+    ["insert", { after_line: 1, text: "Push anywhere." }]] as const) {
     let threw = "";
-    try { await plugin.invoke("revise", { key: "policy/rules.md", ...args }, ctx); } catch (e) { threw = String((e as Error).message); }
-    must(REFUSAL.test(threw), `revise ${show(args)} on a readonly path: ${threw ? `threw ${show(threw)}` : "succeeded"}`);
-    must(await row(store, "policy/rules.md") === before, `revise changed the readonly working copy: ${await row(store, "policy/rules.md")}`);
+    try { await plugin.invoke(tool, { key: "policy/rules.md", ...args }, ctx); } catch (e) { threw = String((e as Error).message); }
+    must(REFUSAL.test(threw), `${tool} ${show(args)} on a readonly path: ${threw ? `threw ${show(threw)}` : "succeeded"}`);
+    must(await row(store, "policy/rules.md") === before, `${tool} changed the readonly working copy: ${await row(store, "policy/rules.md")}`);
   }
-  const r = await plugin.invoke("revise", { key: "notes/plan.md", match: "Ship", replace: "2. Ship the fix (done)" }, ctx) as any;
+  const r = await plugin.invoke("revise", { key: "notes/plan.md", old: "Ship the fix", new: "Ship the fix (done)" }, ctx) as any;
   must(r.line === 2, show(r));
   must((await store.getState("t", "a", "notes/plan.md"))?.value === "1. Learn the repo\n2. Ship the fix (done)\n", await row(store, "notes/plan.md"));
+  const i = await plugin.invoke("insert", { key: "notes/plan.md", after_line: 1, text: "1b. Read the tests" }, ctx) as any;
+  must(i.line === 2, show(i));
+  must((await store.getState("t", "a", "notes/plan.md"))?.value === "1. Learn the repo\n1b. Read the tests\n2. Ship the fix (done)\n", await row(store, "notes/plan.md"));
 });
 
 await check("controls: the same tools succeed on a writable seeded path and on an unseeded key; get and list work on a readonly one", async () => {
@@ -158,10 +163,10 @@ await check("get and list carry seed on a seeded path, and no seed field on any 
 
 // ---- the prompt -------------------------------------------------------------
 
-/** What `promptContribution` answered for this fixture before seeds existed, byte for byte, but for the sentence on correcting a
- *  document, which now names `revise` (src/plugins/state.ts `workingSetParts`). */
+/** What `promptContribution` answered for this fixture before seeds existed, byte for byte, but for the sentences on editing a
+ *  document, which now name its tools (src/plugins/state.ts `workingSetParts`). */
 const MASTER = {
-  mounted: "\n\n# What you already know\nWritten by you on earlier tasks, and shown here so you do not have to go and look. They are kept by the `notes` mount: when a line in one turns out to be wrong or stops being true, correct or delete that line with its `revise` tool; `remember` adds a line, and `forget` drops a whole document.\n\n## todo (open items)\nconfirm web-02\n\n## memory (durable facts)\nthe deploy window is Tuesday 02:00 UTC\n\n## journal (recent log)\n2026-10-01 rolled back web-01",
+  mounted: "\n\n# What you already know\nWritten by you on earlier tasks, and shown here so you do not have to go and look. They are kept by the `notes` mount, and each is one document you edit: its `revise` tool replaces a piece of text (or deletes it), `insert` adds lines at a line number, `remember` adds a line at the end, `put` rewrites a whole document, `get` reads one, and `forget` drops one. When something in one turns out to be wrong or stops being true, correct or delete it with `revise`.\n\n## todo (open items)\nconfirm web-02\n\n## memory (durable facts)\nthe deploy window is Tuesday 02:00 UTC\n\n## journal (recent log)\n2026-10-01 rolled back web-01",
   unmounted: "\n\n# What you already know\nWritten by you on earlier tasks, and shown here so you do not have to go and look. You have no tool mounted for changing it, so treat it as read-only and say so if it is wrong.\n\n## todo (open items)\nconfirm web-02\n\n## memory (durable facts)\nthe deploy window is Tuesday 02:00 UTC\n\n## journal (recent log)\n2026-10-01 rolled back web-01",
 };
 async function writeWorkingSet(plugin: ReturnType<typeof statePlugin>, ctx: PluginContext) {
@@ -379,9 +384,14 @@ await check("two mounts with seeds: the block is contributed once", async () => 
 
 // ---- a seeded MEMORY.md when full -----------------------------------------
 
-/** A plugin context with a small document cap, and the trace rows it was handed. */
-function capped(ctx: PluginContext, maxDocumentBytes: number) {
+/**
+ * A small document cap on the fixture's mount, and a plugin context carrying it, with the trace rows it was handed.
+ * The cap goes on the mount's row, where the plugin reads its settings from (src/plugins/state.ts `invoke`), and in
+ * the context too, as the gateway passes a call the row's own config: the two agree, as they do in a deployment.
+ */
+async function capped(store: SqliteStore, ctx: PluginContext, maxDocumentBytes: number) {
   const traced: any[] = [];
+  must(await store.updateMountConfig("t", "a", ctx.alias, { maxDocumentBytes }), `the cap on the ${ctx.alias} mount's row`);
   return { ctx: { ...ctx, publicConfig: { maxDocumentBytes }, trace: (r: unknown) => { traced.push(r); } } as unknown as PluginContext, traced };
 }
 const thrown = async (fn: () => Promise<unknown>): Promise<any> => {
@@ -392,7 +402,7 @@ const thrown = async (fn: () => Promise<unknown>): Promise<any> => {
 await check("a full writable seeded MEMORY.md refuses remember with MEMORY.md_full and its lines to the model, and is unchanged", async () => {
   const { store, plugin, ctx: base } = await fixture();
   await seed(store, file("MEMORY.md", "the owner is Ilse\nship on Tuesdays\n"));
-  const { ctx, traced } = capped(base, 50);
+  const { ctx, traced } = await capped(store, base, 50);
   const before = await row(store, "MEMORY.md");
   const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, ctx));
   must(e.code === "MEMORY.md_full" && String(e.message).startsWith("MEMORY.md_full: `MEMORY.md` is full: it is 35 characters"), `the refusal: ${show({ code: e.code, message: e.message })}`);
@@ -411,7 +421,7 @@ await check("a full writable seeded MEMORY.md refuses remember with MEMORY.md_fu
   must(await row(store, "MEMORY.md") === before, "the put changed the document");
   // Control: a line that fits is appended.
   const ok = await plugin.invoke("remember", { key: "MEMORY.md", text: "ok" }, ctx) as any;
-  must(ok.bytes === 37 && !ok.dropped, `a line that fits: ${show(ok)}`);
+  must(ok.characters === 37 && !ok.dropped, `a line that fits: ${show(ok)}`);
 });
 
 await check(`a full seeded MEMORY.md past ${SEEDED_MEMORY_BUDGET} characters says the prompt shows only its first ${SEEDED_MEMORY_BUDGET}; exactly at it, nothing`, async () => {
@@ -421,7 +431,8 @@ await check(`a full seeded MEMORY.md past ${SEEDED_MEMORY_BUDGET} characters say
     const text = ("m".repeat(99) + "\n").repeat(39) + "x".repeat(size - 3900 - 1) + "\n";
     must(text.length === size, `${size}: built ${text.length}`);
     await seed(store, file("MEMORY.md", text));
-    const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(1500) }, capped(base, 5000).ctx));
+    const { ctx } = await capped(store, base, 5000);
+    const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(1500) }, ctx));
     const sentence = `. The prompt shows only the first ${SEEDED_MEMORY_BUDGET} characters of \`MEMORY.md\`, saying where it is cut; \`get\` reads all of it`;
     must(e.code === "MEMORY.md_full" && String(e.message).endsWith(sentence) === says && (says || !String(e.message).includes("The prompt shows only")),
       `${size}: ${show({ code: e.code, message: String(e.message).slice(-200) })}`);
@@ -439,7 +450,8 @@ await check("the seeded block says a writable MEMORY.md refuses when full, and a
     must(mode === "writable" ? said : !text.includes(REFUSES), `${mode}: ${text}`);
     must(!text.includes(DROPS), `${mode} says it drops: ${text}`);
     if (mode === "writable") {
-      const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, capped(base, 50).ctx));
+      const { ctx } = await capped(store, base, 50);
+      const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, ctx));
       must(e.code === "MEMORY.md_full", `the remember: ${show({ code: e.code, message: e.message })}`);
     }
   }
@@ -448,7 +460,7 @@ await check("the seeded block says a writable MEMORY.md refuses when full, and a
 await check("a full read-only seeded MEMORY.md is refused by the seed guard first, not as full", async () => {
   const { store, plugin, ctx: base } = await fixture();
   await seed(store, file("MEMORY.md", "the owner is Ilse\nship on Tuesdays\n", "readonly"));
-  const { ctx } = capped(base, 50);
+  const { ctx } = await capped(store, base, 50);
   const before = await row(store, "MEMORY.md");
   const e = await thrown(() => plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, ctx));
   must(REFUSAL.test(String(e.message)) && e.code === undefined && e.modelOnlyText === undefined, `the refusal: ${show({ code: e.code, message: e.message })}`);
@@ -460,7 +472,7 @@ await check("an agent-named key, a seeded path not named MEMORY.md and an unseed
   await seed(store, file("notes/plan.md", "the owner is Ilse\nship on Tuesdays\n"));
   for (const key of ["notes", "notes/plan.md", "MEMORY.md"]) {
     if (key !== "notes/plan.md") await store.putState("t", "a", key, { value: "the owner is Ilse\nship on Tuesdays\n", ref: null, bytes: 0 });
-    const { ctx, traced } = capped(base, 50);
+    const { ctx, traced } = await capped(store, base, 50);
     const r = await plugin.invoke("remember", { key, text: "z".repeat(30) }, ctx) as any;
     must(r.dropped?.lines === 1 && r.dropped.text === "the owner is Ilse", `${key}: ${show(r)}`);
     must(traced.length === 1 && traced[0].kind === "state.dropped" && traced[0].attrs.key === "other", `${key}: ${show(traced)}`);
@@ -474,7 +486,7 @@ await check("an agent-written MEMORY.md of 33,000 characters, past the inline li
   must(typeof grown?.value === "string" && grown.value.length === 32_999 && JSON.stringify(grown.value).length > STATE_INLINE_MAX && !grown.ref, `grown: ${show({ chars: (grown?.value as string)?.length, ref: grown?.ref })}`);
   const r = await plugin.invoke("remember", { key: "MEMORY.md", text: "one more" }, ctx) as any;
   const after = await store.getState("t", "a", "MEMORY.md");
-  must(!r.dropped && r.bytes === 33_008 && !after?.ref && (after?.value as string).endsWith("\none more"), `the remember: ${show(r)} ref ${after?.ref}`);
+  must(!r.dropped && r.characters === 33_008 && !after?.ref && (after?.value as string).endsWith("\none more"), `the remember: ${show(r)} ref ${after?.ref}`);
 });
 
 await check("seeding: a writable MEMORY.md over the state mounts' smallest cap, or one that would be kept in object storage, is refused; read-only and other paths are not", async () => {
