@@ -760,6 +760,14 @@ export interface PluginErrorFields {
   /** The HTTP status the service answered with, when it answered. Trace row only, like `code`. */
   httpStatus?: number;
   /**
+   * Text for the model and nothing else: the gateway adds it after `message` in the error the call returns, and never
+   * puts it in the call's record (`ToolFailure`), from which the trace row and its export are written
+   * (src/trace/seams.ts `failureAttrs`). For what the agent itself wrote, such as the lines of its own notes, which
+   * must reach the model to act on and must not leave the agent's object. `message` is still recorded: keep it free of
+   * such text.
+   */
+  modelOnly?: string;
+  /**
    * Which identity the call was made with. Same value as `credentialState`, so
    * a reader badging a failure does not derive it from the sentence.
    */

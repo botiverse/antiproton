@@ -57,7 +57,9 @@ export type WhenFull = "drop" | "refuse";
  * The `put` it suggests for blank lines and layout has no number: what binds a
  * `put` is not this cap but `putRefusal`'s, in another unit.
  */
-export function documentFull(key: string, size: number, after: number, max: number, short: number, text: string): Error {
+export function documentFull(
+  key: string, size: number, after: number, max: number, short: number, text: string, lines: readonly string[],
+): Error {
   const code = `${key}_full`;
   return Object.assign(new Error(
     `${code}: \`${key}\` is full: it is ${size} characters, this ${multiline(text) ? "text" : "line"} adds ${after - size} `
@@ -65,7 +67,28 @@ export function documentFull(key: string, size: number, after: number, max: numb
     + `dropping them: free at least ${short} characters first, by deleting or shortening a line that is no longer true `
     + "with `revise` or dropping the whole document with `forget`, then remember this again. If what has to go is blank "
     + "lines or layout, `put` the document again, shorter, instead: `revise` changes a line that has text on it",
-  ), { code });
+  ), { code, modelOnly: numberedEntries(key, lines) });
+}
+
+/** How many of a full document's lines its refusal lists, and how much of each. */
+export const LISTED_LINES_MAX = 50;
+export const LISTED_LINE_CHARS = 200;
+
+/**
+ * A full document's lines as its refusal lists them, so the agent can choose what to free without reading the
+ * document first: numbered as `revise` counts them, blank lines left out (but still counted), each cut to
+ * LISTED_LINE_CHARS, the first LISTED_LINES_MAX that say something, then how many more there are. This is the agent's
+ * own writing, so it goes in `modelOnly`, never in the message, which the trace records.
+ */
+function numberedEntries(key: string, lines: readonly string[]): string {
+  const said = lines.map((l, n) => ({ n: n + 1, l: l.replace(/\r$/, "") })).filter((x) => !blank(x.l));
+  const shown = said.slice(0, LISTED_LINES_MAX).map(({ n, l }) => {
+    const cut = l.length > LISTED_LINE_CHARS ? `${l.slice(0, /[\uD800-\uDBFF]/.test(l[LISTED_LINE_CHARS - 1]!) ? LISTED_LINE_CHARS - 1 : LISTED_LINE_CHARS)}…` : l;
+    return `${n}: ${cut}`;
+  });
+  const more = said.length - shown.length;
+  return [`\`${key}\` now, by line number:`, ...shown,
+    ...(more > 0 ? [`… and ${more} more ${more === 1 ? "line" : "lines"}; \`get\` reads all of it`] : [])].join("\n");
 }
 
 /**
@@ -158,7 +181,7 @@ export function appendLines(
     // they go for free, and only content that would still have to go is refused. `revise` could not remove them.
     let free = length;
     while (free > max && i < lines.length && blank(lines[i]!)) { free -= lines[i]!.length + 1; i++; }
-    if (free > max) throw documentFull(key, size, length, max, free - max, text);
+    if (free > max) throw documentFull(key, size, length, max, free - max, text, lines);
     length = free;
   }
   while (length > max && i < lines.length) {

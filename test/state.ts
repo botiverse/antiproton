@@ -18,6 +18,7 @@ import { DurableObjectStore } from "../src/store/durable-object.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import type { StorageAdapter } from "../src/core/store.ts";
 import { QuickJsExecutor } from "../src/runtime/executor.ts";
+import { pendingTrace } from "../src/trace/outbox.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -564,6 +565,59 @@ await check("remember on a full memory or todo is refused on both stores, writes
         throw new Error(`${name}: ${key} no longer drops with a receipt: ${JSON.stringify(r)}`);
       }
     }
+  }
+});
+
+await check("a remember refusal lists the document's lines, numbered, to the model, and none of them reaches the record or the trace", async () => {
+  // The Durable Object store, behind the real gateway, so the trace rows read here are the outbox's own.
+  const host = sqliteHost();
+  const store = new DurableObjectStore({ storage: { sql: host.sql, transactionSync: host.transactionSync } } as any);
+  await store.init();
+  await store.createAgent("t", "a");
+  const plugin = statePlugin(store as StorageAdapter, null, "local");
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "notes", plugin: "state", installationId: "i", connectionId: null,
+    toolVersion: plugin.version, publicConfig: { maxDocumentBytes: 120 }, secretRef: null, policy: null });
+  const failures: any[] = [];
+  const complete = store.completeOperation.bind(store);
+  store.completeOperation = async (...args: Parameters<typeof complete>) => {
+    if (args[5]?.failure) failures.push(args[5].failure);
+    return complete(...args);
+  };
+  const gw = new ToolGateway(store as StorageAdapter, [plugin], new Set(["state"]), { async resolve() { return null; } });
+  const call = { tenantId: "t", agentId: "a", taskId: "k" };
+  const SENTINEL = "SENTINEL-MEM-4b1e the owner's daughter is Ilse";
+  await store.putState("t", "a", "memory", { value: `${SENTINEL}\n\nsecond fact 0123456789`, ref: null, bytes: 0 });
+  const out = await gw.invoke(call, "notes.remember", { key: "memory", text: "z".repeat(60) }) as any;
+  const shown = String(out.error?.message);
+  if (out.status !== "failed" || !shown.startsWith("memory_full: ")) throw new Error(`not refused: ${JSON.stringify(out)}`);
+  // Numbered as `revise` counts them: the blank line 2 is left out, and line 3 keeps its number.
+  if (!shown.includes(`\`memory\` now, by line number:\n1: ${SENTINEL}\n3: second fact 0123456789`)) throw new Error(`the model is not shown the lines: ${shown}`);
+  // The record is written from the message alone, before any cut, so this is not the 200-character trace limit's doing.
+  if (failures.length !== 1 || !String(failures[0].message).startsWith("memory_full: ") || JSON.stringify(failures).includes("SENTINEL")) {
+    throw new Error(`the record: ${JSON.stringify(failures)}`);
+  }
+  const rows = pendingTrace(host.sql as any, 0).rows;
+  const failed = rows.filter((r) => r.kind === "tool.call" && r.status === "failed");
+  if (failed.length !== 1 || failed[0]!.attrs.errorCode !== "memory_full" || !String(failed[0]!.attrs.error).startsWith("memory_full: ")) {
+    throw new Error(`the tool.call row: ${JSON.stringify(failed)}`);
+  }
+  for (const s of ["SENTINEL", "Ilse", "second fact"]) {
+    if (JSON.stringify(rows).includes(s)) throw new Error(`a trace row carries ${s}: ${JSON.stringify(rows)}`);
+  }
+});
+
+await check("the listing stops at 50 lines and 200 characters a line, and says how many more there are", async () => {
+  for (const { name, store, plugin } of await backends()) {
+    const ctx = capped(20_000);
+    const lines = Array.from({ length: 60 }, (_, i) => i === 0 ? `L0 ${"w".repeat(300)}` : `L${i} ${"v".repeat(200)}`);
+    await store.putState("t", "a", "todo", { value: lines.join("\n"), ref: null, bytes: 0 });
+    const r = await (async () => { try { await plugin.invoke("remember", { key: "todo", text: "y".repeat(8000) }, ctx); return null; } catch (e) { return e as any; } })();
+    const listed = String(r?.modelOnly ?? "");
+    const rows = listed.split("\n");
+    if (r?.code !== "todo_full" || rows[0] !== "`todo` now, by line number:" || rows.length !== 52) throw new Error(`${name}: ${rows.length} rows: ${listed.slice(0, 300)}`);
+    if (rows[1] !== `1: L0 ${"w".repeat(197)}…` || rows[50] !== `50: ${lines[49]!.slice(0, 200)}…`) throw new Error(`${name}: ${rows[1]} / ${rows[50]}`);
+    if (rows[51] !== "… and 10 more lines; `get` reads all of it") throw new Error(`${name}: ${rows[51]}`);
+    if (String(r.message).includes("L0 ") || String(r.message).includes("vvvv")) throw new Error(`${name}: the message carries the lines`);
   }
 });
 

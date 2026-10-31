@@ -1738,10 +1738,12 @@ export class ToolGateway {
       // The identity fields travel beside the sentence, not inside it: a page that marks an anonymous
       // failure should read a field, not match the plugin's wording (#434). Spread only what is there, so
       // a plugin that said nothing still produces the error every reader already handles.
+      // `modelOnly` is added here and only here, after the record above was written from `message` alone.
+      const modelOnly = typeof e.modelOnly === "string" && e.modelOnly ? `\n\n${e.modelOnly}` : "";
       return {
         status, operationId,
         error: {
-          code: "tool_error", message: e.message,
+          code: "tool_error", message: e.message + modelOnly,
           ...(e.identity === undefined ? {} : { identity: e.identity }),
           ...(e.credentialRef === undefined ? {} : { credentialRef: e.credentialRef }),
         },
