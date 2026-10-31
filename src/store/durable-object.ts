@@ -1,5 +1,5 @@
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
-import { appendLines, documentText, reviseLines } from "./state-lines.ts";
+import { appendLines, documentText, reviseLines, type WhenFull } from "./state-lines.ts";
 import type { PluginChoice, ToolSnapshot } from "../plugins/types.ts";
 import { AGENT_SCOPE_ALIAS, PluginDbTables } from "./plugin-db.ts";
 import { appendUsage, type UsageRow } from "../usage/outbox.ts";
@@ -595,7 +595,7 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async appendState(
-    tenantId: string, agentId: string, key: string, text: string, maxBytes: number,
+    tenantId: string, agentId: string, key: string, text: string, maxBytes: number, whenFull: WhenFull,
   ) {
     // What the text becomes is decided in state-lines.ts, the same for both stores.
     // Read and written in one synchronous transaction: an await between the two
@@ -603,7 +603,8 @@ export class DurableObjectStore implements StorageAdapter {
     // write discards the earlier one.
     return this.#tx(() => {
       const before = documentText(key, this.#getStateRow(tenantId, agentId, key), "append to");
-      const { kept, dropped } = appendLines(before, text, maxBytes);
+      // A refusal throws here, between the read and the write, so nothing is written and no other call can slip in.
+      const { kept, dropped } = appendLines(key, before, text, maxBytes, whenFull);
       this.#putStateRow(tenantId, agentId, key, { value: kept, ref: null, bytes: kept.length });
       return { bytes: kept.length, dropped };
     });
