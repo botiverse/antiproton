@@ -542,10 +542,19 @@ await check("remember on a full memory or todo is refused on both stores, writes
       for (const want of [`\`${key}\` is full: it is 33 characters, this line adds 30 to make it 63, and it holds at most 50`,
         "nothing was written", "free at least 13 characters first", "`revise`", "`forget`", "then remember this again",
         // No number for `put`: what binds a put is its JSON length, not this cap.
-        "blank lines or layout, `put` the document again, shorter, instead",
-        `The prompt shows only the first and last part of \`${key}\` past ${budget} characters`, "`get` reads all of it"]) {
+        "blank lines or layout, `put` the document again, shorter, instead"]) {
         if (!said.includes(want)) throw new Error(`${name}: ${key}: the refusal does not say ${JSON.stringify(want)}: ${said}`);
       }
+      // 33 characters is under the budget, shown whole, so no cut is claimed.
+      if (said.includes("The prompt shows only")) throw new Error(`${name}: ${key}: a cut claimed of a document shown whole: ${said}`);
+      // Past the budget it is, with the working set's own budget.
+      const big = capped(budget * 2);
+      await store.putState("t", "a", key, { value: Array.from({ length: Math.ceil((budget + 1) / 100) }, (_, i) => `${i}`.padEnd(99, "q")).join("\n"), ref: null, bytes: 0 });
+      const cut = await refusal(() => plugin.invoke("remember", { key, text: "z".repeat(budget) }, big));
+      if (cut.code !== `${key}_full` || !String(cut.threw).endsWith(`. The prompt shows only the first and last part of \`${key}\` past ${budget} characters, saying how much is left out between them; \`get\` reads all of it`)) {
+        throw new Error(`${name}: ${key}: past the budget: ${JSON.stringify(cut).slice(-300)}`);
+      }
+      await store.putState("t", "a", key, { value: before!.value, ref: null, bytes: before!.bytes });
       const after = await store.getState("t", "a", key);
       if (after?.value !== `${A}\n${B}` || after.value !== before?.value || after.bytes !== before.bytes) {
         throw new Error(`${name}: ${key}: a refused remember changed the document: ${JSON.stringify(after)}`);

@@ -566,7 +566,9 @@ imported file is the agent's own: it may change or remove it.
 that were in your workspace when you were created": `MEMORY.md`'s current text (what its `get` answers now, not the copy
 imported) fenced, up to **16,000** characters (`IMPORTED_MEMORY_BUDGET`, the 16 KB Raft agents are told to keep it
 under) with a line after the fence saying where the rest is (`… cut at 16000 of N characters; get \`MEMORY.md\` with
-the \`get\` tool on the \`state\` mount for the rest.`), or a note that it was removed. A copy over its row's
+the \`get\` tool on the \`state\` mount for the rest.`), or a note that it was removed. A copy kept in its row is
+headed by what a full one does, from the rule the write follows (`whenFullSentence`): an imported `MEMORY.md` drops
+its oldest lines, unlike a writable seeded one, which refuses. A copy over its row's
 bound (32 KiB as JSON) is kept in object storage, and shown all the same from the excerpt the import wrote beside it
 in the agent's own database (`import_excerpt`): the prompt never reads the bucket, and the excerpt is the same
 characters the row would have shown. Once the agent replaces that copy with another too large for its row, the
@@ -1335,6 +1337,13 @@ the system prompt (`src/runtime/prompt-context.ts`). Rules for `PUT …/seed`:
   kind named and none of the text). All of an agent's files together are at most 2,097,152 bytes
   (`413`). A file larger than 32 KiB as a state value is kept in object storage, both copies, as the
   state plugin keeps a large value; it reads back the same.
+- A writable `MEMORY.md` refuses a `remember` that does not fit, with `MEMORY.md_full`, as `memory`
+  does, instead of dropping its oldest lines. So it must start where the agent can still write to it:
+  at most the agent's `state` mounts' smallest `maxDocumentBytes` in characters (the default, 65,536,
+  when it has none), and at most 32 KiB as a state value, past which a seeded file is kept in object
+  storage, where a document cannot be appended to or revised; else `413`, `code: "too_large"`, naming
+  the file, its size and the limit, or `409 sealed` once sealed. A read-only one is not held to this. The
+  setup block says beside its text that a full one refuses.
 - The answer is `{ path, mode, bytes, sha256, changed }`: `bytes` the body's length and `sha256` the
   hex SHA-256 of the body, both as sent. The same bytes and mode again change nothing (`200`,
   `changed: false`); different bytes or mode before the seal replace both copies.

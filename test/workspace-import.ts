@@ -17,7 +17,8 @@ import { d1ProviderTokens, d1ProvisionedAgents } from "../cf/src/control-plane.t
 import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts";
 import { sha256Hex } from "../src/store/seed-files.ts";
 import { IMPORT_HOLD_MAX_MS } from "../src/store/workspace-import.ts";
-import { IMPORTED_MEMORY_BUDGET, importedFilesParts } from "../src/plugins/state.ts";
+import { IMPORTED_MEMORY_BUDGET, importedFilesParts, statePlugin } from "../src/plugins/state.ts";
+import type { PluginContext } from "../src/plugins/types.ts";
 import { ApStore } from "../src/store/ap-store.ts";
 import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { d1ServiceTokens } from "../cf/src/control-plane.ts";
@@ -312,6 +313,8 @@ await check("happy path: every file reads back through workspace-files exactly a
   must(((await w.rt.store.loadAgent(T, A))?.config as any)?.description === "You migrated here from a laptop.", "the agent's record");
   // Through the state plugin the agent itself uses, too.
   must((await w.rt.store.getState(T, A, "MEMORY.md"))?.value === "# Memory\nthe user prefers short answers\n", "state get");
+  // An imported file is the agent's own: no seed row, so the state plugin treats its MEMORY.md as unseeded.
+  must((await w.rt.store.listSeedFiles(T, A)).length === 0, `seed rows: ${show(await w.rt.store.listSeedFiles(T, A))}`);
 });
 
 await check("GET /provision/import-limits answers the bounds Raft's exporter applies", async () => {
@@ -561,6 +564,19 @@ await check(`an imported MEMORY.md is shown whole up to ${IMPORTED_MEMORY_BUDGET
   must(IMPORTED_MEMORY_BUDGET === 16_000, `the budget is ${IMPORTED_MEMORY_BUDGET}`);
 });
 
+await check("an imported MEMORY.md's paragraph says a full one drops its oldest lines, and a remember on a full one does", async () => {
+  const w = await world();
+  const text = "the owner is Ilse\nship on Tuesdays\n";
+  must((await imp(w, body(uuid(), [{ path: "MEMORY.md", bytes: text }]))).status === 201, "import");
+  const shown = (await importedFilesParts(w.rt.store, T, A, new Set())).text;
+  must(shown.includes("in your workspace when you were created\nWhen it is full, a `remember` to it drops its oldest lines to make room. Its current content is the text inside the fence below:"), `the paragraph: ${shown}`);
+  must(!shown.includes("is refused"), `the paragraph says it refuses: ${shown}`);
+  const plugin = statePlugin(w.rt.store, null, "local");
+  const ctx = { publicConfig: { maxDocumentBytes: 50 }, credential: null, caller: { tenantId: T, agentId: A, taskId: "k" }, alias: "state" } as unknown as PluginContext;
+  const r = await plugin.invoke("remember", { key: "MEMORY.md", text: "z".repeat(30) }, ctx) as any;
+  must(r.dropped?.lines === 1 && r.dropped.text === "the owner is Ilse", `the remember: ${show(r)}`);
+});
+
 await check("a path shaped like a credential is refused (credential_in_path) on the import and the check, named null, and never repeated in any answer", async () => {
   const w = await world();
   const SECRET_PATH = "notes/sk-ant-api03-" + "P".repeat(90) + ".md";
@@ -595,6 +611,8 @@ await check("an imported MEMORY.md kept in object storage is shown from the exce
     // The row's bound is 32 KiB of JSON characters: past it the copy is in the bucket and the row holds only its name.
     const spilled = JSON.stringify(text).length > 32 * 1024;
     must(spilled === (row?.value == null && !!row?.ref), `${n}: spilled ${spilled}, row ${show({ value: typeof row?.value, ref: row?.ref })}`);
+    // Accepted and kept in object storage with no seed row: an import takes a MEMORY.md past the inline limit.
+    must((await w.rt.store.listSeedFiles(T, A)).length === 0, `${n}: seed rows`);
     const reads: string[] = [];
     const { get, head } = w.R2;
     w.R2.get = async (k: string) => { reads.push(k); return get(k); };
