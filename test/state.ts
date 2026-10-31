@@ -1182,6 +1182,27 @@ await check("with two state mounts, memory's cap and prompt budget are the small
   if (past.status !== "failed" || !String(past.error?.message).includes("holds at most 8000 characters")) throw new Error(`big.put past 8000: ${JSON.stringify(past).slice(0, 300)}`);
 });
 
+await check("with two state mounts, the store's total and the largest value are the smaller of each, whichever mount writes", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  const plugin = statePlugin(store, null, "local");
+  // The looser first, so reading the first or the calling mount's alone would let it through.
+  for (const [alias, cfg] of [["loose", { maxTotalBytes: 1_000_000, maxValueBytes: 1_000_000 }], ["strict", { maxTotalBytes: 200, maxValueBytes: 300 }]] as const) {
+    await store.addMount({ tenantId: "t", agentId: "a", alias, plugin: "state", installationId: alias, connectionId: null,
+      toolVersion: plugin.version, publicConfig: cfg, secretRef: null, policy: null });
+  }
+  const gw = new ToolGateway(store, [plugin], new Set(["state"]), { async resolve() { return null; } });
+  const call = { tenantId: "t", agentId: "a", taskId: "k" };
+  for (const alias of ["loose", "strict"]) {
+    const total = await gw.invoke(call, `${alias}.put`, { key: `n-${alias}`, value: "v".repeat(250) }) as any;
+    if (total.status !== "failed" || !/store_full|past 200/.test(JSON.stringify(total))) throw new Error(`${alias}: total past 200 was let through: ${JSON.stringify(total).slice(0, 300)}`);
+    const value = await gw.invoke(call, `${alias}.put`, { key: `v-${alias}`, value: { big: "w".repeat(400) } }) as any;
+    if (value.status !== "failed") throw new Error(`${alias}: a value past 300 was let through: ${JSON.stringify(value).slice(0, 300)}`);
+  }
+  if ((await store.stateUsage("t", "a")).bytes > 200) throw new Error("the store passed the smaller total");
+});
+
 await check("configOf takes a limit only as a finite number of at least 1, floored; 0, a negative or a fraction under 1 is the default", async () => {
   const d = configOf({});
   for (const bad of [0, -5, 0.5, Number.NaN, Number.POSITIVE_INFINITY, "100", null]) {

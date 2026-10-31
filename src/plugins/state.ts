@@ -230,17 +230,19 @@ export function seedFitProblem(
 export const memoryBudgetOf = (cfg: StateSettings): number => cfg.memoryMaxCharacters;
 
 /**
- * The settings an agent's documents are held to, from the settings of each of its `state` mounts (`configOf`), the
- * calling one first: the smallest `maxDocumentBytes` and the smallest `memoryMaxCharacters`, since the mounts share
- * one store, so a write through any of them, the prompt (`workingSetParts`) and seeding (`seedFitProblem`) hold a
- * document to one number. The other limits are the first's, the call's own. None is the defaults'.
+ * The settings an agent's documents are held to, from the settings of each of its `state` mounts (`configOf`): the
+ * smallest of every limit, since the mounts share one store, so a write through any of them, the prompt
+ * (`workingSetParts`) and seeding (`seedFitProblem`) hold it to one number, and no mount's alias is a way past
+ * another's limit on that store. With no mount, the defaults.
  */
 export function sharedSettings(cfgs: readonly StateSettings[]): StateSettings {
   const all = cfgs.length ? cfgs : [configOf({})];
+  const least = (k: keyof StateSettings) => Math.min(...all.map((c) => c[k]));
   return {
-    ...all[0]!,
-    maxDocumentBytes: Math.min(...all.map((c) => c.maxDocumentBytes)),
-    memoryMaxCharacters: Math.min(...all.map((c) => c.memoryMaxCharacters)),
+    maxTotalBytes: least("maxTotalBytes"),
+    maxValueBytes: least("maxValueBytes"),
+    maxDocumentBytes: least("maxDocumentBytes"),
+    memoryMaxCharacters: least("memoryMaxCharacters"),
   };
 }
 
