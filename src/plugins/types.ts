@@ -333,6 +333,8 @@ export interface AssistantDecisionLog {
   get(checkId: string): Promise<AssistantDecision | null>;
   /** Drops this agent's rows past their retention (src/store/assistant-decisions.ts). */
   prune(): Promise<void>;
+  /** The wake's final count of what its code saw sent, on its note (`AssistantDecision.sentActual`). */
+  setSentActual(checkId: string, sentActual: number): Promise<void>;
 }
 
 export interface PluginContext {

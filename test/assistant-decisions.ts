@@ -27,7 +27,7 @@ const show = (v: unknown) => JSON.stringify(v);
 const DAY = 24 * 3_600_000;
 const T0 = Date.parse("2026-10-01T00:00:00Z");
 const note = (checkId: string, notedAt: number, o: Partial<AssistantDecision> = {}): AssistantDecision => ({
-  checkId, wokeAt: notedAt - 1_000, notedAt, sent: 1, reason: `why ${checkId}`,
+  checkId, wokeAt: notedAt - 1_000, notedAt, sent: 1, sentActual: 1, reason: `why ${checkId}`,
   sources: [{ conversation: "c0ffee00-0000-4000-8000-000000000001", msg: "aaaaaaa1-1111-4222-8333-444455556666", ownerVisible: true }], ...o,
 });
 
@@ -72,6 +72,20 @@ await check("the operator's read: noted in [from, to), newest first; an object w
   for (const [id, d] of [["d0", 0], ["d1", 1], ["d2", 2]] as const) t.put("t", "a", note(id, T0 + d * DAY));
   const got = readAssistantDecisions(host.sql, "t", "a", { from: T0 + DAY, to: T0 + 3 * DAY });
   must(show(got.map((d) => d.checkId)) === show(["d2", "d1"]), show(got));
+  host.dispose();
+});
+
+await check("sentActual is kept beside sent, set again at the wake's end; an agent's delete drops its rows alone", () => {
+  const host = sqliteHost();
+  const t = new AssistantDecisionTables(host).ensure();
+  t.put("t", "a", note("w1", Date.now(), { sent: 1, sentActual: null }));
+  must(t.get("t", "a", "w1")?.sentActual === null && t.get("t", "a", "w1")?.sent === 1, show(t.get("t", "a", "w1")));
+  t.setSentActual("t", "a", "w1", 0);
+  t.setSentActual("t", "a", "no-such-wake", 3);
+  must(t.get("t", "a", "w1")?.sentActual === 0 && t.get("t", "a", "w1")?.sent === 1 && t.list("t", "a").length === 1, show(t.list("t", "a")));
+  t.put("t", "b", note("w1", Date.now()));
+  t.deleteAgent("t", "a");
+  must(t.list("t", "a").length === 0 && t.list("t", "b").length === 1, `after the delete: ${show(t.list("t", "a"))} ${show(t.list("t", "b"))}`);
   host.dispose();
 });
 

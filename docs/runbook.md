@@ -52,8 +52,10 @@ SELECT datetime(at / 1000, 'unixepoch'), route, agent_id, session, token_kind, t
 ```
 
 A personal assistant's checks each leave a private note of what they decided: how many messages the wake sent its
-owner, one sentence on why, and the messages it went on, each with `ownerVisible` (`true` only when an owner read in
-the same wake showed that message, else `"unknown"`). The owner never sees them; they are kept 30 days in the agent's
+owner as the model says (`sent`) and as the code counted its sends (`sentActual`, the one to measure with; null when
+the object restarted during the wake), one sentence on why, and the messages it went on, each with `ownerVisible`
+(`true` only when an owner read in the same wake showed that message, as the read showed it, else `"unknown"`). An
+agent's delete deletes its notes. The owner never sees them; they are kept 30 days in the agent's
 own object (`src/store/assistant-decisions.ts`) and read, newest first, with `from` and `to` as epoch milliseconds or
 ISO times (the last 30 days when left out):
 

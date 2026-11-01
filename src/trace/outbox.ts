@@ -164,8 +164,9 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * `todo` refuse the line instead, and write none): the document's `key` and how many `lines` and `characters` went, never the lines or the document (src/plugins/state.ts `invoke`).
  * It is not forwarded: the receiver has no such kind (cf/src/trace-forward.ts `AGENT_TRACE_FIELDS`).
  * `raft.assistant_decision` is the end of a personal assistant's check session: whether it left a note of what it
- * decided (`noted`, status `noted` or `not_noted`), the note's `sent` (null without one), how many `sources` it gave and
- * how many of them the owner's reads showed (`ownerVisibleSources`), and the wake's `trigger`; never the note's reason
+ * decided (`noted`, status `noted` or `not_noted`), the note's `sent` (null without one), `sentActual` (the DMs the
+ * wake's notify calls sent, as its code counted them; null when the object did not see the wake start), how many
+ * `sources` it gave and how many of them the owner's reads showed (`ownerVisibleSources`), and the wake's `trigger`; never the note's reason
  * or a message id, which stay in the agent's own storage (src/plugins/raft-assistant.ts `decisionEnded`). Not forwarded.
  */
 export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake", "raft.assistant_notify",

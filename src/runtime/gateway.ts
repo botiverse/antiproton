@@ -1959,6 +1959,7 @@ export class ToolGateway {
           put: async (d: AssistantDecision) => store.assistantDecisions.put(ctx.tenantId, ctx.agentId, d),
           get: async (checkId: string) => store.assistantDecisions.get(ctx.tenantId, ctx.agentId, checkId),
           prune: async () => store.assistantDecisions.prune(ctx.tenantId, ctx.agentId),
+          setSentActual: async (checkId: string, n: number) => store.assistantDecisions.setSentActual(ctx.tenantId, ctx.agentId, checkId, n),
         },
       } : {}),
       // A plugin's own facts, beside the spans the kernel writes (`PluginContext.trace`). Its span is the operation

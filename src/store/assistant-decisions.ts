@@ -10,7 +10,8 @@
  * read is.
  *
  * Kept `ASSISTANT_DECISIONS_RETENTION_MS` (30 days): every write deletes this agent's older rows in the same
- * transaction, the one place that already runs for every wake that has anything to keep.
+ * transaction, the one place that already runs for every wake that has anything to keep. An agent's delete deletes all
+ * of its rows (`deleteAgent`): the agent's object outlives its delete.
  *
  * Shared by both storage backends, as `PluginDbTables` is, so the table is defined once; the operator's read
  * (`readAssistantDecisions`) is SELECTs alone, for a route that must not run the store's migrations.
@@ -20,7 +21,7 @@ import type { SqlHost } from "./pi-storage.ts";
 export const ASSISTANT_DECISIONS_SCHEMA: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS assistant_decisions (
      tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, check_id TEXT NOT NULL,
-     woke_at INTEGER NOT NULL, noted_at INTEGER NOT NULL, sent INTEGER NOT NULL, reason TEXT NOT NULL, sources TEXT NOT NULL,
+     woke_at INTEGER NOT NULL, noted_at INTEGER NOT NULL, sent INTEGER NOT NULL, sent_actual INTEGER, reason TEXT NOT NULL, sources TEXT NOT NULL,
      PRIMARY KEY (tenant_id, agent_id, check_id))`,
   `CREATE INDEX IF NOT EXISTS assistant_decisions_by_time ON assistant_decisions (tenant_id, agent_id, noted_at)`,
 ];
@@ -43,7 +44,14 @@ export interface AssistantDecision {
   /** When the wake posted its session; the note's own time when that was not seen. */
   wokeAt: number;
   notedAt: number;
+  /** What the model said it sent. */
   sent: number;
+  /**
+   * What the wake's code saw sent: the notify calls that sent the owner a DM in this wake's session, counted as they
+   * returned. Null when this object did not see the wake start (it restarted since), so the count would be partial. The
+   * one the stats use; a difference from `sent` is itself a signal.
+   */
+  sentActual: number | null;
   reason: string;
   sources: DecisionSource[];
 }
@@ -58,11 +66,12 @@ function rowOf(r: Record<string, unknown>): AssistantDecision {
   } catch { /* a damaged cell reads as no sources rather than failing the read */ }
   return {
     checkId: String(r.check_id), wokeAt: Number(r.woke_at), notedAt: Number(r.noted_at), sent: Number(r.sent),
+    sentActual: r.sent_actual === null || r.sent_actual === undefined ? null : Number(r.sent_actual),
     reason: String(r.reason), sources,
   };
 }
 
-const SELECT = "SELECT check_id, woke_at, noted_at, sent, reason, sources FROM assistant_decisions";
+const SELECT = "SELECT check_id, woke_at, noted_at, sent, sent_actual, reason, sources FROM assistant_decisions";
 
 export class AssistantDecisionTables {
   #host: SqlHost;
@@ -83,13 +92,23 @@ export class AssistantDecisionTables {
   put(tenantId: string, agentId: string, d: AssistantDecision): void {
     this.#host.transactionSync(() => {
       this.#host.sql.exec(
-        `INSERT INTO assistant_decisions(tenant_id, agent_id, check_id, woke_at, noted_at, sent, reason, sources) VALUES (?,?,?,?,?,?,?,?)
+        `INSERT INTO assistant_decisions(tenant_id, agent_id, check_id, woke_at, noted_at, sent, sent_actual, reason, sources) VALUES (?,?,?,?,?,?,?,?,?)
          ON CONFLICT(tenant_id, agent_id, check_id) DO UPDATE SET
-           woke_at=excluded.woke_at, noted_at=excluded.noted_at, sent=excluded.sent, reason=excluded.reason, sources=excluded.sources`,
-        tenantId, agentId, d.checkId, d.wokeAt, d.notedAt, d.sent, d.reason, JSON.stringify(d.sources),
+           woke_at=excluded.woke_at, noted_at=excluded.noted_at, sent=excluded.sent, sent_actual=excluded.sent_actual, reason=excluded.reason, sources=excluded.sources`,
+        tenantId, agentId, d.checkId, d.wokeAt, d.notedAt, d.sent, d.sentActual, d.reason, JSON.stringify(d.sources),
       );
       this.prune(tenantId, agentId);
     });
+  }
+
+  /** The wake's final count of what its code saw sent, on its note when it left one; nothing when it did not. */
+  setSentActual(tenantId: string, agentId: string, checkId: string, sentActual: number): void {
+    this.#host.sql.exec("UPDATE assistant_decisions SET sent_actual=? WHERE tenant_id=? AND agent_id=? AND check_id=?", sentActual, tenantId, agentId, checkId);
+  }
+
+  /** Every row of this agent's: its delete (cf/src/runtime.ts `stopTurn`), since the object itself is kept. */
+  deleteAgent(tenantId: string, agentId: string): void {
+    this.#host.sql.exec("DELETE FROM assistant_decisions WHERE tenant_id=? AND agent_id=?", tenantId, agentId);
   }
 
   /** Deletes this agent's rows noted more than `ASSISTANT_DECISIONS_RETENTION_MS` ago. */

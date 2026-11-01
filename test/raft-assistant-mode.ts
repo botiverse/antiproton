@@ -4189,13 +4189,14 @@ const callOf = (id: string, name: string, args: unknown) =>
  * Raft's check run through the real runtime (`runtimeWith`), its check's model answering with `steps` in order, one per
  * call, and "done" after them. Answers the runtime, its database and every model call the check made.
  */
-async function checkRun(steps: ModelResponse[], o: { allowed?: string[] } = {}) {
+async function checkRun(steps: ModelResponse[], o: { allowed?: string[]; unread?: unknown[] } = {}) {
   let n = 0;
   const w = await runtimeWith(true, (c) => {
     if (!c.systemPrompt.includes("exactly one call")) return say("noted");
     return steps[n++] ?? say("done");
   });
   w.r.raftCheck = true;
+  if (o.unread) (w.r as any).unread = o.unread;
   w.db.write(ASSISTANT_STORE, OWNER_KEY, { ...w.db.read(ASSISTANT_STORE, OWNER_KEY), raftCheck: true });
   w.db.write(ASSISTANT_STORE, "raft_checks", { doorbell: { ...(await import("../src/plugins/raft-assistant-check.ts")).checkOf(raftCheckPayload({ allowed_tools: o.allowed ?? ["notify", "owner_messages"] })), at: Date.now() } });
   askWake(w.host.sql, "raft", Date.now());
@@ -4239,11 +4240,11 @@ await check("note_decision: stored with its fields, the last of a wake's notes k
     const rows = w.decisions();
     must(rows.length === 1, `one row per wake: ${show(rows)}`);
     const d = rows[0];
-    must(d.tenant_id === "t" && d.agent_id === "a" && d.check_id === CHECK_ID && d.sent === 0 && d.reason === SENTINEL, `fields: ${show(d)}`);
+    must(d.tenant_id === "t" && d.agent_id === "a" && d.check_id === CHECK_ID && d.sent === 0 && d.sent_actual === 0 && d.reason === SENTINEL, `fields: ${show(d)}`);
     must(typeof d.woke_at === "number" && d.woke_at > 0 && d.woke_at <= d.noted_at, `times: ${show(d)}`);
     must(show(JSON.parse(d.sources)) === show([{ ...sources[0], ownerVisible: true }, { ...sources[1], ownerVisible: "unknown" }]), `sources: ${d.sources}`);
     const end = w.decisionRows();
-    must(end.length === 1 && end[0].status === "noted" && show(end[0].attrs) === show({ mount: "raft", noted: true, sent: 0, sources: 2, ownerVisibleSources: 1, trigger: "doorbell" }), `the end: ${show(end)}`);
+    must(end.length === 1 && end[0].status === "noted" && show(end[0].attrs) === show({ mount: "raft", noted: true, sent: 0, sentActual: 0, sources: 2, ownerVisibleSources: 1, trigger: "doorbell" }), `the end: ${show(end)}`);
     // The reason and the ids are nowhere but the decisions' table: no trace row, outbox row, operation or kept state.
     const elsewhere = w.everywhereElse();
     for (const needle of ["SENTINEL", "a first try", SEEN_MSG.slice(0, 8) + "-1111-4222-8333-444455556666\",\"ownerVisible", UNSEEN_MSG]) must(!elsewhere.includes(needle), `${needle} is stored outside the decisions: ${elsewhere.split("\n").filter((l) => l.includes(needle)).map((l) => l.slice(0, 120))}`);
@@ -4258,7 +4259,7 @@ await check("note_decision: an id no owner read showed in this wake is unknown, 
   // A read outside a check is not one of a wake's.
   reads.saw({ caller: { tenantId: "t", agentId: "a", taskId: "t_a" } }, [UNSEEN_MSG]);
   const kept: any[] = [];
-  const log = { put: async (d: unknown) => { kept.push(d); }, get: async () => null, prune: async () => {} };
+  const log = { put: async (d: unknown) => { kept.push(d); }, get: async () => null, prune: async () => {}, setSentActual: async () => {} };
   const now = `assistant.raft_check:doorbell:${CHECK_ID}`;
   await noteDecision({ sent: 0, reason: "r", sources: [{ conversation: conv(1).channelId, msg: SEEN_MSG }, { conversation: conv(2).channelId, msg: UNSEEN_MSG }] },
     { ...ctx(now), assistantDecisions: log } as never, reads);
@@ -4274,7 +4275,7 @@ await check("a check that leaves no note: its end is a raft.assistant_decision r
     must(w.r.notifies.length === 1, `control: the check ran: ${show(w.r.notifies)}`);
     must(w.decisions().length === 0, `a row with no note: ${show(w.decisions())}`);
     const end = w.decisionRows();
-    must(end.length === 1 && end[0].status === "not_noted" && show(end[0].attrs) === show({ mount: "raft", noted: false, sent: null, sources: 0, ownerVisibleSources: 0, trigger: "doorbell" }), `the end: ${show(end)}`);
+    must(end.length === 1 && end[0].status === "not_noted" && show(end[0].attrs) === show({ mount: "raft", noted: false, sent: null, sentActual: 1, sources: 0, ownerVisibleSources: 0, trigger: "doorbell" }), `the end: ${show(end)}`);
   } finally { w.host.dispose(); }
 });
 
@@ -4297,6 +4298,82 @@ await check("note_decision failing: the refusal repeats nothing it was given, an
     }
     const end = w.decisionRows();
     must(end.length === 1 && end[0].attrs.noted === false, `the end: ${show(end)}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("note_decision: ownerVisible holds the ids as the reads rendered them: a messages line's short msg= id and an inbox row's whole id", async () => {
+  const shortSeen = SEEN_MSG.slice(0, 8), inboxId = conv(2).firstUnreadMessageId;
+  const w = await checkRun([
+    callOf("r1", "raft__assistant_owner_messages", { channelId: conv(1).channelId }),
+    callOf("r2", "raft__assistant_owner_inbox", { filter: "unread" }),
+    callOf("d1", "raft__note_decision", { sent: 0, reason: "r", sources: [
+      { conversation: conv(1).channelId, msg: shortSeen }, { conversation: conv(2).channelId, msg: inboxId }, { conversation: conv(3).channelId, msg: "bbbbbbb2" },
+      // Near misses, which only a fuzzy match would take: a shown id's neighbour, and part of a whole id.
+      { conversation: conv(1).channelId, msg: "aaaaaaa9" }, { conversation: conv(1).channelId, msg: SEEN_MSG.slice(0, 13) },
+    ] }),
+ ], { allowed: ["notify", "owner_messages", "owner_inbox"], unread: [conv(2)] });
+  try {
+    // What the model was shown: the real rendering of both reads, in the results it was handed.
+    const shown = w.checkCalls().at(-1)!.messages.filter((m: any) => m.role === "toolResult")
+      .flatMap((m: any) => m.content.map((c: any) => { try { return String(JSON.parse(c.text)); } catch { return String(c.text); } })).join("\n");
+    must(shown.includes(`msg=${shortSeen} `) && !shown.includes(`msg=${SEEN_MSG}`), `the messages line does not show the short id: ${shown.slice(0, 600)}`);
+    must(shown.includes(`"firstUnreadMessageId":"${inboxId}"`), `the inbox row does not show the whole id: ${shown}`);
+    const d = w.decisions()[0];
+    must(show(JSON.parse(d.sources).map((x: any) => x.ownerVisible)) === show([true, true, "unknown", "unknown", "unknown"]), `sources: ${d?.sources}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("note_decision: the code's own count of what the wake sent is kept beside the model's: says 1, sent 0; says 0, sent 1 after the note", async () => {
+  const w = await checkRun([callOf("d1", "raft__note_decision", { sent: 1, reason: "told them about the launch", sources: [] })]);
+  try {
+    must(w.r.notifies.length === 0, `control: nothing was sent: ${show(w.r.notifies)}`);
+    const d = w.decisions()[0];
+    must(d && d.sent === 1 && d.sent_actual === 0, `both numbers: ${show(d)}`);
+    const end = w.decisionRows();
+    must(end.length === 1 && end[0].attrs.sent === 1 && end[0].attrs.sentActual === 0, `the end: ${show(end)}`);
+  } finally { w.host.dispose(); }
+  // The note first, the send after it: the end puts the final count on the note.
+  const v = await checkRun([
+    callOf("d1", "raft__note_decision", { sent: 0, reason: "nothing yet", sources: [] }),
+    callOf("n1", "raft__assistant_notify_owner", { items: [{ channelId: conv(1).channelId, summary: "@bob asks for a date" }] }),
+  ]);
+  try {
+    must(v.r.notifies.length === 1, `control: the notify ran: ${show(v.r.notifies)}`);
+    const d = v.decisions()[0];
+    must(d && d.sent === 0 && d.sent_actual === 1, `after the send: ${show(d)}`);
+    must(v.decisionRows()[0]?.attrs.sentActual === 1, show(v.decisionRows()));
+  } finally { v.host.dispose(); }
+});
+
+await check("note_decision: the note carries the count its wake's code saw so far, and null for a wake this object did not see start", async () => {
+  const reads = new WakeReads();
+  const key = `assistant.raft_check:doorbell:${CHECK_ID}`;
+  const ctx = { caller: { tenantId: "t", agentId: "a", taskId: "iso_x", turnKey: key } };
+  const kept: any[] = [];
+  const log = { put: async (d: unknown) => { kept.push(d); }, get: async () => null, prune: async () => {}, setSentActual: async () => {} };
+  const call = (sent: number) => noteDecision({ sent, reason: "r", sources: [] }, { ...ctx, assistantDecisions: log } as never, reads);
+  await call(1);
+  must(kept[0].sent === 1 && kept[0].sentActual === null, `not seen to start: ${show(kept[0])}`);
+  reads.started(ctx, key, Date.now());
+  await call(1);
+  must(kept[1].sent === 1 && kept[1].sentActual === 0, `says 1, sent 0: ${show(kept[1])}`);
+  reads.sentOne(ctx);
+  // A send outside a check is not this wake's.
+  reads.sentOne({ caller: { tenantId: "t", agentId: "a", taskId: "t_a" } });
+  await call(0);
+  must(kept[2].sent === 0 && kept[2].sentActual === 1, `says 0, sent 1: ${show(kept[2])}`);
+});
+
+await check("an assistant's delete deletes its notes of what its checks decided; the object itself is kept", async () => {
+  const w = await checkRun([callOf("d1", "raft__note_decision", { sent: 0, reason: SENTINEL, sources: [] })]);
+  try {
+    must(w.decisions().length === 1, `control: a note was kept: ${show(w.decisions())}`);
+    // Another agent's row in the same table, which the delete must leave.
+    w.rt.store.assistantDecisions.put("t", "other", { checkId: "x", wokeAt: Date.now(), notedAt: Date.now(), sent: 0, sentActual: 0, reason: "r", sources: [] });
+    await w.rt.stopTurn("t", "a", "delete");
+    must(w.decisions().filter((d) => d.agent_id === "a").length === 0, `kept after the delete: ${show(w.decisions())}`);
+    must(w.decisions().filter((d) => d.agent_id === "other").length === 1, "another agent's row went too");
+    must((await w.rt.store.loadAgent("t", "a")) !== null, "control: the delete keeps the agent's record, so the rows were the delete's to drop");
   } finally { w.host.dispose(); }
 });
 

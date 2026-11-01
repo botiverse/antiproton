@@ -1464,23 +1464,24 @@ const WAKES_HELD_MAX = 64;
 const WAKE_IDS_MAX = 2_000;
 
 /**
- * Per wake, in memory and nowhere else: when it posted its session, and the ids of the messages its owner reads showed
- * (`saw`), so a note can say which of its sources the owner could see (`ownerVisible`). Only the ids are kept, never a
+ * Per wake, in memory and nowhere else: when it posted its session, the ids of the messages its owner reads showed
+ * (`saw`), so a note can say which of its sources the owner could see (`ownerVisible`), and how many DMs its notify
+ * calls sent (`sentOne`), so the note keeps what was sent beside what the model says it sent (`sentActual`). Only the ids are kept, never a
  * read's result. A restarted object starts empty, and a note made then says "unknown" for every source, which is what
  * it can tell. Let go of when the wake's session ends (`decisionEnded`).
  */
 export class WakeReads {
-  #wakes = new Map<string, { at: number | null; ids: Set<string> }>();
+  #wakes = new Map<string, { at: number | null; ids: Set<string>; sent: number }>();
 
   #key(ctx: Pick<PluginContext, "caller">, wake: string): string {
     return `${ctx.caller.tenantId}/${ctx.caller.agentId}/${wake}`;
   }
 
-  #entry(ctx: Pick<PluginContext, "caller">, wake: string): { at: number | null; ids: Set<string> } {
+  #entry(ctx: Pick<PluginContext, "caller">, wake: string): { at: number | null; ids: Set<string>; sent: number } {
     const k = this.#key(ctx, wake);
     let e = this.#wakes.get(k);
     if (!e) {
-      e = { at: null, ids: new Set() };
+      e = { at: null, ids: new Set(), sent: 0 };
       this.#wakes.set(k, e);
       while (this.#wakes.size > WAKES_HELD_MAX) this.#wakes.delete(this.#wakes.keys().next().value!);
     }
@@ -1504,8 +1505,19 @@ export class WakeReads {
     }
   }
 
-  seen(ctx: Pick<PluginContext, "caller">, wake: string): { at: number | null; ids: ReadonlySet<string> } {
-    return this.#wakes.get(this.#key(ctx, wake)) ?? { at: null, ids: new Set() };
+  /** A notify call in the session of `ctx` sent the owner a DM. Nothing outside a check's session. */
+  sentOne(ctx: Pick<PluginContext, "caller">): void {
+    const wake = wakeKeyOf(ctx.caller.turnKey);
+    if (wake) this.#entry(ctx, wake).sent++;
+  }
+
+  /**
+   * What this wake's session showed and sent so far. `sentActual` is null when this object did not see the wake start
+   * (`started`): it restarted since, and a count from then on would be partial.
+   */
+  seen(ctx: Pick<PluginContext, "caller">, wake: string): { at: number | null; ids: ReadonlySet<string>; sentActual: number | null } {
+    const e = this.#wakes.get(this.#key(ctx, wake));
+    return e ? { at: e.at, ids: e.ids, sentActual: e.at === null ? null : e.sent } : { at: null, ids: new Set(), sentActual: null };
   }
 
   end(ctx: Pick<PluginContext, "caller">, wake: string): void {
@@ -1549,7 +1561,7 @@ export async function noteDecision(args: unknown, ctx: PluginContext, reads: Wak
     sources.push({ conversation, msg, ownerVisible: seen.ids.has(msg) ? true : "unknown" });
   }
   try {
-    await log.put({ checkId: wake, wokeAt: seen.at ?? now, notedAt: now, sent: a.sent, reason: [...reason].slice(0, DECISION_REASON_MAX).join(""), sources });
+    await log.put({ checkId: wake, wokeAt: seen.at ?? now, notedAt: now, sent: a.sent, sentActual: seen.sentActual, reason: [...reason].slice(0, DECISION_REASON_MAX).join(""), sources });
   } catch {
     throw refusal(`${NOTE_DECISION_TOOL}: the note could not be kept this time`);
   }
@@ -1558,18 +1570,24 @@ export async function noteDecision(args: unknown, ctx: PluginContext, reads: Wak
 
 /**
  * The end of a check's session: one `raft.assistant_decision` row, so a wake that left no note is counted as well as
- * one that did. `noted`, the note's `sent` (null without one), how many `sources` it gave and how many of them the
- * owner's reads showed (`ownerVisibleSources`), and the wake's `trigger`; never the reason or an id. Lets the wake's
- * reads go, and drops expired notes. Never throws: a row is never worth the end's other work.
+ * one that did. `noted`, the note's `sent` (null without one), `sentActual` (what the code saw sent; null when this
+ * object did not see the wake start), how many `sources` it gave and how many of them the owner's reads showed
+ * (`ownerVisibleSources`), and the wake's `trigger`; never the reason or an id. The note gets the final `sentActual`,
+ * since a notify after the note still counts. Lets the wake's reads go, and drops expired notes. Never throws: a row
+ * is never worth the end's other work.
  */
 export async function decisionEnded(ctx: PluginContext, end: Pick<TurnEnd, "turnKey" | "isolated">, reads: WakeReads): Promise<boolean> {
   const wake = end.isolated ? wakeKeyOf(end.turnKey) : null;
   if (!wake) return false;
+  const { sentActual } = reads.seen(ctx, wake);
   reads.end(ctx, wake);
   let note: AssistantDecision | null = null;
   try { note = (await ctx.assistantDecisions?.get(wake)) ?? null; } catch { /* counted as no note */ }
+  if (note && sentActual !== null && note.sentActual !== sentActual) {
+    try { await ctx.assistantDecisions?.setSentActual(wake, sentActual); note = { ...note, sentActual }; } catch { /* the note keeps its own count */ }
+  }
   const attrs = {
-    noted: note !== null, sent: note ? note.sent : null, sources: note ? note.sources.length : 0,
+    noted: note !== null, sent: note ? note.sent : null, sentActual, sources: note ? note.sources.length : 0,
     ownerVisibleSources: note ? note.sources.filter((x) => x.ownerVisible === true).length : 0, trigger: triggerOf(end.turnKey!),
   };
   ctx.trace?.({ kind: "raft.assistant_decision", status: note ? "noted" : "not_noted", verdict: "ok", attrs });

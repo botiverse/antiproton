@@ -2358,7 +2358,7 @@ function isEnvelope(v: unknown): v is MessageEnvelope {
  * `modelLine`), with one difference: the attachment suffix always says there is no tool to open it, since the
  * download runs as this agent and nothing says this agent can reach a file in its owner's conversations.
  */
-export function renderOwnerMessages(data: unknown, alias: string, unoffered: ReadonlySet<string>): string {
+export function renderOwnerMessages(data: unknown, alias: string, unoffered: ReadonlySet<string>, shownIds?: string[]): string {
   const tool = OWNER_MESSAGES_TOOL;
   if (!data || typeof data !== "object" || Array.isArray(data)) throw malformed(tool, "not an object");
   const d = Object.fromEntries(Object.entries(data));
@@ -2379,6 +2379,9 @@ export function renderOwnerMessages(data: unknown, alias: string, unoffered: Rea
   }
   // In seq order, as messages_read shows a page (the SDK's `readHistory` sorts the same way); a message with no seq last.
   projected.sort((x, y) => (x.seq ?? Number.MAX_SAFE_INTEGER) - (y.seq ?? Number.MAX_SAFE_INTEGER));
+  // Each message as its line names it (`msg=`, the SDK's `shortId`) and whole, for a check's note (`WakeReads`): the
+  // short id is what the model copies from the line, and matched exactly, never as a prefix of anything.
+  if (shownIds) for (const m of projected) for (const id of [m.shortId, m.id]) if (typeof id === "string" && id) shownIds.push(id);
   const lines = projected.map((m) => offeredTerms(modelLine(m, without), without, quotedCalls(m.raw, pattern)));
   return [
     ownerMessagesLabel(alias),
@@ -2495,30 +2498,32 @@ async function ownerRead(
       const again = await wire.ownerInbox(ctx, unread);
       if (!again.ok) throw ownerFailure(again);
       const shown = renderOwnerInbox(again.data, ctx.alias, unread.filter, { untoldUnknown: true });
-      saw(shownIds(again.data, "items"));
+      saw(inboxIds(again.data));
       return shown;
     }
     if (!out.ok) throw ownerFailure(out);
     const shown = renderOwnerInbox(out.data, ctx.alias, request.filter);
-    saw(shownIds(out.data, "items"));
+    saw(inboxIds(out.data));
     return shown;
   }
   const out = await wire.ownerMessages(ctx, ownerMessagesRequest(args));
   if (!out.ok) throw ownerFailure(out);
-  const shown = renderOwnerMessages(out.data, ctx.alias, unoffered);
-  saw(shownIds(out.data, "messages"));
+  const ids: string[] = [];
+  const shown = renderOwnerMessages(out.data, ctx.alias, unoffered, ids);
+  saw(ids);
   return shown;
 }
 
 /**
- * The message ids an owner read showed, once its answer was rendered (so held to its checks): an inbox row's first
- * unread message and its thread's parent message, a messages read's every message. What a check's note holds its
- * sources against (src/plugins/raft-assistant.ts `WakeReads`); the ids alone, never anything else of the answer.
+ * The message ids an inbox read showed, once its answer was rendered (so held to its checks): each row's first unread
+ * message and its thread's parent message, written whole on the row's line. What a check's note holds its sources
+ * against (src/plugins/raft-assistant.ts `WakeReads`); the ids alone, never anything else of the answer. A messages
+ * read's ids are collected by its rendering (`renderOwnerMessages`), which shows each as its short id.
  */
-function shownIds(data: unknown, list: "items" | "messages"): string[] {
-  const rows = (data as Record<string, unknown>)[list];
+function inboxIds(data: unknown): string[] {
+  const rows = (data as Record<string, unknown>).items;
   if (!Array.isArray(rows)) return [];
-  const keys = list === "items" ? ["firstUnreadMessageId", "parentMessageId"] : ["id", "message_id"];
+  const keys = ["firstUnreadMessageId", "parentMessageId"];
   return rows.flatMap((r) => keys.map((k) => (r as Record<string, unknown>)?.[k]).filter((v): v is string => typeof v === "string" && v.length > 0));
 }
 
@@ -3506,7 +3511,9 @@ export function createRaftPlugin(deps: {
       if (name === NOTIFY_TOOL || name === PREFERENCES_TOOL) {
         // Offered as the owner reads are, and refused the same way where the mount's list does not name them.
         if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
+        // A DM sent is counted for the check's note (`sentActual`): the code's count, beside the model's own.
         return name === NOTIFY_TOOL ? notifyOwner(args, ctx, { send: sendToOwner, recheck: recheckOwner, api: assistantApi })
+          .then((out) => { if ((out as { state?: unknown } | null)?.state === "sent") wakeReads.sentOne(ctx); return out; })
           : preferences(args, ctx, { inbox: (c, r) => assistant.ownerInbox(c, r), resolve: resolveOwnerPerson, api: assistantApi });
       }
       if (name === REMINDER_TOOL) {
