@@ -26,6 +26,7 @@ import type {
 // `plugins/types.ts` reaches only `core/types.ts`, so nothing circles back.
 import type { CredentialRefKind, CredentialState, PluginChoice, ToolSnapshot } from "../plugins/types.ts";
 import type { PluginDbTables } from "../store/plugin-db.ts";
+import type { AssistantDecisionTables } from "../store/assistant-decisions.ts";
 import type { UsageRow } from "../usage/outbox.ts";
 import type { TraceRow } from "../trace/outbox.ts";
 
@@ -368,6 +369,12 @@ export interface StorageAdapter {
    * reads a plugin's rows through this except a diagnosis and a rename.
    */
   readonly pluginDb: PluginDbTables;
+
+  /**
+   * A personal assistant's private record of what each check decided (src/store/assistant-decisions.ts): written by
+   * its `note_decision` tool through `PluginContext.assistantDecisions`, read by the operator's audited route.
+   */
+  readonly assistantDecisions: AssistantDecisionTables;
 
   /**
    * Whose model account this agent spends. A tenant with no binding cannot run:

@@ -6,6 +6,7 @@ import {
 } from "./state-lines.ts";
 import type { PluginChoice, ToolSnapshot } from "../plugins/types.ts";
 import { AGENT_SCOPE_ALIAS, PluginDbTables } from "./plugin-db.ts";
+import { AssistantDecisionTables } from "./assistant-decisions.ts";
 import { appendUsage, pendingUsage, type UsageRow } from "../usage/outbox.ts";
 import { completedPayload, type CompletedFacts } from "./operation-event.ts";
 import type {
@@ -167,6 +168,7 @@ export class SqliteStore implements StorageAdapter {
   readonly name = "sqlite";
   #db: DatabaseSync;
   readonly pluginDb: PluginDbTables;
+  readonly assistantDecisions: AssistantDecisionTables;
 
   constructor(path = ":memory:") {
     this.#db = new DatabaseSync(path);
@@ -174,10 +176,12 @@ export class SqliteStore implements StorageAdapter {
     // Eager, as the Durable Object's `sql.exec` is: a statement runs when
     // `exec` is called, not when its rows are read, or a CREATE TABLE whose
     // result nobody reads would never run.
-    this.pluginDb = new PluginDbTables({
-      sql: { exec: (query, ...bindings) => { const rows = db.prepare(query).all(...(bindings as any[])); return { toArray: () => rows }; } },
-      transactionSync: (fn) => this.#tx(fn),
-    });
+    const host = {
+      sql: { exec: (query: string, ...bindings: unknown[]) => { const rows = db.prepare(query).all(...(bindings as any[])); return { toArray: () => rows }; } },
+      transactionSync: <T>(fn: () => T): T => this.#tx(fn),
+    };
+    this.pluginDb = new PluginDbTables(host);
+    this.assistantDecisions = new AssistantDecisionTables(host);
   }
 
   async init() {
@@ -185,6 +189,7 @@ export class SqliteStore implements StorageAdapter {
     for (const stmt of SEED_RECORD_SCHEMA) this.#db.exec(stmt);
     for (const stmt of SEED_FILES_SCHEMA) this.#db.exec(stmt);
     this.pluginDb.ensure();
+    this.assistantDecisions.ensure();
     // CREATE TABLE IF NOT EXISTS silently accepts an existing table that lacks
     // the column, so an object created before this change would never get it.
     for (const alter of [

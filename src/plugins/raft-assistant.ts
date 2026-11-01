@@ -40,6 +40,11 @@
  * its closing text, having sent nothing to the owner's DM, has that text sent there by code (`replyFallback`); one that
  * failed before answering has a fixed line sent there instead (`FAILED_TURN_LINE`).
  *
+ * Each check's session may leave a private note of what it decided (`NOTE_DECISION_TOOL`, `noteDecision`): how many
+ * messages it sent, one sentence on why, and the messages it went on, kept in the agent's own storage for us and never
+ * shown to the owner (src/store/assistant-decisions.ts). Its end is a `raft.assistant_decision` row, noted or not, with
+ * counts only (`decisionEnded`), so a wake that left no note is counted too.
+ *
  * When Raft runs the check (RFC 077 step 2, `assistantOf.raftCheck`, `AssistantOwner.raftCheck`), everything above that
  * decides what to tell the owner is Raft's, and this file keeps only the turn: a wake carrying Raft's check posts its
  * instruction in a short session narrowed to the tools Raft allows (`raftCheckWake`, src/plugins/raft-assistant-check.ts),
@@ -56,6 +61,7 @@ import type { RaftAssistantOf } from "@botiverse/raft-sdk";
 import { isIsolatedSession } from "../runtime/isolated-session.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import type { PluginContext, PluginNext, ToolSchema, TurnEnd } from "./types.ts";
+import type { AssistantDecision, DecisionSource } from "../store/assistant-decisions.ts";
 import { REMINDER_TOOL, REMINDER_TOOL_SCHEMA } from "./raft-assistant-reminder.ts";
 import {
   CHECK_COUNT_KEYS, CHECK_INSTRUCTION_MAX_UTF8, checkOf as raftCheckOf, utf8Length, checkOfTurnKey, checkTools, checkTurnKey, notifyIdempotencyKey, substituteTools,
@@ -75,6 +81,12 @@ export const PREFERENCES_TOOL = "assistant_preferences";
 export const SEND_AS_OWNER_TOOL = "assistant_send_as_owner";
 /** Raft's Reminder app, and only it (src/plugins/raft-assistant-reminder.ts): the chat's alone, never a check's. */
 export { REMINDER_TOOL } from "./raft-assistant-reminder.ts";
+/** A check's private record of what it decided (`noteDecision`): a check's alone, never the chat's. */
+export const NOTE_DECISION_TOOL = "note_decision";
+/** The longest reason a note keeps, in characters: a sentence, not a report. A longer one is cut. */
+export const DECISION_REASON_MAX = 500;
+/** The most sources one note takes. */
+export const DECISION_SOURCES_MAX = 20;
 /** The owner reads (src/plugins/raft.ts `ASSISTANT_TOOLS`); repeated here so this file needs nothing from raft.ts. */
 const OWNER_INBOX = "assistant_owner_inbox";
 const OWNER_MESSAGES = "assistant_owner_messages";
@@ -94,11 +106,11 @@ export const CHAT_TOOLS: readonly string[] = [
   OWNER_INBOX, OWNER_MESSAGES, PREFERENCES_TOOL, SEND_AS_OWNER_TOOL, REMINDER_TOOL,
 ];
 /**
- * What one proactive check is offered: the owner reads, and the notify tool to send its one result with. Never
- * `SEND_AS_OWNER_TOOL` or `REMINDER_TOOL`: nobody asked a check for anything, and both tools refuse a short session's
- * call in code too.
+ * What one proactive check is offered: the owner reads, the notify tool to send its one result with, and the note of
+ * what it decided (`NOTE_DECISION_TOOL`), which only we read. Never `SEND_AS_OWNER_TOOL` or `REMINDER_TOOL`: nobody
+ * asked a check for anything, and both tools refuse a short session's call in code too.
  */
-export const CHECK_TOOLS: readonly string[] = [OWNER_INBOX, OWNER_MESSAGES, NOTIFY_TOOL];
+export const CHECK_TOOLS: readonly string[] = [OWNER_INBOX, OWNER_MESSAGES, NOTIFY_TOOL, NOTE_DECISION_TOOL];
 
 /**
  * The memory tools an assistant is offered on its state mount, in its chat and in every check alike: the notes it keeps
@@ -895,6 +907,37 @@ export const ASSISTANT_OWN_TOOLS: readonly ToolSchema[] = [
     modelOnly: true,
   },
   REMINDER_TOOL_SCHEMA,
+  {
+    name: NOTE_DECISION_TOOL,
+    summary: "A private note of what this check decided, for the people who run you; your owner never sees it. " +
+      "Call it once at the end of the check: how many messages you sent your owner (0 if none), one sentence on why, " +
+      `and the messages you based that on, each as its conversation (the channelId) and msg id, at most ${DECISION_SOURCES_MAX}. ` +
+      "A second call in the same check replaces the first.",
+    // No length or count limits in the schema: a value over one is refused by `noteDecision` in words that never
+    // repeat what was given, where a schema check would answer with the arguments.
+    parameters: {
+      type: "object", additionalProperties: false, required: ["sent", "reason", "sources"],
+      properties: {
+        sent: { type: "integer", description: "How many messages this check sent your owner: 0 when it sent none." },
+        reason: { type: "string", description: `One sentence on why, at most ${DECISION_REASON_MAX} characters.` },
+        sources: {
+          type: "array",
+          description: `The messages you based it on, at most ${DECISION_SOURCES_MAX}; empty when there were none.`,
+          items: {
+            type: "object", additionalProperties: false, required: ["conversation", "msg"],
+            properties: {
+              conversation: { type: "string", description: "The conversation's channelId, as a read gave it." },
+              msg: { type: "string", description: "The message's id, as a read gave it." },
+            },
+          },
+        },
+      },
+    },
+    sideEffects: "write",
+    // The same call made again writes the same row: the wake's note, the last kept.
+    idempotency: "native",
+    modelOnly: true,
+  },
 ];
 
 /** What sending one composed DM came to: sent, or held because the DM moved since the model last read it. */
@@ -1397,6 +1440,140 @@ export function checkEnded(ctx: PluginContext, end: Pick<TurnEnd, "turnKey" | "o
   const attrs = { check_id: check.id, trigger: check.trigger, outcome: end.outcome, ...(end.errorCode ? { error_code: end.errorCode } : {}) };
   ctx.trace?.({ kind: "raft.assistant_check", status: "turn_ended", verdict: end.outcome === "completed" ? "ok" : end.outcome === "cancelled" ? "cancelled" : "failed", attrs });
   logEvent("raft.assistant_check", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, status: "turn_ended", ...attrs });
+  return true;
+}
+
+// ---- what a check decided, for us -----------------------------------------------------------------------------------
+
+/**
+ * The wake a call or a turn's end belongs to, or null for any other: Raft's check id in a check Raft runs
+ * (`checkOfTurnKey`), else the key of one of this file's own short sessions (`isOwnTurnKey`). One note per wake.
+ */
+export function wakeKeyOf(turnKey: string | null | undefined): string | null {
+  if (typeof turnKey !== "string") return null;
+  return checkOfTurnKey(turnKey)?.id ?? (isOwnTurnKey(turnKey) ? turnKey : null);
+}
+
+/** Which trigger a wake's key says: a doorbell's check or the brief. */
+function triggerOf(turnKey: string): CheckTrigger {
+  return checkOfTurnKey(turnKey)?.trigger ?? (turnKey.startsWith("assistant.brief") ? "brief" : "doorbell");
+}
+
+/** Wakes held in memory at once, and ids per wake: a bound on memory, past which the oldest wake is let go. */
+const WAKES_HELD_MAX = 64;
+const WAKE_IDS_MAX = 2_000;
+
+/**
+ * Per wake, in memory and nowhere else: when it posted its session, and the ids of the messages its owner reads showed
+ * (`saw`), so a note can say which of its sources the owner could see (`ownerVisible`). Only the ids are kept, never a
+ * read's result. A restarted object starts empty, and a note made then says "unknown" for every source, which is what
+ * it can tell. Let go of when the wake's session ends (`decisionEnded`).
+ */
+export class WakeReads {
+  #wakes = new Map<string, { at: number | null; ids: Set<string> }>();
+
+  #key(ctx: Pick<PluginContext, "caller">, wake: string): string {
+    return `${ctx.caller.tenantId}/${ctx.caller.agentId}/${wake}`;
+  }
+
+  #entry(ctx: Pick<PluginContext, "caller">, wake: string): { at: number | null; ids: Set<string> } {
+    const k = this.#key(ctx, wake);
+    let e = this.#wakes.get(k);
+    if (!e) {
+      e = { at: null, ids: new Set() };
+      this.#wakes.set(k, e);
+      while (this.#wakes.size > WAKES_HELD_MAX) this.#wakes.delete(this.#wakes.keys().next().value!);
+    }
+    return e;
+  }
+
+  /** A wake posted the session keyed `turnKey` at `at`. */
+  started(ctx: Pick<PluginContext, "caller">, turnKey: string, at: number): void {
+    const wake = wakeKeyOf(turnKey);
+    if (wake) this.#entry(ctx, wake).at = at;
+  }
+
+  /** An owner read in the session of `ctx` showed these message ids. Nothing outside a check's session. */
+  saw(ctx: Pick<PluginContext, "caller">, ids: readonly string[]): void {
+    const wake = wakeKeyOf(ctx.caller.turnKey);
+    if (!wake || !ids.length) return;
+    const e = this.#entry(ctx, wake);
+    for (const id of ids) {
+      if (e.ids.size >= WAKE_IDS_MAX) break;
+      e.ids.add(id);
+    }
+  }
+
+  seen(ctx: Pick<PluginContext, "caller">, wake: string): { at: number | null; ids: ReadonlySet<string> } {
+    return this.#wakes.get(this.#key(ctx, wake)) ?? { at: null, ids: new Set() };
+  }
+
+  end(ctx: Pick<PluginContext, "caller">, wake: string): void {
+    this.#wakes.delete(this.#key(ctx, wake));
+  }
+}
+
+/**
+ * The note tool (`NOTE_DECISION_TOOL`): what this wake decided, kept in the agent's own storage
+ * (`PluginContext.assistantDecisions`, src/store/assistant-decisions.ts) and nowhere else. A check's session alone;
+ * a later call of the same wake replaces the row, so the last note is the wake's. A source is `ownerVisible: true`
+ * only when its msg id was in an owner read's result earlier in this wake (`WakeReads`), else "unknown".
+ *
+ * Every refusal is a fixed sentence that never repeats an argument: a failed call's message goes onto its trace row
+ * (src/trace/seams.ts `failureAttrs`), and the reason and the ids are the owner's. The answer repeats none of them either.
+ */
+export async function noteDecision(args: unknown, ctx: PluginContext, reads: WakeReads, now = Date.now()): Promise<Json> {
+  const wake = wakeKeyOf(ctx.caller.turnKey);
+  if (!wake) throw refusal(`${NOTE_DECISION_TOOL} is for a check, and this is not one: nothing was kept`);
+  const log = ctx.assistantDecisions;
+  if (!log) throw refusal(`${NOTE_DECISION_TOOL}: this build cannot keep a note here: nothing was kept`);
+  const a = args && typeof args === "object" && !Array.isArray(args) ? args as Record<string, unknown> : null;
+  if (!a) throw refusal(`${NOTE_DECISION_TOOL} takes sent, reason and sources: nothing was kept`);
+  if (typeof a.sent !== "number" || !Number.isSafeInteger(a.sent) || a.sent < 0) {
+    throw refusal("sent must be a whole number, 0 or more: how many messages this check sent: nothing was kept");
+  }
+  const reason = typeof a.reason === "string" ? a.reason.replace(/\s+/g, " ").trim() : "";
+  if (!reason) throw refusal("reason must be one sentence on why: nothing was kept");
+  if (!Array.isArray(a.sources)) throw refusal("sources must be a list, empty when there were none: nothing was kept");
+  if (a.sources.length > DECISION_SOURCES_MAX) throw refusal(`sources takes at most ${DECISION_SOURCES_MAX}: nothing was kept`);
+  const seen = reads.seen(ctx, wake);
+  const sources: DecisionSource[] = [];
+  for (const raw of a.sources) {
+    const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+    const conversation = typeof o.conversation === "string" ? o.conversation.trim() : "";
+    const msg = typeof o.msg === "string" ? o.msg.trim() : "";
+    if (!conversation || conversation.length > 64 || !msg || msg.length > 64) {
+      throw refusal("each source needs its conversation's channelId and the msg id, as a read gave them: nothing was kept");
+    }
+    if (sources.some((x) => x.conversation === conversation && x.msg === msg)) continue;
+    sources.push({ conversation, msg, ownerVisible: seen.ids.has(msg) ? true : "unknown" });
+  }
+  try {
+    await log.put({ checkId: wake, wokeAt: seen.at ?? now, notedAt: now, sent: a.sent, reason: [...reason].slice(0, DECISION_REASON_MAX).join(""), sources });
+  } catch {
+    throw refusal(`${NOTE_DECISION_TOOL}: the note could not be kept this time`);
+  }
+  return { state: "noted", note: "Kept. Your owner does not see it; another call in this check replaces it." };
+}
+
+/**
+ * The end of a check's session: one `raft.assistant_decision` row, so a wake that left no note is counted as well as
+ * one that did. `noted`, the note's `sent` (null without one), how many `sources` it gave and how many of them the
+ * owner's reads showed (`ownerVisibleSources`), and the wake's `trigger`; never the reason or an id. Lets the wake's
+ * reads go, and drops expired notes. Never throws: a row is never worth the end's other work.
+ */
+export async function decisionEnded(ctx: PluginContext, end: Pick<TurnEnd, "turnKey" | "isolated">, reads: WakeReads): Promise<boolean> {
+  const wake = end.isolated ? wakeKeyOf(end.turnKey) : null;
+  if (!wake) return false;
+  reads.end(ctx, wake);
+  let note: AssistantDecision | null = null;
+  try { note = (await ctx.assistantDecisions?.get(wake)) ?? null; } catch { /* counted as no note */ }
+  const attrs = {
+    noted: note !== null, sent: note ? note.sent : null, sources: note ? note.sources.length : 0,
+    ownerVisibleSources: note ? note.sources.filter((x) => x.ownerVisible === true).length : 0, trigger: triggerOf(end.turnKey!),
+  };
+  ctx.trace?.({ kind: "raft.assistant_decision", status: note ? "noted" : "not_noted", verdict: "ok", attrs });
+  try { await ctx.assistantDecisions?.prune(); } catch { /* the next write prunes */ }
   return true;
 }
 
@@ -2776,7 +2953,10 @@ async function raftCheckWake(ctx: PluginContext, deps: WakeDeps, owner0: Assista
   const retry = await pushBriefImport(ctx, deps.api, now).catch(() => null);
   const wakeAt = taken.left > 0 ? now : retry !== null ? Math.min(retry, next) : next;
   const id: Record<string, string> = { check_id: c.id };
-  const { tools, dropped } = checkTools(c.allowedTools, CHECK_TOOLS);
+  const narrowed = checkTools(c.allowedTools, CHECK_TOOLS);
+  const dropped = narrowed.dropped;
+  // The note is ours, not Raft's to allow: its record is for us, and Raft's list does not name it.
+  const tools = narrowed.tools.includes(NOTE_DECISION_TOOL) ? narrowed.tools : [...narrowed.tools, NOTE_DECISION_TOOL];
   // The turn exists to call notify once: without it there is nothing it could do.
   if (!tools.includes(NOTIFY_TOOL)) {
     await record(ctx, day, trigger, "check_refused", { ...id, raft_check: true, reason: "no_notify", tools_dropped: dropped });
@@ -3112,11 +3292,21 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
 function raftCheckPrompt(t: (n: string) => string, has: (n: string) => boolean, notify: boolean): string {
   return [
     "You are a personal assistant in Raft for one person, your owner, making one check of their activity. Nobody is talking to you. Your input says what to look at, and " +
-      (notify ? `your only output is exactly one call to ${t(NOTIFY_TOOL)}.` : "this check has no tool to tell them with, so end without a call."),
+      (notify ? `your only message to them is exactly one call to ${t(NOTIFY_TOOL)}.` : "this check has no tool to tell them with, so end without a call."),
     reads(t, has),
     `Code has already applied your owner's contact settings and removed what they were already told. Of what is left, report only what is waiting on your owner: ${WAITING}. Chatter and talk between other people is not waiting on them, even in a channel they follow.`,
     notify ? `Call ${t(NOTIFY_TOOL)} exactly once, with items alone: each item is a conversation's channelId as your input gives it, a summary, and its kind when you can tell. The summary is one short line: start with who, then what they want from your owner, e.g. "@cy needs your OK on the Friday launch date". Don't paste their message, don't add background, and don't give advice. Leave out what does not need your owner; when nothing does, call it with no items. Code adds everything else, writes the message and decides what is shown, so let it decide. Never message anyone any other way.` : null,
+    noteGuidance(t, has),
   ].filter((x): x is string => x !== null).join("\n\n");
+}
+
+/**
+ * The check's note (`NOTE_DECISION_TOOL`), as guidance: once at the end, what was sent and why, on which messages.
+ * Null when the check is not offered it.
+ */
+function noteGuidance(t: (n: string) => string, has: (n: string) => boolean): string | null {
+  if (!has(NOTE_DECISION_TOOL)) return null;
+  return `At the end of the check, it helps to call ${t(NOTE_DECISION_TOOL)} once: how many messages you sent your owner (0 if none), one sentence on why, and the messages you based it on, each as its conversation and msg id from your reads. It is a private note for the people who run you; your owner never sees it.`;
 }
 
 /**
@@ -3303,11 +3493,12 @@ export function assistantCheckPrompt(
   if (o.raftCheck) return [raftCheckPrompt(t, has, notify), notes].filter((x): x is string => x !== null).join("\n\n");
   return [
     `You are a personal assistant in Raft for one person, your owner, making one check of their activity. Nobody is talking to you. Your input lists the conversations to look at, and ` +
-      (notify ? `your only output is one call to ${t(NOTIFY_TOOL)}, or none.` : `this check has no tool to tell them with, so end without a call.`),
+      (notify ? `your only message to them is one call to ${t(NOTIFY_TOOL)}, or none.` : `this check has no tool to tell them with, so end without a call.`),
     reads(t, has),
     `Code has already removed what your owner muted, what they were already told and what a check already looked at, and applied their contact settings, except any rules about people your input lists, which you apply. Of what is left, report only what is waiting on your owner: ${WAITING}. Chatter and talk between other people is not waiting on them, even in a channel they follow.`,
     notify ? `Each item needs a reference they can click and a summary. The reference is #channel:msgid, using the msg= id from a read; for a task, use the message that is the task, never a bare task #N, which in their DM means the DM's own task. The summary is one short line, at most ${SUMMARY_MAX} characters: start with who, then what they want from your owner, e.g. "@cy needs your OK on the Friday launch date". Don't paste their message, don't add background, and don't give advice.
-Give every item you found in one call. The tool drops what they were already told and what their rules mute, keeps for the brief what their rules or their quiet hours hold, and shows at most ${DM_ITEMS_MAX}, so let it decide. Never message anyone any other way. When nothing is waiting on them, end without a call.` : null,
+Give every item you found in one call. The tool drops what they were already told and what their rules mute, keeps for the brief what their rules or their quiet hours hold, and shows at most ${DM_ITEMS_MAX}, so let it decide. Never message anyone any other way. When nothing is waiting on them, end without calling ${t(NOTIFY_TOOL)}.` : null,
+    noteGuidance(t, has),
     notes,
   ].filter((x): x is string => x !== null).join("\n\n");
 }

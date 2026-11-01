@@ -76,6 +76,8 @@ import {
   isAdmin,
 } from "./auth.ts";
 import { adminTranscript } from "./admin-transcript.ts";
+import { adminAssistantDecisions } from "./admin-assistant-decisions.ts";
+import { readAssistantDecisions } from "../../src/store/assistant-decisions.ts";
 import { auditRead, d1ReadAudit, readReason } from "./read-audit.ts";
 import { readFrictionWindow, type FrictionLimits, type FrictionWindow } from "./friction-read.ts";
 import { dailyCron, frictionDaily, scanDay, tenantScope, writeReport, type FrictionBucket, type WindowReader } from "./friction-scan.ts";
@@ -2612,6 +2614,15 @@ export class AgentDO extends DurableObject<Env> {
    */
   async adminTranscript(tenantId: string, agentId: string, taskId: string): Promise<TranscriptEvents | null> {
     return readTranscript(this.sql, tenantId, agentId, taskId);
+  }
+
+  /**
+   * A personal assistant's notes of what its checks decided (/admin/assistant-decisions), noted in [from, to): SELECTs
+   * on this object's SQLite and nothing else, as adminTranscript. Null for an agent this object does not hold.
+   */
+  async adminAssistantDecisions(tenantId: string, agentId: string, from: number, to: number) {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return readAssistantDecisions(this.sql as never, tenantId, agentId, { from, to });
   }
 
   /**
@@ -5376,6 +5387,9 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
         case "/admin/transcript":
           // Awaited, so a failure reaches this route's catch and its log instead of the platform's 1101.
           return await adminTranscript(request, env.AUTOMATION_TOKEN,
+            (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))), d1ReadAudit(env.CONTROL_DB));
+        case "/admin/assistant-decisions":
+          return await adminAssistantDecisions(request, env.AUTOMATION_TOKEN,
             (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))), d1ReadAudit(env.CONTROL_DB));
         case "/":
           // The demo is the point of this deployment; making people know to

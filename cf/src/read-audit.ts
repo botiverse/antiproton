@@ -1,8 +1,8 @@
 /**
  * Who read an agent's conversation, and why: one row per read in D1 (`admin_read_audit`, migration 0026), never in the
  * Workers log, which drops lines. The audited routes are the ones that return what an agent was told or said:
- * `/admin/transcript`, the `/agent/*` reads, the console's `/ui/transcript`, and the provisioning eval `transcript` and
- * `model-input`. A row is metadata only — the route, the agent, the conversation, what kind of credential read it and
+ * `/admin/transcript`, the `/agent/*` reads, the console's `/ui/transcript`, the provisioning eval `transcript` and
+ * `model-input`, and `/admin/assistant-decisions`, a personal assistant's notes of what its checks decided. A row is metadata only — the route, the agent, the conversation, what kind of credential read it and
  * its label, the reason the caller gave — never the content.
  *
  * A personal assistant's conversation holds what it read of its owner's Raft (src/plugins/raft-assistant.ts), which is

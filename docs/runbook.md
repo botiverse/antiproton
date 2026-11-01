@@ -51,6 +51,21 @@ SELECT datetime(at / 1000, 'unixepoch'), route, agent_id, session, token_kind, t
   FROM admin_read_audit WHERE tenant_id = '<tenantId>' ORDER BY at DESC LIMIT 50;
 ```
 
+A personal assistant's checks each leave a private note of what they decided: how many messages the wake sent its
+owner, one sentence on why, and the messages it went on, each with `ownerVisible` (`true` only when an owner read in
+the same wake showed that message, else `"unknown"`). The owner never sees them; they are kept 30 days in the agent's
+own object (`src/store/assistant-decisions.ts`) and read, newest first, with `from` and `to` as epoch milliseconds or
+ISO times (the last 30 days when left out):
+
+```
+curl -s -H "x-harness-token: $AUTOMATION_TOKEN" -H "X-Read-Reason: <why>" "$HOST/admin/assistant-decisions?tenantId=<tenantId>&agentId=<agentId>&from=<from>&to=<to>"
+```
+
+Every read is audited as a personal assistant's conversation read is (`route = '/admin/assistant-decisions'`): the
+reason is required and a read whose row cannot be written is refused, whether or not the agent is still an assistant.
+A wake that left no note is counted by its `raft.assistant_decision` trace row (`noted: false`), which carries counts
+only, never the reason or an id, and is not forwarded.
+
 Every stop, cancel or delete of a turn writes a `turn.stop` line to the Workers logs: `trigger` (`admin_cancel`,
 `provider_stop`, `delete`), `result` (`aborted`, `nothing_running`, `failed`), `turn` when one was aborted, `error` when
 it failed, and `side`. The Worker that answered the stop writes one (`side` = `worker`) for every attempt; the agent's

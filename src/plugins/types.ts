@@ -3,6 +3,7 @@ import type { AnswerSpec } from "../core/execution.ts";
 import type { PluginTraceKind, TraceVerdict } from "../trace/outbox.ts";
 import type { AnswerErrorCode } from "../model/pi-bridge.ts";
 import type { TurnEndEvent } from "../runtime/activity.ts";
+import type { AssistantDecision } from "../store/assistant-decisions.ts";
 
 /** What a tool declares it reads back (`ToolSchema.reads`); the one place the values are listed. */
 export type ToolReads = "parked-result" | "own-state";
@@ -326,6 +327,14 @@ export interface DbSpec {
   upgrade?(db: DbOperations, oldVersion: number): void;
 }
 
+/** `PluginContext.assistantDecisions`: scoped to the context's agent by the gateway. */
+export interface AssistantDecisionLog {
+  put(decision: AssistantDecision): Promise<void>;
+  get(checkId: string): Promise<AssistantDecision | null>;
+  /** Drops this agent's rows past their retention (src/store/assistant-decisions.ts). */
+  prune(): Promise<void>;
+}
+
 export interface PluginContext {
   /** Read-only identity of the caller. Plugins cannot use it to escalate. */
   caller: {
@@ -593,6 +602,14 @@ export interface PluginContext {
    * {@link Plugin.readsOwnerSecrets}; a plugin reads its absence as "none".
    */
   ownerSecret?(name: string): Promise<string | null>;
+  /**
+   * This agent's private record of what each personal-assistant check decided (src/store/assistant-decisions.ts): one
+   * row per wake, keyed by the wake, written again by a later note of the same wake. The agent's own rows only. The
+   * reason and the sources are the owner's data: a plugin puts them here and nowhere else, not into a trace row, a
+   * log line or an error. Present only for a plugin that declares {@link Plugin.keepsAssistantDecisions}, on the
+   * contexts the gateway builds for a mount; a plugin reads its absence as "cannot keep one".
+   */
+  assistantDecisions?: AssistantDecisionLog;
   /**
    * A one-time Agent Login grant for `service`, obtained through this agent's raft mount: the raft plugin signs in to
    * the app with this agent's Raft identity (Raft Agent Login, reusing an app session it already holds) and asks the
@@ -2224,6 +2241,8 @@ export interface Plugin {
    * elsewhere such as an `extraPlugins` entry, is outside what it sees).
    */
   readsOwnerSecrets?: true;
+  /** Whether its contexts carry `PluginContext.assistantDecisions`: raft alone, whose assistant checks write it. */
+  keepsAssistantDecisions?: true;
   /**
    * The services this plugin may obtain an Agent Login grant for (`PluginContext.agentLogin`). Absent: none, and
    * its contexts have no such method. stamp declares `["stamp"]` and nothing else.
