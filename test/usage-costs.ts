@@ -475,8 +475,8 @@ await check("an impossible date is refused, not rolled over into the next month"
   must(b.status === 400 && /ISO 8601/.test(b.body?.error ?? ""), `${b.status} ${b.text}`);
 });
 
-await check("both Worker configs schedule the fold daily", () => {
-  for (const f of ["wrangler.jsonc", "wrangler.preview.jsonc"]) {
+await check("every Worker config schedules the fold daily", () => {
+  for (const f of ["wrangler.jsonc", "wrangler.preview.jsonc", "wrangler.canary.jsonc"]) {
     const text = readFileSync(new URL(`../cf/${f}`, import.meta.url), "utf8");
     must(/"triggers":\s*\{\s*"crons":\s*\["\d+ \d+ \* \* \*"\]\s*\}/.test(text), `${f} has no daily cron`);
   }

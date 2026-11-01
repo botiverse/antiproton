@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 // What happened, from the deployment's log store (Workers Logs), without a tail opened beforehand.
 //
-//   node cf/scripts/logs.mjs [--preview] --agent <agentId | Raft agent id> [--since 60m]
-//   node cf/scripts/logs.mjs [--preview] --trace <X-Raft-Trace-Id>
-//   node cf/scripts/logs.mjs [--preview] --request <X-Request-Id>
+//   node cf/scripts/logs.mjs [--preview | --canary] --agent <agentId | Raft agent id> [--since 60m]
+//   node cf/scripts/logs.mjs [--preview | --canary] --trace <X-Raft-Trace-Id>
+//   node cf/scripts/logs.mjs [--preview | --canary] --request <X-Request-Id>
 //
 // Needs CF_API_TOKEN (Workers Observability read) and R2_ACCOUNT_ID (the account) in the environment,
 // as ~/.secrets/antiproton.env provides. Prints one line per event, oldest first. The lines are the
 // ones src/core/log.ts writes: http, trace, raft.call, alarm.*, connect.*.
 const args = process.argv.slice(2);
 const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
-const script = args.includes("--preview") ? "antiproton-preview" : "antiproton";
+const script = args.includes("--preview") ? "antiproton-preview" : args.includes("--canary") ? "antiproton-canary" : "antiproton";
 const sinceArg = opt("--since") ?? "60m";
 const unit = { s: 1, m: 60, h: 3600, d: 86400 }[sinceArg.slice(-1)] ?? 60;
 const sinceMs = Number.parseFloat(sinceArg) * unit * 1000;

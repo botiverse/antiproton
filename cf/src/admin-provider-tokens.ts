@@ -3,9 +3,13 @@
  * a Raft server provisions agents with.
  *
  * Operator header only, and closed when no token is configured, like /admin/service-tokens: a route
- * that mints a tenant's identity does not open for a local dev server. The token appears in the POST
+ * that mints a tenant's identity does not open for a local dev server. A minted token appears in the POST
  * answer and nowhere else; the table keeps its hash, and the listing carries the hash because it names
  * the row and cannot be presented as a token.
+ *
+ * A POST with `hash` registers a token its holder made instead, and the answer carries no token: the
+ * plaintext never reaches this deployment. Only where PROVIDER_TOKEN_HASH_REGISTRATION is "1" (preview and
+ * the canary; never cf/wrangler.jsonc, test/provider-tokens.ts checks), and refused with a 403 elsewhere.
  */
 import { isOperator } from "./auth.ts";
 import { agentObjectName } from "./object-name.ts";
@@ -23,6 +27,19 @@ function field(body: unknown, key: string): string | undefined {
 }
 
 export const LABEL_MAX = 64;
+
+/** Exactly what hashProviderToken returns (cf/src/provider-token.ts): SHA-256, lowercase hex. */
+export const PROVIDER_TOKEN_HASH = /^[0-9a-f]{64}$/;
+
+/**
+ * Whether an insert failed because the hash is already a row. `hash` is the table's primary key
+ * (cf/migrations/0008_provisioning.sql), so a revoked row counts too; test/spec/control-plane-spec.ts checks
+ * this reading against real D1.
+ */
+export function isDuplicateHash(e: unknown): boolean {
+  const message = typeof e === "object" && e !== null && "message" in e ? String((e as { message?: unknown }).message) : String(e);
+  return /UNIQUE constraint failed: provider_tokens\.hash/.test(message);
+}
 
 /** The prefix every tenant derived from a Raft server id starts with (derivedTenant, cf/src/provision/handlers.ts). */
 export const RESERVED_TENANT_PREFIX = "raft_";
@@ -47,7 +64,8 @@ export function reservedTenantProblem(tenantId: string): string | null {
   return `a tenant id starting with "${RESERVED_TENANT_PREFIX}" is reserved for the tenants derived from Raft server ids`;
 }
 
-export async function adminProviderTokens(request: Request, token: string | undefined, dir: ProviderTokenDirectory, url: URL): Promise<Response> {
+export async function adminProviderTokens(request: Request, token: string | undefined, dir: ProviderTokenDirectory, url: URL,
+  options: { hashRegistration?: boolean } = {}): Promise<Response> {
   if (!isOperator(token, request.headers.get("x-harness-token"))) return answer({ error: "unauthorized" }, 401);
   switch (request.method) {
     case "GET":
@@ -61,13 +79,37 @@ export async function adminProviderTokens(request: Request, token: string | unde
       const raftOrigin = (field(body, "raftOrigin") ?? "").trim();
       const problem = originProblem(raftOrigin);
       if (problem) return answer({ error: "raftOrigin", hint: `raftOrigin ${problem}` }, 400);
-      const t = newProviderToken();
-      const hash = await hashProviderToken(t);
+      // Registered by hash: the holder made the token and keeps it, and only its hash is sent, so the plaintext
+      // never reaches this deployment. Nothing is minted and the answer carries no token.
+      const byHash = typeof body === "object" && body !== null && "hash" in body;
+      let t: string | null = null;
+      let hash: string;
+      if (byHash) {
+        if (!options.hashRegistration) {
+          return answer({ error: "hash_registration_disabled", hint: "registering a provider token by hash is enabled only where PROVIDER_TOKEN_HASH_REGISTRATION is \"1\" (preview and the canary)" }, 403);
+        }
+        const given = (body as Record<string, unknown>).hash;
+        if (typeof given !== "string" || !PROVIDER_TOKEN_HASH.test(given)) {
+          return answer({ error: "hash", hint: "the lowercase hex SHA-256 of the token's UTF-8 bytes: 64 characters of 0-9a-f" }, 400);
+        }
+        if ("token" in (body as Record<string, unknown>)) return answer({ error: "token", hint: "send only the hash; the token stays with its holder" }, 400);
+        hash = given;
+      } else {
+        t = newProviderToken();
+        hash = await hashProviderToken(t);
+      }
+      const issue = async (row: Parameters<ProviderTokenDirectory["issue"]>[0]): Promise<Response | null> => {
+        try { await dir.issue(row); return null; } catch (e) {
+          if (isDuplicateHash(e)) return answer({ error: "duplicate", hint: "a provider token with this hash is already registered (live or revoked)" }, 409);
+          throw e;
+        }
+      };
       if (scope === "platform") {
         // One key for a whole Raft deployment: no tenant here, each request names its server.
         if (field(body, "tenantId") !== undefined) return answer({ error: "tenantId", hint: "a platform token has no tenant; the request's raftServerId decides" }, 400);
-        await dir.issue({ hash, label, raftOrigin, scope });
-        return answer({ token: t, hash, label, scope, raftOrigin }, 201);
+        const refused = await issue({ hash, label, raftOrigin, scope });
+        if (refused) return refused;
+        return answer({ ...(t ? { token: t } : {}), hash, label, scope, raftOrigin }, 201);
       }
       const tenantId = field(body, "tenantId") ?? "";
       // The tenant is checked the way an object name checks it: what cannot name an object cannot be a tenant.
@@ -80,8 +122,9 @@ export async function adminProviderTokens(request: Request, token: string | unde
       if (reserved) {
         return answer({ error: "tenantId", hint: `${reserved}; issue a platform token for a Raft server, or pick another tenant id` }, 400);
       }
-      await dir.issue({ hash, label, scope, tenantId, raftOrigin });
-      return answer({ token: t, hash, label, scope, tenantId, raftOrigin }, 201);
+      const refused = await issue({ hash, label, scope, tenantId, raftOrigin });
+      if (refused) return refused;
+      return answer({ ...(t ? { token: t } : {}), hash, label, scope, tenantId, raftOrigin }, 201);
     }
     case "DELETE": {
       const hash = url.searchParams.get("hash") ?? "";

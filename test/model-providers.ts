@@ -116,7 +116,7 @@ async function varsOf(file: string): Promise<Record<string, unknown>> {
 }
 
 await check("each deployment's declaration is accepted, offers cloudflare under vendor/model through its own gateway, and holds no secret; DeepSeek is the default and production's is exactly the provider it derived before", async () => {
-  for (const [file, gateway] of [["wrangler.preview.jsonc", "antiproton-preview"], ["wrangler.jsonc", "antiproton"]] as const) {
+  for (const [file, gateway] of [["wrangler.preview.jsonc", "antiproton-preview"], ["wrangler.canary.jsonc", "antiproton-canary"], ["wrangler.jsonc", "antiproton"]] as const) {
     const vars = await varsOf(file);
     const configs = parseProviders(vars.MODEL_PROVIDERS);
     must(configs.map((p) => p.id).join() === `${DEFAULT_PROVIDER},cloudflare`, `${file}: ${JSON.stringify(configs)}`);
