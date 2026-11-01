@@ -21,6 +21,7 @@ import { AGENT_SCOPE_ALIAS } from "../store/plugin-db.ts";
 import { payerKey, toolCallRows } from "../usage/outbox.ts";
 import type { DecidedBy } from "../core/types.ts";
 import { DEFAULT_APPROVAL_TTL_MS } from "../store/approvals-schema.ts";
+import type { AssistantDecision } from "../store/assistant-decisions.ts";
 import type { ApprovalRecord } from "../core/types.ts";
 import { approvalOutcome, approvedNotice, deniedNotice, expiredNotice, unknownOutcomeNotice } from "./approval-notice.ts";
 
@@ -1950,6 +1951,15 @@ export class ToolGateway {
         async ownerSecret(name: string) {
           if (!KEPT_NAME.test(name)) return null;
           return secrets.resolve(agentRef(OWNER_PREFIX + name), { tenantId: ctx.tenantId, agentId: ctx.agentId });
+        },
+      } : {}),
+      // The agent's own rows, and only for the plugin that declared it keeps them (`Plugin.keepsAssistantDecisions`).
+      ...(plugin?.keepsAssistantDecisions ? {
+        assistantDecisions: {
+          put: async (d: AssistantDecision) => store.assistantDecisions.put(ctx.tenantId, ctx.agentId, d),
+          get: async (checkId: string) => store.assistantDecisions.get(ctx.tenantId, ctx.agentId, checkId),
+          prune: async () => store.assistantDecisions.prune(ctx.tenantId, ctx.agentId),
+          setSentActual: async (checkId: string, n: number) => store.assistantDecisions.setSentActual(ctx.tenantId, ctx.agentId, checkId, n),
         },
       } : {}),
       // A plugin's own facts, beside the spans the kernel writes (`PluginContext.trace`). Its span is the operation

@@ -29,6 +29,7 @@ import {
   sendAsOwner, type SendAsOwnerAnswer, assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, mergeSources, noteDoorbell,
   notifyOwner, noteChatNotice, noteOwnerReply, noteToldInChat, pauseOn, replyFallback, preferences, type PersonResolve, type OwnerResolveRead, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
   checkEnded, pushBriefImport, turnDelivered, type AssistantApi, type DeliveredReport, type RaftAnswer,
+  NOTE_DECISION_TOOL, WakeReads, decisionEnded, noteDecision,
 } from "./raft-assistant.ts";
 import type { RaftCheck, RefusedCheck } from "./raft-assistant-check.ts";
 import { clearIntegrationSessions, INTEGRATION_SESSIONS_STORE, REMINDER_TOOL, reminderTool } from "./raft-assistant-reminder.ts";
@@ -2357,7 +2358,7 @@ function isEnvelope(v: unknown): v is MessageEnvelope {
  * `modelLine`), with one difference: the attachment suffix always says there is no tool to open it, since the
  * download runs as this agent and nothing says this agent can reach a file in its owner's conversations.
  */
-export function renderOwnerMessages(data: unknown, alias: string, unoffered: ReadonlySet<string>): string {
+export function renderOwnerMessages(data: unknown, alias: string, unoffered: ReadonlySet<string>, shownIds?: string[]): string {
   const tool = OWNER_MESSAGES_TOOL;
   if (!data || typeof data !== "object" || Array.isArray(data)) throw malformed(tool, "not an object");
   const d = Object.fromEntries(Object.entries(data));
@@ -2378,6 +2379,9 @@ export function renderOwnerMessages(data: unknown, alias: string, unoffered: Rea
   }
   // In seq order, as messages_read shows a page (the SDK's `readHistory` sorts the same way); a message with no seq last.
   projected.sort((x, y) => (x.seq ?? Number.MAX_SAFE_INTEGER) - (y.seq ?? Number.MAX_SAFE_INTEGER));
+  // Each message as its line names it (`msg=`, the SDK's `shortId`) and whole, for a check's note (`WakeReads`): the
+  // short id is what the model copies from the line, and matched exactly, never as a prefix of anything.
+  if (shownIds) for (const m of projected) for (const id of [m.shortId, m.id]) if (typeof id === "string" && id) shownIds.push(id);
   const lines = projected.map((m) => offeredTerms(modelLine(m, without), without, quotedCalls(m.raw, pattern)));
   return [
     ownerMessagesLabel(alias),
@@ -2480,7 +2484,7 @@ export async function probeOwnerMessages(ctx: PluginContext, channelId: string, 
 /** One owner read, end to end: offered on this mount, its arguments checked, the wire asked, the answer checked. */
 async function ownerRead(
   name: typeof OWNER_INBOX_TOOL | typeof OWNER_MESSAGES_TOOL, args: unknown, ctx: PluginContext, wire: AssistantWire,
-  unoffered: ReadonlySet<string>,
+  unoffered: ReadonlySet<string>, saw: (ids: string[]) => void = () => {},
 ): Promise<string> {
   if (!ctx.offered?.includes(name)) {
     throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant, or its tool list has not been taken since it became one`);
@@ -2493,14 +2497,34 @@ async function ownerRead(
       const unread = { ...request, filter: "unread" as const };
       const again = await wire.ownerInbox(ctx, unread);
       if (!again.ok) throw ownerFailure(again);
-      return renderOwnerInbox(again.data, ctx.alias, unread.filter, { untoldUnknown: true });
+      const shown = renderOwnerInbox(again.data, ctx.alias, unread.filter, { untoldUnknown: true });
+      saw(inboxIds(again.data));
+      return shown;
     }
     if (!out.ok) throw ownerFailure(out);
-    return renderOwnerInbox(out.data, ctx.alias, request.filter);
+    const shown = renderOwnerInbox(out.data, ctx.alias, request.filter);
+    saw(inboxIds(out.data));
+    return shown;
   }
   const out = await wire.ownerMessages(ctx, ownerMessagesRequest(args));
   if (!out.ok) throw ownerFailure(out);
-  return renderOwnerMessages(out.data, ctx.alias, unoffered);
+  const ids: string[] = [];
+  const shown = renderOwnerMessages(out.data, ctx.alias, unoffered, ids);
+  saw(ids);
+  return shown;
+}
+
+/**
+ * The message ids an inbox read showed, once its answer was rendered (so held to its checks): each row's first unread
+ * message and its thread's parent message, written whole on the row's line. What a check's note holds its sources
+ * against (src/plugins/raft-assistant.ts `WakeReads`); the ids alone, never anything else of the answer. A messages
+ * read's ids are collected by its rendering (`renderOwnerMessages`), which shows each as its short id.
+ */
+function inboxIds(data: unknown): string[] {
+  const rows = (data as Record<string, unknown>).items;
+  if (!Array.isArray(rows)) return [];
+  const keys = ["firstUnreadMessageId", "parentMessageId"];
+  return rows.flatMap((r) => keys.map((k) => (r as Record<string, unknown>)?.[k]).filter((v): v is string => typeof v === "string" && v.length > 0));
 }
 
 /**
@@ -3011,11 +3035,15 @@ export function createRaftPlugin(deps: {
   agentLoginCalls?: { invoke: typeof integrationsInvoke; login: typeof integrationsLogin };
   /** `receive_events`' cap on waiting for announced messages (`WAIT_FOR_MAX_MS`), for a test that reaches it quickly. */
   waitForMaxMs?: number;
+  /** The checks' reads by id (`WakeReads`), for a test that starts a wake without going through `wake`. */
+  wakeReads?: WakeReads;
 } = {}): Plugin {
   const waitForMaxMs = deps.waitForMaxMs ?? WAIT_FOR_MAX_MS;
   const loginCalls = deps.agentLoginCalls ?? { invoke: integrationsInvoke, login: integrationsLogin };
   const excluded = deps.excluded ?? EXCLUDED;
   const assistant = deps.assistant ?? RAFT_ASSISTANT_WIRE;
+  /** What each check's owner reads showed, by id, for its note (`noteDecision`): this isolate's memory alone. */
+  const wakeReads = deps.wakeReads ?? new WakeReads();
   const artifacts = deps.artifacts ?? null;
   const generated = excluded === EXCLUDED ? GENERATED : generatedFrom(excluded);
   // With nowhere to keep a file the download could only fail, so it is not offered at all: not in `tools`, not in
@@ -3092,6 +3120,8 @@ export function createRaftPlugin(deps: {
     op.name === DOWNLOAD_OP ? downloadAttachment(args, ctx, artifacts, unofferedFor(ctx)) : runOperation(op, args, ctx, unofferedFor(ctx), resumed);
   const plugin: Plugin = {
     id: "raft",
+    // A personal assistant's checks note what they decided (`noteDecision`).
+    keepsAssistantDecisions: true,
     version: "1.0.0",
     /**
      * Which tools this build can offer, and what each needs, as one string: it moves when the SDK's manifest
@@ -3471,11 +3501,19 @@ export function createRaftPlugin(deps: {
       if (name === LOGIN_TOOL) return integrationsLogin(args, ctx, agentLogin(ctx));
       if (name === ACTIONS_TOOL) return integrationsActions(args, ctx, agentLogin(ctx), manifests);
       if (name === INVOKE_TOOL) return integrationsInvoke(args, ctx, agentLogin(ctx), manifests);
-      if (name === OWNER_INBOX_TOOL || name === OWNER_MESSAGES_TOOL) return ownerRead(name, args, ctx, assistant, unofferedFor(ctx));
+      if (name === OWNER_INBOX_TOOL || name === OWNER_MESSAGES_TOOL) {
+        return ownerRead(name, args, ctx, assistant, unofferedFor(ctx), (ids) => wakeReads.saw(ctx, ids));
+      }
+      if (name === NOTE_DECISION_TOOL) {
+        if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
+        return noteDecision(args, ctx, wakeReads);
+      }
       if (name === NOTIFY_TOOL || name === PREFERENCES_TOOL) {
         // Offered as the owner reads are, and refused the same way where the mount's list does not name them.
         if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
+        // A DM sent is counted for the check's note (`sentActual`): the code's count, beside the model's own.
         return name === NOTIFY_TOOL ? notifyOwner(args, ctx, { send: sendToOwner, recheck: recheckOwner, api: assistantApi })
+          .then((out) => { if ((out as { state?: unknown } | null)?.state === "sent") wakeReads.sentOne(ctx); return out; })
           : preferences(args, ctx, { inbox: (c, r) => assistant.ownerInbox(c, r), resolve: resolveOwnerPerson, api: assistantApi });
       }
       if (name === REMINDER_TOOL) {
@@ -3768,6 +3806,7 @@ export function createRaftPlugin(deps: {
       // A short session's end is told to this mount only when it asked for the session: one of Raft's checks.
       if (end.isolated) {
         checkEnded(ctx, end);
+        await decisionEnded(ctx, end, wakeReads);
         await turnDelivered(ctx, end, reportEventsDelivered);
         return;
       }
@@ -3776,11 +3815,14 @@ export function createRaftPlugin(deps: {
 
     /** A personal assistant's doorbell checks and morning brief (`assistantWake`); nothing for any other agent. */
     async wake(ctx) {
-      return assistantWake(ctx, {
+      const next = await assistantWake(ctx, {
         recheck: recheckOwner, inbox: (c, r) => assistant.ownerInbox(c, r), send: sendToOwner,
         messages: (c, channelId) => probeOwnerMessages(c, channelId, assistant),
         mode: readRaftCheck, api: assistantApi, delivered: reportEventsDelivered,
       });
+      // When the check's session was posted: its note's wake time (`noteDecision`).
+      if (next?.isolated && next.turnKey) wakeReads.started(ctx, next.turnKey, Date.now());
+      return next;
     },
   };
   // Every call: a failure that is Raft's `assistant_not_enabled` pauses an assistant's proactive work (`pauseOn`), and

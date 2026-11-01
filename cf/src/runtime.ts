@@ -5031,7 +5031,12 @@ export class AgentRuntime {
     };
     try {
       await this.ready();
-      if (trigger === "delete") markAgentDeleted(sql, Date.now());
+      if (trigger === "delete") {
+        markAgentDeleted(sql, Date.now());
+        // A personal assistant's notes of what its checks decided hold its owner's data, and the object outlives the
+        // delete: they go with the agent (src/store/assistant-decisions.ts).
+        this.store.assistantDecisions.deleteAgent(tenantId, agentId);
+      }
       if (!(await this.store.loadAgent(tenantId, agentId)) || !(await this.store.getModelBinding(tenantId, agentId))) {
         return done({ result: "not_running" });
       }
