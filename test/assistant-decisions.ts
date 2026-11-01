@@ -100,7 +100,7 @@ const get = (q: string, headers: Record<string, string> = {}) => new Request(`ht
 const quiet = async <T>(fn: () => Promise<T>) => { const e = console.error; console.error = () => {}; try { return await fn(); } finally { console.error = e; } };
 
 await check("GET /admin/assistant-decisions: the operator's token or nothing, and never an object opened without it", async () => {
-  for (const headers of [{}, { "x-harness-token": "wrong" }]) {
+  for (const headers of [{}, { "x-harness-token": "wrong" }] as Array<Record<string, string>>) {
     const s = source();
     const res = await adminAssistantDecisions(get("tenantId=t&agentId=a&reason=x", headers), TOKEN, s.open, null);
     must(res.status === 401 && s.asked.length === 0, `${show(headers)}: ${res.status} ${show(s.asked)}`);
@@ -113,7 +113,7 @@ await check("GET /admin/assistant-decisions: always audited as an assistant's re
   const { db, d1: database } = d1();
   const s = source();
   const none = await adminAssistantDecisions(get("tenantId=t&agentId=a", { "x-harness-token": TOKEN }), TOKEN, s.open, d1ReadAudit(database), T0);
-  must(none.status === 400 && (await none.json()).code === "read_reason_required" && s.asked.length === 0, `no reason: ${none.status}`);
+  must(none.status === 400 && (await none.json() as { code?: string }).code === "read_reason_required" && s.asked.length === 0, `no reason: ${none.status}`);
   const res = await adminAssistantDecisions(get("tenantId=t&agentId=a&from=2026-09-20T00:00:00Z&to=1790000000000", { "x-harness-token": TOKEN, "x-read-reason": "why no DM on 10-01" }), TOKEN, s.open, d1ReadAudit(database), T0);
   must(res.status === 200 && res.headers.get("cache-control") === "no-store", `read: ${res.status}`);
   const body = await res.json() as any;
