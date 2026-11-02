@@ -709,7 +709,7 @@ The file is append-only. Removing a line takes a reviewed PR that says why the f
 
 **Emergency rollback below a floor.** Set both `DEPLOY_BELOW_FLOOR=<full SHA of every floor crossed>`
 (space-separated) and `DEPLOY_BELOW_FLOOR_REASON="<why>"`. A SHA that is not a floor being crossed, or a crossed floor
-left unnamed, is refused. The deploy prints `STEP deploy crossed floor <sha>: <reason>` and a warning: tell Raft
+left unnamed, is refused. The deploy prints `STEP deploy crossed floor <sha> at <UTC time>: <reason>` and a warning: tell Raft
 (AppFather) at once, because its web may already depend on what the floor changed. It also appends to
 `~/tmp/antiproton-below-floor.<prod|preview>`; the next deploy that satisfies every floor prints
 `STEP back above all floors (previous deploy crossed <sha>)` and removes that file.

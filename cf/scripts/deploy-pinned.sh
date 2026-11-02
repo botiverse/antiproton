@@ -133,9 +133,10 @@ done
 # step, since a deploy that reports failure may still have shipped.
 marker="$HOME/tmp/antiproton-below-floor.$mode"
 if [ -n "$crossed" ]; then
-  mkdir -p "$HOME/tmp" && printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$short" "$crossed" >> "$marker" \
+  at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  mkdir -p "$HOME/tmp" && printf '%s %s %s\n' "$at" "$short" "$crossed" >> "$marker" \
     || { echo "STEP floor FAILED (cannot write the marker $marker)"; exit 1; }
-  for f in $crossed; do echo "STEP deploy crossed floor $f: $below_reason"; done
+  for f in $crossed; do echo "STEP deploy crossed floor $f at $at: $below_reason"; done
   echo "WARNING: production will run a build below a deploy floor. Tell Raft (AppFather) now: its web may already depend on what the floor changed." >&2
 fi
 echo "STEP floor ok ($(printf '%s\n' "$floors" | wc -l | tr -d ' ') checked${crossed:+, crossed:$crossed})"

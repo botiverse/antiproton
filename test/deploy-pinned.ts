@@ -220,7 +220,7 @@ check("floors: a floor this checkout lists but the target's file dropped still h
   writeFileSync(join(f.repo, "cf/deploy-floors.txt"), `# ${REASON}\n${f.sha}\n`);
   refusedEarly(f.run(["--preview"]), `floor not satisfied: ${f.sha} ${REASON} [listed in this checkout's cf/deploy-floors.txt but not in ${t.slice(0, 7)}'s]`);
   const r = f.run(["--preview"], { DEPLOY_BELOW_FLOOR: f.sha, DEPLOY_BELOW_FLOOR_REASON: "drill" });
-  if (r.status !== 0 || !r.out.includes(`STEP deploy crossed floor ${f.sha}: drill`)) throw new Error(`exited ${r.status}:\n${r.out}`);
+  if (r.status !== 0 || !new RegExp(`STEP deploy crossed floor ${f.sha} at \\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ: drill`).test(r.out)) throw new Error(`exited ${r.status}:\n${r.out}`);
 });
 
 check("floors: DEPLOY_BELOW_FLOOR must name the exact floor crossed and give a reason; then it deploys, loudly, and the next deploy above every floor says so", () => {
@@ -233,7 +233,7 @@ check("floors: DEPLOY_BELOW_FLOOR must name the exact floor crossed and give a r
   refusedEarly(f.run(["--preview"], { DEPLOY_BELOW_FLOOR_REASON: "rollback" }), "names no floor");
   const r = f.run(["--preview"], { DEPLOY_BELOW_FLOOR: f.sha, DEPLOY_BELOW_FLOOR_REASON: "rollback for an outage" });
   if (r.status !== 0) throw new Error(`exited ${r.status}:\n${r.out}`);
-  if (!r.out.includes(`STEP deploy crossed floor ${f.sha}: rollback for an outage`)) throw new Error(`no crossed-floor line:\n${r.out}`);
+  if (!new RegExp(`STEP deploy crossed floor ${f.sha} at \\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ: rollback for an outage`).test(r.out)) throw new Error(`no crossed-floor line:\n${r.out}`);
   if (!r.out.includes("Tell Raft (AppFather)")) throw new Error(`no warning to tell Raft:\n${r.out}`);
   if (r.calls.find((l) => l.startsWith("deploy "))?.split(" ")[1] !== t) throw new Error(`did not deploy ${t}:\n${r.calls.join("\n")}`);
   const marker = join(f.base, "tmp/antiproton-below-floor.preview");
