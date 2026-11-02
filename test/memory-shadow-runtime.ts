@@ -12,6 +12,7 @@ import type { ModelResponse } from "../src/model/types.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { modelToolName } from "../src/runtime/pi-tools.ts";
 import { MEMORY_OBSERVE_PROMPT } from "../src/runtime/memory-shadow.ts";
+import { clearMemoryShadow } from "../src/store/memory-shadow.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -107,7 +108,7 @@ await check("shadow: a direct write writes a due row, then the subagent's run is
   must((shadow.job.context.tools ?? []).length === 0, `the shadow session was offered tools: ${show(shadow.job.context.tools)}`);
   const input = lastUser(shadow.job);
   must(input.includes("1| - [owner] reply in English") && !input.includes("prefers short replies\n</memory>"), `shown the document before the write: ${input.slice(0, 300)}`);
-  must(input.includes("Remember this: - prefers short replies") && input.includes("please remember that I prefer short replies"), `request and conversation: ${input}`);
+  must(input.includes("Remember this:\n- prefers short replies") && input.includes("please remember that I prefer short replies"), `request and conversation: ${input}`);
   await answer(w, shadow, { text: JSON.stringify({ ops: [{ op: "insert", key: "memory", after_line: 1, text: "- [owner] keep replies short" }] }) });
   must(await memoryNow(w) === afterMain, `the shadow run changed memory: ${show(await memoryNow(w))}`);
   const beats = rows(w, "memory.shadow");
@@ -152,7 +153,7 @@ await check("shadow: two writes in one turn: each run is shown the conversation 
   await answer(w, await one(w, "main"), { text: "done" });
   const shadows = (await out(w)).filter((c) => c.kind === "shadow").map((c) => lastUser(c.job));
   must(shadows.length === 2, `runs: ${shadows.length}`);
-  const first = shadows.find((s) => s.includes("Remember this: - alpha"))!, second = shadows.find((s) => s.includes("Remember this: - bravo"))!;
+  const first = shadows.find((s) => s.includes("Remember this:\n- alpha"))!, second = shadows.find((s) => s.includes("Remember this:\n- bravo"))!;
   must(first && second, show(shadows));
   const conv = (s: string) => s.slice(s.indexOf("<conversation>"));
   must(conv(first).includes("remember ALPHA please") && !conv(first).includes("BRAVO"), `the first run: ${conv(first)}`);
@@ -177,16 +178,63 @@ await check("shadow: a run whose answer fails or cannot be read is a failed hear
   must(main.length === 0, "the main conversation was left waiting");
 });
 
-await check("shadow: a due row whose run never started is countable: due rows outnumber heartbeats", async () => {
+await check("shadow: a due row whose run has not started is countable: due rows outnumber heartbeats until the agent's run ends", async () => {
   const w = await world();
   await w.rt.postMessage("t", "a", "remember gamma", "prompt", "main");
   await answer(w, await one(w, "main"), { toolCalls: [call("c1", REMEMBER, { key: "memory", text: "- gamma" })] });
-  // The setting is switched off before the run ends, so the runtime never starts what the write queued.
+  // The agent's run is still going (its next model call is out): the write's run is owed and not started.
+  must((await out(w)).every((c) => c.kind === "main"), "a memory subagent session was posted mid-run");
+  must(rows(w, "memory.shadow_due").length === 1 && rows(w, "memory.shadow").length === 0, `due ${rows(w, "memory.shadow_due").length}, heartbeats ${rows(w, "memory.shadow").length}`);
+  await answer(w, await one(w, "main"), { text: "noted" });
+  await answer(w, await one(w, "shadow"), { text: '{"ops": []}' });
+  must(rows(w, "memory.shadow").length === 1, "the run did not end with a heartbeat");
+});
+
+await check("switched back to self before the run ended: the queued run is finished as skipped (writer_self) with its heartbeat and redacted", async () => {
+  const w = await world();
+  await w.rt.postMessage("t", "a", "remember gamma", "prompt", "main");
+  await answer(w, await one(w, "main"), { toolCalls: [call("c1", REVISE, { key: "memory", old: "- works on Raft", new: "- works on Antiproton" })] });
   w.host.sql.exec("UPDATE mounts SET public_config = ? WHERE alias = 'mem'", JSON.stringify({ memoryWriter: "self" }));
   await answer(w, await one(w, "main"), { text: "noted" });
-  must((await out(w)).every((c) => c.kind === "main") && (await out(w)).length === 0, "a memory subagent session was posted");
-  must(rows(w, "memory.shadow_due").length === 1 && rows(w, "memory.shadow").length === 0, `due ${rows(w, "memory.shadow_due").length}, heartbeats ${rows(w, "memory.shadow").length}`);
-  must(w.rt.store.memoryShadow.list("t", "a")[0]?.state === "queued", "the run is not left queued");
+  must((await out(w)).length === 0, "a memory subagent session was posted under self");
+  const beats = rows(w, "memory.shadow");
+  must(beats.length === 1 && beats[0]!.status === "skipped" && beats[0]!.attrs.error === "writer_self", show(beats));
+  const run = w.rt.store.memoryShadow.list("t", "a")[0]!;
+  must(run.state === "done" && !JSON.stringify(run).includes("works on Raft"), JSON.stringify(run));
+});
+
+await check("four writes in one run, the last a revise of the first: no row deleted, every due row gets a heartbeat, the old wording redacted everywhere", async () => {
+  const w = await world();
+  await w.rt.postMessage("t", "a", "keep these", "prompt", "main");
+  await answer(w, await one(w, "main"), { toolCalls: [
+    call("c1", REMEMBER, { key: "memory", text: "- secret plan ALPHA" }), call("c2", REMEMBER, { key: "memory", text: "- likes green tea" }),
+    call("c3", REMEMBER, { key: "memory", text: "- office on floor 7" }), call("c4", REVISE, { key: "memory", old: "- secret plan ALPHA", new: "- plan B" }),
+  ] });
+  await answer(w, await one(w, "main"), { text: "done" });
+  for (const c of (await out(w)).filter((x) => x.kind === "shadow")) await answer(w, c, { text: '{"ops": []}' });
+  must(rows(w, "memory.shadow_due").length === 4 && rows(w, "memory.shadow").length === 4, `due ${rows(w, "memory.shadow_due").length}, heartbeats ${rows(w, "memory.shadow").length}`);
+  const stored = w.host.sql.exec("SELECT memory_before, memory_main, memory_after, request, main_op, ops FROM memory_shadow").toArray();
+  must(stored.length === 4, `rows ${stored.length}`);
+  must(!JSON.stringify(stored).includes("secret plan ALPHA"), JSON.stringify(stored));
+  for (const r of stored as any[]) for (const k of ["main_op", "ops"]) if (r[k] !== null) JSON.parse(r[k]);
+});
+
+await check("the operator's clear: every row goes, a queued run gets a cleared heartbeat, one in flight ends job_missing; a second clear deletes 0", async () => {
+  const w = await world();
+  await chatThatRemembers(w, "- one");
+  const posted = await one(w, "shadow");
+  w.rt.store.memoryShadow.queue("t", "a", { id: "ms_q", trigger: "chat", session: "main", request: "r", mainOp: { tool: "remember", args: {}, result: "ok" }, memoryBefore: "", memoryMain: "x" });
+  const first = clearMemoryShadow(w.host.sql as never, "t", "a");
+  must(first.deleted === 2 && first.stillRecording === true, JSON.stringify(first));
+  await answer(w, posted, { text: '{"ops": []}' });
+  const beats = rows(w, "memory.shadow").map((b) => [b.status, b.attrs.error]);
+  must(JSON.stringify(beats.sort()) === JSON.stringify([["failed", "job_missing"], ["skipped", "cleared"]]), JSON.stringify(beats));
+  must(rows(w, "memory.shadow_due").length === 1 && w.rt.store.memoryShadow.list("t", "a").length === 0, "rows left");
+  must(clearMemoryShadow(w.host.sql as never, "t", "a").deleted === 0, "the second clear deleted something");
+  const cleared = rows(w, "memory.shadow_clear");
+  must(cleared.length === 2 && cleared[0]!.attrs.deleted === 2 && cleared[1]!.attrs.deleted === 0, JSON.stringify(cleared));
+  w.host.sql.exec("UPDATE mounts SET public_config = ? WHERE alias = 'mem'", JSON.stringify({ memoryWriter: "self" }));
+  must(clearMemoryShadow(w.host.sql as never, "t", "a").stillRecording === false, "stillRecording under self");
 });
 
 await check("self: no due row, no run, no observer, no row in memory_shadow; the agent's requests are the same as with the setting unset", async () => {

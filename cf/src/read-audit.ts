@@ -3,7 +3,8 @@
  * Workers log, which drops lines. The audited routes are the ones that return what an agent was told or said:
  * `/admin/transcript`, the `/agent/*` reads, the console's `/ui/transcript`, the provisioning eval `transcript` and
  * `model-input`, `/admin/assistant-decisions`, a personal assistant's notes of what its checks decided, and
- * `/admin/memory-shadow`, the memory subagent's shadow runs over an agent's memory. A row is metadata only — the route, the agent, the conversation, what kind of credential read it and
+ * `/admin/memory-shadow`, the memory subagent's shadow runs over an agent's memory (its `DELETE`, the operator's clear of them, is
+ * recorded the same way under the route `DELETE /admin/memory-shadow`). A row is metadata only — the route, the agent, the conversation, what kind of credential read it and
  * its label, the reason the caller gave — never the content.
  *
  * A personal assistant's conversation holds what it read of its owner's Raft (src/plugins/raft-assistant.ts), which is

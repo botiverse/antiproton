@@ -79,7 +79,7 @@ import { adminTranscript } from "./admin-transcript.ts";
 import { adminAssistantDecisions } from "./admin-assistant-decisions.ts";
 import { readAssistantDecisions } from "../../src/store/assistant-decisions.ts";
 import { adminMemoryShadow } from "./admin-memory-shadow.ts";
-import { readMemoryShadow } from "../../src/store/memory-shadow.ts";
+import { clearMemoryShadow, readMemoryShadow } from "../../src/store/memory-shadow.ts";
 import { auditRead, d1ReadAudit, readReason } from "./read-audit.ts";
 import { readFrictionWindow, type FrictionLimits, type FrictionWindow } from "./friction-read.ts";
 import { dailyCron, frictionDaily, scanDay, tenantScope, writeReport, type FrictionBucket, type WindowReader } from "./friction-scan.ts";
@@ -2634,6 +2634,15 @@ export class AgentDO extends DurableObject<Env> {
   async adminMemoryShadow(tenantId: string, agentId: string, from: number, to: number) {
     if (!this.#isAgent(tenantId, agentId)) return null;
     return readMemoryShadow(this.sql as never, tenantId, agentId, { from, to });
+  }
+
+  /**
+   * The operator's clear of the memory subagent's shadow runs (DELETE /admin/memory-shadow): this agent's rows and marks,
+   * a heartbeat first for each run still queued (`clearMemoryShadow`). Null for an agent this object does not hold.
+   */
+  async adminMemoryShadowClear(tenantId: string, agentId: string) {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return clearMemoryShadow(this.sql as never, tenantId, agentId);
   }
 
   /**

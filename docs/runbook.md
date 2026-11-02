@@ -77,6 +77,14 @@ is left out):
 curl -s -H "x-harness-token: $AUTOMATION_TOKEN" -H "X-Read-Reason: <why>" "$HOST/admin/memory-shadow?tenantId=<tenantId>&agentId=<agentId>&from=<from>&to=<to>"
 ```
 
+To clear them at once (an owner's request), the same gate and audit, recorded as `DELETE /admin/memory-shadow`. It
+answers `deleted` (0 on a second call) and `stillRecording`: clearing does not stop recording, which only setting the
+state mount's `memoryWriter` back to `self` does.
+
+```
+curl -s -X DELETE -H "x-harness-token: $AUTOMATION_TOKEN" -H "X-Read-Reason: <why>" "$HOST/admin/memory-shadow?tenantId=<tenantId>&agentId=<agentId>"
+```
+
 Every stop, cancel or delete of a turn writes a `turn.stop` line to the Workers logs: `trigger` (`admin_cancel`,
 `provider_stop`, `delete`), `result` (`aborted`, `nothing_running`, `failed`), `turn` when one was aborted, `error` when
 it failed, and `side`. The Worker that answered the stop writes one (`side` = `worker`) for every attempt; the agent's

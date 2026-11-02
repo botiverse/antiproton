@@ -1925,7 +1925,7 @@ seeing the whole document but no longer edits it.
 | Value | What happens |
 |---|---|
 | `self` (default) | The agent writes `memory` with its own tools, exactly as before: the model is sent the same requests, no row is written, nothing else runs. |
-| `shadow` | The agent still writes `memory` itself, unchanged. Each of its direct writes is also run past the memory subagent, whose edits are recorded privately and **never applied**, so the two can be compared on the same intent. After each finished turn an observer classifies whether a memory intent appeared. |
+| `shadow` | The agent still writes `memory` itself, unchanged. Each of its direct writes is also run past the memory subagent, whose edits are recorded privately and **never applied**, so the two can be compared on the same intent. After each finished turn an observer classifies whether a memory intent appeared. Turning `shadow` off (back to `self`) stops new shadow records; the ones already kept stay up to 7 days, unless cleared at once with `DELETE /admin/memory-shadow` (below) or by deleting the agent. |
 | `subagent` | Not available yet: a mount carrying it is refused with a message saying so. It needs the agent's write tools replaced by one synchronous `memory_update` tool, which the queue-driven model path cannot serve inside a tool call today. A stored value that is not `self` or `shadow` is read as `self`. |
 
 **Several state mounts.** They share one `memory`, so every mount's ask holds: `shadow` on any of them is `shadow` for
@@ -1942,7 +1942,8 @@ the default never switches off a shadow the first asked for.
    Nothing waits for the subagent, so the write is neither delayed nor failed by it.
 2. When the run that made the write has ended, the runtime posts one short session per queued run, at most three per
    run of the agent's (`MEMORY_SHADOW_RUNS_PER_RUN`); the rest are finished as `skipped` (`per_run_cap`), each with its
-   heartbeat. A session is offered **no tools**; its system prompt is the subagent's rules and its input is the document before the write, the request, and
+   heartbeat. A run whose document could not be read is finished as `read_failed` without a call and takes no slot;
+   one still queued when the agent has been switched back to `self` is finished as `skipped` (`writer_self`). A session is offered **no tools**; its system prompt is the subagent's rules and its input is the document before the write, the request, and
    the conversation since the previous run in that conversation (a per-conversation mark; the first run sees the most
    recent messages; at most 12,000 characters, oldest cut first). Two writes in one turn are shown disjoint parts.
 3. Its answer is JSON: `{"ops": [...]}` with `revise`, `insert`, `remember` and `put` in the state tools' shapes. The
@@ -1983,14 +1984,28 @@ of it.
 document, the request and the proposed edits are the owner's data and stay in the agent's own `memory_shadow` table:
 
 - **Kept 7 days**, pruned on every pass of the agent's object and as a run is queued, and deleted with the agent.
-- **A forget takes effect there too.** Every write to `memory`, under any writer, compares the document before and
-  after it: a row whose stored text (either document, the request, the agent's write, the proposed edits) holds a line
-  the write removed or reworded is deleted. Under `self` this is asked only when an earlier shadow left rows. The run
-  queued for the removing write itself keeps the text until it has been judged, and has those lines replaced by
-  `[forgotten]` as it finishes.
+- **What the agent removes is redacted there too, never deleted.** Every write to `memory`, under any writer, compares
+  the document before and after it: every line present before and absent after (a reworded line counts, so a
+  `revise`'s whole old line goes, not only its `old`) is replaced by `[forgotten]` in every row of the agent's, queued,
+  in flight or finished. In the three stored documents only lines equal to a removed line change (trailing whitespace
+  ignored), so removing `- chai` leaves `- chai with milk` as it was. In the request, the agent's write and the
+  proposed edits, each JSON string value is redacted the same way and, for a `revise`, the exact `old` text wherever it
+  occurs; the JSON is parsed and written again, never edited as text. A line or fragment with fewer than 4 letters or
+  digits (`-`, `---`, `## a`) is not redacted: it carries nothing of the owner's and would blank the same marker
+  everywhere. Rows are never deleted for it, so due rows keep their heartbeats and the comparison keeps its documents.
+  The run queued for the removing write itself keeps its text until it has been judged and is redacted as it finishes.
+  Under `self` this is asked only when an earlier shadow left rows. The due row carries `redactedRows`; a redaction
+  that fails, or meets a cell that does not parse, never fails the write and is a `memory.shadow_redact` row (`error`
+  `redact_failed` or `unparsable_cell`, counts only).
 - **One read path:** `GET /admin/memory-shadow?tenantId=…&agentId=…` with the operator's token
   (`cf/src/admin-memory-shadow.ts`), gated and audited exactly as `/admin/assistant-decisions`: a reason is required
   and a read whose audit row cannot be written is refused.
+- **Clearing:** `DELETE /admin/memory-shadow?tenantId=…&agentId=…`, behind the same gate and audit (recorded as
+  `DELETE /admin/memory-shadow`), deletes all of the agent's rows and marks at once and answers `deleted: N`; a second
+  call answers `deleted: 0`. A run still queued is given a `cleared` heartbeat first and one in flight ends with
+  `job_missing`, so due rows and heartbeats still balance; the count is also a `memory.shadow_clear` trace row. It clears
+  what is kept and does **not** stop recording: while the mount says `shadow` the answer says `stillRecording: true`,
+  and only setting `memoryWriter` back to `self` stops it. The route never changes the setting.
 
 **Phase 2** (`subagent`) must apply the subagent's edits with the same function shadow judges them with (`simulate`),
 its whole result written in one compare-and-set transaction against the document it was shown, so the

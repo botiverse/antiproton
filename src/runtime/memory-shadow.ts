@@ -79,8 +79,10 @@ export function requestOf(tool: string, args: unknown): string {
   const a = (args && typeof args === "object" ? args : {}) as Record<string, unknown>;
   const said = (() => {
     switch (tool) {
-      case "remember": return `Remember this: ${str(a.text)}`;
-      case "insert": return `Add this, at line ${str(a.after_line)}: ${str(a.text)}`;
+      // The text on lines of its own, as in the other requests, so a line the agent later removes is a whole line here
+      // too and is redacted as one (src/store/memory-shadow.ts `redactRow`).
+      case "remember": return `Remember this:\n${str(a.text)}`;
+      case "insert": return `Add this, at line ${str(a.after_line)}:\n${str(a.text)}`;
       case "revise": return typeof a.new === "string" && a.new !== ""
         ? `Change this text:\n${str(a.old)}\nto:\n${a.new}`
         : `Delete this text:\n${str(a.old)}`;

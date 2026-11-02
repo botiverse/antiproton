@@ -6245,10 +6245,14 @@ This call was made by your subagent ${a.taskId}.`;
   async #memoryAfterRun(tenantId: string, agentId: string, agent: AgentEngine, session: string,
     settled: Array<{ operationId: string; status: string }>): Promise<boolean> {
     const mounts = await this.store.findMountsByPlugin(tenantId, agentId, "state");
-    if (!mounts.length) return false;
     const cfg = sharedSettings(mounts.map((m) => configOf(m.publicConfig)));
-    if (cfg.memoryWriter !== "shadow") return false;
     const runs = this.store.memoryShadow.queued(tenantId, agentId, session);
+    if (!mounts.length || cfg.memoryWriter !== "shadow") {
+      // Switched back to `self` (or the mount removed) after a write was queued: the run is finished as skipped, with its
+      // heartbeat, and redacted as every finished run is, rather than left queued holding text the agent may remove.
+      for (const run of runs) this.#shadowFinished(tenantId, agentId, run, { skipped: "writer_self" }, 0);
+      return false;
+    }
     const branch = await agent.branch() as BranchEntry[];
     const last = ([...branch].reverse().find((e) => e.type === "message") as { message?: unknown } | undefined)?.message;
     const completed = settled.length > 0 && turnEndOf(settled.at(-1)!.status, last).outcome === "completed";
@@ -6262,9 +6266,14 @@ This call was made by your subagent ${a.taskId}.`;
       const { slices, marker } = contextSlices(branch, this.store.memoryShadow.mark(tenantId, agentId, conversation), runs.length, calls.isWrite);
       // At most MEMORY_SHADOW_RUNS_PER_RUN calls for one run of the agent's; the rest are finished as `skipped`, each with
       // its heartbeat, so due rows and heartbeats still balance and a write-heavy run costs a bounded number of calls.
+      // A run without its document (`readFailed`) is finished without a call and takes no slot.
+      let started = 0;
       for (let i = 0; i < runs.length; i++) {
-        if (i >= MEMORY_SHADOW_RUNS_PER_RUN) { this.#shadowFinished(tenantId, agentId, runs[i]!, { skipped: "per_run_cap" }, 0); continue; }
-        posted = await this.#postShadow(tenantId, agentId, alias, capOf("memory", cfg), runs[i]!, renderConversation(slices[i]!)) || posted;
+        const run = runs[i]!;
+        if (run.mainOp.readFailed) { this.#shadowFinished(tenantId, agentId, run, { error: "read_failed" }, 0); continue; }
+        if (started >= MEMORY_SHADOW_RUNS_PER_RUN) { this.#shadowFinished(tenantId, agentId, run, { skipped: "per_run_cap" }, 0); continue; }
+        started++;
+        posted = await this.#postShadow(tenantId, agentId, alias, capOf("memory", cfg), run, renderConversation(slices[i]!)) || posted;
       }
       if (marker) this.store.memoryShadow.setMark(tenantId, agentId, conversation, marker);
     }
@@ -6284,8 +6293,6 @@ This call was made by your subagent ${a.taskId}.`;
 
   /** One queued shadow run's short session, posted; a post that fails finishes the run as failed (`post_failed`). */
   async #postShadow(tenantId: string, agentId: string, alias: string, cap: number, run: MemoryShadowRun, conversation: string): Promise<boolean> {
-    // The state plugin could not read the document around the write: there is nothing to show the subagent.
-    if (run.mainOp.readFailed) { this.#shadowFinished(tenantId, agentId, run, { error: "read_failed" }, 0); return false; }
     const at = Date.now();
     const ok = await this.#postMemorySession(tenantId, agentId, alias, `${SHADOW_KEY_PREFIX}${run.id}`,
       shadowInput({ memory: run.memoryBefore, cap, request: run.request, conversation }),

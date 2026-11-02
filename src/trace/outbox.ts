@@ -110,7 +110,7 @@ export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "contain
   "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "github.refresh", "github.refresh_skipped", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call",
   "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check", "raft.session_unsealable",
   "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner", "stamp.agent_login", "state.dropped",
-  "raft.assistant_decision", "memory.shadow_due", "memory.shadow", "memory.observe"] as const;
+  "raft.assistant_decision", "memory.shadow_due", "memory.shadow", "memory.observe", "memory.shadow_redact", "memory.shadow_clear"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
@@ -176,12 +176,17 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * proposed (src/runtime/memory-shadow.ts `ShadowCounts`). A due row with no heartbeat is a run that never ran.
  * `memory.observe` is one finished turn of such an agent, classified: whether a memory `intent` appeared in it, whether
  * the agent `called` a memory write in it, `sampled` (always true in shadow) and `trigger`, or `failed` with an `error`
- * code. None of the three is forwarded.
+ * code. `memory.shadow_redact` is a write to `memory` whose removed text could not be redacted from the shadow runs
+ * (src/plugins/state.ts): `error` (`redact_failed`, `unparsable_cell`), how many removed `lines`, and how many `rows`
+ * held an unparsable cell; written only on a failure, since a success is `redactedRows` on the due row.
+ * `memory.shadow_clear` is the operator's clear of an agent's shadow runs (src/store/memory-shadow.ts
+ * `clearMemoryShadow`): how many rows were `deleted`, how many were still `queued` (each given a `cleared` heartbeat),
+ * and `stillRecording`. None of the five is forwarded.
  */
 export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake", "raft.assistant_notify",
   "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check",
   "raft.session_unsealable", "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner",
-  "stamp.agent_login", "state.dropped", "raft.assistant_decision", "memory.shadow_due"] as const satisfies readonly TraceKind[];
+  "stamp.agent_login", "state.dropped", "raft.assistant_decision", "memory.shadow_due", "memory.shadow_redact"] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;

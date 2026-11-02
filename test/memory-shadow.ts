@@ -17,7 +17,7 @@ import {
   calledMemory, contextSlices, FIRST_CONTEXT_MESSAGES, isOwnerLine, lineDiff, memoryCallMatcher, memoryShadowPrompt, OWNER_TAG, parseObservation,
   parseProposal, renderConversation, REQUEST_MAX, requestOf, revisedInPlace, simulate, type BranchEntry,
 } from "../src/runtime/memory-shadow.ts";
-import { FORGOTTEN, MEMORY_SHADOW_RETENTION_MS, MemoryShadowTables } from "../src/store/memory-shadow.ts";
+import { FORGOTTEN, MEMORY_SHADOW_RETENTION_MS, MemoryShadowTables, redactable } from "../src/store/memory-shadow.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { modelToolName } from "../src/runtime/pi-tools.ts";
 
@@ -60,11 +60,14 @@ async function plugin(config: Record<string, unknown>, opts: { taskId?: string; 
   const store = new SqliteStore(":memory:");
   await store.init();
   await store.createAgent("t", "a");
+  // The shadow table on a host of the test's own, so a case can damage a cell past the store's API, as damage would.
+  const host = sqliteHost();
+  (store as any).memoryShadow = new MemoryShadowTables(host).ensure();
   const p = statePlugin(store, null, "local", undefined, opts.shadowsMemory ? { shadowsMemory: opts.shadowsMemory } : {});
   const traces: any[] = [];
   const ctx = { publicConfig: config, credential: null, caller: { tenantId: "t", agentId: "a", taskId: opts.taskId ?? "main" }, alias: "mem",
     trace: (r: unknown) => { traces.push(r); } } as unknown as PluginContext;
-  return { store, p, ctx, traces };
+  return { store, p, ctx, traces, host };
 }
 
 await check("shadow: a direct write to memory writes the due row, then queues the run with the document before and after the write", async () => {
@@ -75,7 +78,7 @@ await check("shadow: a direct write to memory writes the due row, then queues th
   must(!show(traces).includes("one") && !show(traces).includes("two"), "the due row carries text");
   const runs = store.memoryShadow.queued("t", "a", "main");
   must(runs.length === 2 && runs[0]!.memoryBefore === "" && runs[0]!.memoryMain === "- one" && runs[1]!.memoryBefore === "- one" && runs[1]!.memoryMain === "- one\n- two", show(runs));
-  must(runs[0]!.id === traces[0]!.attrs.job && runs[1]!.request === "Remember this: - two", show(runs.map((r) => r.request)));
+  must(runs[0]!.id === traces[0]!.attrs.job && runs[1]!.request === "Remember this:\n- two", show(runs.map((r) => r.request)));
 });
 
 await check("shadow: a write to another key, a read, or a write from a subagent's session queues nothing", async () => {
@@ -136,28 +139,103 @@ await check("the agent's write is kept with its arguments cut at REQUEST_MAX, as
   must(kept.length < REQUEST_MAX + 100 && kept.length < long.length, `kept ${kept.length}`);
 });
 
-await check("a forget takes effect: a revise that rewords a line deletes the runs holding the old wording; its own run blanks it out as it finishes", async () => {
-  const { store, p, ctx } = await plugin({ memoryWriter: "shadow" });
+const rawRows = (store: SqliteStore) => store.memoryShadow.list("t", "a").map((r) => r.id).map((id) => store.memoryShadow.get("t", "a", id)!);
+const done = (store: SqliteStore, id: string) =>
+  store.memoryShadow.finish("t", "a", id, { outcome: "no_change", errorCode: null, memoryAfter: store.memoryShadow.get("t", "a", id)!.memoryBefore, ops: [{ op: "revise", args: { old: "x" } }], counts: {} });
+
+await check("redaction: a revise of an older line redacts its old wording from every row, deleting none; its own run is redacted as it finishes", async () => {
+  const { store, p, ctx, traces } = await plugin({ memoryWriter: "shadow" });
   await p.invoke("remember", { key: "memory", text: "- secret plan ALPHA" }, ctx);
-  await p.invoke("remember", { key: "memory", text: "- likes tea" }, ctx);
-  must(store.memoryShadow.list("t", "a").length === 2, "two runs");
+  await p.invoke("remember", { key: "memory", text: "- likes green tea" }, ctx);
+  await p.invoke("remember", { key: "memory", text: "- works on Raft" }, ctx);
   await p.invoke("revise", { key: "memory", old: "- secret plan ALPHA", new: "- plan B" }, ctx);
-  const left = store.memoryShadow.list("t", "a");
-  // The first run (its request and document after hold ALPHA) and the second (its documents hold ALPHA) are gone; the revise's own remains.
-  must(left.length === 1 && left[0]!.mainOp.tool === "revise", show(left.map((r) => r.mainOp.tool)));
-  must(left[0]!.memoryBefore.includes("ALPHA"), "the revise's own run lost its text before it was judged");
-  store.memoryShadow.finish("t", "a", left[0]!.id, { outcome: "no_change", errorCode: null, memoryAfter: left[0]!.memoryBefore, ops: [], counts: {} });
-  const done = show(store.memoryShadow.get("t", "a", left[0]!.id));
-  must(!done.includes("secret plan ALPHA") && done.includes(FORGOTTEN), done);
+  const rows = rawRows(store);
+  must(rows.length === 4, `rows ${rows.length}`);
+  const revise = rows.find((r) => r.mainOp.tool === "revise")!;
+  must(revise.memoryBefore.includes("secret plan ALPHA"), "the revise's own run lost its text before it was judged");
+  for (const r of rows.filter((x) => x !== revise)) must(!show(r).includes("secret plan ALPHA"), `an earlier row kept the old wording: ${show(r)}`);
+  must(rows[rows.length - 1]!.memoryMain === `${FORGOTTEN}`, `the first row's document after: ${show(rows[rows.length - 1]!.memoryMain)}`);
+  must(traces.at(-1)?.attrs.redactedRows === 3, show(traces.at(-1)));
+  done(store, revise.id);
+  const after = show(store.memoryShadow.get("t", "a", revise.id));
+  must(!after.includes("secret plan ALPHA") && after.includes(FORGOTTEN) && after.includes("- likes green tea"), after);
 });
 
-await check("a forget takes effect under self too, for runs an earlier shadow left", async () => {
+await check("redaction: a revise of a fragment removes the fragment from the request and the agent's write, and the whole old line from the documents", async () => {
+  const { store, p, ctx } = await plugin({ memoryWriter: "shadow" });
+  await p.invoke("remember", { key: "memory", text: "- lives at 12 Rose St, flat 2" }, ctx);
+  await p.invoke("revise", { key: "memory", old: "12 Rose St", new: "9 Elm Rd" }, ctx);
+  const revise = rawRows(store).find((r) => r.mainOp.tool === "revise")!;
+  done(store, revise.id);
+  const r = store.memoryShadow.get("t", "a", revise.id)!;
+  must(!r.request.includes("12 Rose St") && !show(r.mainOp).includes("12 Rose St"), show({ request: r.request, mainOp: r.mainOp }));
+  must(r.memoryBefore === FORGOTTEN && r.memoryMain === "- lives at 9 Elm Rd, flat 2", show(r));
+  const first = rawRows(store).find((x) => x.mainOp.tool === "remember")!;
+  must(!show(first).includes("12 Rose St"), `the earlier row: ${show(first)}`);
+});
+
+await check("redaction: whole lines only: '- chai' removed leaves '- chai with milk' intact", async () => {
+  const { store, p, ctx } = await plugin({ memoryWriter: "shadow" });
+  await p.invoke("put", { key: "memory", value: "- chai\n- chai with milk\n- works on Raft" }, ctx);
+  await p.invoke("put", { key: "memory", value: "- chai with milk\n- works on Raft" }, ctx);
+  const first = rawRows(store).find((r) => r.memoryBefore === "")!;
+  must(first.memoryMain === `${FORGOTTEN}\n- chai with milk\n- works on Raft`, show(first.memoryMain));
+  must(String((first.mainOp.args as any).value) === `${FORGOTTEN}\n- chai with milk\n- works on Raft`, show(first.mainOp));
+});
+
+await check("redaction: a line with fewer than 4 letters or digits ('-', '---', '## a') is never redacted", async () => {
+  const { store, p, ctx } = await plugin({ memoryWriter: "shadow" });
+  await p.invoke("put", { key: "memory", value: "## a\n-\n---\n- works on Raft" }, ctx);
+  await p.invoke("put", { key: "memory", value: "- works on Raft" }, ctx);
+  const first = rawRows(store).find((r) => r.memoryBefore === "")!;
+  must(first.memoryMain === "## a\n-\n---\n- works on Raft", show(first.memoryMain));
+  must(redactable("abcd") && !redactable("- a-b") && !redactable("---") && redactable("- 12 Rose"), "redactable");
+});
+
+await check("redaction: the structured cells stay valid JSON, a removed line with quotes and backslashes redacted as a value", async () => {
+  const { store, p, ctx } = await plugin({ memoryWriter: "shadow" });
+  const line = '- said "ship it" at C:\\work\\notes';
+  await p.invoke("remember", { key: "memory", text: line }, ctx);
+  const id = rawRows(store)[0]!.id;
+  store.memoryShadow.finish("t", "a", id, { outcome: "changed", errorCode: null, memoryAfter: line, ops: [{ op: "remember", key: "memory", args: { text: line } }], counts: {} });
+  await p.invoke("forget", { key: "memory" }, ctx);
+  const cells = (store.memoryShadow as any).list("t", "a");
+  const raw = cells.find((r: any) => r.id === id)!;
+  must(show(raw.mainOp) === show({ tool: "remember", args: { key: "memory", text: FORGOTTEN }, result: "ok" }), show(raw.mainOp));
+  must(show(raw.ops) === show([{ op: "remember", key: "memory", args: { text: FORGOTTEN } }]), show(raw.ops));
+  must(raw.request === `Remember this:\n${FORGOTTEN}` && raw.memoryAfter === FORGOTTEN, show(raw));
+});
+
+await check("redaction failure never fails the write: a memory.shadow_redact row with a code and counts; an unparsable cell is counted too", async () => {
+  const { store, p, ctx, traces } = await plugin({ memoryWriter: "shadow" });
+  await p.invoke("remember", { key: "memory", text: "- secret plan ALPHA" }, ctx);
+  const real = store.memoryShadow.redactRemoved.bind(store.memoryShadow);
+  (store.memoryShadow as any).redactRemoved = () => { throw new Error("disk"); };
+  const quietly = console.error; console.error = () => {};
+  try { await p.invoke("revise", { key: "memory", old: "- secret plan ALPHA", new: "- plan B" }, ctx); } finally { console.error = quietly; }
+  (store.memoryShadow as any).redactRemoved = real;
+  must((await store.getState("t", "a", "memory"))?.value === "- plan B", "the write did not land");
+  const failRows = traces.filter((t) => t.kind === "memory.shadow_redact");
+  must(failRows.length === 1 && failRows[0].attrs.error === "redact_failed" && failRows[0].attrs.lines === 1 && !show(failRows).includes("ALPHA"), show(failRows));
+  const s2 = await plugin({ memoryWriter: "shadow" });
+  await s2.p.invoke("remember", { key: "memory", text: "- secret plan BRAVO" }, s2.ctx);
+  const id = rawRows(s2.store)[0]!.id;
+  // A damaged JSON cell: written past the store's own API, as damage would be.
+  (s2.store as any).memoryShadow.finish("t", "a", id, { outcome: "no_change", errorCode: null, memoryAfter: null, ops: null, counts: null });
+  s2.host.sql.exec("UPDATE memory_shadow SET main_op = '{bad' WHERE id = ?", id);
+  await s2.p.invoke("forget", { key: "memory" }, s2.ctx);
+  const bad = s2.traces.filter((t) => t.kind === "memory.shadow_redact");
+  must(bad.length === 1 && bad[0].attrs.error === "unparsable_cell" && bad[0].attrs.rows === 1, show(bad));
+});
+
+await check("redaction under self too, for runs an earlier shadow left; no row deleted", async () => {
   const { store, p, ctx } = await plugin({ memoryWriter: "shadow" });
   await p.invoke("remember", { key: "memory", text: "- secret plan ALPHA" }, ctx);
   must(store.memoryShadow.list("t", "a").length === 1, "a run");
   const self = { ...ctx, publicConfig: {} } as PluginContext;
   await p.invoke("forget", { key: "memory" }, self);
-  must(store.memoryShadow.list("t", "a").length === 0, show(store.memoryShadow.list("t", "a")));
+  const rows = store.memoryShadow.list("t", "a");
+  must(rows.length === 1 && !show(rows).includes("secret plan ALPHA"), show(rows));
 });
 
 // ---- judging a proposal ---------------------------------------------------------------------------------------
@@ -273,10 +351,10 @@ await check("answers: JSON, fenced JSON or a bare list read as ops; prose is unp
 });
 
 await check("requests say the write: remember, insert, revise to new text, revise to delete, put, forget", () => {
-  must(requestOf("remember", { key: "memory", text: "x" }) === "Remember this: x", "remember");
+  must(requestOf("remember", { key: "memory", text: "x" }) === "Remember this:\nx", "remember");
   must(requestOf("revise", { key: "memory", old: "a", new: "b" }) === "Change this text:\na\nto:\nb", "revise");
   must(requestOf("revise", { key: "memory", old: "a" }) === "Delete this text:\na", "delete");
-  must(requestOf("insert", { key: "memory", after_line: 2, text: "x" }) === "Add this, at line 2: x", "insert");
+  must(requestOf("insert", { key: "memory", after_line: 2, text: "x" }) === "Add this, at line 2:\nx", "insert");
   must(requestOf("put", { key: "memory", value: "v" }).startsWith("Replace the whole memory with:") && requestOf("forget", { key: "memory" }) === "Forget the whole memory.", "put, forget");
 });
 
@@ -355,13 +433,17 @@ const TOKEN = "operator-token";
 const DAY = 24 * 3_600_000;
 const T0 = Date.parse("2026-10-01T00:00:00Z");
 const RUNS = [{ id: "ms_1" }];
-function source() {
+function source(stillRecording = true) {
   const asked: Array<[string, string, number, number]> = [];
+  const cleared: string[] = [];
+  let rows = 3;
   const open = (_t: string, _a: string): MemoryShadowSource => ({
     adminMemoryShadow: async (t, a, from, to) => { asked.push([t, a, from, to]); return a === "a" ? RUNS : null; },
+    adminMemoryShadowClear: async (_t2, a) => { cleared.push(a); if (a !== "a") return null; const deleted = rows; rows = 0; return { deleted, stillRecording }; },
   });
-  return { asked, open };
+  return { asked, cleared, open };
 }
+const del = (q: string, headers: Record<string, string> = {}) => new Request(`https://x/admin/memory-shadow?${q}`, { method: "DELETE", headers });
 const get = (q: string, headers: Record<string, string> = {}) => new Request(`https://x/admin/memory-shadow?${q}`, { headers });
 const quiet = async <T>(fn: () => Promise<T>) => { const e = console.error; console.error = () => {}; try { return await fn(); } finally { console.error = e; } };
 
@@ -402,6 +484,37 @@ await check("GET /admin/memory-shadow: the last 7 days by default, a bad range i
     must(r.status === 400, `${q}: ${r.status}`);
   }
   const missing = await adminMemoryShadow(get("tenantId=t&agentId=nobody&reason=x", { "x-harness-token": TOKEN }), TOKEN, s.open, { record: async () => {} }, T0);
+  must(missing.status === 404, `missing: ${missing.status}`);
+});
+
+await check("DELETE /admin/memory-shadow: the GET's gate: the operator's token, a reason, an audit row naming the clear, refused when it cannot be written", async () => {
+  for (const headers of [{}, { "x-harness-token": "wrong" }] as Array<Record<string, string>>) {
+    const s = source();
+    const res = await adminMemoryShadow(del("tenantId=t&agentId=a&reason=x", headers), TOKEN, s.open, null);
+    must(res.status === 401 && s.cleared.length === 0, `${show(headers)}: ${res.status}`);
+  }
+  const { db, d1: database } = d1();
+  const s = source();
+  const none = await adminMemoryShadow(del("tenantId=t&agentId=a", { "x-harness-token": TOKEN }), TOKEN, s.open, d1ReadAudit(database as never), T0);
+  must(none.status === 400 && s.cleared.length === 0, `no reason: ${none.status}`);
+  const res = await adminMemoryShadow(del("tenantId=t&agentId=a", { "x-harness-token": TOKEN, "x-read-reason": "owner asked" }), TOKEN, s.open, d1ReadAudit(database as never), T0);
+  const body = await res.json() as any;
+  must(res.status === 200 && body.deleted === 3 && body.stillRecording === true && /set it back to "self"/.test(body.note), show(body));
+  const rows = db.prepare("SELECT route, agent_id, reason, assistant, outcome FROM admin_read_audit").all() as any[];
+  must(rows.length === 1 && rows[0].route === "DELETE /admin/memory-shadow" && rows[0].reason === "owner asked" && rows[0].assistant === 1, `audit: ${show(rows)}`);
+  const failing: ReadAudit = { record: async (_r: ReadAuditRow) => { throw new Error("D1 down"); } };
+  const s2 = source();
+  const refused = await quiet(() => adminMemoryShadow(del("tenantId=t&agentId=a&reason=x", { "x-harness-token": TOKEN }), TOKEN, s2.open, failing, T0));
+  must(refused.status === 503 && s2.cleared.length === 0, `audit down: ${refused.status}`);
+});
+
+await check("DELETE /admin/memory-shadow: idempotent (a second clear says deleted 0), no stillRecording note under self, 404 for an agent the object lacks", async () => {
+  const s = source(false);
+  const ok = { record: async () => {} };
+  const first = await (await adminMemoryShadow(del("tenantId=t&agentId=a&reason=x", { "x-harness-token": TOKEN }), TOKEN, s.open, ok, T0)).json() as any;
+  const second = await (await adminMemoryShadow(del("tenantId=t&agentId=a&reason=x", { "x-harness-token": TOKEN }), TOKEN, s.open, ok, T0)).json() as any;
+  must(first.deleted === 3 && second.deleted === 0 && second.stillRecording === false && second.note === undefined, show({ first, second }));
+  const missing = await adminMemoryShadow(del("tenantId=t&agentId=nobody&reason=x", { "x-harness-token": TOKEN }), TOKEN, s.open, ok, T0);
   must(missing.status === 404, `missing: ${missing.status}`);
 });
 

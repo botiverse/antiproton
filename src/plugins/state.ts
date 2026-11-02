@@ -10,7 +10,7 @@ import { STATE_INLINE_MAX, STATE_KEY } from "./state-key.ts";
 import { seedInline, type SeedFileMeta, type SeedMode } from "../store/seed-files.ts";
 import { putRefusal, storeFull, totalRefusal, type WhenFull } from "../store/state-lines.ts";
 import { boundedArgs, isMemoryWrite, requestOf } from "../runtime/memory-shadow.ts";
-import { removedLines } from "../store/memory-shadow.ts";
+import { removedLines, reviseFragment } from "../store/memory-shadow.ts";
 import { isIsolatedSession } from "../runtime/isolated-session.ts";
 
 type SealingKey = Awaited<ReturnType<typeof importKek>>;
@@ -458,6 +458,7 @@ export function statePlugin(
         summary: "Who writes `memory`. `self` (the default): the agent, with its own tools. `shadow`: the agent still does, " +
           "and after each of its finished turns one short model call proposes the edits a memory subagent would make; they " +
           "are recorded privately for comparison and never applied. With several state mounts, `shadow` on any of them holds. " +
+          "Setting it back to `self` stops new records; those kept stay up to 7 days unless cleared (DELETE /admin/memory-shadow) or the agent is deleted. " +
           "`subagent` is not available yet." },
     ],
     configProblem: (config) => memoryWriterProblem(config),
@@ -942,7 +943,7 @@ export function statePlugin(
   // Under `memoryWriter: "shadow"`, a direct write to `memory` is also queued for the memory subagent to be run on,
   // after the run that made it has ended (src/runtime/memory-shadow.ts): wrapped around `invoke` so the write itself is
   // the code above, unchanged, and every other call goes straight to it. Any write to `memory`, under any writer, also
-  // purges the shadow runs that hold what it removed (`purgeLines`), which under `self` is asked only of an agent an
+  // redacts what it removed from the shadow runs (`redactRemoved`), which under `self` is asked only of an agent an
   // earlier shadow left rows for.
   const direct = plugin.invoke.bind(plugin);
   plugin.invoke = async (tool, args, ctx) => {
@@ -955,24 +956,38 @@ export function statePlugin(
     // session, on an engine that runs them (`shadowsMemory`). Anywhere else a queued run would never start, and its due
     // row would count as a run that never ran. `main` is the main conversation's task id (MAIN_SESSION, src/store/pi-storage.ts).
     const shadow = writer === "shadow" && (session === "main" || isIsolatedSession(session)) && (opts.shadowsMemory?.() ?? true);
-    let purge = shadow;
-    if (!purge) {
-      try { purge = store.memoryShadow.hasRows(tenantId, agentId); } catch { purge = false; }
+    let redact = shadow;
+    if (!redact) {
+      try { redact = store.memoryShadow.hasRows(tenantId, agentId); } catch { redact = false; }
     }
-    if (!purge) return direct(tool, args, ctx);
+    if (!redact) return direct(tool, args, ctx);
     // Each read is allowed to fail without failing the write: a run without the document is finished as `read_failed`
-    // by the runtime, and a purge without both documents is not attempted.
+    // by the runtime, and a redaction without both documents is not attempted.
     const read = async () => { try { return await memoryText(store, tenantId, agentId); } catch { return null; } };
     const before = await read();
     let out: Json = null, failure: unknown = null, failed = false;
     try { out = await direct(tool, args, ctx); } catch (e) { failure = e; failed = true; }
     const after = failed ? before : await read();
+    // Redacted by the line diff of the write (every line present before and absent after, so a revise's whole old line
+    // goes from the stored documents, not only its `old`), plus a revise's `old` in the structured fields. A failure is
+    // a `memory.shadow_redact` row, counts only, and never the write's; a success is `redactedRows` on the due row.
+    let redacted: number | null = null;
     if (before !== null && after !== null && before !== after) {
-      try { store.memoryShadow.purgeLines(tenantId, agentId, removedLines(before, after)); }
-      catch (e) { console.error(`the memory subagent's shadow runs of ${tenantId}/${agentId} were not purged of a write's removed lines:`, e); }
+      const lines = removedLines(before, after);
+      const fail = (error: string, rows: number) => {
+        try { ctx.trace?.({ kind: "memory.shadow_redact", status: "failed", verdict: "failed", attrs: { error, lines: lines.length, rows } }); } catch { /* the log line stands */ }
+      };
+      try {
+        const r = store.memoryShadow.redactRemoved(tenantId, agentId, lines, reviseFragment({ tool, args }));
+        redacted = r.changed;
+        if (r.unparsable) fail("unparsable_cell", r.unparsable);
+      } catch (e) {
+        console.error(`the memory subagent's shadow runs of ${tenantId}/${agentId} were not redacted of a write's removed text:`, e);
+        fail("redact_failed", 0);
+      }
     }
     // A refused write is still the agent's intent, and the subagent may manage what it could not: queued as well.
-    if (shadow) await queueShadow(ctx, tool, args, session, before, after, failed ? codeOf(failure) : "ok");
+    if (shadow) await queueShadow(ctx, tool, args, session, before, after, failed ? codeOf(failure) : "ok", redacted);
     if (failed) throw failure;
     return out;
   };
@@ -982,12 +997,13 @@ export function statePlugin(
    * never started still shows as owed. Never throws: the agent's write is never failed by its shadow. A document that
    * could not be read (null) is queued as `readFailed`, which the runtime finishes as `read_failed` without a call.
    */
-  async function queueShadow(ctx: PluginContext, tool: string, args: Json, session: string, before: string | null, after: string | null, result: string): Promise<void> {
+  async function queueShadow(ctx: PluginContext, tool: string, args: Json, session: string, before: string | null, after: string | null, result: string,
+    redactedRows: number | null): Promise<void> {
     const id = `ms_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
     const trigger = isIsolatedSession(session) ? "check" : "chat";
     const readFailed = before === null || after === null;
     try {
-      ctx.trace?.({ kind: "memory.shadow_due", status: "due", verdict: "ok", attrs: { op: tool, trigger, job: id, main: result, ...(readFailed ? { read: "failed" } : {}) } });
+      ctx.trace?.({ kind: "memory.shadow_due", status: "due", verdict: "ok", attrs: { op: tool, trigger, job: id, main: result, ...(readFailed ? { read: "failed" } : {}), ...(redactedRows === null ? {} : { redactedRows }) } });
     } catch { /* the run is still queued; its heartbeat stands without the due row */ }
     try {
       store.memoryShadow.queue(ctx.caller.tenantId, ctx.caller.agentId, {
