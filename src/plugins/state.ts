@@ -454,7 +454,9 @@ export function statePlugin(
       { name: "maxTotalBytes", type: "number", default: DEFAULTS.maxTotalBytes,
         summary: "How much this agent may keep in total. A write that would pass it is refused." },
       // No `choices`: a value outside them would be refused with the list alone, and `subagent` deserves the reason.
-      { name: "memoryWriter", type: "string", default: DEFAULTS.memoryWriter,
+      // Changeable in place (`PATCH /admin/mounts`): it is how shadow is turned on and off for an agent that exists, and
+      // it says how the mount behaves, not what it is connected to. The limits above stay as the mount was made.
+      { name: "memoryWriter", type: "string", default: DEFAULTS.memoryWriter, changeable: true,
         summary: "Who writes `memory`. `self` (the default): the agent, with its own tools. `shadow`: the agent still does, " +
           "and after each of its finished turns one short model call proposes the edits a memory subagent would make; they " +
           "are recorded privately for comparison and never applied. With several state mounts, `shadow` on any of them holds. " +

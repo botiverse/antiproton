@@ -1928,6 +1928,23 @@ seeing the whole document but no longer edits it.
 | `shadow` | The agent still writes `memory` itself, unchanged. Each of its direct writes is also run past the memory subagent, whose edits are recorded privately and **never applied**, so the two can be compared on the same intent. After each finished turn an observer classifies whether a memory intent appeared. Turning `shadow` off (back to `self`) stops new shadow records; the ones already kept stay up to 7 days, unless cleared at once with `DELETE /admin/memory-shadow` (below) or by deleting the agent. |
 | `subagent` | Not available yet: a mount carrying it is refused with a message saying so. It needs the agent's write tools replaced by one synchronous `memory_update` tool, which the queue-driven model path cannot serve inside a tool call today. A stored value that is not `self` or `shadow` is read as `self`. |
 
+**Turning it on and off for an agent that exists.** `memoryWriter` is the state mount's one setting an operator may
+change in place (`changeable`), with `PATCH /admin/mounts` and the operator's token; the mount's other settings stay as
+it was made:
+
+```
+curl -s -X PATCH -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: application/json" "$HOST/admin/mounts" \
+  -d '{"tenantId":"<tenantId>","agentId":"<agentId>","alias":"state","settings":{"memoryWriter":"shadow"}}'
+```
+
+`"self"` turns it off again, and `null` removes the key, which reads as `self`. `"subagent"` or any other value is
+refused with a 400 saying why. A provisioning re-ask that does not name the setting keeps it (`repeatsMount`). Turning
+it off stops new records only: those kept stay until their 7 days are up, or until `DELETE /admin/memory-shadow`
+(below) or the agent's delete. One thing resets it, as it resets every setting of a catalogue mount: opening the agent
+in the console (`uiEnsure`) reconciles the `state` mount it was given from the catalogue back to the catalogue's
+config, which names no `memoryWriter`, so an agent opened there is back on `self` and its next write records nothing.
+That reconcile is unchanged here; set the value again after such an open.
+
 **Several state mounts.** They share one `memory`, so every mount's ask holds: `shadow` on any of them is `shadow` for
 the agent, and `self` only when all say `self` (`memoryWriterOf`). It is the rule the limits follow read the same way —
 the smallest limit holds so that no mount's alias is a way past another's — and it means a second mount added with
