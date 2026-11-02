@@ -462,6 +462,36 @@ await check("the next call runs with the changed settings: the gateway hands the
   host.dispose();
 });
 
+await check("memoryWriter is changed in place on the state mount: shadow on, self back, null removes it; subagent and a typo are 400; the other state settings are not changeable", async () => {
+  const { rt, host, agentId } = await raftAgent();
+  const before = JSON.stringify(settingsOf(host, agentId, "state"));
+  must(before === JSON.stringify({ account: "agent memory" }), `the fixture's state mount: ${before}`);
+  const on = await patch(env(rt), { tenantId: T, agentId, alias: "state", settings: { memoryWriter: "shadow" } });
+  must(on.status === 200 && on.body.config.memoryWriter === "shadow" && on.body.changed[0] === "memoryWriter", on.text);
+  must(settingsOf(host, agentId, "state").memoryWriter === "shadow", "not stored");
+  const off = await patch(env(rt), { tenantId: T, agentId, alias: "state", settings: { memoryWriter: "self" } });
+  must(off.status === 200 && off.body.config.memoryWriter === "self", off.text);
+  const cleared = await patch(env(rt), { tenantId: T, agentId, alias: "state", settings: { memoryWriter: null } });
+  must(cleared.status === 200 && JSON.stringify(settingsOf(host, agentId, "state")) === before, cleared.text);
+  const sub = await patch(env(rt), { tenantId: T, agentId, alias: "state", settings: { memoryWriter: "subagent" } });
+  must(sub.status === 400 && /not available yet/.test(sub.body?.error ?? "") && /"shadow"/.test(sub.body?.error ?? ""), `${sub.status} ${sub.text}`);
+  const typo = await patch(env(rt), { tenantId: T, agentId, alias: "state", settings: { memoryWriter: "shadowy" } });
+  must(typo.status === 400 && /"self" or "shadow"/.test(typo.body?.error ?? ""), `${typo.status} ${typo.text}`);
+  for (const other of ["memoryMaxCharacters", "maxDocumentBytes", "maxValueBytes", "maxTotalBytes"]) {
+    const r = await patch(env(rt), { tenantId: T, agentId, alias: "state", settings: { [other]: 9000 } });
+    must(r.status === 400 && /cannot be changed on an existing state mount \(only memoryWriter can\)/.test(r.body?.error ?? ""), `${other}: ${r.status} ${r.text}`);
+  }
+  must(JSON.stringify(settingsOf(host, agentId, "state")) === before, "a refused change moved the settings");
+  host.dispose();
+});
+
+await check("repeatsMount on the state mount: a stored memoryWriter the re-ask does not name is a repeat, so provisioning keeps it", async () => {
+  const { statePlugin } = await import("../src/plugins/state.ts");
+  const state = statePlugin(null as never, null, "local");
+  must(repeatsMount(state, { account: "agent memory", memoryWriter: "shadow" }, { account: "agent memory" }), "kept on a re-ask");
+  must(!repeatsMount(state, { account: "agent memory", memoryMaxCharacters: 9000 }, { account: "agent memory" }), "an unchangeable stored limit is still another mount");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.ok ? "" : `\n      ${r.error}`}`);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
