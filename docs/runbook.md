@@ -714,6 +714,11 @@ left unnamed, is refused. The deploy prints `STEP deploy crossed floor <sha> at 
 `~/tmp/antiproton-below-floor.<prod|preview>`; the next deploy that satisfies every floor prints
 `STEP back above all floors (previous deploy crossed <sha>)` and removes that file.
 
+**Which side to roll back.** A floor makes the two directions unequal. Rolling Raft back (for the first floor, to
+v1.21.44) is safe: the older Raft still reads the older antiproton answers as well as the new ones. Rolling antiproton
+back below the floor is the dangerous one: current Raft (v1.21.45 on, slock #12403) no longer reads the old 502
+disconnect answer and shows it to the user as an error. In an incident that involves both, roll Raft back first.
+
 This guards against deploying the wrong version through `deploy-pinned.sh`. It does not stop a deploy that bypasses
 the script, and it cannot see a revert: a commit on master that undoes a floor's change still has the floor as an
 ancestor.

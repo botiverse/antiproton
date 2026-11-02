@@ -407,7 +407,7 @@ console.log(`\n  agent.trace forward\n  ${"─".repeat(56)}`);
 
 /**
  * The receiver's fields per kind and their types, as the trace-upload worker's `antiprotonTrace.ts`
- * (`ANTIPROTON_TRACE_KINDS`) has them at botiverse/slock 8596d839 (#10611, #10643). Pinned here so a drift on either side shows.
+ * (`ANTIPROTON_TRACE_KINDS`) has them at botiverse/slock 33c1802e (#10611, #10643, #12359). Pinned here so a drift on either side shows.
  * `mount_index` is this side's envelope (any row about a mount), so it is checked apart from the kind's fields.
  */
 const ENUM = (...v: string[]) => v.join("|");
@@ -453,14 +453,15 @@ const WORKER_FIELDS: Record<string, Record<string, string>> = {
   "rebuild.outcome": { decision: "id", trigger: ENUM("window", "cold-wake", "operator"), strategy: ENUM("summary", "briefing"),
     agreement: ENUM("agree", "false-cold", "false-warm", "expected-cold", "unmeasured"), would_rebuild: "bool", predicted_cold: "bool",
     expected_cold: "bool", measured_cold: "bool", input: "count", cache_read: "count", since_decision_ms: "count" },
+  "state.dropped": { mount: "id", key: ENUM("memory", "todo", "journal", "other"), lines: "count", characters: "count" },
 };
 /**
  * What this side sends that the receiver does not keep yet, by the receiver's types: new kinds, new fields, and enums
  * widened (a value outside the receiver's list is dropped by it, the row kept). The field table sent to the receiving
- * side is this; when the receiver takes an entry, it moves to WORKER_FIELDS. Empty: botiverse/slock#10611 and #10643 took
- * every entry they had.
+ * side is this; when the receiver takes an entry, it moves to WORKER_FIELDS. botiverse/slock#10611 and #10643 took every
+ * entry they had; #12359 took state.dropped without the `mount_index` every plugin row carries.
  */
-const PROPOSED: Record<string, Record<string, string>> = {};
+const PROPOSED: Record<string, Record<string, string>> = { "state.dropped": { mount_index: "count" } };
 /** The receiver's fields once PROPOSED lands: what this side's fields are pinned to. */
 const CONTRACT: Record<string, Record<string, string>> = Object.fromEntries([...new Set([...Object.keys(WORKER_FIELDS), ...Object.keys(PROPOSED)])]
   .map((k) => [k, { ...WORKER_FIELDS[k], ...PROPOSED[k] }]));
@@ -615,6 +616,11 @@ async function newKinds(sql: any): Promise<void> {
     { at: T0 + 24, ...t, kind: "raft.assistant_send_as_owner", spanId: "op_00000000000000000015", status: "refused:channel_not_found", verdict: "blocked",
       attrs: { mount: "assistant", result: "refused:channel_not_found", target_kind: "channel", in_thread: false, chars: 42, http_status: 404 } },
   ]);
+  // src/plugins/state.ts `remember` on a full journal, as the gateway writes it (test/state.ts "a remember that drops
+  // lines": the mount's alias first, then key, lines, characters). The alias sorts after `raft`, so no ordinal above moves.
+  withMounts(sql, [["scratch", "state"]]);
+  appendTrace(sql, [{ at: T0 + 25, ...t, kind: "state.dropped", spanId: "op_00000000000000000016", status: "dropped", verdict: "ok",
+    attrs: { mount: "scratch", key: "journal", lines: 2, characters: 33 } }]);
 }
 
 const env0 = (seq: number, kind: string, at: number, extra: Record<string, unknown>) =>
@@ -655,6 +661,8 @@ const GOLDEN_NEW: Record<number, Record<string, unknown>> = {
     action: "add", effect: "mute", scope: "channel", result: "added", rules_total: 2, mute_channel: 1, always_person: 1 }),
   24: env0(24, "raft.assistant_send_as_owner", T0 + 24, { span_id: "op_00000000000000000015", mount_index: 0, status: "refused:channel_not_found",
     verdict: "blocked", result: "refused:channel_not_found", target_kind: "channel", in_thread: false, chars: 42, http_status: 404 }),
+  25: env0(25, "state.dropped", T0 + 25, { span_id: "op_00000000000000000016", mount_index: 2, status: "dropped", verdict: "ok",
+    mount: "state", key: "journal", lines: 2, characters: 33 }),
 };
 
 const GOLDEN: Record<string, Record<string, unknown>> = {
@@ -692,7 +700,7 @@ const sameRow = (a: Record<string, unknown>, b: Record<string, unknown>) => {
 
 await check("the agent.trace lane is the receiver's kinds and the proposed ones, every one a trace kind, and none of github.refresh's", async () => {
   must(AGENT_TRACE_KINDS.slice().sort().join(",") === Object.keys(CONTRACT).sort().join(","), `kinds: ${AGENT_TRACE_KINDS}`);
-  must(AGENT_TRACE_KINDS.length === 15, `kinds: ${AGENT_TRACE_KINDS.length}`);
+  must(AGENT_TRACE_KINDS.length === 16, `kinds: ${AGENT_TRACE_KINDS.length}`);
   // Every proposal is new to the receiver: a field it already keeps as it is moves to WORKER_FIELDS, not here.
   for (const [kind, fields] of Object.entries(PROPOSED)) {
     for (const [f, type] of Object.entries(fields)) must(WORKER_FIELDS[kind]?.[f] !== type, `${kind}.${f} is proposed but the receiver has it`);
@@ -796,6 +804,27 @@ await check("the new kinds' fields hold their shapes: a check id, a decision id,
   must(!e.requests.map((q) => q.text).join("").includes("alice") && !e.requests.map((q) => q.text).join("").includes("Alice"), "a name was sent");
 });
 
+await check("a state.dropped row sends the mount's type, the key and the sizes, never the dropped text, the document or the alias", async () => {
+  // The attrs a writer could add that must stay local: the reply's own `dropped.text`, the document, an excerpt.
+  const { sql } = sqliteHost(); const e = routes();
+  withMounts(sql, [["owner-notes-alice", "state"]]);
+  const LOST = "SENTINEL-LOST-7f3a owner said call the dentist";
+  appendTrace(sql, [
+    { at: T0 + 1, ...OWNER, kind: "state.dropped", spanId: "mount:owner-notes-alice", status: "dropped", verdict: "ok",
+      attrs: { mount: "owner-notes-alice", key: "journal", lines: 1, characters: LOST.length, text: LOST, dropped: { text: LOST }, excerpt: LOST, value: LOST } },
+    // A key the writer did not narrow to the working set or `other` is left out, never sent as the agent spelled it.
+    { at: T0 + 2, ...OWNER, kind: "state.dropped", spanId: "mount:owner-notes-alice", status: "dropped", verdict: "ok",
+      attrs: { mount: "owner-notes-alice", key: "call-the-dentist", lines: 1, characters: 4 } },
+  ]);
+  await lanePass(sql, e);
+  const [d, k] = traced(e);
+  must(d && sameRow(d, env0(1, "state.dropped", T0 + 1, { span_id: "mount", mount_index: 0, status: "dropped", verdict: "ok",
+    mount: "state", key: "journal", lines: 1, characters: LOST.length })), `sent ${JSON.stringify(d)}`);
+  must(k && k.key === undefined && k.lines === 1 && k.characters === 4, `an unlisted key: ${JSON.stringify(k)}`);
+  const text = e.requests.map((q) => q.text).join("\n");
+  for (const leak of ["SENTINEL", "dentist", "alice", '"text"', '"excerpt"', '"value"', '"dropped":{']) must(!text.includes(leak), `sent ${leak}: ${text}`);
+});
+
 await check("a send as the owner's resolution attrs stay local: resolved_by, rows_read, pages_read, bound_hit and resolve_status are not forwarded", async () => {
   // The forwarder picks attrs by key name alone, so staying local is a property of these names: a rename to a listed key,
   // or adding them to the kind's fields, sends them.
@@ -816,7 +845,7 @@ await check("an agent.trace row carries the envelope and its kind's fields, noth
   everyKind(sql); await newKinds(sql);
   await lanePass(sql, e);
   const rows = traced(e);
-  must(rows.length === 24, `rows: ${rows.length}`);
+  must(rows.length === 25, `rows: ${rows.length}`);
   for (const r of rows) {
     const allowed = new Set([...ENVELOPE, ...Object.keys(AGENT_TRACE_FIELDS[r.kind as TraceKind]!)]);
     const extra = Object.keys(r).filter((k) => !allowed.has(k));
