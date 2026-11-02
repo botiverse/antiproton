@@ -1990,9 +1990,9 @@ document, the request and the proposed edits are the owner's data and stay in th
   in flight or finished. In the three stored documents only lines equal to a removed line change (trailing whitespace
   ignored), so removing `- chai` leaves `- chai with milk` as it was. In the request, the agent's write and the
   proposed edits, each JSON string value is redacted the same way and, for a `revise`, the exact `old` text wherever it
-  occurs; the JSON is parsed and written again, never edited as text. A line or fragment with fewer than 4 letters or
-  digits (`-`, `---`, `## a`) is not redacted: it carries nothing of the owner's and would blank the same marker
-  everywhere. Rows are never deleted for it, so due rows keep their heartbeats and the comparison keeps its documents.
+  occurs; the JSON is parsed and written again, never edited as text. A line or fragment that is empty once whitespace,
+  punctuation and symbols are taken out (`-`, `---`, `##`, a blank line) is not redacted: it carries nothing of the
+  owner's and would blank the same marker everywhere. Any other line is redacted however short (`- Bob`, `- 3F`). Rows are never deleted for it, so due rows keep their heartbeats and the comparison keeps its documents.
   The run queued for the removing write itself keeps its text until it has been judged and is redacted as it finishes.
   Under `self` this is asked only when an earlier shadow left rows. The due row carries `redactedRows`; a redaction
   that fails, or meets a cell that does not parse, never fails the write and is a `memory.shadow_redact` row (`error`

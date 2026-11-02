@@ -253,12 +253,13 @@ function hasTable(sql: Sql): boolean {
 export const FORGOTTEN = "[forgotten]";
 
 /**
- * Whether a line or fragment is worth redacting: at least 4 letters or digits. A blank line, a bullet, a rule (`---`) or
- * a bare heading marker carries nothing of the owner's, and redacting it would blank the same marker in every kept line
- * of every row.
+ * Whether a line or fragment is redacted: anything left once whitespace, punctuation and symbols (`\p{P}`, `\p{S}`,
+ * markdown's markers among them) are taken out. A blank line, a bullet, a rule (`---`) or a bare heading marker carries
+ * nothing of the owner's, and redacting it would blank the same marker in every kept line of every row; anything else
+ * is redacted however short, since a name or a number ("- Bob", "- 3F") is exactly what an owner asks to be forgotten.
  */
 export function redactable(text: string): boolean {
-  return (text.match(/[\p{L}\p{N}]/gu)?.length ?? 0) >= 4;
+  return text.replace(/[\s\p{P}\p{S}]/gu, "").length > 0;
 }
 
 /** The lines of `before` that are not in `after`, compared with trailing whitespace trimmed: what a write removed or reworded. */

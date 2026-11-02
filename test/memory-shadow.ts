@@ -183,13 +183,22 @@ await check("redaction: whole lines only: '- chai' removed leaves '- chai with m
   must(String((first.mainOp.args as any).value) === `${FORGOTTEN}\n- chai with milk\n- works on Raft`, show(first.mainOp));
 });
 
-await check("redaction: a line with fewer than 4 letters or digits ('-', '---', '## a') is never redacted", async () => {
+await check("redaction: a line of only whitespace, punctuation or markdown markers ('-', '---', '##', blank) is never redacted", async () => {
   const { store, p, ctx } = await plugin({ memoryWriter: "shadow" });
-  await p.invoke("put", { key: "memory", value: "## a\n-\n---\n- works on Raft" }, ctx);
+  await p.invoke("put", { key: "memory", value: "##\n-\n---\n   \n- works on Raft" }, ctx);
   await p.invoke("put", { key: "memory", value: "- works on Raft" }, ctx);
   const first = rawRows(store).find((r) => r.memoryBefore === "")!;
-  must(first.memoryMain === "## a\n-\n---\n- works on Raft", show(first.memoryMain));
-  must(redactable("abcd") && !redactable("- a-b") && !redactable("---") && redactable("- 12 Rose"), "redactable");
+  must(first.memoryMain === "##\n-\n---\n   \n- works on Raft", show(first.memoryMain));
+  must(!redactable("-") && !redactable("---") && !redactable("##") && !redactable("") && !redactable(" * — ") && redactable("- 12 Rose"), "redactable");
+});
+
+await check("redaction: short names and numbers are redacted however short: '- Bob', '- 42 号', '- 3F'", async () => {
+  const { store, p, ctx } = await plugin({ memoryWriter: "shadow" });
+  await p.invoke("put", { key: "memory", value: "- Bob\n- 42 号\n- 3F\n- works on Raft" }, ctx);
+  await p.invoke("put", { key: "memory", value: "- works on Raft" }, ctx);
+  const first = rawRows(store).find((r) => r.memoryBefore === "")!;
+  must(first.memoryMain === `${FORGOTTEN}\n${FORGOTTEN}\n${FORGOTTEN}\n- works on Raft`, show(first.memoryMain));
+  must(String((first.mainOp.args as any).value) === first.memoryMain, show(first.mainOp));
 });
 
 await check("redaction: the structured cells stay valid JSON, a removed line with quotes and backslashes redacted as a value", async () => {
