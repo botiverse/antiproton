@@ -20,6 +20,10 @@
 #   ANTIPROTON_ENV_FILE  the secrets file deploy needs (default ~/.secrets/antiproton.env)
 #   DEPLOY_PINNED_ROOT   where the worktree is made (default ~/tmp; /tmp is often
 #                        a small tmpfs, and the worktree holds a full node_modules)
+#   DEPLOY_BELOW_FLOOR   an emergency rollback below a deploy floor: the full SHA of
+#   DEPLOY_BELOW_FLOOR_REASON  every floor it crosses (space-separated), and why.
+#                        Both or neither; see cf/deploy-floors.txt and
+#                        docs/runbook.md, "Deploy floors".
 set -uo pipefail
 mode=prod
 case "${1:-}" in
@@ -43,6 +47,98 @@ root=${DEPLOY_PINNED_ROOT:-$HOME/tmp}
 g fetch -q origin master || { echo "STEP fetch FAILED"; exit 1; }
 sha=$(g rev-parse --verify --quiet 'origin/master^{commit}') || { echo "STEP fetch FAILED (no origin/master)"; exit 1; }
 short=${sha:0:7}
+
+# Deploy floors (cf/deploy-floors.txt): commits whose ancestry the deployed
+# commit must contain, because something outside this repository already
+# depends on what they changed. Read from the commit being deployed, so the
+# answer is about that tree, and also from the copy beside this script, so a
+# floor deleted in the target is still enforced by any checkout that has it.
+# Checked before the worktree and npm ci: a refusal costs nothing.
+floors_rel=cf/deploy-floors.txt
+# stdin: a floors file; $1: where it came from. stdout: "<sha>\t<from>\t<reason>"
+# per floor, or "BAD\t<from>\t<line>".
+parse_floors() {
+  local line reason="" entry
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    case "$line" in
+      "") reason="" ;;
+      \#*) line=${line#\#}; reason="${reason:+$reason }${line# }" ;;
+      *)
+        entry=${line%%#*}; entry=${entry//[[:space:]]/}
+        case "$line" in *\#*) line=${line#*#}; reason="${reason:+$reason }${line# }" ;; esac
+        if [[ "$entry" =~ ^[0-9a-f]{40}$ ]]; then printf '%s\t%s\t%s\n' "$entry" "$1" "$reason"
+        else printf 'BAD\t%s\t%s\n' "$1" "$line"; fi
+        reason="" ;;
+    esac
+  done
+}
+below=${DEPLOY_BELOW_FLOOR:-}
+below_reason=${DEPLOY_BELOW_FLOOR_REASON:-}
+if [ -n "$below" ] && [ -z "$below_reason" ]; then echo "STEP floor FAILED (DEPLOY_BELOW_FLOOR needs DEPLOY_BELOW_FLOOR_REASON: why production may run below it)"; exit 1; fi
+if [ -z "$below" ] && [ -n "$below_reason" ]; then echo "STEP floor FAILED (DEPLOY_BELOW_FLOOR_REASON without DEPLOY_BELOW_FLOOR names no floor)"; exit 1; fi
+floors=""
+if target_floors=$(g show "$sha:$floors_rel" 2>/dev/null); then
+  floors=$(printf '%s\n' "$target_floors" | parse_floors target)
+elif [ -z "$below" ]; then
+  # Every floor is listed in a commit at or after it, so a commit without the
+  # file is older than all of them.
+  echo "STEP floor FAILED ($short has no $floors_rel, so it predates every deploy floor; an emergency rollback below a floor is DEPLOY_BELOW_FLOOR, docs/runbook.md)"
+  exit 1
+fi
+local_floors_file="$here/../deploy-floors.txt"
+if [ -f "$local_floors_file" ]; then
+  floors=$(printf '%s\n%s\n' "$floors" "$(parse_floors local < "$local_floors_file")")
+fi
+floors=$(printf '%s\n' "$floors" | awk -F'\t' 'NF && !seen[$1]++')
+if [ -z "$floors" ]; then
+  if [ -n "$below" ]; then echo "STEP floor FAILED (no $floors_rel in $short or beside this script, so there is no floor for DEPLOY_BELOW_FLOOR to cross)"; exit 1; fi
+  echo "STEP floor FAILED ($floors_rel in $short lists no floor)"; exit 1
+fi
+bad=$(printf '%s\n' "$floors" | awk -F'\t' '$1 == "BAD" { print $3 }')
+if [ -n "$bad" ]; then echo "STEP floor FAILED (not a full 40-character SHA in $floors_rel: $bad)"; exit 1; fi
+crossed=""
+while IFS=$'\t' read -r floor from reason; do
+  # The SHA must be a commit here before ancestry can be asked; origin/master
+  # was just fetched, and a floor is a master commit.
+  if ! g cat-file -e "$floor^{commit}" 2>/dev/null; then
+    echo "STEP floor FAILED (cannot check floor $floor: commit missing locally or git error — this is not a floor violation; fetch and retry)"
+    exit 1
+  fi
+  g merge-base --is-ancestor "$floor" "$sha"
+  rc=$?
+  case $rc in
+    0) ;;
+    1)
+      case " $below " in
+        *" $floor "*) crossed="$crossed $floor"; echo "WARNING: deploying $short BELOW floor $floor: $reason" ;;
+        *)
+          # A floor only the local copy lists: master's file lost it, or this
+          # checkout is ahead of origin/master. Either way it still holds.
+          [ "$from" = local ] && reason="$reason [listed in this checkout's $floors_rel but not in $short's]"
+          echo "STEP floor FAILED (floor not satisfied: $floor $reason) — $short does not contain it. An emergency rollback below it is DEPLOY_BELOW_FLOOR=$floor with DEPLOY_BELOW_FLOOR_REASON (docs/runbook.md)"; exit 1 ;;
+      esac ;;
+    # Anything else is git failing to answer, which is never a pass.
+    *) echo "STEP floor FAILED (cannot check floor $floor: commit missing locally or git error $rc — this is not a floor violation; fetch and retry)"; exit 1 ;;
+  esac
+done <<< "$floors"
+for f in $below; do
+  case " $crossed " in
+    *" $f "*) ;;
+    *) echo "STEP floor FAILED (DEPLOY_BELOW_FLOOR names $f, which is not a floor $short is below; name exactly the floors crossed)"; exit 1 ;;
+  esac
+done
+# A deploy below a floor leaves a marker, so the next deploy that satisfies
+# every floor says production is back above them. Written before the deploy
+# step, since a deploy that reports failure may still have shipped.
+marker="$HOME/tmp/antiproton-below-floor.$mode"
+if [ -n "$crossed" ]; then
+  mkdir -p "$HOME/tmp" && printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$short" "$crossed" >> "$marker" \
+    || { echo "STEP floor FAILED (cannot write the marker $marker)"; exit 1; }
+  for f in $crossed; do echo "STEP deploy crossed floor $f: $below_reason"; done
+  echo "WARNING: production will run a build below a deploy floor. Tell Raft (AppFather) now: its web may already depend on what the floor changed." >&2
+fi
+echo "STEP floor ok ($(printf '%s\n' "$floors" | wc -l | tr -d ' ') checked${crossed:+, crossed:$crossed})"
 
 wt=""
 added=""
@@ -88,4 +184,8 @@ for _ in $(seq 1 24); do
 done
 echo "STEP live build ${b:-none} read $(date -u +%H:%M:%SZ)"
 [ "$b" = "$short" ] || { echo "STEP live build MISMATCH (expected $short)"; exit 1; }
+if [ -z "$crossed" ] && [ -f "$marker" ]; then
+  echo "STEP back above all floors (previous deploy crossed$(awk '{ for (i = 3; i <= NF; i++) printf " %s", $i }' "$marker"))"
+  rm -f "$marker"
+fi
 echo "STEP done"

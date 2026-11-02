@@ -41,6 +41,8 @@ function fixture() {
   git("init", "-q", "-b", "master"); git("config", "user.email", "t@t"); git("config", "user.name", "t");
   git("add", "-A"); git("commit", "-qm", "one");
   const older = git("rev-parse", "HEAD");
+  // The commit deployed lists the one before it as a deploy floor.
+  writeFileSync(join(repo, "cf/deploy-floors.txt"), `# fixture floor\n${older}\n`);
   writeFileSync(join(repo, "b.txt"), "two\n"); git("add", "-A"); git("commit", "-qm", "two");
   const sha = git("rev-parse", "HEAD");
   execFileSync("git", ["init", "-q", "--bare", origin]);
@@ -59,6 +61,21 @@ function fixture() {
     return { status: r.status, out: `${r.stdout}${r.stderr}`, calls: existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [] };
   };
   return { base, repo, git, older, sha, root, env, live, run };
+}
+
+/** Makes origin/master a new commit on `parent` whose cf/deploy-floors.txt is
+ * `floors` (none when null), then puts the checkout back where it stood. */
+function target(f: ReturnType<typeof fixture>, parent: string, floors: string | null) {
+  f.git("checkout", "-q", parent);
+  if (floors === null) f.git("rm", "-q", "--ignore-unmatch", "cf/deploy-floors.txt");
+  else { writeFileSync(join(f.repo, "cf/deploy-floors.txt"), floors); f.git("add", "cf/deploy-floors.txt"); }
+  writeFileSync(join(f.repo, "c.txt"), `${Math.random()}\n`); f.git("add", "c.txt");
+  f.git("commit", "-qm", "target");
+  const sha = f.git("rev-parse", "HEAD");
+  f.git("push", "-qf", "origin", "HEAD:master");
+  f.git("checkout", "-q", f.older);
+  writeFileSync(f.live, sha.slice(0, 7));
+  return sha;
 }
 
 const worktrees = (f: ReturnType<typeof fixture>) => f.git("worktree", "list", "--porcelain").split("\n").filter((l) => l.startsWith("worktree ")).length;
@@ -143,6 +160,91 @@ check("an env file that cannot be read stops it before anything runs", () => {
   const r = f.run([], { ANTIPROTON_ENV_FILE: join(f.base, "missing.env") });
   if (r.status === 0 || !r.out.includes("STEP env FAILED")) throw new Error(`exited ${r.status}:\n${r.out}`);
   if (r.calls.length) throw new Error(`ran anyway: ${r.calls.join("\n")}`);
+});
+
+const REASON = "the provisioning DELETE answers changed";
+const refusedEarly = (r: { status: number | null; out: string; calls: string[] }, text: string) => {
+  if (r.status === 0 || !r.out.includes(text)) throw new Error(`expected a refusal containing ${JSON.stringify(text)}; exited ${r.status}:\n${r.out}`);
+  if (r.calls.length) throw new Error(`ran anyway: ${r.calls.join("\n")}`);
+};
+
+check("floors: a target that has every floor as an ancestor passes the floor check", () => {
+  const f = fixture();
+  for (const args of [[], ["--preview"]]) {
+    const r = f.run(args);
+    if (r.status !== 0 || !r.out.includes("STEP floor ok (1 checked)")) throw new Error(`exited ${r.status}:\n${r.out}`);
+  }
+});
+
+check("floors: a target older than a floor is refused, naming the floor and its reason, before anything runs", () => {
+  const f = fixture();
+  // The floor is f.sha; the target is built on the commit before it.
+  target(f, f.older, `# header\n\n# ${REASON}\n${f.sha}  # guarded by: deploy check\n`);
+  for (const args of [[], ["--preview"]]) refusedEarly(f.run(args), `floor not satisfied: ${f.sha} ${REASON} guarded by: deploy check)`);
+});
+
+check("floors: a target without cf/deploy-floors.txt predates every floor and is refused", () => {
+  const f = fixture();
+  target(f, f.older, null);
+  refusedEarly(f.run([]), "predates every deploy floor");
+});
+
+check("floors: a floor that is not a commit here is \"cannot check\", never a pass", () => {
+  const f = fixture();
+  target(f, f.sha, `${"0123456789abcdef".repeat(2)}01234567\n`);
+  refusedEarly(f.run([]), "cannot check floor 0123456789abcdef");
+  refusedEarly(f.run([]), "this is not a floor violation");
+});
+
+check("floors: git answering the ancestry question with neither 0 nor 1 is \"cannot check\", never a pass", () => {
+  const f = fixture();
+  // A git that fails merge-base (as a corrupt object store would, exit 128)
+  // and is the real git for everything else.
+  const stub = join(f.base, "gitstub"); mkdirSync(stub);
+  const realGit = execFileSync("bash", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  writeFileSync(join(stub, "git"), `#!/usr/bin/env bash\ncase " $* " in *" merge-base "*) exit 128 ;; esac\nexec ${JSON.stringify(realGit)} "$@"\n`);
+  chmodSync(join(stub, "git"), 0o755);
+  const r = f.run([], { PATH: `${stub}:${join(f.base, "bin")}:${process.env.PATH}` });
+  refusedEarly(r, `cannot check floor ${f.older}: commit missing locally or git error 128`);
+});
+
+check("floors: an entry that is not a full 40-character SHA is refused", () => {
+  const f = fixture();
+  target(f, f.sha, `${f.older.slice(0, 12)}\n`);
+  refusedEarly(f.run([]), "not a full 40-character SHA");
+});
+
+check("floors: a floor this checkout lists but the target's file dropped still holds", () => {
+  const f = fixture();
+  const t = target(f, f.older, `${f.older}\n`);
+  writeFileSync(join(f.repo, "cf/deploy-floors.txt"), `# ${REASON}\n${f.sha}\n`);
+  refusedEarly(f.run(["--preview"]), `floor not satisfied: ${f.sha} ${REASON} [listed in this checkout's cf/deploy-floors.txt but not in ${t.slice(0, 7)}'s]`);
+  const r = f.run(["--preview"], { DEPLOY_BELOW_FLOOR: f.sha, DEPLOY_BELOW_FLOOR_REASON: "drill" });
+  if (r.status !== 0 || !r.out.includes(`STEP deploy crossed floor ${f.sha}: drill`)) throw new Error(`exited ${r.status}:\n${r.out}`);
+});
+
+check("floors: DEPLOY_BELOW_FLOOR must name the exact floor crossed and give a reason; then it deploys, loudly, and the next deploy above every floor says so", () => {
+  const f = fixture();
+  const t = target(f, f.older, `# ${REASON}\n${f.sha}\n`);
+  refusedEarly(f.run(["--preview"], { DEPLOY_BELOW_FLOOR: f.older, DEPLOY_BELOW_FLOOR_REASON: "rollback" }), `floor not satisfied: ${f.sha}`);
+  refusedEarly(f.run(["--preview"], { DEPLOY_BELOW_FLOOR: f.sha.slice(0, 12), DEPLOY_BELOW_FLOOR_REASON: "rollback" }), `floor not satisfied: ${f.sha}`);
+  refusedEarly(f.run(["--preview"], { DEPLOY_BELOW_FLOOR: `${f.sha} ${f.older}`, DEPLOY_BELOW_FLOOR_REASON: "rollback" }), `DEPLOY_BELOW_FLOOR names ${f.older}`);
+  refusedEarly(f.run(["--preview"], { DEPLOY_BELOW_FLOOR: f.sha }), "DEPLOY_BELOW_FLOOR needs DEPLOY_BELOW_FLOOR_REASON");
+  refusedEarly(f.run(["--preview"], { DEPLOY_BELOW_FLOOR_REASON: "rollback" }), "names no floor");
+  const r = f.run(["--preview"], { DEPLOY_BELOW_FLOOR: f.sha, DEPLOY_BELOW_FLOOR_REASON: "rollback for an outage" });
+  if (r.status !== 0) throw new Error(`exited ${r.status}:\n${r.out}`);
+  if (!r.out.includes(`STEP deploy crossed floor ${f.sha}: rollback for an outage`)) throw new Error(`no crossed-floor line:\n${r.out}`);
+  if (!r.out.includes("Tell Raft (AppFather)")) throw new Error(`no warning to tell Raft:\n${r.out}`);
+  if (r.calls.find((l) => l.startsWith("deploy "))?.split(" ")[1] !== t) throw new Error(`did not deploy ${t}:\n${r.calls.join("\n")}`);
+  const marker = join(f.base, "tmp/antiproton-below-floor.preview");
+  if (!existsSync(marker)) throw new Error("no marker left for the next deploy");
+  // Back above: a target that contains the floor.
+  target(f, f.sha, `${f.sha}\n`);
+  const back = f.run(["--preview"]);
+  if (back.status !== 0 || !back.out.includes(`STEP back above all floors (previous deploy crossed ${f.sha})`)) throw new Error(`exited ${back.status}:\n${back.out}`);
+  if (existsSync(marker)) throw new Error("the marker was not removed");
+  const again = f.run(["--preview"]);
+  if (again.status !== 0 || again.out.includes("back above")) throw new Error(`reported twice:\n${again.out}`);
 });
 
 console.log(`\n  Deploy from a pinned worktree\n  ${"─".repeat(56)}`);
