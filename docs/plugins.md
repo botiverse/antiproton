@@ -1916,6 +1916,101 @@ What the runtime promises, and what it leaves to the plugin (`src/runtime/plugin
 `src/plugins/raftbench.ts` is the plugin that uses all three; `test/after-turn.ts` holds the runtime's side with
 plugins of its own.
 
+## Memory writer (`memoryWriter`, shadow mode)
+
+The `state` plugin's `memoryWriter` setting says who writes an agent's `memory` document. It is the first step towards
+one writer: a memory subagent that reads the current document and decides the edits, while the agent itself keeps
+seeing the whole document but no longer edits it.
+
+| Value | What happens |
+|---|---|
+| `self` (default) | The agent writes `memory` with its own tools, exactly as before: the model is sent the same requests, no row is written, nothing else runs. |
+| `shadow` | The agent still writes `memory` itself, unchanged. Each of its direct writes is also run past the memory subagent, whose edits are recorded privately and **never applied**, so the two can be compared on the same intent. After each finished turn an observer classifies whether a memory intent appeared. Turning `shadow` off (back to `self`) stops new shadow records; the ones already kept stay up to 7 days, unless cleared at once with `DELETE /admin/memory-shadow` (below) or by deleting the agent. |
+| `subagent` | Not available yet: a mount carrying it is refused with a message saying so. It needs the agent's write tools replaced by one synchronous `memory_update` tool, which the queue-driven model path cannot serve inside a tool call today. A stored value that is not `self` or `shadow` is read as `self`. |
+
+**Several state mounts.** They share one `memory`, so every mount's ask holds: `shadow` on any of them is `shadow` for
+the agent, and `self` only when all say `self` (`memoryWriterOf`). It is the rule the limits follow read the same way —
+the smallest limit holds so that no mount's alias is a way past another's — and it means a second mount added with
+the default never switches off a shadow the first asked for.
+
+**How a shadow run goes** (`src/runtime/memory-shadow.ts`):
+
+1. The agent calls `remember`, `put`, `revise`, `insert` or `forget` on `memory` in its main conversation or in a
+   check's short session. A refused write counts too: the intent was there. As the write returns, the state plugin
+   writes a `memory.shadow_due` row and then queues a run in `memory_shadow` with the document **before** the write, the
+   document the write left, and a request derived from the write ("Remember this: …", "Change this text: … to: …").
+   Nothing waits for the subagent, so the write is neither delayed nor failed by it.
+2. When the run that made the write has ended, the runtime posts one short session per queued run, at most three per
+   run of the agent's (`MEMORY_SHADOW_RUNS_PER_RUN`); the rest are finished as `skipped` (`per_run_cap`), each with its
+   heartbeat. A run whose document could not be read is finished as `read_failed` without a call and takes no slot;
+   one still queued when the agent has been switched back to `self` is finished as `skipped` (`writer_self`). A session is offered **no tools**; its system prompt is the subagent's rules and its input is the document before the write, the request, and
+   the conversation since the previous run in that conversation (a per-conversation mark; the first run sees the most
+   recent messages; at most 12,000 characters, oldest cut first). Two writes in one turn are shown disjoint parts.
+3. Its answer is JSON: `{"ops": [...]}` with `revise`, `insert`, `remember` and `put` in the state tools' shapes. The
+   runtime applies them **to a copy** with the state store's own line rules and cap, so a refusal is the one the tool
+   would have given (`memory_full`, `memory_over_cap`, …), records each edit's result and the document they would have
+   left, and writes the heartbeat: one `memory.shadow` row with the same `job` id, status `changed`, `no_change` or
+   `failed` with an `error` code (`post_failed`, `turn_failed`, `unparseable`, …), the real latency in `ms`, counts per
+   op and refusal code, line diffs of both the subagent's result and the agent's own edit, and `sameAsMain`.
+   A failed run is recorded once, never retried.
+
+**The subagent's rules**, in its prompt and, where code can hold them, in the judging:
+
+- A line recording something the owner explicitly asked for (a preference, a rule, "always", "never") starts with
+  `[owner]`, after a list bullet if it has one. The tag is decided when the line is written and never judged again.
+- A tagged line is never deleted. Any edit that leaves one of the tagged lines it found not as it was is refused as
+  `owner_line_deleted` and counted in `taggedDeletions`, one per line, whatever it adds in its place: a `put` that
+  swaps one tagged line for another is a deletion. The one exception is a `revise` of one tagged line in place: the
+  document keeps its number of lines, exactly that line differs, and it is tagged before and after
+  (`revisedInPlace`). Such a revise may change what the line says, not only shorten it: code cannot tell compression
+  from a change of meaning, and the agent's own direct writes can do the same today, so it is counted as
+  `taggedRevised` for the comparison rather than refused.
+- When the change does not fit: compress wording, merge duplicates, drop what is no longer true, then move details to
+  a separate document (`put` to `notes/<topic>`) with a pointer line in `memory` (`moved`, `movedWithPointer`). Never
+  make room by deleting the oldest lines; a deletion at the top of the document is counted as `oldestDeleted`.
+- Only `memory` is edited, besides `put`s of new documents; `forget` is refused.
+
+**The observer.** After each completed turn of a `shadow` agent, in its chat and after each check session alike, one
+more short session, also with no tools, answers
+only `{"intent": true|false}`: did the owner ask for something to be kept, state a standing rule, or contradict the
+memory. Its `memory.observe` row carries `intent`, `called` (read from the turn's own calls, not asked: a direct
+write to `memory` or a `memory_update` call), `sampled` (always true in shadow) and `trigger`, or `failed` with a code.
+`intent: true, called: false` is a missed intent. Cost: one small call per finished turn, checks included, on top of
+one call per direct write (at most three per run); for an assistant that wakes every few minutes the observer is most
+of it.
+
+**Counting.** Due rows and heartbeats come from different code, so a run that never ran is a due row without a
+`memory.shadow` row of the same `job`. Every trace row is counts and fixed codes only, and none is forwarded. The
+document, the request and the proposed edits are the owner's data and stay in the agent's own `memory_shadow` table:
+
+- **Kept 7 days**, pruned on every pass of the agent's object and as a run is queued, and deleted with the agent.
+- **What the agent removes is redacted there too, never deleted.** Every write to `memory`, under any writer, compares
+  the document before and after it: every line present before and absent after (a reworded line counts, so a
+  `revise`'s whole old line goes, not only its `old`) is replaced by `[forgotten]` in every row of the agent's, queued,
+  in flight or finished. In the three stored documents only lines equal to a removed line change (trailing whitespace
+  ignored), so removing `- chai` leaves `- chai with milk` as it was. In the request, the agent's write and the
+  proposed edits, each JSON string value is redacted the same way and, for a `revise`, the exact `old` text wherever it
+  occurs; the JSON is parsed and written again, never edited as text. A line or fragment that is empty once whitespace,
+  punctuation and symbols are taken out (`-`, `---`, `##`, a blank line) is not redacted: it carries nothing of the
+  owner's and would blank the same marker everywhere. Any other line is redacted however short (`- Bob`, `- 3F`). Rows are never deleted for it, so due rows keep their heartbeats and the comparison keeps its documents.
+  The run queued for the removing write itself keeps its text until it has been judged and is redacted as it finishes.
+  Under `self` this is asked only when an earlier shadow left rows. The due row carries `redactedRows`; a redaction
+  that fails, or meets a cell that does not parse, never fails the write and is a `memory.shadow_redact` row (`error`
+  `redact_failed` or `unparsable_cell`, counts only).
+- **One read path:** `GET /admin/memory-shadow?tenantId=…&agentId=…` with the operator's token
+  (`cf/src/admin-memory-shadow.ts`), gated and audited exactly as `/admin/assistant-decisions`: a reason is required
+  and a read whose audit row cannot be written is refused.
+- **Clearing:** `DELETE /admin/memory-shadow?tenantId=…&agentId=…`, behind the same gate and audit (recorded as
+  `DELETE /admin/memory-shadow`), deletes all of the agent's rows and marks at once and answers `deleted: N`; a second
+  call answers `deleted: 0`. A run still queued is given a `cleared` heartbeat first and one in flight ends with
+  `job_missing`, so due rows and heartbeats still balance; the count is also a `memory.shadow_clear` trace row. It clears
+  what is kept and does **not** stop recording: while the mount says `shadow` the answer says `stillRecording: true`,
+  and only setting `memoryWriter` back to `self` stops it. The route never changes the setting.
+
+**Phase 2** (`subagent`) must apply the subagent's edits with the same function shadow judges them with (`simulate`),
+its whole result written in one compare-and-set transaction against the document it was shown, so the
+`taggedDeletions` and refusal counts gathered in shadow describe exactly what would have been written.
+
 ## Tests
 
 Every `test/*.ts` runs in the deploy gate (`cf/scripts/verify-and-deploy.sh`).

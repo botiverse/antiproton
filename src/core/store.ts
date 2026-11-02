@@ -27,6 +27,7 @@ import type {
 import type { CredentialRefKind, CredentialState, PluginChoice, ToolSnapshot } from "../plugins/types.ts";
 import type { PluginDbTables } from "../store/plugin-db.ts";
 import type { AssistantDecisionTables } from "../store/assistant-decisions.ts";
+import type { MemoryShadowTables } from "../store/memory-shadow.ts";
 import type { UsageRow } from "../usage/outbox.ts";
 import type { TraceRow } from "../trace/outbox.ts";
 
@@ -375,6 +376,12 @@ export interface StorageAdapter {
    * its `note_decision` tool through `PluginContext.assistantDecisions`, read by the operator's audited route.
    */
   readonly assistantDecisions: AssistantDecisionTables;
+
+  /**
+   * What the memory subagent would have done with each of the agent's direct writes to `memory`, never applied
+   * (src/store/memory-shadow.ts): queued by the state plugin as the write returns, run and finished by the runtime.
+   */
+  readonly memoryShadow: MemoryShadowTables;
 
   /**
    * Whose model account this agent spends. A tenant with no binding cannot run:

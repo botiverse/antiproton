@@ -68,6 +68,23 @@ reason is required and a read whose row cannot be written is refused, whether or
 A wake that left no note is counted by its `raft.assistant_decision` trace row (`noted: false`), which carries counts
 only, never the reason or an id, and is not forwarded.
 
+An agent under `memoryWriter: "shadow"` keeps what its memory subagent would have done with each of its direct writes
+to `memory` (`src/store/memory-shadow.ts`, 7 days). The one way to read it, with the same gate and audit
+(`route = '/admin/memory-shadow'`, reason required, refused when the row cannot be written; the last 7 days when `from`
+is left out):
+
+```
+curl -s -H "x-harness-token: $AUTOMATION_TOKEN" -H "X-Read-Reason: <why>" "$HOST/admin/memory-shadow?tenantId=<tenantId>&agentId=<agentId>&from=<from>&to=<to>"
+```
+
+To clear them at once (an owner's request), the same gate and audit, recorded as `DELETE /admin/memory-shadow`. It
+answers `deleted` (0 on a second call) and `stillRecording`: clearing does not stop recording, which only setting the
+state mount's `memoryWriter` back to `self` does.
+
+```
+curl -s -X DELETE -H "x-harness-token: $AUTOMATION_TOKEN" -H "X-Read-Reason: <why>" "$HOST/admin/memory-shadow?tenantId=<tenantId>&agentId=<agentId>"
+```
+
 Every stop, cancel or delete of a turn writes a `turn.stop` line to the Workers logs: `trigger` (`admin_cancel`,
 `provider_stop`, `delete`), `result` (`aborted`, `nothing_running`, `failed`), `turn` when one was aborted, `error` when
 it failed, and `side`. The Worker that answered the stop writes one (`side` = `worker`) for every attempt; the agent's

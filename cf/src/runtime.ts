@@ -40,7 +40,7 @@ import {
 } from "../../src/runtime/background-jobs.ts";
 import { unknownOutcomeNotice } from "../../src/runtime/approval-notice.ts";
 import {
-  bridgeTools, bridgeModulesFor, harnessTools, offeredToolName, offersPlugin, replayPolicy, offersCapability, qualifyMountedTools, resumeTool, runJsTools, type MountedTool,
+  bridgeTools, bridgeModulesFor, harnessTools, modelToolName, offeredToolName, offersPlugin, replayPolicy, offersCapability, qualifyMountedTools, resumeTool, runJsTools, type MountedTool,
   withholdTools,
   refuseWithheld, type RunEnd,
 } from "../../src/runtime/pi-tools.ts";
@@ -421,7 +421,14 @@ import { stampPlugin } from "../../src/plugins/stamp.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
 import { exaPlugin } from "../../src/plugins/exa.ts";
-import { IMPORTED_MEMORY_BUDGET, keptDelete, keptList, keptNameProblem, keptPut, keptValueProblem, memoryExcerpt, SEEDED_MEMORY, seedFitProblem, statePlugin } from "../../src/plugins/state.ts";
+import {
+  capOf, configOf, IMPORTED_MEMORY_BUDGET, keptDelete, keptList, keptNameProblem, keptPut, keptValueProblem, memoryExcerpt, SEEDED_MEMORY, seedFitProblem, sharedSettings, statePlugin,
+} from "../../src/plugins/state.ts";
+import {
+  calledMemory, contextSlices, heartbeatAttrs, MEMORY_SHADOW_RUNS_PER_RUN, isMemorySessionKey, lastTurn, MEMORY_OBSERVE_PROMPT, memoryCallMatcher, memoryShadowPrompt, observeInput, observeKey,
+  parseObservation, parseProposal, readObserveKey, renderConversation, SHADOW_KEY_PREFIX, shadowInput, simulate, type BranchEntry,
+} from "../../src/runtime/memory-shadow.ts";
+import type { MemoryShadowRun } from "../../src/store/memory-shadow.ts";
 import { sandboxPlugin, SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/artifacts.ts";
@@ -1421,7 +1428,7 @@ export class AgentRuntime {
       // The lease reaches the plugin so its tools state the lifetime this deployment gives a box.
       sandboxPlugin(this.#artifacts as any, deps.bucketName, deps.idle ?? null),
       // The key is read when a secret tool runs, not now: `#kek` is set a few lines below.
-      statePlugin(this.store, this.#artifacts as any, deps.bucketName, () => this.#kek),
+      statePlugin(this.store, this.#artifacts as any, deps.bucketName, () => this.#kek, { shadowsMemory: () => !this.#isPd() }),
       artifactsPlugin(this.#artifacts, deps.bucketName),
       createRaftPlugin({ artifacts: this.#artifacts }),
       mcpPlugin,
@@ -3742,7 +3749,10 @@ export class AgentRuntime {
       const allowed = new Set(ask.tools.map((n) => `${ask.alias}.${n}`));
       return list.filter((t) => !t.address.startsWith(`${ask.alias}.`) || allowed.has(t.address));
     };
-    const tools = narrowed(profileOf(agentConfig) ? []
+    // The memory subagent's own short sessions, a shadow run's or the observer's (src/runtime/memory-shadow.ts), are offered
+    // no tool at all: they answer in their final text, so nothing they say can write anything.
+    const memoryCall = isolated && isMemorySessionKey(ask?.turnKey);
+    const tools = narrowed(profileOf(agentConfig) || memoryCall ? []
       : isSubagentSession(session)
       ? (() => { const withheld = this.#childWithheldIn(catalogue); return catalogue.tools.filter((t) => !withheld.has(t.address)); })()
       : assistant ? assistantTools(catalogue.tools, assistant, isolated ? "check" : "chat", memory)
@@ -3800,7 +3810,7 @@ export class AgentRuntime {
     // An evaluation's `harness: "minimal"` (src/core/tool-config.ts), read from the record every turn path and the
     // tool export build from here, so a prompt, a steer and a push are offered the same list, under either engine.
     // An assistant keeps `resume`: a send to its owner's DM can be held for messages it has not read, and is answered with it.
-    const extras = assistant ? { runJs: false, jobs: false, resume: !isolated } : harnessExtras({
+    const extras = memoryCall ? { runJs: false, jobs: false, resume: false } : assistant ? { runJs: false, jobs: false, resume: !isolated } : harnessExtras({
       apiAgent: !!apiConfig, sandbox, minimal: toolConfigOf(agentConfig)?.harness === "minimal",
       hasBackgroundMount: offersCapability(
         records, offered as MountedTool[],
@@ -3813,12 +3823,12 @@ export class AgentRuntime {
     // A subagent's session (src/runtime/subagents.ts) is offered neither the caller's functions, which only the caller's
     // own session can answer, nor `send_to_agent`: delegation is one level deep.
     const child = isSubagentSession(session);
-    const callerDefs = !child && Array.isArray(apiTools)
+    const callerDefs = !child && !memoryCall && Array.isArray(apiTools)
       ? apiTools.filter((t: any) => typeof t?.name === "string" && !taken.has(t.name)).map((t: any) => ({
           name: String(t.name), description: String(t.description ?? ""), parameters: t.parameters ?? { type: "object", properties: {} },
         }))
       : [];
-    const callerTools = !child && Array.isArray(apiTools) && engine !== "pd"
+    const callerTools = !child && !memoryCall && Array.isArray(apiTools) && engine !== "pd"
       ? clientTools(callerDefs,
           { sql: this.#deps.ctx.storage.sql, session, lane: () => agentRef.current!.lane,
             branch: (tip) => agentRef.current!.storage.scanBranch({ start: tip, order: "oldestFirst" }, BACKGROUND_CONTEXT) as any })
@@ -3875,7 +3885,7 @@ export class AgentRuntime {
       ...(extras.jobs && !child ? [jobs] : []),
       // Only where the agent's setting is on, never in a child (above), and not where the caller's own function has the
       // name (`callerShadows`). Its body is this object's (`#sendToAgent`).
-      ...(!child && !assistant && this.#settingsNow(tenantId, agentConfig).subagents && !callerShadows(tenantId, agentId, session, callerDefs)
+      ...(!child && !assistant && !memoryCall && this.#settingsNow(tenantId, agentConfig).subagents && !callerShadows(tenantId, agentId, session, callerDefs)
         ? [subagentTool({
             models: (this.#deps.userModels?.offered ?? []).map((o) => ({ id: o.id, label: o.label })),
             send: (p, callId, invocation) => this.#sendToAgent(tenantId, agentId, session, p, callId, invocation),
@@ -3955,7 +3965,13 @@ export class AgentRuntime {
     const on = (alias: string | null) => alias ? (offered as MountedTool[]).filter((t) => t.address.startsWith(`${alias}.`))
       .map((t) => t.address.slice(alias.length + 1)) : [];
     const onAssistant = on(assistant);
-    const prompt = profile ? profilePrompt(profile) : assistant ? assistantSystemPrompt(personaOf(record), assistant, isIsolatedSession(session) ? "check" : "chat",
+    // A memory subagent's session (`memoryCall` in `#turnTools`) is prompted with its own instructions and nothing of the agent's.
+    const memoryKey = isIsolatedSession(session) ? isolatedSession(this.#deps.ctx.storage.sql, session)?.turnKey ?? null : null;
+    const prompt = isMemorySessionKey(memoryKey)
+      ? (memoryKey.startsWith(SHADOW_KEY_PREFIX)
+        ? memoryShadowPrompt(capOf("memory", sharedSettings(records.filter((r) => r.plugin === "state").map((r) => configOf(r.publicConfig)))))
+        : MEMORY_OBSERVE_PROMPT)
+      : profile ? profilePrompt(profile) : assistant ? assistantSystemPrompt(personaOf(record), assistant, isIsolatedSession(session) ? "check" : "chat",
       onAssistant, isolatedSession(this.#deps.ctx.storage.sql, session)?.turnKey ?? null, memory ? { alias: memory, offered: on(memory) } : null, shown.contributions) : systemPrompt({
       // The agent's own record: a person named and described it at creation,
       // and that is the first thing the prompt says after the core.
@@ -5036,6 +5052,8 @@ export class AgentRuntime {
         // A personal assistant's notes of what its checks decided hold its owner's data, and the object outlives the
         // delete: they go with the agent (src/store/assistant-decisions.ts).
         this.store.assistantDecisions.deleteAgent(tenantId, agentId);
+        // So do the memory subagent's shadow runs, which hold its memory and the edits proposed to it (src/store/memory-shadow.ts).
+        this.store.memoryShadow.deleteAgent(tenantId, agentId);
       }
       if (!(await this.store.loadAgent(tenantId, agentId)) || !(await this.store.getModelBinding(tenantId, agentId))) {
         return done({ result: "not_running" });
@@ -6057,6 +6075,8 @@ This call was made by your subagent ${a.taskId}.`;
       // Best effort within the pass (#1021): a read or write of the ends that throws loses only those ends (no `afterTurn`
       // for them), said on a trace row; the rest of the pass — the session's mark, the hooks, the subagents' reports,
       // the releases — still runs, where a throw here used to end the pass on every wake that settled a run.
+      // A run rebuilt for overflow runs again for the same input: the memory subagent waits for that run's end.
+      let rebuiltHere = false;
       const ends = !pd && session === MAIN_SESSION
         ? await this.#turnEndsOf(tenantId, agentId, agent, out.settled).catch((e) => this.#turnEndsUnrecorded(tenantId, agentId, "read", e))
         : null;
@@ -6064,6 +6084,7 @@ This call was made by your subagent ${a.taskId}.`;
       // on every wake (`#overflowBackstop`); this pass then drives the rebuilt conversation's first call.
       if (!pd && session === MAIN_SESSION && rebuilds && out.open === 0 && (out.settled.length || readBackstop(sql).pending !== null)) {
         const backstop = await this.#overflowBackstop(tenantId, agentId);
+        if (backstop?.rebuilt) rebuiltHere = true;
         // The run whose overflow was rebuilt (the last to settle before the rebuild: a conversation's runs are one at a
         // time) runs again for the same input; its end says so (`TurnEnd.rebuilding`), and the rebuilt run's own does not.
         const last = ends?.at(-1);
@@ -6083,9 +6104,23 @@ This call was made by your subagent ${a.taskId}.`;
         try { for (const e of ends) recordTurnEnd(sql, e.operationId, e.end, now); }
         catch (e) { this.#turnEndsUnrecorded(tenantId, agentId, "record", e); }
       }
+      // The memory subagent's own short sessions end here (`#memorySessionEnded`); a run of the agent's that has ended
+      // starts what its writes to `memory` queued and the observer (`#memoryAfterRun`, src/runtime/memory-shadow.ts).
+      // Never a reason for the pass to fail: each says its own failures on its own rows.
+      const memoryKey = !pd && isIsolatedSession(session) ? isolatedSession(sql, session)?.turnKey ?? null : null;
+      if (isMemorySessionKey(memoryKey)) {
+        if (out.settled.length) {
+          await this.#memorySessionEnded(tenantId, agentId, agent, memoryKey, out.settled)
+            .catch((e) => console.error(`${tenantId}/${agentId}: a memory subagent session's end was not read:`, e));
+        }
+      } else if (!pd && (session === MAIN_SESSION || isIsolatedSession(session)) && out.open === 0 && !rebuiltHere) {
+        const started = await this.#memoryAfterRun(tenantId, agentId, agent, session, out.settled)
+          .catch((e) => { console.error(`${tenantId}/${agentId}: the memory subagent was not started after a run:`, e); return false; });
+        if (started) wakeInMs = 0;
+      }
       // A short session's end, owed to the mount that asked for it with a key, and to it alone (#1020); best effort, as
       // the main conversation's are (#1021): a read or write that throws loses only those ends, said on a trace row.
-      if (!pd && isIsolatedSession(session) && out.settled.length) {
+      if (!pd && isIsolatedSession(session) && out.settled.length && !isMemorySessionKey(memoryKey)) {
         await this.#recordIsolatedEnds(agent, session, out.settled).catch((e) => this.#turnEndsUnrecorded(tenantId, agentId, "record", e));
       }
       open += out.open;
@@ -6111,6 +6146,9 @@ This call was made by your subagent ${a.taskId}.`;
     if (await this.#reportSubagents(tenantId, agentId) > 0) wakeInMs = 0;
     await this.#archiveSubagents(tenantId, agentId);
     await this.#eraseIsolated(tenantId, agentId);
+    // The memory subagent's shadow runs past their retention go on every pass, not only when a new one is queued
+    // (src/store/memory-shadow.ts): an agent switched back to `self` still loses them on time.
+    try { this.store.memoryShadow.prune(tenantId, agentId); } catch (e) { console.error(`${tenantId}/${agentId}: the shadow runs were not pruned:`, e); }
     const retry = reportRetryMs(sql, { tenantId, agentId }, Date.now());
     if (retry !== null) wakeInMs = wakeInMs === null ? retry : Math.min(wakeInMs, retry);
     // A running subagent past its ceiling is cancelled by a pass; the pass comes back for the ceiling's moment.
@@ -6195,6 +6233,160 @@ This call was made by your subagent ${a.taskId}.`;
     const last = ([...branch].reverse().find((e) => e.type === "message") as { message?: unknown } | undefined)?.message;
     const now = Date.now();
     for (const s of settled) recordTurnEnd(sql, s.operationId, turnEndOf(s.status, last), now, { alias: ask.alias, turnKey: ask.turnKey });
+  }
+
+  /**
+   * After a run of the agent's main conversation or of a check's short session has ended, under `memoryWriter: "shadow"`
+   * (src/runtime/memory-shadow.ts): one short session per run its writes to `memory` queued (src/plugins/state.ts),
+   * each shown the conversation since the run before it in this conversation (`contextSlices`, the mark kept per
+   * conversation), and, when the run completed, one observer session for the turn. Says whether it posted anything, so
+   * the pass comes back for it at once. Under `self`, the one read of the mounts and nothing else.
+   */
+  async #memoryAfterRun(tenantId: string, agentId: string, agent: AgentEngine, session: string,
+    settled: Array<{ operationId: string; status: string }>): Promise<boolean> {
+    const mounts = await this.store.findMountsByPlugin(tenantId, agentId, "state");
+    const cfg = sharedSettings(mounts.map((m) => configOf(m.publicConfig)));
+    const runs = this.store.memoryShadow.queued(tenantId, agentId, session);
+    if (!mounts.length || cfg.memoryWriter !== "shadow") {
+      // Switched back to `self` (or the mount removed) after a write was queued: the run is finished as skipped, with its
+      // heartbeat, and redacted as every finished run is, rather than left queued holding text the agent may remove.
+      for (const run of runs) this.#shadowFinished(tenantId, agentId, run, { skipped: "writer_self" }, 0);
+      return false;
+    }
+    const branch = await agent.branch() as BranchEntry[];
+    const last = ([...branch].reverse().find((e) => e.type === "message") as { message?: unknown } | undefined)?.message;
+    const completed = settled.length > 0 && turnEndOf(settled.at(-1)!.status, last).outcome === "completed";
+    if (!runs.length && !completed) return false;
+    const alias = mounts[0]!.alias;
+    const trigger = isIsolatedSession(session) ? "check" : "chat";
+    const calls = memoryCallMatcher(mounts.map((m) => m.alias), modelToolName);
+    let posted = false;
+    if (runs.length) {
+      const conversation = this.#conversationOf(session);
+      const { slices, marker } = contextSlices(branch, this.store.memoryShadow.mark(tenantId, agentId, conversation), runs.length, calls.isWrite);
+      // At most MEMORY_SHADOW_RUNS_PER_RUN calls for one run of the agent's; the rest are finished as `skipped`, each with
+      // its heartbeat, so due rows and heartbeats still balance and a write-heavy run costs a bounded number of calls.
+      // A run without its document (`readFailed`) is finished without a call and takes no slot.
+      let started = 0;
+      for (let i = 0; i < runs.length; i++) {
+        const run = runs[i]!;
+        if (run.mainOp.readFailed) { this.#shadowFinished(tenantId, agentId, run, { error: "read_failed" }, 0); continue; }
+        if (started >= MEMORY_SHADOW_RUNS_PER_RUN) { this.#shadowFinished(tenantId, agentId, run, { skipped: "per_run_cap" }, 0); continue; }
+        started++;
+        posted = await this.#postShadow(tenantId, agentId, alias, capOf("memory", cfg), run, renderConversation(slices[i]!)) || posted;
+      }
+      if (marker) this.store.memoryShadow.setMark(tenantId, agentId, conversation, marker);
+    }
+    if (completed) {
+      const turn = lastTurn(branch);
+      const at = Date.now();
+      const got = await this.store.getState(tenantId, agentId, "memory");
+      const memory = !got || got.ref ? "" : typeof got.value === "string" ? got.value : JSON.stringify(got.value);
+      // Whether the agent changed its memory in the turn is read from its calls, not asked of the observer.
+      const called = calledMemory(turn, calls.isChange);
+      posted = await this.#postMemorySession(tenantId, agentId, alias, observeKey(trigger, called, at),
+        observeInput({ memory, conversation: renderConversation(turn) }),
+        (code) => this.#observeRow(tenantId, agentId, { trigger, called, at }, { error: code })) || posted;
+    }
+    return posted;
+  }
+
+  /** One queued shadow run's short session, posted; a post that fails finishes the run as failed (`post_failed`). */
+  async #postShadow(tenantId: string, agentId: string, alias: string, cap: number, run: MemoryShadowRun, conversation: string): Promise<boolean> {
+    const at = Date.now();
+    const ok = await this.#postMemorySession(tenantId, agentId, alias, `${SHADOW_KEY_PREFIX}${run.id}`,
+      shadowInput({ memory: run.memoryBefore, cap, request: run.request, conversation }),
+      (code) => this.#shadowFinished(tenantId, agentId, run, { error: code }, 0));
+    if (ok) this.store.memoryShadow.posted(tenantId, agentId, run.id, at);
+    return ok;
+  }
+
+  /** A memory subagent's short session: offered no tools (`#turnTools`), erased once its run ends, as a check's is. */
+  async #postMemorySession(tenantId: string, agentId: string, alias: string, turnKey: string, input: string, failed: (code: string) => void): Promise<boolean> {
+    const sql = this.#deps.ctx.storage.sql;
+    const session = newIsolatedSessionId();
+    try {
+      recordIsolated(sql, session, alias, Date.now(), { tools: [], turnKey });
+      await this.postMessage(tenantId, agentId, input, "prompt", session);
+      return true;
+    } catch (e) {
+      try { forgetIsolated(sql, session); } catch { /* the erase takes a row with no work */ }
+      console.error(`${tenantId}/${agentId}: a memory subagent session was not posted:`, e);
+      failed("post_failed");
+      return false;
+    }
+  }
+
+  /**
+   * A memory subagent's short session has ended: a shadow run's answer judged against the document it was shown
+   * (`simulate`) and recorded, never applied, with its heartbeat; or an observer's answer, as its row.
+   */
+  async #memorySessionEnded(tenantId: string, agentId: string, agent: AgentEngine, key: string, settled: Array<{ operationId: string; status: string }>) {
+    const branch = await agent.branch();
+    const last = ([...branch].reverse().find((e) => e.type === "message") as { message?: unknown } | undefined)?.message;
+    const end = turnEndOf(settled.at(-1)!.status, last);
+    const failure = end.outcome === "completed" ? null
+      : end.outcome === "cancelled" ? "turn_cancelled" : end.errorCode === "output_limit" ? "output_limit" : "turn_failed";
+    const observed = readObserveKey(key);
+    if (observed) {
+      const read = failure ? null : parseObservation(end.finalText);
+      this.#observeRow(tenantId, agentId, observed, failure ? { error: failure } : read!.ok ? { intent: read!.intent } : { error: read!.code });
+      return;
+    }
+    const id = key.slice(SHADOW_KEY_PREFIX.length);
+    const run = this.store.memoryShadow.get(tenantId, agentId, id);
+    if (!run) {
+      this.#shadowRow(tenantId, agentId, id, "failed", null, heartbeatAttrs({ job: id, trigger: "chat", error: "job_missing" }));
+      return;
+    }
+    const ms = run.postedAt === null ? 0 : Date.now() - run.postedAt;
+    if (failure) return this.#shadowFinished(tenantId, agentId, run, { error: failure }, ms);
+    const proposal = parseProposal(end.finalText);
+    if (!proposal.ok) return this.#shadowFinished(tenantId, agentId, run, { error: proposal.code }, ms);
+    const mounts = await this.store.findMountsByPlugin(tenantId, agentId, "state");
+    const cap = capOf("memory", sharedSettings(mounts.map((m) => configOf(m.publicConfig))));
+    this.#shadowFinished(tenantId, agentId, run, simulate(run.memoryBefore, proposal.ops, cap), ms);
+  }
+
+  /** A shadow run's end on its row and its heartbeat, `memory.shadow`: changed, no_change, or failed with a code. */
+  #shadowFinished(tenantId: string, agentId: string, run: MemoryShadowRun,
+    r: { error: string } | { skipped: string } | ReturnType<typeof simulate>, ms: number) {
+    const sim = "results" in r ? r : null;
+    const code = "error" in r ? r.error : "skipped" in r ? r.skipped : null;
+    const outcome = "skipped" in r ? "skipped" : sim === null ? "failed" : sim.after !== run.memoryBefore ? "changed" : "no_change";
+    let error = code ?? undefined;
+    try {
+      this.store.memoryShadow.finish(tenantId, agentId, run.id, sim === null
+        ? { outcome, errorCode: code, memoryAfter: null, ops: null, counts: null }
+        : { outcome, errorCode: null, memoryAfter: sim.after, ops: sim.results, counts: { ...sim.counts, ms } });
+    } catch (e) {
+      console.error(`${tenantId}/${agentId}: a memory subagent shadow run's result was not recorded:`, e);
+      error = "record_failed";
+    }
+    const attrs = heartbeatAttrs({
+      job: run.id, trigger: run.trigger, ...(error ? { error } : {}), ...(sim ? { counts: sim.counts, after: sim.after } : {}),
+      before: run.memoryBefore, main: run.memoryMain, mainResult: run.mainOp.result,
+    });
+    this.#shadowRow(tenantId, agentId, run.id, error === "record_failed" ? "failed" : outcome, ms, attrs);
+  }
+
+  #shadowRow(tenantId: string, agentId: string, id: string, status: string, ms: number | null, attrs: Record<string, unknown>) {
+    const at = Date.now();
+    try {
+      appendTrace(this.#deps.ctx.storage.sql, [{ at, tenantId, agentId, kind: "memory.shadow", spanId: `memory_shadow:${id}`, status,
+        verdict: status === "failed" ? "failed" : status === "skipped" ? "cancelled" : "ok", ...(ms === null ? {} : { ms }), attrs: attrs as never }]);
+    } catch (e) { console.error(`the memory.shadow row of ${tenantId}/${agentId} could not be written:`, e); }
+  }
+
+  /** One observed turn, `memory.observe`: whether an intent appeared and whether the agent changed its memory, counts only. */
+  #observeRow(tenantId: string, agentId: string, o: { trigger: "chat" | "check"; called: boolean; at: number }, r: { intent: boolean } | { error: string }) {
+    const now = Date.now();
+    const failed = "error" in r;
+    try {
+      appendTrace(this.#deps.ctx.storage.sql, [{ at: now, tenantId, agentId, kind: "memory.observe", spanId: `memory_observe:${o.at}`,
+        status: failed ? "failed" : "ok", verdict: failed ? "failed" : "ok", ms: now - o.at,
+        attrs: { trigger: o.trigger, called: o.called, sampled: true, ...(failed ? { error: r.error } : { intent: r.intent }) } }]);
+    } catch (e) { console.error(`the memory.observe row of ${tenantId}/${agentId} could not be written:`, e); }
   }
 
   /**
