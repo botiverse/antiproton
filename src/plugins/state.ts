@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Plugin, PluginContext, PromptPart } from "./types.ts";
 import { READ_WHOLE_MAX } from "./artifacts.ts";
 import { toAgentRef } from "../store/refs.ts";
@@ -8,6 +9,8 @@ import { importKek, KEPT_NAME, KEPT_PREFIX, open, seal } from "../runtime/secret
 import { STATE_INLINE_MAX, STATE_KEY } from "./state-key.ts";
 import { seedInline, type SeedFileMeta, type SeedMode } from "../store/seed-files.ts";
 import { putRefusal, storeFull, totalRefusal, type WhenFull } from "../store/state-lines.ts";
+import { isMemoryWrite, requestOf } from "../runtime/memory-shadow.ts";
+import { isIsolatedSession } from "../runtime/isolated-session.ts";
 
 type SealingKey = Awaited<ReturnType<typeof importKek>>;
 
@@ -107,7 +110,19 @@ interface StateConfig {
   maxDocumentBytes?: number;
   /** `memory`'s cap and its budget in the prompt, one number (`memoryBudgetOf`). */
   memoryMaxCharacters?: number;
+  /** Who writes `memory` (`MemoryWriter`, `memoryWriterOf`). */
+  memoryWriter?: MemoryWriter;
 }
+
+/**
+ * Who writes `memory`. `self`: the agent, with its own tools, as always. `shadow`: the agent still does, and after each
+ * of its finished turns one short isolated model call proposes the edits a memory subagent would make, which are kept
+ * privately and never applied (src/runtime/memory-shadow.ts). `subagent`, where that call is the only writer and the
+ * agent loses its memory write tools, is not built yet: a mount is refused it (`memoryWriterProblem`), and a stored
+ * value that is not one of the two is read as `self` (`configOf`).
+ */
+export type MemoryWriter = "self" | "shadow";
+export const MEMORY_WRITERS: readonly MemoryWriter[] = ["self", "shadow"];
 
 /**
  * `memory`'s cap and its budget in the prompt, in characters: one number, so a `memory` within its cap is always shown
@@ -122,7 +137,11 @@ const DEFAULTS: Required<Omit<StateConfig, "account">> = {
   maxValueBytes: 4 * 1024 * 1024,
   maxDocumentBytes: 64 * 1024,
   memoryMaxCharacters: MEMORY_MAX,
+  memoryWriter: "self",
 };
+
+/** The numeric limits, the settings `sharedSettings` takes the smallest of. */
+type Limit = Exclude<keyof typeof DEFAULTS, "memoryWriter">;
 
 /** A mount's settings with the defaults filled in (`configOf`). */
 export type StateSettings = Required<Omit<StateConfig, "account">>;
@@ -181,14 +200,31 @@ export function configOf(publicConfig: unknown): StateSettings {
   const given = (publicConfig && typeof publicConfig === "object" ? publicConfig : {}) as Record<string, unknown>;
   // A limit of nothing, or less, would leave every write refused (and `memory` unshown): that is a bad value, not a
   // setting, so it is the default's too. A fraction is floored, so every limit is a whole count.
-  const limit = (name: keyof typeof DEFAULTS) => {
+  const limit = (name: Limit) => {
     const v = given[name];
     return typeof v === "number" && Number.isFinite(v) && v >= 1 ? Math.floor(v) : DEFAULTS[name];
   };
+  // Anything but a known writer is `self`, what every agent did before the setting: a stored value the mount check
+  // would refuse today (`subagent` among them) must not switch on a mode that is not built.
+  const writer = MEMORY_WRITERS.find((w) => w === given.memoryWriter) ?? DEFAULTS.memoryWriter;
   return {
     maxTotalBytes: limit("maxTotalBytes"), maxValueBytes: limit("maxValueBytes"), maxDocumentBytes: limit("maxDocumentBytes"),
-    memoryMaxCharacters: limit("memoryMaxCharacters"),
+    memoryMaxCharacters: limit("memoryMaxCharacters"), memoryWriter: writer,
   };
+}
+
+/**
+ * Why a mount's `memoryWriter` is refused, or undefined (`Plugin.configProblem`). `subagent` is named apart from a
+ * typo, since it is a mode the design has and this build does not.
+ */
+export function memoryWriterProblem(config: Record<string, unknown>): string | undefined {
+  const v = config.memoryWriter;
+  if (v === undefined || v === null || MEMORY_WRITERS.includes(v as MemoryWriter)) return undefined;
+  if (v === "subagent") {
+    return "memoryWriter \"subagent\" is not available yet: the memory subagent runs only as \"shadow\" for now, proposing "
+      + "edits that are recorded and never applied, while the agent keeps writing its own memory. Use \"shadow\" or \"self\"";
+  }
+  return `memoryWriter must be "self" or "shadow", got ${JSON.stringify(v).slice(0, 40)}`;
 }
 
 /**
@@ -237,13 +273,28 @@ export const memoryBudgetOf = (cfg: StateSettings): number => cfg.memoryMaxChara
  */
 export function sharedSettings(cfgs: readonly StateSettings[]): StateSettings {
   const all = cfgs.length ? cfgs : [configOf({})];
-  const least = (k: keyof StateSettings) => Math.min(...all.map((c) => c[k]));
+  const least = (k: Limit) => Math.min(...all.map((c) => c[k]));
   return {
     maxTotalBytes: least("maxTotalBytes"),
     maxValueBytes: least("maxValueBytes"),
     maxDocumentBytes: least("maxDocumentBytes"),
     memoryMaxCharacters: least("memoryMaxCharacters"),
+    memoryWriter: memoryWriterOf(all),
   };
+}
+
+/**
+ * The writer of the agent's `memory`, from its `state` mounts' settings: the furthest along `MEMORY_WRITERS` any of them
+ * asks for, so `shadow` on one mount holds whatever another says. It is the limits' rule read the same way: every
+ * mount's ask holds, because the mounts share one `memory`. The smallest limit holds so that no mount's alias is a way
+ * past another's; here, a second mount added with the default must not switch off a shadow the first one asked for, and
+ * once a subagent is the only writer, no mount's tools may still be a second one. A run that does nothing is never
+ * stronger than one that does something, so `self` is chosen only when every mount says it.
+ */
+export function memoryWriterOf(cfgs: ReadonlyArray<Pick<StateSettings, "memoryWriter">>): MemoryWriter {
+  let at = 0;
+  for (const c of cfgs) at = Math.max(at, MEMORY_WRITERS.indexOf(c.memoryWriter));
+  return MEMORY_WRITERS[at]!;
 }
 
 /** The cap on `key`, in characters: `maxDocumentBytes`, and for `memory` no more than its budget (`memoryBudgetOf`). */
@@ -399,7 +450,14 @@ export function statePlugin(
         summary: "`memory`'s cap and how much of it the prompt shows, in characters: one number, so a `memory` within its cap is shown whole. Raise it for an agent that needs more standing facts; a value that is not a number of at least 1 is the default's." },
       { name: "maxTotalBytes", type: "number", default: DEFAULTS.maxTotalBytes,
         summary: "How much this agent may keep in total. A write that would pass it is refused." },
+      // No `choices`: a value outside them would be refused with the list alone, and `subagent` deserves the reason.
+      { name: "memoryWriter", type: "string", default: DEFAULTS.memoryWriter,
+        summary: "Who writes `memory`. `self` (the default): the agent, with its own tools. `shadow`: the agent still does, " +
+          "and after each of its finished turns one short model call proposes the edits a memory subagent would make; they " +
+          "are recorded privately for comparison and never applied. With several state mounts, `shadow` on any of them holds. " +
+          "`subagent` is not available yet." },
     ],
+    configProblem: (config) => memoryWriterProblem(config),
     version: "1.0.0",
     tools: [
       {
@@ -878,7 +936,62 @@ export function statePlugin(
       throw new Error(`unknown tool: ${tool}`);
     },
   };
+  // Under `memoryWriter: "shadow"`, a direct write to `memory` is also queued for the memory subagent to be run on,
+  // after the run that made it has ended (src/runtime/memory-shadow.ts): wrapped around `invoke` so the write itself is
+  // the code above, unchanged, and every other call, and every call under `self`, goes straight to it.
+  const direct = plugin.invoke.bind(plugin);
+  plugin.invoke = async (tool, args, ctx) => {
+    if (!isMemoryWrite(tool, args)) return direct(tool, args, ctx);
+    const { tenantId, agentId } = ctx.caller;
+    const rows = await store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID);
+    const writer = sharedSettings(rows.length ? rows.map((m) => configOf(m.publicConfig)) : [configOf(ctx.publicConfig)]).memoryWriter;
+    const session = ctx.caller.taskId;
+    // Only where the runtime runs what is queued once the run has ended: the main conversation and a check's short
+    // session. Anywhere else a queued run would never start, and its due row would count as a run that never ran.
+    // `main` is the main conversation's task id (MAIN_SESSION, src/store/pi-storage.ts).
+    if (writer !== "shadow" || !(session === "main" || isIsolatedSession(session))) return direct(tool, args, ctx);
+    const before = await memoryText(store, tenantId, agentId);
+    let out: Json;
+    try { out = await direct(tool, args, ctx); }
+    catch (e) {
+      // A refused write is still the agent's intent, and the subagent may manage what it could not: queued as well.
+      await queueShadow(ctx, tool, args, session, before, before, codeOf(e));
+      throw e;
+    }
+    await queueShadow(ctx, tool, args, session, before, await memoryText(store, tenantId, agentId), "ok");
+    return out;
+  };
+
+  /**
+   * The due row, then the queued run (src/store/memory-shadow.ts), in that order, so a run that is never queued or
+   * never started still shows as owed. Never throws: the agent's write is never failed by its shadow.
+   */
+  async function queueShadow(ctx: PluginContext, tool: string, args: Json, session: string, before: string, after: string, result: string): Promise<void> {
+    const id = `ms_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
+    const trigger = isIsolatedSession(session) ? "check" : "chat";
+    try { ctx.trace?.({ kind: "memory.shadow_due", status: "due", verdict: "ok", attrs: { op: tool, trigger, job: id, main: result } }); }
+    catch { /* the run is still queued; its heartbeat stands without the due row */ }
+    try {
+      store.memoryShadow.queue(ctx.caller.tenantId, ctx.caller.agentId, {
+        id, trigger, session, request: requestOf(tool, args), mainOp: { tool, args, result }, memoryBefore: before, memoryMain: after,
+      });
+    } catch (e) { console.error(`the memory subagent's shadow run for ${ctx.caller.tenantId}/${ctx.caller.agentId} could not be queued:`, e); }
+  }
+
   return plugin;
+}
+
+/** `memory` as text: empty when absent, its JSON when a `put` left something else there, empty when it is in object storage. */
+async function memoryText(store: StorageAdapter, tenantId: string, agentId: string): Promise<string> {
+  const got = await store.getState(tenantId, agentId, "memory");
+  if (!got || got.ref) return "";
+  return typeof got.value === "string" ? got.value : JSON.stringify(got.value);
+}
+
+/** A refusal's code, as the store gives it (`memory_full`), else `refused`: never the message, which may quote the text. */
+function codeOf(e: unknown): string {
+  const c = (e as { code?: unknown })?.code;
+  return typeof c === "string" && /^[a-z_]{1,40}$/.test(c) ? c : "refused";
 }
 
 /**

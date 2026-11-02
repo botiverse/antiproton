@@ -22,6 +22,7 @@ import {
 } from "./seed-files.ts";
 import { readImport, readImportExcerpt } from "./workspace-import.ts";
 import { AssistantDecisionTables } from "./assistant-decisions.ts";
+import { MemoryShadowTables } from "./memory-shadow.ts";
 
 /**
  * Durable Object SQLite backend. Same schema and same guards as the sqlite
@@ -119,6 +120,7 @@ export class DurableObjectStore implements StorageAdapter {
   #now: () => number;
   readonly pluginDb: PluginDbTables;
   readonly assistantDecisions: AssistantDecisionTables;
+  readonly memoryShadow: MemoryShadowTables;
 
   constructor(ctx: Ctx, opts: { now?: () => number } = {}) {
     this.#ctx = ctx;
@@ -126,6 +128,7 @@ export class DurableObjectStore implements StorageAdapter {
     this.#now = opts.now ?? (() => Date.now());
     this.pluginDb = new PluginDbTables(ctx.storage, { now: this.#now });
     this.assistantDecisions = new AssistantDecisionTables(ctx.storage, { now: this.#now });
+    this.memoryShadow = new MemoryShadowTables(ctx.storage, { now: this.#now });
   }
 
   async init() {
@@ -134,6 +137,7 @@ export class DurableObjectStore implements StorageAdapter {
     for (const stmt of SEED_FILES_SCHEMA) this.#sql.exec(stmt);
     this.pluginDb.ensure();
     this.assistantDecisions.ensure();
+    this.memoryShadow.ensure();
     // Columns added after a table already exists are invisible to
     // CREATE TABLE IF NOT EXISTS; each ALTER is idempotent by trial.
     for (const alter of [

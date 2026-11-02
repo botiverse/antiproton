@@ -7,6 +7,7 @@ import {
 import type { PluginChoice, ToolSnapshot } from "../plugins/types.ts";
 import { AGENT_SCOPE_ALIAS, PluginDbTables } from "./plugin-db.ts";
 import { AssistantDecisionTables } from "./assistant-decisions.ts";
+import { MemoryShadowTables } from "./memory-shadow.ts";
 import { appendUsage, pendingUsage, type UsageRow } from "../usage/outbox.ts";
 import { completedPayload, type CompletedFacts } from "./operation-event.ts";
 import type {
@@ -169,6 +170,7 @@ export class SqliteStore implements StorageAdapter {
   #db: DatabaseSync;
   readonly pluginDb: PluginDbTables;
   readonly assistantDecisions: AssistantDecisionTables;
+  readonly memoryShadow: MemoryShadowTables;
 
   constructor(path = ":memory:") {
     this.#db = new DatabaseSync(path);
@@ -182,6 +184,7 @@ export class SqliteStore implements StorageAdapter {
     };
     this.pluginDb = new PluginDbTables(host);
     this.assistantDecisions = new AssistantDecisionTables(host);
+    this.memoryShadow = new MemoryShadowTables(host);
   }
 
   async init() {
@@ -190,6 +193,7 @@ export class SqliteStore implements StorageAdapter {
     for (const stmt of SEED_FILES_SCHEMA) this.#db.exec(stmt);
     this.pluginDb.ensure();
     this.assistantDecisions.ensure();
+    this.memoryShadow.ensure();
     // CREATE TABLE IF NOT EXISTS silently accepts an existing table that lacks
     // the column, so an object created before this change would never get it.
     for (const alter of [
