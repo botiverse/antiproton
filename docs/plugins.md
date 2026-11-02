@@ -1940,8 +1940,9 @@ the default never switches off a shadow the first asked for.
    writes a `memory.shadow_due` row and then queues a run in `memory_shadow` with the document **before** the write, the
    document the write left, and a request derived from the write ("Remember this: …", "Change this text: … to: …").
    Nothing waits for the subagent, so the write is neither delayed nor failed by it.
-2. When the run that made the write has ended, the runtime posts one short session per queued run. It is offered **no
-   tools**; its system prompt is the subagent's rules and its input is the document before the write, the request, and
+2. When the run that made the write has ended, the runtime posts one short session per queued run, at most three per
+   run of the agent's (`MEMORY_SHADOW_RUNS_PER_RUN`); the rest are finished as `skipped` (`per_run_cap`), each with its
+   heartbeat. A session is offered **no tools**; its system prompt is the subagent's rules and its input is the document before the write, the request, and
    the conversation since the previous run in that conversation (a per-conversation mark; the first run sees the most
    recent messages; at most 12,000 characters, oldest cut first). Two writes in one turn are shown disjoint parts.
 3. Its answer is JSON: `{"ops": [...]}` with `revise`, `insert`, `remember` and `put` in the state tools' shapes. The
@@ -1956,24 +1957,44 @@ the default never switches off a shadow the first asked for.
 
 - A line recording something the owner explicitly asked for (a preference, a rule, "always", "never") starts with
   `[owner]`, after a list bullet if it has one. The tag is decided when the line is written and never judged again.
-- A tagged line is never deleted and never reworded except to shorten it with the tag kept. Any edit that leaves
-  fewer tagged lines as they were than it found is refused as `owner_line_deleted` and counted in `taggedDeletions`,
-  whatever the edit gives as its reason.
+- A tagged line is never deleted. Any edit that leaves one of the tagged lines it found not as it was is refused as
+  `owner_line_deleted` and counted in `taggedDeletions`, one per line, whatever it adds in its place: a `put` that
+  swaps one tagged line for another is a deletion. The one exception is a `revise` of one tagged line in place: the
+  document keeps its number of lines, exactly that line differs, and it is tagged before and after
+  (`revisedInPlace`). Such a revise may change what the line says, not only shorten it: code cannot tell compression
+  from a change of meaning, and the agent's own direct writes can do the same today, so it is counted as
+  `taggedRevised` for the comparison rather than refused.
 - When the change does not fit: compress wording, merge duplicates, drop what is no longer true, then move details to
   a separate document (`put` to `notes/<topic>`) with a pointer line in `memory` (`moved`, `movedWithPointer`). Never
   make room by deleting the oldest lines; a deletion at the top of the document is counted as `oldestDeleted`.
 - Only `memory` is edited, besides `put`s of new documents; `forget` is refused.
 
-**The observer.** After each completed turn of a `shadow` agent, one more short session, also with no tools, answers
+**The observer.** After each completed turn of a `shadow` agent, in its chat and after each check session alike, one
+more short session, also with no tools, answers
 only `{"intent": true|false}`: did the owner ask for something to be kept, state a standing rule, or contradict the
 memory. Its `memory.observe` row carries `intent`, `called` (read from the turn's own calls, not asked: a direct
 write to `memory` or a `memory_update` call), `sampled` (always true in shadow) and `trigger`, or `failed` with a code.
-`intent: true, called: false` is a missed intent.
+`intent: true, called: false` is a missed intent. Cost: one small call per finished turn, checks included, on top of
+one call per direct write (at most three per run); for an assistant that wakes every few minutes the observer is most
+of it.
 
 **Counting.** Due rows and heartbeats come from different code, so a run that never ran is a due row without a
 `memory.shadow` row of the same `job`. Every trace row is counts and fixed codes only, and none is forwarded. The
 document, the request and the proposed edits are the owner's data and stay in the agent's own `memory_shadow` table:
-kept 30 days (pruned as a new run is queued) and deleted with the agent.
+
+- **Kept 7 days**, pruned on every pass of the agent's object and as a run is queued, and deleted with the agent.
+- **A forget takes effect there too.** Every write to `memory`, under any writer, compares the document before and
+  after it: a row whose stored text (either document, the request, the agent's write, the proposed edits) holds a line
+  the write removed or reworded is deleted. Under `self` this is asked only when an earlier shadow left rows. The run
+  queued for the removing write itself keeps the text until it has been judged, and has those lines replaced by
+  `[forgotten]` as it finishes.
+- **One read path:** `GET /admin/memory-shadow?tenantId=…&agentId=…` with the operator's token
+  (`cf/src/admin-memory-shadow.ts`), gated and audited exactly as `/admin/assistant-decisions`: a reason is required
+  and a read whose audit row cannot be written is refused.
+
+**Phase 2** (`subagent`) must apply the subagent's edits with the same function shadow judges them with (`simulate`),
+its whole result written in one compare-and-set transaction against the document it was shown, so the
+`taggedDeletions` and refusal counts gathered in shadow describe exactly what would have been written.
 
 ## Tests
 

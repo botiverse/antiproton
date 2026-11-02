@@ -11,9 +11,13 @@
  * the agent's own storage, and nowhere else: the trace rows (`memory.shadow_due`, `memory.shadow`) carry counts only, as
  * `assistant_decisions` does for a check's note (src/store/assistant-decisions.ts).
  *
- * Kept `MEMORY_SHADOW_RETENTION_MS` (30 days): every new row deletes this agent's older ones in the same transaction. An
- * agent's delete deletes all of its rows (`deleteAgent`, from cf/src/runtime.ts `stopTurn`): the agent's object outlives
- * its delete. Shared by both storage backends, as `assistant_decisions` is.
+ * Kept `MEMORY_SHADOW_RETENTION_MS` (7 days): pruned on every pass of the agent's object (cf/src/runtime.ts `step`) and
+ * as a new row is queued. What the agent removes from its memory goes from here too (`purgeLines`, from the state
+ * plugin's write): a row whose stored text holds a removed line is deleted, and the run queued for the removing write
+ * itself has those lines blanked out as it finishes (`finish`), once it has been judged. An agent's delete deletes all
+ * of its rows (`deleteAgent`, from cf/src/runtime.ts `stopTurn`): the agent's object outlives its delete. Read by an
+ * operator through `GET /admin/memory-shadow` alone (cf/src/admin-memory-shadow.ts, `readMemoryShadow`), audited as an
+ * assistant's conversation read is. Shared by both storage backends, as `assistant_decisions` is.
  */
 import type { SqlHost } from "./pi-storage.ts";
 
@@ -32,13 +36,13 @@ export const MEMORY_SHADOW_SCHEMA: readonly string[] = [
      PRIMARY KEY (tenant_id, agent_id, conversation))`,
 ];
 
-/** How long a shadow run is kept. */
-export const MEMORY_SHADOW_RETENTION_MS = 30 * 24 * 3_600_000;
+/** How long a shadow run is kept: long enough for a few days' comparison, no longer. */
+export const MEMORY_SHADOW_RETENTION_MS = 7 * 24 * 3_600_000;
 /** The most one read returns. */
 export const MEMORY_SHADOW_READ_MAX = 500;
 
-/** What a finished run came to. */
-export type ShadowOutcome = "changed" | "no_change" | "failed";
+/** What a finished run came to; `skipped` is a run never started (`per_run_cap`). */
+export type ShadowOutcome = "changed" | "no_change" | "failed" | "skipped";
 
 export interface MemoryShadowRun {
   id: string;
@@ -55,7 +59,7 @@ export interface MemoryShadowRun {
   /** What the subagent was asked: the agent's write, as a request (`requestOf`). */
   request: string;
   /** The agent's own write: the tool and its arguments. */
-  mainOp: { tool: string; args: unknown; result: string };
+  mainOp: { tool: string; args: unknown; result: string; readFailed?: true };
   /** The memory document before the agent's write: what the subagent is shown and its edits are judged against. */
   memoryBefore: string;
   /** The document the agent's own write left. */
@@ -110,7 +114,7 @@ export class MemoryShadowTables {
 
   /** A run owed for the agent's write, `queued` until its session's run has ended; drops this agent's expired rows. */
   queue(tenantId: string, agentId: string, r: {
-    id: string; trigger: "chat" | "check"; session: string; request: string; mainOp: { tool: string; args: unknown; result: string };
+    id: string; trigger: "chat" | "check"; session: string; request: string; mainOp: { tool: string; args: unknown; result: string; readFailed?: true };
     memoryBefore: string; memoryMain: string;
   }): void {
     this.#host.transactionSync(() => {
@@ -135,7 +139,11 @@ export class MemoryShadowTables {
     this.#host.sql.exec("UPDATE memory_shadow SET state='posted', posted_at=? WHERE tenant_id=? AND agent_id=? AND id=?", at, tenantId, agentId, id);
   }
 
-  /** What the run came to. */
+  /**
+   * What the run came to. The lines the agent's own write removed (its `memoryBefore` against its `memoryMain`) are
+   * blanked out of every stored text of the row as it is written: the run needed them to be judged, and once it has
+   * been, what the agent removed is not kept here.
+   */
   finish(tenantId: string, agentId: string, id: string, r: {
     outcome: ShadowOutcome; errorCode: string | null; memoryAfter: string | null; ops: unknown[] | null; counts: Record<string, unknown> | null;
   }): void {
@@ -144,6 +152,47 @@ export class MemoryShadowTables {
       this.#now(), r.outcome, r.errorCode, r.memoryAfter, r.ops === null ? null : JSON.stringify(r.ops),
       r.counts === null ? null : JSON.stringify(r.counts), tenantId, agentId, id,
     );
+    const row = this.get(tenantId, agentId, id);
+    const lines = row ? removedLines(row.memoryBefore, row.memoryMain) : [];
+    if (!lines.length) return;
+    const blank = (cell: unknown) => {
+      if (cell === null || cell === undefined) return cell;
+      let t = String(cell);
+      for (const l of lines) t = t.split(l).join(FORGOTTEN).split(JSON.stringify(l).slice(1, -1)).join(FORGOTTEN);
+      return t;
+    };
+    const r0 = this.#host.sql.exec("SELECT memory_before, memory_main, memory_after, request, main_op, ops FROM memory_shadow WHERE tenant_id=? AND agent_id=? AND id=?",
+      tenantId, agentId, id).toArray()[0] as Record<string, unknown>;
+    this.#host.sql.exec("UPDATE memory_shadow SET memory_before=?, memory_main=?, memory_after=?, request=?, main_op=?, ops=? WHERE tenant_id=? AND agent_id=? AND id=?",
+      blank(r0.memory_before), blank(r0.memory_main), blank(r0.memory_after), blank(r0.request), blank(r0.main_op), blank(r0.ops), tenantId, agentId, id);
+  }
+
+  /** Whether this agent has any row: a write under `self` asks it before reading `memory` for a purge (src/plugins/state.ts). */
+  hasRows(tenantId: string, agentId: string): boolean {
+    if (!hasTable(this.#host.sql)) return false;
+    return this.#host.sql.exec("SELECT 1 AS x FROM memory_shadow WHERE tenant_id=? AND agent_id=? LIMIT 1", tenantId, agentId).toArray().length > 0;
+  }
+
+  /**
+   * Deletes this agent's rows whose stored text (any document, the request, the agent's write, the proposed edits) holds
+   * any of `lines`, as it is or as JSON writes it, a run still queued or in flight included (its end then finds no row
+   * and says `job_missing` on its heartbeat). Called before the write's own run is queued, which keeps its text until it
+   * has been judged and blanks it out as it finishes (`finish`). Blank lines match nothing. Returns how many rows went.
+   */
+  purgeLines(tenantId: string, agentId: string, lines: readonly string[]): number {
+    const wanted = lines.filter((l) => l.trim());
+    if (!wanted.length || !hasTable(this.#host.sql)) return 0;
+    const needles = wanted.flatMap((l) => [l, JSON.stringify(l).slice(1, -1)]);
+    const rows = this.#host.sql.exec("SELECT id, memory_before, memory_main, memory_after, request, main_op, ops FROM memory_shadow WHERE tenant_id=? AND agent_id=?",
+      tenantId, agentId).toArray() as Array<Record<string, unknown>>;
+    let gone = 0;
+    for (const r of rows) {
+      const cells = [r.memory_before, r.memory_main, r.memory_after, r.request, r.main_op, r.ops].filter((c) => c !== null && c !== undefined).map(String);
+      if (!cells.some((c) => needles.some((n) => c.includes(n)))) continue;
+      this.#host.sql.exec("DELETE FROM memory_shadow WHERE tenant_id=? AND agent_id=? AND id=?", tenantId, agentId, String(r.id));
+      gone++;
+    }
+    return gone;
   }
 
   get(tenantId: string, agentId: string, id: string): MemoryShadowRun | null {
@@ -152,12 +201,9 @@ export class MemoryShadowTables {
     return r ? rowOf(r as Record<string, unknown>) : null;
   }
 
-  /** One agent's runs due in [from, to), newest first, at most `MEMORY_SHADOW_READ_MAX`. SELECTs only. */
+  /** One agent's runs due in [from, to), newest first, at most `MEMORY_SHADOW_READ_MAX` (`readMemoryShadow`). */
   list(tenantId: string, agentId: string, range: { from?: number; to?: number } = {}): MemoryShadowRun[] {
-    if (!hasTable(this.#host.sql)) return [];
-    const from = range.from ?? 0, to = range.to ?? Number.MAX_SAFE_INTEGER;
-    return (this.#host.sql.exec(`${SELECT} WHERE tenant_id=? AND agent_id=? AND due_at >= ? AND due_at < ? ORDER BY due_at DESC, rowid DESC LIMIT ?`,
-      tenantId, agentId, from, to, MEMORY_SHADOW_READ_MAX).toArray() as Array<Record<string, unknown>>).map(rowOf);
+    return readMemoryShadow(this.#host.sql, tenantId, agentId, range);
   }
 
   /** The last entry of `conversation` a run was shown, or null. */
@@ -192,4 +238,25 @@ export class MemoryShadowTables {
 
 function hasTable(sql: Sql): boolean {
   return sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'memory_shadow'").toArray().length > 0;
+}
+
+/** What a blanked-out removed line reads as (`finish`). */
+export const FORGOTTEN = "[forgotten]";
+
+/** The non-blank lines of `before` that are not in `after`: what a write removed or reworded. */
+export function removedLines(before: string, after: string): string[] {
+  const kept = new Set(after.split("\n"));
+  return [...new Set(before.split("\n").filter((l) => l.trim() && !kept.has(l)))];
+}
+
+/**
+ * One agent's runs due in [from, to), newest first, at most `MEMORY_SHADOW_READ_MAX`. SELECTs only, for the operator's
+ * route (cf/src/admin-memory-shadow.ts), which must not run the store's migrations; an object that never made the table
+ * reads as having none.
+ */
+export function readMemoryShadow(sql: Sql, tenantId: string, agentId: string, range: { from?: number; to?: number } = {}): MemoryShadowRun[] {
+  if (!hasTable(sql)) return [];
+  const from = range.from ?? 0, to = range.to ?? Number.MAX_SAFE_INTEGER;
+  return (sql.exec(`${SELECT} WHERE tenant_id=? AND agent_id=? AND due_at >= ? AND due_at < ? ORDER BY due_at DESC, rowid DESC LIMIT ?`,
+    tenantId, agentId, from, to, MEMORY_SHADOW_READ_MAX).toArray() as Array<Record<string, unknown>>).map(rowOf);
 }

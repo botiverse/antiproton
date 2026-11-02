@@ -100,6 +100,8 @@ const ROUTES: Route[] = [
   { path: "/admin/transcript", method: "GET", refused: 401, passed: (s) => s === 400 },
   // A personal assistant's notes of what its checks decided (cf/src/admin-assistant-decisions.ts): no agent named is a 400.
   { path: "/admin/assistant-decisions", method: "GET", refused: 401, passed: (s, c) => s === 400 && !c.some((x) => /^(object|agent)\./.test(x)) },
+  // The memory subagent's shadow runs (cf/src/admin-memory-shadow.ts): no agent named is a 400.
+  { path: "/admin/memory-shadow", method: "GET", refused: 401, passed: (s, c) => s === 400 && !c.some((x) => /^(object|agent)\./.test(x)) },
   // The storage scan (cf/src/storage-scan.ts): with no body it names no agent, a 400 before the object or R2 is read.
   { path: "/admin/storage-scan", method: "POST", refused: 401, passed: (s, c) => s === 400 && !c.some((x) => /^(object|r2)\./.test(x)) },
   // The credential inventory (cf/src/credential-inventory.ts): with no x-claimed-caller it is a 400, before any object is asked.

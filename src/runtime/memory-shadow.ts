@@ -58,6 +58,12 @@ export const CONTEXT_MAX = 12_000;
 export const ENTRY_MAX = 1_500;
 /** Without a marker, the most recent messages a first run is shown. */
 export const FIRST_CONTEXT_MESSAGES = 20;
+/**
+ * The most shadow runs one run of the agent's starts: each is a model call, and a run that writes `memory` ten times
+ * should not cost ten. The rest are finished as `skipped` (`per_run_cap`) with their heartbeats. Three covers the
+ * usual turn (one or two writes) with room, and keeps a write-heavy one to a known cost.
+ */
+export const MEMORY_SHADOW_RUNS_PER_RUN = 3;
 /** The most edits one answer may propose; past it the rest are refused as `too_many_ops`. */
 export const OPS_MAX = 12;
 
@@ -179,7 +185,7 @@ export function memoryShadowPrompt(cap: number): string {
 Reply {"ops": []} when nothing should change.`,
     `Rules:
 1. A line that records something the owner explicitly asked for (a preference, a rule, "always", "never", "remember that") starts with "${OWNER_TAG} ", after the list bullet if it has one ("- ${OWNER_TAG} ..."). Decide that when you write the line, from the request and the conversation. Never add the tag to a line already written, and never take it off.
-2. Never delete a line that carries "${OWNER_TAG}", and never change what it says. When the document is full you may shorten its wording, keeping the tag and the meaning.
+2. Never delete a line that carries "${OWNER_TAG}", and never change what it says. When the document is full you may shorten its wording with a revise of that one line, keeping the tag and the meaning. A put that drops, swaps or untags one is refused.
 3. Write the fact, not the story, one fact per line. When something stops being true, replace its line rather than adding one that contradicts it.
 4. When the change does not fit in ${cap} characters: first shorten wording, merge duplicates and drop what the conversation shows is no longer true; then move details out: put them into a document of their own (notes/<topic>) and leave a short line in memory that says where they are. Never make room by deleting the oldest lines: being old is not a reason to forget something.
 5. Never write a credential.`,
@@ -273,14 +279,30 @@ function taggedGone(before: string, after: string): number {
   return gone;
 }
 
+/**
+ * Whether `after` is `before` with one tagged line revised in place: the same number of lines, exactly one line
+ * different, and that line tagged in both. What "the same line" means for the exception in `simulate`: its position
+ * is kept and nothing else in the document moved, so a revise that spans lines, joins or splits them, or drops the tag
+ * is not one.
+ */
+export function revisedInPlace(before: string, after: string): boolean {
+  const a = before.split("\n"), b = after.split("\n");
+  if (a.length !== b.length) return false;
+  const diff = a.map((l, i) => i).filter((i) => a[i] !== b[i]);
+  return diff.length === 1 && isOwnerLine(a[diff[0]!]!) && isOwnerLine(b[diff[0]!]!);
+}
+
 /** A refusal's code: the store's own (`<key>_full`, `<key>_over_cap`), else a name for the reason. */
 function codeOf(e: unknown, fallback: string): string {
   const c = (e as { code?: unknown })?.code;
   return typeof c === "string" && /^[a-z_]{1,40}$/.test(c) ? c : fallback;
 }
 
-/** Each string argument cut, so a row's size is bounded by `OPS_MAX` and not by what the model wrote. */
-function boundedArgs(o: ProposedOp): Record<string, unknown> {
+/**
+ * Each string argument cut at `REQUEST_MAX`, so a row's size is bounded and not by what the model wrote: a proposal's,
+ * and the agent's own write's as its run keeps it (src/plugins/state.ts).
+ */
+export function boundedArgs(o: ProposedOp): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(o)) {
     if (k === "op") continue;
@@ -318,6 +340,8 @@ export interface ShadowCounts {
   ops: number; put: number; revise: number; insert: number; remember: number; forget: number; other: number;
   accepted: number; refused: number; refusedCodes: Record<string, number>;
   touchesOwner: number; taggedDeletions: number; taggedAdded: number;
+  /** Tagged lines reworded in place (`revisedInPlace`), which may change what they say: counted apart, not refused. */
+  taggedRevised: number;
   moved: number; movedWithPointer: number;
   linesAdded: number; linesRevised: number; linesDeleted: number; oldestDeleted: number;
   charsBefore: number; charsAfter: number; cap: number;
@@ -329,9 +353,12 @@ export interface ShadowCounts {
  * was, as the tool does. Nothing is written anywhere: this is what the edits would have come to.
  *
  * Held to more than the tools are, since the subagent is the writer under test:
- * - an edit that leaves fewer `OWNER_TAG` lines as they were than it found, by deleting or rewriting one, is refused as
- *   `owner_line_deleted` and counted in `taggedDeletions` (what a compression keeps is the line's tag; one that drops
- *   the tag is a deletion);
+ * - an edit that leaves any of the `OWNER_TAG` lines it found not as they were is refused as `owner_line_deleted` and
+ *   counted in `taggedDeletions`, one per such line, whatever it adds in their place: a `put` that swaps one tagged line
+ *   for another, or untags one, is a deletion. The one exception is a `revise` of one tagged line in place
+ *   (`revisedInPlace`), counted in `taggedRevised`. It may change what the line says, not only shorten it: code cannot
+ *   tell a compression from a change of meaning, and the agent's own direct writes can make the same change today, so
+ *   it is counted for the comparison rather than refused;
  * - only `memory` is edited: a `put` of another key is the move the rules ask for and is accepted (`moved`, and
  *   `movedWithPointer` when the document it leaves names that key); any other edit of another key, or a `forget` of
  *   anything, is refused (`outside_memory`, `forget_refused`).
@@ -340,7 +367,7 @@ export function simulate(memory: string, proposed: readonly ProposedOp[], cap: n
   let doc = memory;
   const results: ShadowOpResult[] = [];
   const movedKeys: string[] = [];
-  let taggedAdded = 0;
+  let taggedAdded = 0, taggedRevised = 0;
   proposed.forEach((o, n) => {
     const op = typeof o.op === "string" ? o.op : "other";
     const key = typeof o.key === "string" ? o.key : null;
@@ -396,8 +423,12 @@ export function simulate(memory: string, proposed: readonly ProposedOp[], cap: n
       return refuse(codeOf(e, op === "insert" && !(e as { size?: unknown })?.size ? "insert_out_of_range" : "memory_full"));
     }
     const gone = taggedGone(doc, next);
-    const lost = tagged(doc).length - tagged(next).length;
-    if (gone > 0 && lost > 0) return refuse("owner_line_deleted", { touchesOwner: true, taggedDeleted: lost });
+    // The one change a tagged line may take: a `revise` of that line alone, in place (`revisedInPlace`). Any other edit
+    // that leaves one of its tagged lines not as it was is a deletion, however many tagged lines it leaves: a swap of
+    // one for another loses the first.
+    const inPlace = gone > 0 && op === "revise" && revisedInPlace(doc, next);
+    if (gone > 0 && !inPlace) return refuse("owner_line_deleted", { touchesOwner: true, taggedDeleted: gone });
+    if (inPlace) taggedRevised++;
     taggedAdded += Math.max(0, tagged(next).length - tagged(doc).length);
     results.push({ ...base, result: "accepted", touchesOwner: gone > 0, taggedDeleted: 0 });
     doc = next;
@@ -411,7 +442,7 @@ export function simulate(memory: string, proposed: readonly ProposedOp[], cap: n
     other: results.filter((r) => !["put", "revise", "insert", "remember", "forget"].includes(r.op)).length,
     accepted: results.filter((r) => r.result === "accepted").length, refused: results.filter((r) => r.result === "refused").length, refusedCodes,
     touchesOwner: results.filter((r) => r.touchesOwner).length, taggedDeletions: results.reduce((s, r) => s + r.taggedDeleted, 0), taggedAdded,
-    moved: movedKeys.length, movedWithPointer: movedKeys.filter((k) => doc.includes(k)).length,
+    taggedRevised, moved: movedKeys.length, movedWithPointer: movedKeys.filter((k) => doc.includes(k)).length,
     linesAdded: diff.added, linesRevised: diff.revised, linesDeleted: diff.deleted, oldestDeleted: diff.oldestDeleted,
     charsBefore: memory.length, charsAfter: doc.length, cap,
   };

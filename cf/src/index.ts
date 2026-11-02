@@ -78,6 +78,8 @@ import {
 import { adminTranscript } from "./admin-transcript.ts";
 import { adminAssistantDecisions } from "./admin-assistant-decisions.ts";
 import { readAssistantDecisions } from "../../src/store/assistant-decisions.ts";
+import { adminMemoryShadow } from "./admin-memory-shadow.ts";
+import { readMemoryShadow } from "../../src/store/memory-shadow.ts";
 import { auditRead, d1ReadAudit, readReason } from "./read-audit.ts";
 import { readFrictionWindow, type FrictionLimits, type FrictionWindow } from "./friction-read.ts";
 import { dailyCron, frictionDaily, scanDay, tenantScope, writeReport, type FrictionBucket, type WindowReader } from "./friction-scan.ts";
@@ -2623,6 +2625,15 @@ export class AgentDO extends DurableObject<Env> {
   async adminAssistantDecisions(tenantId: string, agentId: string, from: number, to: number) {
     if (!this.#isAgent(tenantId, agentId)) return null;
     return readAssistantDecisions(this.sql as never, tenantId, agentId, { from, to });
+  }
+
+  /**
+   * The memory subagent's shadow runs (/admin/memory-shadow), due in [from, to): SELECTs on this object's SQLite and
+   * nothing else, as adminAssistantDecisions. Null for an agent this object does not hold.
+   */
+  async adminMemoryShadow(tenantId: string, agentId: string, from: number, to: number) {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return readMemoryShadow(this.sql as never, tenantId, agentId, { from, to });
   }
 
   /**
@@ -5390,6 +5401,9 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
             (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))), d1ReadAudit(env.CONTROL_DB));
         case "/admin/assistant-decisions":
           return await adminAssistantDecisions(request, env.AUTOMATION_TOKEN,
+            (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))), d1ReadAudit(env.CONTROL_DB));
+        case "/admin/memory-shadow":
+          return await adminMemoryShadow(request, env.AUTOMATION_TOKEN,
             (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))), d1ReadAudit(env.CONTROL_DB));
         case "/":
           // The demo is the point of this deployment; making people know to

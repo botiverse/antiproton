@@ -5,15 +5,19 @@
  * cap), the conversation each run is shown, and the private table's retention and delete. Through the runtime:
  * test/memory-shadow-runtime.ts.
  */
+import { DatabaseSync } from "node:sqlite";
+import { readdirSync, readFileSync } from "node:fs";
 import { SqliteStore } from "../src/store/sqlite.ts";
+import { adminMemoryShadow, type MemoryShadowSource } from "../cf/src/admin-memory-shadow.ts";
+import { d1ReadAudit, type ReadAudit, type ReadAuditRow } from "../cf/src/read-audit.ts";
 import { configOf, memoryWriterOf, memoryWriterProblem, sharedSettings, statePlugin, MEMORY_MAX } from "../src/plugins/state.ts";
 import { validateMount } from "../src/runtime/mount-config.ts";
 import type { PluginContext } from "../src/plugins/types.ts";
 import {
   calledMemory, contextSlices, FIRST_CONTEXT_MESSAGES, isOwnerLine, lineDiff, memoryCallMatcher, memoryShadowPrompt, OWNER_TAG, parseObservation,
-  parseProposal, renderConversation, requestOf, simulate, type BranchEntry,
+  parseProposal, renderConversation, REQUEST_MAX, requestOf, revisedInPlace, simulate, type BranchEntry,
 } from "../src/runtime/memory-shadow.ts";
-import { MEMORY_SHADOW_RETENTION_MS, MemoryShadowTables } from "../src/store/memory-shadow.ts";
+import { FORGOTTEN, MEMORY_SHADOW_RETENTION_MS, MemoryShadowTables } from "../src/store/memory-shadow.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { modelToolName } from "../src/runtime/pi-tools.ts";
 
@@ -52,11 +56,11 @@ await check("memoryWriter on a mount: self and shadow accepted; subagent refused
 
 // ---- the state plugin's half: the due row, then the queued run ---------------------------------------------------
 
-async function plugin(config: Record<string, unknown>, opts: { taskId?: string } = {}) {
+async function plugin(config: Record<string, unknown>, opts: { taskId?: string; shadowsMemory?: () => boolean } = {}) {
   const store = new SqliteStore(":memory:");
   await store.init();
   await store.createAgent("t", "a");
-  const p = statePlugin(store, null, "local");
+  const p = statePlugin(store, null, "local", undefined, opts.shadowsMemory ? { shadowsMemory: opts.shadowsMemory } : {});
   const traces: any[] = [];
   const ctx = { publicConfig: config, credential: null, caller: { tenantId: "t", agentId: "a", taskId: opts.taskId ?? "main" }, alias: "mem",
     trace: (r: unknown) => { traces.push(r); } } as unknown as PluginContext;
@@ -104,6 +108,58 @@ await check("shadow: a run that cannot be queued never fails the agent's write",
   must((await store.getState("t", "a", "memory"))?.value === "- kept", "the write did not land");
 });
 
+await check("shadow: a failed read of memory around the write never fails the write; the run is queued as readFailed and the due row says so", async () => {
+  const { store, p, ctx, traces } = await plugin({ memoryWriter: "shadow" });
+  const real = store.getState.bind(store);
+  (store as any).getState = async (t: string, a: string, k: string) => { if (k === "memory") throw new Error("read failed"); return real(t, a, k); };
+  const r = await p.invoke("remember", { key: "memory", text: "- kept" }, ctx) as any;
+  must(r.key === "memory", show(r));
+  (store as any).getState = real;
+  must((await store.getState("t", "a", "memory"))?.value === "- kept", "the write did not land");
+  const runs = store.memoryShadow.queued("t", "a", "main");
+  must(runs.length === 1 && runs[0]!.mainOp.readFailed === true && traces[0]?.attrs.read === "failed", show({ runs, traces }));
+});
+
+await check("shadow on an engine that runs no shadow sessions (pd): no due row, nothing queued, the write as usual", async () => {
+  const { store, p, ctx, traces } = await plugin({ memoryWriter: "shadow" }, { shadowsMemory: () => false });
+  await p.invoke("remember", { key: "memory", text: "- one" }, ctx);
+  must(traces.length === 0 && store.memoryShadow.list("t", "a").length === 0 && (await store.getState("t", "a", "memory"))?.value === "- one", show(traces));
+});
+
+await check("the agent's write is kept with its arguments cut at REQUEST_MAX, as proposals are", async () => {
+  const { store, p, ctx } = await plugin({ memoryWriter: "shadow", maxDocumentBytes: 100_000, memoryMaxCharacters: 100_000 });
+  const long = "x".repeat(REQUEST_MAX + 5_000);
+  await p.invoke("put", { key: "notes/n", value: "y" }, ctx);
+  await p.invoke("put", { key: "memory", value: long }, ctx).catch(() => null);
+  const run = store.memoryShadow.list("t", "a")[0]!;
+  const kept = String((run.mainOp.args as any).value);
+  must(kept.length < REQUEST_MAX + 100 && kept.length < long.length, `kept ${kept.length}`);
+});
+
+await check("a forget takes effect: a revise that rewords a line deletes the runs holding the old wording; its own run blanks it out as it finishes", async () => {
+  const { store, p, ctx } = await plugin({ memoryWriter: "shadow" });
+  await p.invoke("remember", { key: "memory", text: "- secret plan ALPHA" }, ctx);
+  await p.invoke("remember", { key: "memory", text: "- likes tea" }, ctx);
+  must(store.memoryShadow.list("t", "a").length === 2, "two runs");
+  await p.invoke("revise", { key: "memory", old: "- secret plan ALPHA", new: "- plan B" }, ctx);
+  const left = store.memoryShadow.list("t", "a");
+  // The first run (its request and document after hold ALPHA) and the second (its documents hold ALPHA) are gone; the revise's own remains.
+  must(left.length === 1 && left[0]!.mainOp.tool === "revise", show(left.map((r) => r.mainOp.tool)));
+  must(left[0]!.memoryBefore.includes("ALPHA"), "the revise's own run lost its text before it was judged");
+  store.memoryShadow.finish("t", "a", left[0]!.id, { outcome: "no_change", errorCode: null, memoryAfter: left[0]!.memoryBefore, ops: [], counts: {} });
+  const done = show(store.memoryShadow.get("t", "a", left[0]!.id));
+  must(!done.includes("secret plan ALPHA") && done.includes(FORGOTTEN), done);
+});
+
+await check("a forget takes effect under self too, for runs an earlier shadow left", async () => {
+  const { store, p, ctx } = await plugin({ memoryWriter: "shadow" });
+  await p.invoke("remember", { key: "memory", text: "- secret plan ALPHA" }, ctx);
+  must(store.memoryShadow.list("t", "a").length === 1, "a run");
+  const self = { ...ctx, publicConfig: {} } as PluginContext;
+  await p.invoke("forget", { key: "memory" }, self);
+  must(store.memoryShadow.list("t", "a").length === 0, show(store.memoryShadow.list("t", "a")));
+});
+
 // ---- judging a proposal ---------------------------------------------------------------------------------------
 
 const MEM = "- [owner] reply in English\n- works on Raft\n- [owner] never book meetings before 10am";
@@ -119,7 +175,21 @@ await check("an [owner] line's tag taken off is a deletion too; its wording shor
   const off = simulate(MEM, [{ op: "revise", key: "memory", old: "- [owner] reply in English", new: "- reply in English" }], 8000);
   must(off.results[0]!.code === "owner_line_deleted" && off.counts.taggedDeletions === 1, show(off.results));
   const shorter = simulate(MEM, [{ op: "revise", key: "memory", old: "- [owner] never book meetings before 10am", new: "- [owner] no meetings before 10am" }], 8000);
-  must(shorter.results[0]!.result === "accepted" && shorter.counts.touchesOwner === 1 && shorter.counts.taggedDeletions === 0 && shorter.counts.linesRevised === 1, show(shorter));
+  must(shorter.results[0]!.result === "accepted" && shorter.counts.touchesOwner === 1 && shorter.counts.taggedDeletions === 0 && shorter.counts.taggedRevised === 1 && shorter.counts.linesRevised === 1, show(shorter));
+});
+
+await check("a put that swaps one [owner] line for another, keeping the count, is a deletion: refused and counted", () => {
+  const swapped = MEM.replace("- [owner] reply in English", "- [owner] reply in French");
+  const r = simulate(MEM, [{ op: "put", key: "memory", value: swapped }], 8000);
+  must(r.results[0]!.code === "owner_line_deleted" && r.counts.taggedDeletions === 1 && r.after === MEM, show(r.results));
+});
+
+await check("a revise of one [owner] line in place is allowed even when it reverses the meaning, and counted as taggedRevised; one spanning lines is refused", () => {
+  const r = simulate(MEM, [{ op: "revise", key: "memory", old: "never book", new: "always book" }], 8000);
+  must(r.results[0]!.result === "accepted" && r.counts.taggedRevised === 1 && r.counts.taggedDeletions === 0, show(r.counts));
+  const span = simulate(MEM, [{ op: "revise", key: "memory", old: "English\n- works", new: "English and works" }], 8000);
+  must(span.results[0]!.code === "owner_line_deleted", show(span.results));
+  must(revisedInPlace("- [owner] a\n- b", "- [owner] A\n- b") && !revisedInPlace("- [owner] a\n- b", "- a\n- b") && !revisedInPlace("- [owner] a\n- b", "- [owner] a b"), "revisedInPlace");
 });
 
 await check("a whole-document put that drops an [owner] line, and a forget, are refused", () => {
@@ -250,10 +320,11 @@ await check("called: a direct write to memory and a memory_update call both coun
 
 // ---- the private table ----------------------------------------------------------------------------------------
 
-await check("memory_shadow: kept 30 days, pruned as a new run is queued; an agent's delete takes its runs and marks, not another agent's", () => {
+await check("memory_shadow: kept 7 days, pruned as a new run is queued; an agent's delete takes its runs and marks, not another agent's", () => {
   const host = sqliteHost();
   let now = 1_000_000_000_000;
   const t = new MemoryShadowTables(host, { now: () => now }).ensure();
+  must(MEMORY_SHADOW_RETENTION_MS === 7 * 24 * 3_600_000, "retention");
   const run = (id: string) => ({ id, trigger: "chat" as const, session: "main", request: "r", mainOp: { tool: "remember", args: {}, result: "ok" }, memoryBefore: "", memoryMain: "x" });
   t.queue("t", "a", run("old"));
   t.queue("t", "b", run("other"));
@@ -265,6 +336,73 @@ await check("memory_shadow: kept 30 days, pruned as a new run is queued; an agen
   t.setMark("t", "a", "main", "e2");
   t.deleteAgent("t", "a");
   must(t.list("t", "a").length === 0 && t.mark("t", "a", "main") === null && t.list("t", "b").length === 1, "the delete");
+});
+
+// ---- the operator's read ---------------------------------------------------------------------------------------
+
+/** D1 as node:sqlite with every migration applied, as test/assistant-decisions.ts makes it. */
+function d1() {
+  const db = new DatabaseSync(":memory:");
+  const dir = new URL("../cf/migrations/", import.meta.url);
+  for (const f of readdirSync(dir).filter((n) => n.endsWith(".sql")).sort()) db.exec(readFileSync(new URL(f, dir), "utf8"));
+  const stmt = (q: string, b: unknown[] = []): any => ({
+    bind: (...v: unknown[]) => stmt(q, v),
+    run: async () => ({ meta: { changes: Number(db.prepare(q).run(...(b as any[])).changes) } }),
+  });
+  return { db, d1: { prepare: (q: string) => stmt(q) } };
+}
+const TOKEN = "operator-token";
+const DAY = 24 * 3_600_000;
+const T0 = Date.parse("2026-10-01T00:00:00Z");
+const RUNS = [{ id: "ms_1" }];
+function source() {
+  const asked: Array<[string, string, number, number]> = [];
+  const open = (_t: string, _a: string): MemoryShadowSource => ({
+    adminMemoryShadow: async (t, a, from, to) => { asked.push([t, a, from, to]); return a === "a" ? RUNS : null; },
+  });
+  return { asked, open };
+}
+const get = (q: string, headers: Record<string, string> = {}) => new Request(`https://x/admin/memory-shadow?${q}`, { headers });
+const quiet = async <T>(fn: () => Promise<T>) => { const e = console.error; console.error = () => {}; try { return await fn(); } finally { console.error = e; } };
+
+await check("GET /admin/memory-shadow: the operator's token or nothing, and never an object opened without it", async () => {
+  for (const headers of [{}, { "x-harness-token": "wrong" }] as Array<Record<string, string>>) {
+    const s = source();
+    const res = await adminMemoryShadow(get("tenantId=t&agentId=a&reason=x", headers), TOKEN, s.open, null);
+    must(res.status === 401 && s.asked.length === 0, `${show(headers)}: ${res.status}`);
+  }
+  const unset = source();
+  must((await adminMemoryShadow(get("tenantId=t&agentId=a&reason=x", { "x-harness-token": "" }), undefined, unset.open, null)).status === 401 && unset.asked.length === 0, "no token configured opened");
+});
+
+await check("GET /admin/memory-shadow: always audited as an assistant's read: a reason is required, a row written, a failed write refuses", async () => {
+  const { db, d1: database } = d1();
+  const s = source();
+  const none = await adminMemoryShadow(get("tenantId=t&agentId=a", { "x-harness-token": TOKEN }), TOKEN, s.open, d1ReadAudit(database as never), T0);
+  must(none.status === 400 && (await none.json() as { code?: string }).code === "read_reason_required" && s.asked.length === 0, `no reason: ${none.status}`);
+  const res = await adminMemoryShadow(get("tenantId=t&agentId=a&from=2026-09-10T00:00:00Z&to=1790000000000", { "x-harness-token": TOKEN, "x-read-reason": "compare day 2" }), TOKEN, s.open, d1ReadAudit(database as never), T0);
+  must(res.status === 200 && res.headers.get("cache-control") === "no-store", `read: ${res.status}`);
+  const body = await res.json() as any;
+  must(show(body.records) === show(RUNS) && show(s.asked) === show([["t", "a", Date.parse("2026-09-10T00:00:00Z"), 1_790_000_000_000]]), show({ body, asked: s.asked }));
+  const rows = db.prepare("SELECT route, agent_id, session, token_kind, reason, assistant, outcome FROM admin_read_audit").all() as any[];
+  must(rows.length === 1 && rows[0].route === "/admin/memory-shadow" && rows[0].agent_id === "a" && rows[0].reason === "compare day 2" &&
+    rows[0].assistant === 1 && rows[0].outcome === "read" && rows[0].session === null, `audit: ${show(rows)}`);
+  const failing: ReadAudit = { record: async (_r: ReadAuditRow) => { throw new Error("D1 down"); } };
+  const s2 = source();
+  const refused = await quiet(() => adminMemoryShadow(get("tenantId=t&agentId=a&reason=x", { "x-harness-token": TOKEN }), TOKEN, s2.open, failing, T0));
+  must(refused.status === 503 && s2.asked.length === 0, `audit down: ${refused.status}`);
+});
+
+await check("GET /admin/memory-shadow: the last 7 days by default, a bad range is a 400, an agent the object lacks a 404", async () => {
+  const s = source();
+  const res = await adminMemoryShadow(get("tenantId=t&agentId=a&reason=x", { "x-harness-token": TOKEN }), TOKEN, s.open, { record: async () => {} }, T0);
+  must(res.status === 200 && show(s.asked) === show([["t", "a", T0 - 7 * DAY, T0]]), `default: ${show(s.asked)}`);
+  for (const q of ["from=yesterday", "from=20&to=10"]) {
+    const r = await adminMemoryShadow(get(`tenantId=t&agentId=a&reason=x&${q}`, { "x-harness-token": TOKEN }), TOKEN, s.open, { record: async () => {} }, T0);
+    must(r.status === 400, `${q}: ${r.status}`);
+  }
+  const missing = await adminMemoryShadow(get("tenantId=t&agentId=nobody&reason=x", { "x-harness-token": TOKEN }), TOKEN, s.open, { record: async () => {} }, T0);
+  must(missing.status === 404, `missing: ${missing.status}`);
 });
 
 const failed = results.filter((r) => !r.ok);

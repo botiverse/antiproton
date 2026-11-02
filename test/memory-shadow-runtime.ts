@@ -222,6 +222,29 @@ await check("shadow: a refused direct write is shadowed too, with the agent's re
   must(beats.length === 1 && beats[0]!.status === "no_change" && beats[0]!.attrs.mainResult === "refused" && beats[0]!.attrs.ops === 0, show(beats));
 });
 
+await check("ten writes in one run: three runs are started, the other seven finished as skipped (per_run_cap), so due rows and heartbeats balance", async () => {
+  const w = await world();
+  await w.rt.postMessage("t", "a", "remember these ten", "prompt", "main");
+  await answer(w, await one(w, "main"), { toolCalls: Array.from({ length: 10 }, (_, i) => call(`c${i}`, REMEMBER, { key: "memory", text: `- fact ${i}` })) });
+  await answer(w, await one(w, "main"), { text: "all noted" });
+  const shadows = (await out(w)).filter((c) => c.kind === "shadow");
+  must(shadows.length === 3, `started ${shadows.length}`);
+  const skipped = rows(w, "memory.shadow");
+  must(skipped.length === 7 && skipped.every((r) => r.status === "skipped" && r.verdict === "cancelled" && r.attrs.error === "per_run_cap"), show(skipped));
+  for (const c of shadows) await answer(w, c, { text: '{"ops": []}' });
+  must(rows(w, "memory.shadow_due").length === 10 && rows(w, "memory.shadow").length === 10, `due ${rows(w, "memory.shadow_due").length}, heartbeats ${rows(w, "memory.shadow").length}`);
+  must(await memoryNow(w) === "- [owner] reply in English\n- works on Raft\n" + Array.from({ length: 10 }, (_, i) => `- fact ${i}`).join("\n"), "the agent's writes");
+});
+
+await check("a shadow run past 7 days is pruned by the next pass, with no new run queued", async () => {
+  const w = await world();
+  w.rt.store.memoryShadow.queue("t", "a", { id: "ms_old", trigger: "chat", session: "main", request: "r", mainOp: { tool: "remember", args: {}, result: "ok" }, memoryBefore: "", memoryMain: "x" });
+  w.rt.store.memoryShadow.queue("t", "a", { id: "ms_new", trigger: "chat", session: "main", request: "r", mainOp: { tool: "remember", args: {}, result: "ok" }, memoryBefore: "", memoryMain: "x" });
+  w.host.sql.exec("UPDATE memory_shadow SET due_at = ? WHERE id = 'ms_old'", Date.now() - 8 * 24 * 3_600_000);
+  await w.rt.step("t", "a");
+  must(show(w.rt.store.memoryShadow.list("t", "a").map((r) => r.id)) === show(["ms_new"]), show(w.rt.store.memoryShadow.list("t", "a").map((r) => r.id)));
+});
+
 await check("an agent's delete deletes its shadow runs and marks", async () => {
   const w = await world();
   await chatThatRemembers(w, "- delta");

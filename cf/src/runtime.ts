@@ -425,7 +425,7 @@ import {
   capOf, configOf, IMPORTED_MEMORY_BUDGET, keptDelete, keptList, keptNameProblem, keptPut, keptValueProblem, memoryExcerpt, SEEDED_MEMORY, seedFitProblem, sharedSettings, statePlugin,
 } from "../../src/plugins/state.ts";
 import {
-  calledMemory, contextSlices, heartbeatAttrs, isMemorySessionKey, lastTurn, MEMORY_OBSERVE_PROMPT, memoryCallMatcher, memoryShadowPrompt, observeInput, observeKey,
+  calledMemory, contextSlices, heartbeatAttrs, MEMORY_SHADOW_RUNS_PER_RUN, isMemorySessionKey, lastTurn, MEMORY_OBSERVE_PROMPT, memoryCallMatcher, memoryShadowPrompt, observeInput, observeKey,
   parseObservation, parseProposal, readObserveKey, renderConversation, SHADOW_KEY_PREFIX, shadowInput, simulate, type BranchEntry,
 } from "../../src/runtime/memory-shadow.ts";
 import type { MemoryShadowRun } from "../../src/store/memory-shadow.ts";
@@ -1428,7 +1428,7 @@ export class AgentRuntime {
       // The lease reaches the plugin so its tools state the lifetime this deployment gives a box.
       sandboxPlugin(this.#artifacts as any, deps.bucketName, deps.idle ?? null),
       // The key is read when a secret tool runs, not now: `#kek` is set a few lines below.
-      statePlugin(this.store, this.#artifacts as any, deps.bucketName, () => this.#kek),
+      statePlugin(this.store, this.#artifacts as any, deps.bucketName, () => this.#kek, { shadowsMemory: () => !this.#isPd() }),
       artifactsPlugin(this.#artifacts, deps.bucketName),
       createRaftPlugin({ artifacts: this.#artifacts }),
       mcpPlugin,
@@ -6146,6 +6146,9 @@ This call was made by your subagent ${a.taskId}.`;
     if (await this.#reportSubagents(tenantId, agentId) > 0) wakeInMs = 0;
     await this.#archiveSubagents(tenantId, agentId);
     await this.#eraseIsolated(tenantId, agentId);
+    // The memory subagent's shadow runs past their retention go on every pass, not only when a new one is queued
+    // (src/store/memory-shadow.ts): an agent switched back to `self` still loses them on time.
+    try { this.store.memoryShadow.prune(tenantId, agentId); } catch (e) { console.error(`${tenantId}/${agentId}: the shadow runs were not pruned:`, e); }
     const retry = reportRetryMs(sql, { tenantId, agentId }, Date.now());
     if (retry !== null) wakeInMs = wakeInMs === null ? retry : Math.min(wakeInMs, retry);
     // A running subagent past its ceiling is cancelled by a pass; the pass comes back for the ceiling's moment.
@@ -6257,7 +6260,10 @@ This call was made by your subagent ${a.taskId}.`;
     if (runs.length) {
       const conversation = this.#conversationOf(session);
       const { slices, marker } = contextSlices(branch, this.store.memoryShadow.mark(tenantId, agentId, conversation), runs.length, calls.isWrite);
+      // At most MEMORY_SHADOW_RUNS_PER_RUN calls for one run of the agent's; the rest are finished as `skipped`, each with
+      // its heartbeat, so due rows and heartbeats still balance and a write-heavy run costs a bounded number of calls.
       for (let i = 0; i < runs.length; i++) {
+        if (i >= MEMORY_SHADOW_RUNS_PER_RUN) { this.#shadowFinished(tenantId, agentId, runs[i]!, { skipped: "per_run_cap" }, 0); continue; }
         posted = await this.#postShadow(tenantId, agentId, alias, capOf("memory", cfg), runs[i]!, renderConversation(slices[i]!)) || posted;
       }
       if (marker) this.store.memoryShadow.setMark(tenantId, agentId, conversation, marker);
@@ -6278,6 +6284,8 @@ This call was made by your subagent ${a.taskId}.`;
 
   /** One queued shadow run's short session, posted; a post that fails finishes the run as failed (`post_failed`). */
   async #postShadow(tenantId: string, agentId: string, alias: string, cap: number, run: MemoryShadowRun, conversation: string): Promise<boolean> {
+    // The state plugin could not read the document around the write: there is nothing to show the subagent.
+    if (run.mainOp.readFailed) { this.#shadowFinished(tenantId, agentId, run, { error: "read_failed" }, 0); return false; }
     const at = Date.now();
     const ok = await this.#postMemorySession(tenantId, agentId, alias, `${SHADOW_KEY_PREFIX}${run.id}`,
       shadowInput({ memory: run.memoryBefore, cap, request: run.request, conversation }),
@@ -6335,30 +6343,31 @@ This call was made by your subagent ${a.taskId}.`;
 
   /** A shadow run's end on its row and its heartbeat, `memory.shadow`: changed, no_change, or failed with a code. */
   #shadowFinished(tenantId: string, agentId: string, run: MemoryShadowRun,
-    r: { error: string } | ReturnType<typeof simulate>, ms: number) {
-    const failed = "error" in r;
-    const outcome = failed ? "failed" : r.after !== run.memoryBefore ? "changed" : "no_change";
-    let error = failed ? r.error : undefined;
+    r: { error: string } | { skipped: string } | ReturnType<typeof simulate>, ms: number) {
+    const sim = "results" in r ? r : null;
+    const code = "error" in r ? r.error : "skipped" in r ? r.skipped : null;
+    const outcome = "skipped" in r ? "skipped" : sim === null ? "failed" : sim.after !== run.memoryBefore ? "changed" : "no_change";
+    let error = code ?? undefined;
     try {
-      this.store.memoryShadow.finish(tenantId, agentId, run.id, failed
-        ? { outcome: "failed", errorCode: r.error, memoryAfter: null, ops: null, counts: null }
-        : { outcome, errorCode: null, memoryAfter: r.after, ops: r.results, counts: { ...r.counts, ms } });
+      this.store.memoryShadow.finish(tenantId, agentId, run.id, sim === null
+        ? { outcome, errorCode: code, memoryAfter: null, ops: null, counts: null }
+        : { outcome, errorCode: null, memoryAfter: sim.after, ops: sim.results, counts: { ...sim.counts, ms } });
     } catch (e) {
       console.error(`${tenantId}/${agentId}: a memory subagent shadow run's result was not recorded:`, e);
       error = "record_failed";
     }
     const attrs = heartbeatAttrs({
-      job: run.id, trigger: run.trigger, ...(error ? { error } : {}), ...(failed ? {} : { counts: r.counts, after: r.after }),
+      job: run.id, trigger: run.trigger, ...(error ? { error } : {}), ...(sim ? { counts: sim.counts, after: sim.after } : {}),
       before: run.memoryBefore, main: run.memoryMain, mainResult: run.mainOp.result,
     });
-    this.#shadowRow(tenantId, agentId, run.id, error ? "failed" : outcome, ms, attrs);
+    this.#shadowRow(tenantId, agentId, run.id, error === "record_failed" ? "failed" : outcome, ms, attrs);
   }
 
   #shadowRow(tenantId: string, agentId: string, id: string, status: string, ms: number | null, attrs: Record<string, unknown>) {
     const at = Date.now();
     try {
       appendTrace(this.#deps.ctx.storage.sql, [{ at, tenantId, agentId, kind: "memory.shadow", spanId: `memory_shadow:${id}`, status,
-        verdict: status === "failed" ? "failed" : "ok", ...(ms === null ? {} : { ms }), attrs: attrs as never }]);
+        verdict: status === "failed" ? "failed" : status === "skipped" ? "cancelled" : "ok", ...(ms === null ? {} : { ms }), attrs: attrs as never }]);
     } catch (e) { console.error(`the memory.shadow row of ${tenantId}/${agentId} could not be written:`, e); }
   }
 
