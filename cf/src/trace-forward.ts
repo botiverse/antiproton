@@ -6,8 +6,9 @@
  *   `/api/external/github-refresh`.
  * - `agent.trace` (`AGENT_TRACE_LANE`): the kinds that say how a turn went (model calls and failed attempts, tool calls
  *   and refusals, turn timing and stops, turn ends a pass could not record, a rebuild's measured outcome, the
- *   assistant's wakes, checks, notifies, rules, chat tellings and sends as its owner, Raft's answer to a turn's end), so
- *   they can be read next to Raft's own telemetry, to `/api/external/antiproton-trace`.
+ *   assistant's wakes, checks, notifies, rules, chat tellings and sends as its owner, Raft's answer to a turn's end, how
+ *   much a full state document dropped), so they can be read next to Raft's own telemetry, to
+ *   `/api/external/antiproton-trace`.
  * Off until the deployment names the endpoint and its token (`forwardConfigOf`); off, nothing here runs and no table is
  * made. One configuration turns on both lanes; a lane the receiver does not have yet answers 404 and pauses alone.
  *
@@ -427,6 +428,11 @@ export const AGENT_TRACE_FIELDS: Readonly<Partial<Record<TraceKind, FieldSpec>>>
   "raft.turn_ended": {
     result: [STATUS, ["settled", "skipped", "unreadable"]], reason: ["reason", "code"], conversations: ["targets", "count"],
     outcome: ["outcome", ["completed", "interrupted", "failed"]],
+  },
+  // src/plugins/state.ts `remember`: how much a full document dropped, never the lines; a key outside the working set
+  // is already written as `other`, since the agent names it.
+  "state.dropped": {
+    mount: ["mount", "mount"], key: ["key", ["memory", "todo", "journal", "other"]], lines: ["lines", "count"], characters: ["characters", "count"],
   },
 };
 
