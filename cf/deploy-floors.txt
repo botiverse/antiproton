@@ -1,0 +1,22 @@
+# Deploy floors: commits production must never run a build older than.
+# cf/scripts/deploy-pinned.sh refuses to deploy a commit that does not have
+# every SHA below as an ancestor (git merge-base --is-ancestor), reading this
+# file as it is in the commit being deployed, together with the copy in the
+# checkout the script runs from, so a floor deleted in the target still holds.
+#
+# One full 40-character SHA per line, optionally followed by "# ...". The #
+# lines directly above a SHA (up to a blank line) and its trailing comment are
+# its reason, printed when the floor refuses. Each entry says what guards it in
+# a "guarded by:" line; a new floor is "guarded by: deploy check" alone unless
+# something else is added for it.
+#
+# Append-only. Removing a line takes a reviewed PR that says why the floor no
+# longer holds. The only bypass is DEPLOY_BELOW_FLOOR (docs/runbook.md,
+# "Deploy floors").
+
+# antiproton#1131 changed the provisioning DELETE answers (409 not_cleared);
+# Raft's web drops its handling of the older 502 shape (slock #12403), so
+# production must never run a build older than this.
+# guarded by: deploy check; Raft alarm on partially_disconnected PENDING (not
+# yet configured, see #proj-apps:#31)
+2a3c272cadebb0fc2bf42be119a9df14179d3570

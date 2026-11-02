@@ -690,3 +690,30 @@ still be listed and revoked.
 
 All of these are operator-only. Preview has one tenant-scoped provider token under `raft_`, `raft_pu-verify-1013`. The
 admin route issued it before the refusal existed, and it is revoked.
+
+## Deploy floors
+
+`cf/deploy-floors.txt` lists commits production must never run a build older than: each one changed something that a
+system outside this repository (Raft's web, for the first entry) already stopped handling the old way. Before the
+worktree or `npm ci`, `cf/scripts/deploy-pinned.sh` (production and `--preview`) asks
+`git merge-base --is-ancestor <floor> <commit being deployed>` for every floor listed in the deployed commit's copy of
+the file and in the copy beside the script, and refuses when:
+
+- the answer is 1: `floor not satisfied: <sha> <reason>`;
+- git cannot answer (the floor is not a commit locally, or any other exit): `cannot check floor <sha>` — not a floor
+  violation; fetch and retry;
+- the deployed commit has no `cf/deploy-floors.txt`: it predates every floor;
+- an entry is not a full 40-character SHA.
+
+The file is append-only. Removing a line takes a reviewed PR that says why the floor no longer holds.
+
+**Emergency rollback below a floor.** Set both `DEPLOY_BELOW_FLOOR=<full SHA of every floor crossed>`
+(space-separated) and `DEPLOY_BELOW_FLOOR_REASON="<why>"`. A SHA that is not a floor being crossed, or a crossed floor
+left unnamed, is refused. The deploy prints `STEP deploy crossed floor <sha> at <UTC time>: <reason>` and a warning: tell Raft
+(AppFather) at once, because its web may already depend on what the floor changed. It also appends to
+`~/tmp/antiproton-below-floor.<prod|preview>`; the next deploy that satisfies every floor prints
+`STEP back above all floors (previous deploy crossed <sha>)` and removes that file.
+
+This guards against deploying the wrong version through `deploy-pinned.sh`. It does not stop a deploy that bypasses
+the script, and it cannot see a revert: a commit on master that undoes a floor's change still has the floor as an
+ancestor.
