@@ -92,11 +92,8 @@ for f in test/*.ts; do
   if suite_needs_service "$t"; then suite_name "$t"; echo "skipped (needs a live service)"; continue; fi
   run_suite "$t" node "$f"
 done
-# A tracked suite the loop above never reached is a failure: narrowing that glob, or moving the loop, would otherwise
-# switch suites off with every line here still green. git's own list is the independent count.
-for t in $(git ls-files 'test/*.ts' | sed -n 's#^test/\([^/]*\)\.ts$#\1#p'); do
-  case "$visited" in *" $t "*) ;; *) suite_name "$t"; echo "FAIL (tracked but never run by this gate: the test/*.ts loop above no longer reaches it)"; fails=$((fails+1)) ;; esac
-done
+# A tracked suite the loop above never reached is a failure (suite_unvisited, cf/scripts/suite-verdict.sh).
+if ! suite_unvisited "$visited"; then fails=$((fails+1)); fi
 run_suite pi-storage-do bash test/pi-storage-do.sh
 run_suite pi-durable-do bash test/pi-durable-do.sh
 run_suite ap-store-do bash test/ap-store-do.sh

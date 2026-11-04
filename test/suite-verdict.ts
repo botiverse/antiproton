@@ -195,6 +195,53 @@ check("the deploy gate says it before the suites and again before the deploy", (
   if (!calls.some((i) => i > loop && i < deploy)) throw new Error("no gate_provenance between the suites and the deploy");
 });
 
+/** suite_unvisited run in a git repository of its own, holding exactly `files` (paths under it), with cwd there. */
+function unvisited(files: string[], visited: string): { out: string; ok: boolean } {
+  const repo = mkdtempSync(join(tmpdir(), "suite-unvisited-"));
+  execFileSync("git", ["init", "-q", repo]);
+  for (const f of files) {
+    execFileSync("mkdir", ["-p", join(repo, f, "..")]);
+    writeFileSync(join(repo, f), "");
+  }
+  if (files.length) execFileSync("git", ["-C", repo, "add", "-A"]);
+  const script = `. "${join(process.cwd(), "cf/scripts/suite-verdict.sh")}"; suite_unvisited "$1"`;
+  try {
+    return { out: execFileSync("bash", ["-c", script, "verdict", visited], { cwd: repo, encoding: "utf8" }).trim(), ok: true };
+  } catch (e) {
+    return { out: String((e as { stdout?: string }).stdout ?? "").trim(), ok: false };
+  }
+}
+
+check("a tracked suite the gate's loop did not reach fails, named, with the counts", () => {
+  const files = ["test/alpha.ts", "test/beta.ts", "test/nested/gamma.ts", "test/notes.md"];
+  const all = unvisited(files, " alpha beta ");
+  if (!all.ok || all.out !== "suites: tracked 2, visited 2") throw new Error(`every suite visited: ${JSON.stringify(all)}`);
+  // A narrowed loop: beta was never reached. Only top-level .ts files count, as the loops walk test/*.ts.
+  const narrowed = unvisited(files, " alpha ");
+  if (narrowed.ok) throw new Error("a suite the loop never reached passed");
+  if (narrowed.out !== "beta: tracked but never run by this gate (the test/*.ts loop no longer reaches it)\nsuites: tracked 2, visited 1") {
+    throw new Error(`narrowed: ${JSON.stringify(narrowed.out)}`);
+  }
+  // Untracked files are not suites, and visiting a name git does not list is not a pass of anything.
+  const none = unvisited([], " alpha ");
+  if (none.ok || none.out !== "suites: tracked 0, visited 0") throw new Error(`git listed none, so nothing was checked: ${JSON.stringify(none)}`);
+});
+
+check("both gates record every name their loop visits and call suite_unvisited after it", () => {
+  for (const file of ["cf/scripts/gate.sh", "cf/scripts/verify-and-deploy.sh"]) {
+    const src = execFileSync("cat", [file], { encoding: "utf8" });
+    const loop = src.indexOf("for f in test/*.ts; do");
+    const done = loop < 0 ? -1 : src.indexOf("\ndone\n", loop);
+    if (loop < 0 || done < 0) throw new Error(`${file}: cannot find the suite loop; the check is looking for the wrong text`);
+    const body = src.slice(loop, done);
+    const record = body.indexOf('visited="$visited$t "');
+    const skip = body.indexOf("suite_needs_service");
+    if (record < 0 || (skip >= 0 && record > skip)) throw new Error(`${file}: the loop must record its name before any skip`);
+    const call = src.indexOf('suite_unvisited "$visited"', done);
+    if (call < 0) throw new Error(`${file}: no suite_unvisited "$visited" after the suite loop`);
+  }
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }

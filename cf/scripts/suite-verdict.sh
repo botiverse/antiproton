@@ -56,6 +56,25 @@ typecheck_clean() {
 # they can rot unseen between runs. A known gap, not coverage elsewhere.
 GATE_NEEDS_SERVICE=" appworld live-e2e live-github "
 
+# suite_unvisited VISITED: prints one line per tracked top-level test/*.ts
+# (git's own list, independent of any glob a gate loops over) whose name is
+# not in VISITED (" name1 name2 "), then "suites: tracked N, visited M"
+# (M counts tracked names found), and fails when any was not visited or
+# git listed none. A gate's loop can be narrowed or moved with every line it
+# prints still green; this is the count that says so.
+suite_unvisited() {
+  local visited="$1" t tracked=0 seen=0 missing=0
+  for t in $(git ls-files 'test/*.ts' | sed -n 's#^test/\([^/]*\)\.ts$#\1#p'); do
+    tracked=$((tracked+1))
+    case "$visited" in
+      *" $t "*) seen=$((seen+1)) ;;
+      *) echo "$t: tracked but never run by this gate (the test/*.ts loop no longer reaches it)"; missing=$((missing+1)) ;;
+    esac
+  done
+  echo "suites: tracked $tracked, visited $seen"
+  [ "$tracked" -gt 0 ] && [ "$missing" -eq 0 ]
+}
+
 # suite_needs_service NAME: succeeds when NAME is one of GATE_NEEDS_SERVICE.
 suite_needs_service() {
   case "$GATE_NEEDS_SERVICE" in *" $1 "*) return 0;; esac
