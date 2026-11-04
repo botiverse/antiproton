@@ -172,6 +172,7 @@
     "test/prewarm.ts",
     "test/provision-model.ts",
     "test/raft-approvals.ts",
+    "test/provider-secret-unreachable.ts",
     "test/egress-verify-route.ts",
     "test/credential-inventory.ts",
     "test/provision-origin.ts",
