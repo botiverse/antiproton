@@ -48,6 +48,13 @@ export const LOGICAL_TOOLS: Readonly<Record<string, string>> = {
 };
 
 /**
+ * The kinds a forwarded notify item may carry: Raft records each item's as the reason it was told (its answer's
+ * `reasons`), and one with none as `unstated`. `decided` is not among them: it is this plugin's own brief's, for a
+ * decision others made, which Raft's check does not take.
+ */
+export const RAFT_ITEM_KINDS = ["question", "review", "decision", "task", "mention"] as const;
+
+/**
  * `check.counts`' keys, all numbers: the only ones put on a trace row, so the trace forwarder can list them. One list,
  * to be kept in step with Raft's (any other key Raft sends is left off the row, never an error).
  */

@@ -64,7 +64,7 @@ import type { PluginContext, PluginNext, ToolSchema, TurnEnd } from "./types.ts"
 import type { AssistantDecision, DecisionSource } from "../store/assistant-decisions.ts";
 import { REMINDER_TOOL, REMINDER_TOOL_SCHEMA } from "./raft-assistant-reminder.ts";
 import {
-  CHECK_COUNT_KEYS, CHECK_INSTRUCTION_MAX_UTF8, checkOf as raftCheckOf, utf8Length, checkOfTurnKey, checkTools, checkTurnKey, notifyIdempotencyKey, substituteTools,
+  CHECK_COUNT_KEYS, CHECK_INSTRUCTION_MAX_UTF8, checkOf as raftCheckOf, utf8Length, checkOfTurnKey, checkTools, checkTurnKey, notifyIdempotencyKey, substituteTools, RAFT_ITEM_KINDS,
   type CheckTrigger, type RaftCheck, type RefusedCheck,
 } from "./raft-assistant-check.ts";
 import {
@@ -818,7 +818,9 @@ export const ASSISTANT_OWN_TOOLS: readonly ToolSchema[] = [
       "the brief, and during their quiet hours everything not marked for any time of day, for the morning brief. " +
       `It shows at most ${DM_ITEMS_MAX} items, @mentions first, and says how many more there are; those are not counted as told, and a later check looks at them again. ` +
       "Its result says what was sent, held back, kept or dropped. Set brief: true only when the morning brief asks you to. " +
-      "When your check names its conversations by channelId, each item is that channelId and a summary (kind if you can tell), and nothing else.",
+      "When your check names its conversations by channelId, each item is that channelId, a summary and its kind, and nothing else. " +
+      "Write only the items that need your owner now and leave the rest out: nothing left out is lost, since the message stays in their Activity " +
+      "and the morning brief and \"more\" can still list it.",
     parameters: {
       type: "object", additionalProperties: false, required: ["items"],
       properties: {
@@ -826,12 +828,15 @@ export const ASSISTANT_OWN_TOOLS: readonly ToolSchema[] = [
           type: "array",
           items: {
             // `ref` and `kind` are required in code where this file runs the check, `channelId` where Raft does (`notifyRaft`).
+            // `kind` stays out of `required` here although the description asks for it always: the runtime validates against
+            // this schema before the tool runs, so a call without it would be refused and its items never reach Raft, which
+            // tells them anyway and records the missing kind as `unstated`.
             type: "object", additionalProperties: false, required: ["summary"],
             properties: {
               channelId: { type: "string", description: "When your check lists conversations by channelId: the conversation's channelId, as given. Raft writes the link itself." },
               ref: { type: "string", description: "#channel:msgid: the channel's name and the msg= id of the message (for a task, the message that is the task). Never task #N." },
               summary: { type: "string", description: `Who wants what from your owner, e.g. "@cy needs your OK on the launch date". One line, at most ${SUMMARY_MAX} characters; a longer one is cut.` },
-              kind: { type: "string", enum: [...ITEM_KINDS], description: "question, review or decision asked of your owner, a task assigned to them, an unanswered @mention; decided is a decision others made (brief only)." },
+              kind: { type: "string", enum: [...ITEM_KINDS], description: "Always set it: a question, review or decision asked of your owner, a task assigned to them, or an @mention of them. decided is a decision others made, only when a morning brief asks for it." },
               sender: { type: "string", description: "Who is waiting (their @name), so a rule about them applies." },
               since: { type: "string", description: "When it started waiting (ISO time), so your owner sees how long." },
             },
@@ -981,7 +986,8 @@ const RAFT_OUTCOMES = ["sent", "duplicate", "nothing_to_send", "kept_for_brief"]
 
 /**
  * The notify tool while Raft runs the check (RFC 077 step 2): the items, checked here for shape only (a channelId and a
- * summary each, cut to `SUMMARY_MAX`; a kind when given must be one), go to Raft (`POST /assistant/notify`) with the
+ * summary each, cut to `SUMMARY_MAX`; a kind when given must be one of Raft's, `RAFT_ITEM_KINDS`, and one not given goes
+ * without, which Raft records as `unstated`), go to Raft (`POST /assistant/notify`) with the
  * check's id, from the session's key (`checkOfTurnKey`), and an idempotency key made from the check and the items
  * (`notifyIdempotencyKey`), neither of which the model gives or sees. Raft confirms each item against its check (one it
  * did not offer is dropped, `not_in_check`), applies kind rules, composes and sends the one DM and records what it
@@ -1011,8 +1017,8 @@ async function notifyRaft(
     if (!summary) throw refusal(`item ${JSON.stringify(channelId)} has no summary`);
     let kind: string | undefined;
     if (o.kind !== undefined && o.kind !== null) {
-      kind = ITEM_KINDS.find((k) => k === o.kind);
-      if (!kind) throw refusal(`item ${JSON.stringify(channelId)}: kind must be one of ${ITEM_KINDS.join(", ")}`);
+      kind = RAFT_ITEM_KINDS.find((k) => k === o.kind);
+      if (!kind) throw refusal(`item ${JSON.stringify(channelId)}: kind must be one of ${RAFT_ITEM_KINDS.join(", ")}`);
     }
     if (!items.some((i) => i.channelId === channelId)) items.push({ channelId, summary: clipSummary(summary), ...(kind ? { kind } : {}) });
   }
@@ -3312,8 +3318,8 @@ function raftCheckPrompt(t: (n: string) => string, has: (n: string) => boolean, 
     "You are a personal assistant in Raft for one person, your owner, making one check of their activity. Nobody is talking to you. Your input says what to look at, and " +
       (notify ? `your only message to them is exactly one call to ${t(NOTIFY_TOOL)}.` : "this check has no tool to tell them with, so end without a call."),
     reads(t, has),
-    `Code has already applied your owner's contact settings and removed what they were already told. Of what is left, report only what is waiting on your owner: ${WAITING}. Chatter and talk between other people is not waiting on them, even in a channel they follow.`,
-    notify ? `Call ${t(NOTIFY_TOOL)} exactly once, with items alone: each item is a conversation's channelId as your input gives it, a summary, and its kind when you can tell. The summary is one short line: start with who, then what they want from your owner, e.g. "@cy needs your OK on the Friday launch date". Don't paste their message, don't add background, and don't give advice. Leave out what does not need your owner; when nothing does, call it with no items. Code adds everything else, writes the message and decides what is shown, so let it decide. Never message anyone any other way.` : null,
+    `Code has already applied your owner's contact settings and removed what they were already told. Of what is left, you judge each item: write only the items that need your owner now, such as ${WAITING}, and leave the rest out, a DM or an @mention included. Nothing left out is lost: the message stays in your owner's Activity, and the morning brief and "more" can still list it. Chatter and talk between other people does not need them, even in a channel they follow.`,
+    notify ? `Call ${t(NOTIFY_TOOL)} exactly once, with items alone: each item is a conversation's channelId as your input gives it, a summary, and its kind, always one of ${RAFT_ITEM_KINDS.join(", ")}. The summary is one short line: start with who, then what they want from your owner, e.g. "@cy needs your OK on the Friday launch date". Don't paste their message, don't add background, and don't give advice. When nothing needs your owner now, call it with no items. Code adds everything else, writes the message and decides what is shown, so let it decide. Never message anyone any other way.` : null,
     noteGuidance(t, has),
   ].filter((x): x is string => x !== null).join("\n\n");
 }
