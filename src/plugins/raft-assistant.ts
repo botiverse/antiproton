@@ -986,8 +986,8 @@ const RAFT_OUTCOMES = ["sent", "duplicate", "nothing_to_send", "kept_for_brief"]
 
 /**
  * The notify tool while Raft runs the check (RFC 077 step 2): the items, checked here for shape only (a channelId and a
- * summary each, cut to `SUMMARY_MAX`; a kind when given must be one of Raft's, `RAFT_ITEM_KINDS`, and one not given goes
- * without, which Raft records as `unstated`), go to Raft (`POST /assistant/notify`) with the
+ * summary each, cut to `SUMMARY_MAX`; a kind that is not one of Raft's, `RAFT_ITEM_KINDS`, or not given goes without,
+ * which Raft records as `unstated`), go to Raft (`POST /assistant/notify`) with the
  * check's id, from the session's key (`checkOfTurnKey`), and an idempotency key made from the check and the items
  * (`notifyIdempotencyKey`), neither of which the model gives or sees. Raft confirms each item against its check (one it
  * did not offer is dropped, `not_in_check`), applies kind rules, composes and sends the one DM and records what it
@@ -1015,11 +1015,9 @@ async function notifyRaft(
     if (!channelId || channelId.length > 64) throw refusal("each item needs the channelId of a conversation your check gave you");
     const summary = typeof o.summary === "string" ? o.summary.replace(/\s+/g, " ").trim() : "";
     if (!summary) throw refusal(`item ${JSON.stringify(channelId)} has no summary`);
-    let kind: string | undefined;
-    if (o.kind !== undefined && o.kind !== null) {
-      kind = RAFT_ITEM_KINDS.find((k) => k === o.kind);
-      if (!kind) throw refusal(`item ${JSON.stringify(channelId)}: kind must be one of ${RAFT_ITEM_KINDS.join(", ")}`);
-    }
+    // A kind Raft does not take goes without one, which Raft records as unstated: a refusal would keep every item of
+    // the call from Raft over one label.
+    const kind = RAFT_ITEM_KINDS.find((k) => k === o.kind);
     if (!items.some((i) => i.channelId === channelId)) items.push({ channelId, summary: clipSummary(summary), ...(kind ? { kind } : {}) });
   }
   const answer = await deps.api(ctx, "POST", "/assistant/notify", { check_id: check.id, idempotency_key: notifyIdempotencyKey(check.id, items), items });

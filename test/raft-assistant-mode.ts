@@ -3493,15 +3493,20 @@ await check("notify in Raft's check: items alone go to Raft with the check's id 
   must(a.r.sends.length === 0 && a.read(REMINDED_STORE, "msg:aaaaaaa1") === undefined, "something was composed or recorded here");
 });
 
-await check("notify in Raft's check: refused shapes before Raft; 409 check_unknown and no answer are not_sent; 403 assistant_not_enabled pauses", async () => {
+await check("notify in Raft's check: refused shapes before Raft, an unknown kind sent without; 409 check_unknown and no answer are not_sent; 403 assistant_not_enabled pauses", async () => {
   const a = await raftAssistant();
-  for (const bad of [{ items: [{ summary: "no id" }] }, { items: [{ channelId: conv(1).channelId, summary: "" }] }, { items: [{ channelId: conv(1).channelId, summary: "s", kind: "fyi" }] },
-    // This plugin's own brief's kind, which Raft's check does not take.
-    { items: [{ channelId: conv(1).channelId, summary: "s", kind: "decided" }] },
+  for (const bad of [{ items: [{ summary: "no id" }] }, { items: [{ channelId: conv(1).channelId, summary: "" }] }, 
     { items: Array.from({ length: 31 }, (_, n) => ({ channelId: `c${n}`, summary: "s" })) }]) {
     must(await notify(inCheck(a.ctx), bad).then(() => false, () => true), `accepted: ${show(bad).slice(0, 80)}`);
   }
   must(a.r.notifies.length === 0, "a bad shape reached Raft");
+  // A kind Raft does not take, this plugin's own decided included, is sent without one, and the other items with it.
+  const unknownKind = await notify(inCheck(a.ctx), { items: [{ channelId: conv(1).channelId, summary: "s", kind: "fyi" }, { channelId: conv(2).channelId, summary: "t", kind: "decided" },
+    { channelId: conv(3).channelId, summary: "u", kind: "task" }] });
+  must(unknownKind.state === "sent" && a.r.notifies.length === 1, show(unknownKind));
+  must(show(a.r.notifies[0].items) === show([{ channelId: conv(1).channelId, summary: "s" }, { channelId: conv(2).channelId, summary: "t" },
+    { channelId: conv(3).channelId, summary: "u", kind: "task" }]), show(a.r.notifies[0].items));
+  a.r.notifies.length = 0;
   must((await notify(inCheck(a.ctx), { items: Array.from({ length: 30 }, (_, n) => ({ channelId: `c${n}`, summary: "s" })) })).state === "sent", "30 items, Raft's cap, were refused");
   a.r.notifyAnswer = { status: 409, code: "check_unknown" };
   const unknown = await notify(inCheck(a.ctx), { items: [] });

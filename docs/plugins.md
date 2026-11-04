@@ -1080,7 +1080,7 @@ from the session's key, and an idempotency key made from the check and the items
 judges each item itself and writes only what needs the owner now, DMs and @mentions included: what it leaves out stays
 in the owner's Activity, where the morning brief and "more" can still list it, and a row an `always` rule covers is
 told by Raft whether or not the model wrote it. The tool asks for `kind` on every item, one of `question`,
-`review`, `decision`, `task` or `mention` (`RAFT_ITEM_KINDS`; this plugin's own `decided` is refused before Raft),
+`review`, `decision`, `task` or `mention` (`RAFT_ITEM_KINDS`; any other, this plugin's own `decided` included, is sent without a kind rather than refused, so one label never keeps a call's items from Raft),
 which Raft records as the reason the item was told. The schema does not make it required, since the runtime would then
 refuse the whole call and its items would never reach Raft; one sent without is recorded as `unstated`. A wake with
 a check clears a stale pause. The chat's references are recorded as told by Raft's Server itself (the plugin sends
