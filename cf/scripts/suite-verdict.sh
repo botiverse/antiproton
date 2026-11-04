@@ -50,7 +50,10 @@ typecheck_clean() {
 # start: a live AppWorld server (appworld), the real deployment and GitHub
 # (live-e2e, live-github). Named, so "did not run" is printed rather than
 # absent, and named ONCE: the deploy gate, the branch gate and CI (which runs
-# the branch gate) all skip exactly these.
+# the branch gate) all skip exactly these. Nothing else runs them either: no
+# workflow or schedule does, only a person by hand on a machine with the
+# credentials (live-e2e and live-github read ~/.secrets/antiproton.env), so
+# they can rot unseen between runs. A known gap, not coverage elsewhere.
 GATE_NEEDS_SERVICE=" appworld live-e2e live-github "
 
 # suite_needs_service NAME: succeeds when NAME is one of GATE_NEEDS_SERVICE.
