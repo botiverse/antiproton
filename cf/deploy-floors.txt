@@ -17,6 +17,7 @@
 # antiproton#1131 changed the provisioning DELETE answers (409 not_cleared);
 # Raft's web drops its handling of the older 502 shape (slock #12403), so
 # production must never run a build older than this.
-# guarded by: deploy check; Raft alarm on partially_disconnected PENDING (not
-# yet configured, see #proj-apps:#31)
+# guarded by: deploy check; Raft alarm on partially_disconnected (o11y-check
+# every 2 hours, posts to #o11y-alerts; it finds a breach up to ~2 hours late,
+# see #proj-apps:#31)
 2a3c272cadebb0fc2bf42be119a9df14179d3570
