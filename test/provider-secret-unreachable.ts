@@ -48,7 +48,7 @@ import { agentObjectName } from "../cf/src/object-name.ts";
 import { d1ProviderTokens } from "../cf/src/control-plane.ts";
 import { hashProviderToken } from "../cf/src/provider-token.ts";
 import { verifyHint, SIGNATURE_HEADER, TIMESTAMP_HEADER } from "../cf/src/approvals.ts";
-import { assistantMountOf, CHAT_TOOLS, MEMORY_TOOLS } from "../src/plugins/raft-assistant.ts";
+import { assistantMountOf } from "../src/plugins/raft-assistant.ts";
 import { envSecrets } from "../src/runtime/gateway.ts";
 import { secretRefKind } from "../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor } from "../src/runtime/dynamic-worker-executor.ts";
@@ -246,11 +246,18 @@ let w = await world();
 
 // ---- what this agent is, and the push registration ------------------------------------------------------------------
 
-await check("setup: the provisioned agent is a personal assistant, offered only an assistant's chat tools", async () => {
+await check("setup: the provisioned agent is a personal assistant, offered exactly the listed assistant tools, no more and no fewer", async () => {
   must(assistantMountOf(await w.rt.store.listMounts(T, A)) === "raft", "control: Raft's assistantOf did not make the agent an assistant");
   const offered: string[] = (await w.rt.offeredTools(T, A))!.tools.map((t: { name: string }) => t.name);
-  const allowed = new Set([...CHAT_TOOLS.map((n) => `raft__${n}`), ...MEMORY_TOOLS.map((n) => `state__${n}`), "artifacts__read", "resume"]);
-  must(offered.length > 0 && offered.every((n) => allowed.has(n)), `offered beyond an assistant's chat: ${offered.filter((n) => !allowed.has(n))}`);
+  // Written out, not derived from CHAT_TOOLS: the whole result above rests on this list (no tool takes a file path,
+  // none runs code or reaches an arbitrary host), so a tool added to an assistant must turn this red and send whoever
+  // added it to re-check the paths in this file's header.
+  const EXPECTED = ["raft__receive_events", "raft__identity_whoami", "raft__messages_send", "raft__messages_read", "raft__messages_react",
+    "raft__messages_unreact", "raft__attachments_download_url", "raft__attachments_view", "raft__attachments_upload", "raft__assistant_owner_inbox",
+    "raft__assistant_owner_messages", "raft__assistant_preferences", "raft__assistant_send_as_owner", "raft__assistant_reminder",
+    "state__remember", "state__put", "state__get", "state__list", "state__forget", "state__revise", "state__insert", "artifacts__read", "resume"];
+  must(show([...offered].sort()) === show([...EXPECTED].sort()),
+    `an assistant's tools changed: added ${offered.filter((n) => !EXPECTED.includes(n))}, removed ${EXPECTED.filter((n) => !offered.includes(n))}`);
   for (const n of ["run_js", "jobs", "http__request", "http__fetch", "web__fetch", "sandbox__exec", "raft__enable_push", "state__secret_get"]) {
     must(!offered.includes(n), `offered ${n}: ${offered}`);
   }
