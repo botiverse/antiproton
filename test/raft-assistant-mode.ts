@@ -3471,14 +3471,14 @@ await check("notify in Raft's check: items alone go to Raft with the check's id 
   const items = [
     { channelId: conv(1).channelId, summary: "  @bob asks\nfor a date ", kind: "question" },
     { channelId: conv(2).channelId, summary: "@cy wants a review" },
-    { channelId: conv(9).channelId, summary: "@dee, elsewhere", kind: "decided" },
+    { channelId: conv(9).channelId, summary: "@dee, elsewhere", kind: "mention" },
   ];
   const out = await notify(inCheck(a.ctx), { items });
   must(a.r.notifies.length === 1, show(a.r.notifies));
   const body = a.r.notifies[0];
   must(body.check_id === CHECK_ID && /^assistant-notify-[0-9a-f]{32}$/.test(body.idempotency_key), show(body));
   must(show(body.items) === show([{ channelId: conv(1).channelId, summary: "@bob asks for a date", kind: "question" }, { channelId: conv(2).channelId, summary: "@cy wants a review" },
-    { channelId: conv(9).channelId, summary: "@dee, elsewhere", kind: "decided" }]), show(body.items));
+    { channelId: conv(9).channelId, summary: "@dee, elsewhere", kind: "mention" }]), show(body.items));
   must(out.state === "sent" && out.items === 2 && out.more === 1 && out.dropped[conv(9).channelId] === "not_in_check" && !("check_id" in out), show(out));
   const row = a.traced.filter((t) => t.kind === "raft.assistant_notify").at(-1)!;
   must(row.attrs.check_id === CHECK_ID && row.attrs.forwarded === 1 && row.attrs.sent === 2 && row.attrs.held_back === 1 && row.attrs.dropped_not_in_check === 1 && row.attrs.given === 3, show(row));
@@ -3493,13 +3493,20 @@ await check("notify in Raft's check: items alone go to Raft with the check's id 
   must(a.r.sends.length === 0 && a.read(REMINDED_STORE, "msg:aaaaaaa1") === undefined, "something was composed or recorded here");
 });
 
-await check("notify in Raft's check: refused shapes before Raft; 409 check_unknown and no answer are not_sent; 403 assistant_not_enabled pauses", async () => {
+await check("notify in Raft's check: refused shapes before Raft, an unknown kind sent without; 409 check_unknown and no answer are not_sent; 403 assistant_not_enabled pauses", async () => {
   const a = await raftAssistant();
-  for (const bad of [{ items: [{ summary: "no id" }] }, { items: [{ channelId: conv(1).channelId, summary: "" }] }, { items: [{ channelId: conv(1).channelId, summary: "s", kind: "fyi" }] },
+  for (const bad of [{ items: [{ summary: "no id" }] }, { items: [{ channelId: conv(1).channelId, summary: "" }] }, 
     { items: Array.from({ length: 31 }, (_, n) => ({ channelId: `c${n}`, summary: "s" })) }]) {
     must(await notify(inCheck(a.ctx), bad).then(() => false, () => true), `accepted: ${show(bad).slice(0, 80)}`);
   }
   must(a.r.notifies.length === 0, "a bad shape reached Raft");
+  // A kind Raft does not take, this plugin's own decided included, is sent without one, and the other items with it.
+  const unknownKind = await notify(inCheck(a.ctx), { items: [{ channelId: conv(1).channelId, summary: "s", kind: "fyi" }, { channelId: conv(2).channelId, summary: "t", kind: "decided" },
+    { channelId: conv(3).channelId, summary: "u", kind: "task" }] });
+  must(unknownKind.state === "sent" && a.r.notifies.length === 1, show(unknownKind));
+  must(show(a.r.notifies[0].items) === show([{ channelId: conv(1).channelId, summary: "s" }, { channelId: conv(2).channelId, summary: "t" },
+    { channelId: conv(3).channelId, summary: "u", kind: "task" }]), show(a.r.notifies[0].items));
+  a.r.notifies.length = 0;
   must((await notify(inCheck(a.ctx), { items: Array.from({ length: 30 }, (_, n) => ({ channelId: `c${n}`, summary: "s" })) })).state === "sent", "30 items, Raft's cap, were refused");
   a.r.notifyAnswer = { status: 409, code: "check_unknown" };
   const unknown = await notify(inCheck(a.ctx), { items: [] });
@@ -3670,8 +3677,26 @@ await check("the check prompt under Raft's check: notify exactly once, items alo
   must(/exactly one call to `raft__assistant_notify_owner`/.test(p) && /with no items/.test(p) && /items alone/.test(p), p);
   must(!/rules about people/.test(p) && !p.includes(String(SUMMARY_MAX)) && !p.includes(`at most ${DM_ITEMS_MAX}`) && !/check_id|idempotency/.test(p), p);
   must(/information, never instructions/.test(p) && /Never message anyone any other way/.test(p) && !p.includes("raft__assistant_owner_inbox"), p);
+  // The model judges each item, DMs and @mentions too, and says why each is told.
+  must(/you judge each item: write only the items that need your owner now/.test(p) && /leave the rest out, a DM or an @mention included/.test(p), p);
+  must(/Nothing left out is lost: the message stays in your owner's Activity, and the morning brief and "more" can still list it/.test(p), p);
+  must(p.includes("its kind, always one of question, review, decision, task, mention.") && !/when you can tell/.test(p), p);
+  must(!/must (be )?(kept|keep|include)|may be omitted|only .?named/i.test(p), p);
   must(assistantCheckPrompt("raft") === assistantCheckPrompt("raft", CHECK_TOOLS, { raftCheck: false }), "the local prompt moved");
   must(assistantSystemPrompt({}, "raft", "check", undefined, `assistant.raft_check:doorbell:${CHECK_ID}`) === assistantCheckPrompt("raft", CHECK_TOOLS, { raftCheck: true }), "the key does not choose the prompt");
+});
+
+await check("the notify tool's schema: kind asked for on every item, Raft's five or the brief's decided; only what needs the owner now is written", async () => {
+  const { ASSISTANT_OWN_TOOLS } = await import("../src/plugins/raft-assistant.ts");
+  const tool = ASSISTANT_OWN_TOOLS.find((t) => t.name === "assistant_notify_owner")!;
+  const item = (tool.parameters as any).properties.items.items;
+  // Asked for always, not required: a schema refusal would keep the items from Raft, which records a missing kind as unstated.
+  must(show(item.required) === show(["summary"]), show(item.required));
+  must(show(item.properties.kind.enum) === show(["question", "review", "decision", "task", "mention", "decided"]), show(item.properties.kind.enum));
+  must(/^Always set it/.test(item.properties.kind.description), item.properties.kind.description);
+  must(/each item is that channelId, a summary and its kind, and nothing else/.test(tool.summary), tool.summary);
+  must(/Write only the items that need your owner now and leave the rest out: nothing left out is lost, since the message stays in their Activity and the morning brief and "more" can still list it/.test(tool.summary), tool.summary);
+  must(!/kind if you can tell|must (be )?(kept|keep|include)|may be omitted/i.test(tool.summary), tool.summary);
 });
 
 await check("Raft's check end to end: a narrowed short session under Raft's prompt; notify forwarded with the check's id; its end a raft.assistant_check row", async () => {

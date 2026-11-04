@@ -1075,8 +1075,14 @@ counted). An instruction over 16 KB of UTF-8 as posted (names put in), another `
 trigger is refused, never cut, and a malformed one is never kept in place of a valid pending one. `allowed_tools`
 can only narrow the check's tools: it is intersected in code with the reads and the notify tool, the runtime offers
 the session that list alone (`PluginNext.tools`) and refuses anything else of the mount at the host too. The notify
-tool then forwards the items (`{ channelId, summary, kind? }` each) to `POST /assistant/notify` with the check's id,
-from the session's key, and an idempotency key made from the check and the items; the model gives neither. A wake with
+tool then forwards the items (`{ channelId, summary, kind }` each) to `POST /assistant/notify` with the check's id,
+from the session's key, and an idempotency key made from the check and the items; the model gives neither. The model
+judges each item itself and writes only what needs the owner now, DMs and @mentions included: what it leaves out stays
+in the owner's Activity, where the morning brief and "more" can still list it, and a row an `always` rule covers is
+told by Raft whether or not the model wrote it. The tool asks for `kind` on every item, one of `question`,
+`review`, `decision`, `task` or `mention` (`RAFT_ITEM_KINDS`; any other, this plugin's own `decided` included, is sent without a kind rather than refused, so one label never keeps a call's items from Raft),
+which Raft records as the reason the item was told. The schema does not make it required, since the runtime would then
+refuse the whole call and its items would never reach Raft; one sent without is recorded as `unstated`. A wake with
 a check clears a stale pause. The chat's references are recorded as told by Raft's Server itself (the plugin sends
 nothing and keeps nothing for them), the preferences tool
 reads and writes Raft's `contact-rules` and `contact-settings`, and the first time the flag reads true the plugin pushes
