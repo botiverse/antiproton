@@ -263,6 +263,21 @@ await check("setup: the provisioned agent is a personal assistant, offered exact
   }
 });
 
+await check("the allowlists that bound every assistant session (chat and check) are exactly these: configuration can only remove", async () => {
+  // assistantTools offers the intersection of the agent's mounts with these lists (plus the parked-result reader,
+  // `resume`), so mounts, plans or switches can only take tools away; a tool reaches an assistant, in its chat or in a
+  // check session, only by being added here. Written out for the same reason as the setup case's list.
+  const m = await import("../src/plugins/raft-assistant.ts");
+  must(show(m.CHAT_TOOLS) === show(["receive_events", "identity_whoami", "messages_send", "messages_read", "messages_react", "messages_unreact",
+    "attachments_download_url", "attachments_view", "attachments_upload", "assistant_owner_inbox", "assistant_owner_messages", "assistant_preferences",
+    "assistant_send_as_owner", "assistant_reminder"]), `CHAT_TOOLS changed: ${show(m.CHAT_TOOLS)}`);
+  must(show(m.CHECK_TOOLS) === show(["assistant_owner_inbox", "assistant_owner_messages", "assistant_notify_owner", "note_decision"]), `CHECK_TOOLS changed: ${show(m.CHECK_TOOLS)}`);
+  must(show(m.MEMORY_TOOLS) === show(["remember", "put", "get", "list", "forget", "revise", "insert"]), `MEMORY_TOOLS changed: ${show(m.MEMORY_TOOLS)}`);
+  const catalogue = ["raft.receive_events", "raft.assistant_notify_owner", "raft.enable_push", "web.send", "sandbox.run", "state.get", "state.secret_get", "x.run_js"]
+    .map((address) => ({ address }));
+  must(show(m.assistantTools(catalogue, "raft", "check", "state").map((t) => t.address)) === show(["raft.assistant_notify_owner", "state.get"]), "check session widened");
+});
+
 await check("push registration: PUT …/push-webhook went out on the agent's own sk_agent, with an https URL at the configured HOOK_ORIGIN", () => {
   must(HOOK_ORIGIN.startsWith("https://"), `cf/wrangler.jsonc HOOK_ORIGIN is not https: ${HOOK_ORIGIN}`);
   const puts = outbound.filter((o) => o.method === "PUT" && o.url === `${ORIGIN}/internal/agent-api/push-webhook`);
