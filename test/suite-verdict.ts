@@ -230,9 +230,16 @@ check("a tracked suite the gate's loop did not reach fails, named, with the coun
 check("both gates record every name their loop visits and call suite_unvisited after it", () => {
   for (const file of ["cf/scripts/gate.sh", "cf/scripts/verify-and-deploy.sh"]) {
     const src = execFileSync("cat", [file], { encoding: "utf8" });
-    const loop = src.indexOf("for f in test/*.ts; do");
-    const done = loop < 0 ? -1 : src.indexOf("\ndone\n", loop);
-    if (loop < 0 || done < 0) throw new Error(`${file}: cannot find the suite loop; the check is looking for the wrong text`);
+    // The loop that runs the suites: a for-loop at the start of a line whose body calls run_suite. Its glob must be
+    // exactly test/*.ts; a narrowed one is the change suite_unvisited exists to catch, and is refused here as well.
+    const loops = [...src.matchAll(/^for f in (.+); do$/gm)].filter((m) => {
+      const end = src.indexOf("\ndone\n", m.index!);
+      return end > 0 && src.slice(m.index!, end).includes("run_suite ");
+    });
+    if (loops.length !== 1) throw new Error(`${file}: expected one suite loop, found ${loops.length}; the check is looking for the wrong text`);
+    if (loops[0]![1] !== "test/*.ts") throw new Error(`${file}: the suite loop walks ${JSON.stringify(loops[0]![1])}, not test/*.ts`);
+    const loop = loops[0]!.index!;
+    const done = src.indexOf("\ndone\n", loop);
     const body = src.slice(loop, done);
     const record = body.indexOf('visited="$visited$t "');
     const skip = body.indexOf("suite_needs_service");
