@@ -168,7 +168,7 @@ export interface ApprovalRecord {
   decidedAt: number | null;
   createdAt: number;
   /**
-   * When an undecided hold is denied as `expired` (src/runtime/gateway.ts `expireApproval`). Null only on a row the
+   * When an undecided hold ends as `expired` (src/runtime/gateway.ts `expireApproval`). Null only on a row the
    * gateway was told to keep open (a TTL of 0); every pending row from before the column existed was given its
    * creation plus the default TTL when the column was added (src/store/approvals-schema.ts).
    */
@@ -183,7 +183,28 @@ export interface ApprovalRecord {
   outcome: { summary: string } | null;
   /** When an approved call's run was claimed (`StorageAdapter.claimApprovalRun`); null before, and for other states. */
   runAt: number | null;
+  /**
+   * What Raft reported of the hold's approval card (`StorageAdapter.recordApprovalDelivery`, docs/raft-approvals.md):
+   * null until a report lands. The expiry notice is worded from it, so "it never reached an approver" is only ever
+   * said on a recorded `no_recipient`.
+   */
+  delivery: ApprovalDelivery | null;
+  /** How antiproton's own hand-off of the hold to Raft went (the `approval.requested` hint); null before it was tried. */
+  handoff: ApprovalHandoff | null;
 }
+
+/**
+ * Raft's report of a hold's approval card: `delivered`, it sent the first card at `at`; `no_recipient`, it checked at
+ * `at` and had nobody to send one to. A `delivered` is never replaced; a `no_recipient` gives way to a later `delivered`.
+ */
+export interface ApprovalDelivery { outcome: "delivered" | "no_recipient"; at: number }
+
+/**
+ * The `approval.requested` hint (cf/src/approvals.ts `publishApprovals`): `not_sent`, this deployment has no hint
+ * channel (RAFT_APPROVAL_CALLBACK_PATH or its secret unset) and Raft finds the hold by reconciling; `accepted`, Raft
+ * answered 2xx; `failed`, the last attempt was refused or did not arrive.
+ */
+export type ApprovalHandoff = "not_sent" | "accepted" | "failed";
 
 /**
  * Where a held call stands. `approved` is a decision whose run has not ended yet; the run ends it as `executed` or

@@ -2,12 +2,13 @@ import type { SeedNoticeRow, SeedPassResult, SeedPlan, SeedRecord } from "../sto
 import type { SealHow, SeedFileMeta, SeedSeal, SeedStoreResult, SeedWrite } from "../store/seed-files.ts";
 import type { ImportedFile, ImportExcerpt } from "../store/workspace-import.ts";
 import type { WhenFull } from "../store/state-lines.ts";
-import type { DecideOutcome, UntoldApproval } from "../store/approvals-schema.ts";
+import type { DecideOutcome, DeliveryOutcome, UntoldApproval } from "../store/approvals-schema.ts";
 import type { ToolConfig } from "./tool-config.ts";
 import type {
   AdvanceTxn,
   CommitResult,
   Json,
+  ApprovalDelivery,
   ApprovalRecord,
   ApprovalState,
   DecidedBy,
@@ -396,7 +397,7 @@ export interface StorageAdapter {
    *  to be able to see exactly what they are approving. `expiresAt` absent or
    *  null: no deadline (the gateway always gives one unless its TTL is 0). */
   requireApproval(
-    a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt" | "decidedBy" | "expiresAt" | "outcome" | "runAt"> & { expiresAt?: number | null },
+    a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt" | "decidedBy" | "expiresAt" | "outcome" | "runAt" | "delivery" | "handoff"> & { expiresAt?: number | null },
   ): Promise<void>;
   /**
    * Hold a call unless the same call is already held: the agent's pending approvals for this mount and tool are
@@ -407,7 +408,7 @@ export interface StorageAdapter {
    * insert. `same` must be synchronous: an await inside it would reopen that gap.
    */
   holdApproval(
-    a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt" | "decidedBy" | "expiresAt" | "outcome" | "runAt"> & { expiresAt?: number | null },
+    a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt" | "decidedBy" | "expiresAt" | "outcome" | "runAt" | "delivery" | "handoff"> & { expiresAt?: number | null },
     same: (held: ApprovalRecord) => boolean,
   ): Promise<{ created: true } | { created: false; existing: ApprovalRecord }>;
   getApproval(tenantId: string, operationId: string): Promise<ApprovalRecord | null>;
@@ -434,6 +435,12 @@ export interface StorageAdapter {
   finishApproval(tenantId: string, operationId: string, state: "executed" | "failed", outcome: { summary: string }, notice: string): Promise<boolean>;
   /** Holds that ended (FINAL_STATES) the agent has not been told of, oldest decision first. */
   untoldApprovals(tenantId: string): Promise<UntoldApproval[]>;
+  /**
+   * Record Raft's report of a hold's approval card, by the rule of src/store/approvals-schema.ts `deliveryStep`, in
+   * one transaction: kept, written, or refused as `late`. Any state, ended ones included; the notice an expiry already
+   * wrote is not rewritten.
+   */
+  recordApprovalDelivery(tenantId: string, operationId: string, report: ApprovalDelivery): Promise<DeliveryOutcome>;
 
   addMount(m: MountRecord): Promise<void>;
   /**

@@ -19,8 +19,8 @@
  */
 import { auditRead, auditRefused, type ReadAudit } from "../read-audit.ts";
 import { RECONNECT_REASON, type OAuthStatus } from "../github-refresh.ts";
-import type { ApprovalState, DecidedBy, Json } from "../../../src/core/types.ts";
-import { APPROVAL_RETENTION_MS, AUDIT_RETENTION_MS, decodeCursor, encodeCursor, type ApprovalIndex, type ApprovalItem, type ProvisionDecideResult } from "../approvals.ts";
+import type { ApprovalDelivery, ApprovalState, DecidedBy, Json } from "../../../src/core/types.ts";
+import { APPROVAL_RETENTION_MS, AUDIT_RETENTION_MS, decodeCursor, encodeCursor, type ApprovalIndex, type ApprovalItem, type ProvisionDecideResult, type ProvisionDeliveryResult } from "../approvals.ts";
 import { originProblem } from "../../../src/plugins/types.ts";
 import { secretShape } from "../secret-shape.ts";
 import {
@@ -248,6 +248,8 @@ export interface ProvisionApprovals {
   list(tenantId: string, agentId: string, ids: { raftAgentId: string; raftServerId: string }, status: ApprovalState | null): Promise<ApprovalItem[] | null>;
   decide(tenantId: string, agentId: string, ids: { raftAgentId: string; raftServerId: string }, operationId: string,
     decision: "approved" | "denied", decidedBy: Extract<DecidedBy, { via: "raft" }>): Promise<ProvisionDecideResult | null>;
+  delivery(tenantId: string, agentId: string, ids: { raftAgentId: string; raftServerId: string }, operationId: string,
+    report: ApprovalDelivery): Promise<ProvisionDeliveryResult | null>;
   index: ApprovalIndex;
 }
 
@@ -607,7 +609,7 @@ async function decideApproval(tenantId: string, row: ProvisionedAgent, operation
   if (r.code === "approval_not_found") return fail({ status: 404, code: r.code, message: `no held call ${operationId} for ${row.agentId}` });
   const item = r.item;
   const message = r.code === "approval_expired"
-    ? "nobody decided this held call before it expired; it was denied as expired and nothing was run"
+    ? "nobody decided this held call before it expired, so nothing was run"
     : `this held call was already decided: ${item?.status ?? "decided"}`;
   // `decision` is what was decided (an approval is "approved" whether its run is under way or ended), `status` where it is now.
   const decided = item ? (item.status === "executed" || item.status === "failed" ? "approved" : item.status) : null;
@@ -615,6 +617,49 @@ async function decideApproval(tenantId: string, row: ProvisionedAgent, operation
     code: r.code, message,
     ...(item ? { decision: decided, status: item.status, decidedBy: item.decidedBy, decidedAt: item.decidedAt } : {}),
   }, ...(item ? { approval: item } : {}) }, { status: 409, headers: { "cache-control": "no-store" } });
+}
+
+/** Each outcome of a delivery report, and the one time field that goes with it. */
+const DELIVERY_TIME = { delivered: "deliveredAt", no_recipient: "checkedAt" } as const;
+/** An ISO 8601 instant with its offset, as `Date.prototype.toISOString` and most clocks write one. */
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * `POST /agents/{id}/approvals/{operationId}/delivery`: Raft's report of the hold's approval card, which the expiry
+ * notice is worded from (src/runtime/approval-notice.ts `expiredNotice`). Found and authorised as `…/decide` is, by
+ * the same path. A hold that is gone, or an agent that is (deleted included), is `approval_not_found`, never
+ * `not_found`: Raft stops retrying on that code alone, and there is nothing a retry could record.
+ */
+async function approvalDelivery(tenantId: string, row: ProvisionedAgent, operationId: string, body: unknown, credentialId: string | null,
+  a: ProvisionApprovals): Promise<Response> {
+  const gone = () => fail({ status: 404, code: "approval_not_found", message: `no held call ${operationId.slice(0, 128)} for ${row.agentId}` });
+  if (!OPERATION_ID.test(operationId)) return gone();
+  const shape = 'the body is { "outcome": "delivered", "deliveredAt": ISO 8601 } or { "outcome": "no_recipient", "checkedAt": ISO 8601 }';
+  const b = typeof body === "object" && body !== null && !Array.isArray(body) ? body as Record<string, unknown> : null;
+  if (!b) return fail({ status: 400, code: "invalid", message: shape });
+  if (b.outcome === undefined) return fail({ status: 400, code: "missing", param: "outcome", message: shape });
+  if (b.outcome !== "delivered" && b.outcome !== "no_recipient") {
+    return fail({ status: 400, code: "invalid_outcome", param: "outcome", message: `outcome is delivered or no_recipient; ${shape}` });
+  }
+  const outcome = b.outcome, timeField = DELIVERY_TIME[outcome];
+  const extra = Object.keys(b).find((k) => k !== "outcome" && k !== timeField);
+  if (extra) return fail({ status: 400, code: "invalid", param: extra, message: `unknown field ${extra} for ${outcome}; ${shape}` });
+  const t = b[timeField];
+  if (t === undefined) return fail({ status: 400, code: "missing", param: timeField, message: shape });
+  const at = typeof t === "string" && ISO_INSTANT.test(t) ? Date.parse(t) : NaN;
+  if (!Number.isFinite(at)) return fail({ status: 400, code: "invalid_timestamp", param: timeField, message: `${timeField} is an ISO 8601 instant with its offset` });
+  const r = await a.delivery(tenantId, row.agentId, { raftAgentId: row.raftAgentId, raftServerId: row.raftServerId }, operationId, { outcome, at });
+  logEvent("provision.approval_delivery", {
+    tenantId, agentId: row.agentId, raftAgentId: row.raftAgentId, operationId, reported: outcome, at, credentialId,
+    outcome: r === null ? "no_agent" : r.ok ? (r.changed ? "recorded" : "kept") : r.code,
+  });
+  if (r === null || (!r.ok && r.code === "approval_not_found")) return gone();
+  if (!r.ok) {
+    return fail({ status: 409, code: r.code, param: timeField,
+      message: `${timeField} is more than 60 seconds after this held call ended; nothing was recorded` });
+  }
+  // What is recorded, which a first `delivered` keeps whatever came after it.
+  return ok({ outcome: r.delivery.outcome, [DELIVERY_TIME[r.delivery.outcome]]: new Date(r.delivery.at).toISOString() });
 }
 
 /**
@@ -949,16 +994,21 @@ export async function handleProvision(
     return evalSetup(method, rest.slice(1).join("/"), tenantId, found.agentId, query, raw, headers.credentialId ?? null, deps.seed,
       { audit: deps.readAudit ?? null, reason: headers.readReason ?? null });
   }
-  // `…/approvals` and `…/approvals/{operationId}/decide`: this agent's held calls, from its own object.
-  if (rest[1] === "approvals" && ((rest.length === 2 && method === "GET") || (rest.length === 4 && rest[3] === "decide" && method === "POST"))) {
+  // `…/approvals`, `…/approvals/{operationId}/decide` and `…/delivery`: this agent's held calls, from its own object.
+  // One branch, so the report is found and authorised exactly as a decision is.
+  if (rest[1] === "approvals" && ((rest.length === 2 && method === "GET") || (rest.length === 4 && (rest[3] === "decide" || rest[3] === "delivery") && method === "POST"))) {
     if (!deps.approvals) return null;
     const found = await pathAgent();
     if (!found || found.status === "deleted") {
+      // A report's 404 carries the code Raft stops on (`approvalDelivery`).
+      if (rest[3] === "delivery") return fail({ status: 404, code: "approval_not_found", message: `no held call ${rest[2]!.slice(0, 128)}: no provisioned agent ${rest[0]}` });
       return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
     }
     return rest.length === 2
       ? agentApprovals(tenantId, found, query, deps.approvals)
-      : decideApproval(tenantId, found, rest[2]!, body, headers.credentialId ?? null, deps.approvals);
+      : rest[3] === "decide"
+        ? decideApproval(tenantId, found, rest[2]!, body, headers.credentialId ?? null, deps.approvals)
+        : approvalDelivery(tenantId, found, rest[2]!, body, headers.credentialId ?? null, deps.approvals);
   }
   const read = method === "GET" && rest.length >= 2 ? surfaceReadOf(rest.slice(1), "provider") : null;
   if (read && deps.surface) {

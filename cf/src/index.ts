@@ -20,8 +20,8 @@ import type { AgentProfile } from "../../src/runtime/agent-profile.ts";
 import { adminModels } from "./admin-models.ts";
 import { agentModel } from "./agent-model.ts";
 import { html, conditional, holds, notModified } from "./version.ts";
-import type { ApprovalRecord, ApprovalState, DecidedBy, Json } from "../../src/core/types.ts";
-import { approvalItem, d1ApprovalIndex, hintTarget, publishApprovals, type ApprovalItem, type ProvisionDecideResult } from "./approvals.ts";
+import type { ApprovalDelivery, ApprovalRecord, ApprovalState, DecidedBy, Json } from "../../src/core/types.ts";
+import { approvalItem, d1ApprovalIndex, hintTarget, publishApprovals, type ApprovalItem, type ProvisionDecideResult, type ProvisionDeliveryResult } from "./approvals.ts";
 import { DEFAULT_APPROVAL_TTL_MS } from "../../src/store/approvals-schema.ts";
 
 /** The states an approval is in from its decision on: being run, then its end. */
@@ -224,7 +224,7 @@ export interface Env {
   /** How long a run_js program suspended at `await pause(...)` waits for `resume`, in ms (default 60000). */
   RUN_JS_RESUME_MS?: string;
   /**
-   * How long a held call waits for a decision before it is denied as expired, in hours (docs/raft-approvals.md,
+   * How long a held call waits for a decision before it expires, in hours (docs/raft-approvals.md,
    * "Expiry"). Unset or not a positive number: 24. A change applies to holds made after it; a hold keeps its deadline.
    */
   APPROVAL_TTL_HOURS?: string;
@@ -2775,6 +2775,34 @@ export class AgentDO extends DurableObject<Env> {
     });
   }
 
+  /**
+   * `POST /provision/agents/{id}/approvals/{operationId}/delivery` in this object: Raft's report of the hold's card,
+   * recorded by `StorageAdapter.recordApprovalDelivery`'s rule, then onto the provider-wide copy's item. That copy is a
+   * view: if it cannot be written the report stands, and the hold's next state's write carries it. No wake: nothing
+   * the agent is told changes, since an expiry's notice is already written. Null for an agent this object does not hold.
+   */
+  async provisionDelivery(tenantId: string, agentId: string, ids: { raftAgentId: string; raftServerId: string }, operationId: string,
+    report: ApprovalDelivery): Promise<ProvisionDeliveryResult | null> {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return this.#busy("provisionDelivery", async () => {
+      const rt = this.runtime();
+      await rt.ready();
+      const held = await rt.store.getApproval(tenantId, operationId);
+      if (!held || held.agentId !== agentId) return { ok: false as const, code: "approval_not_found" as const };
+      const r = await rt.store.recordApprovalDelivery(tenantId, operationId, report);
+      if (!r.ok) return { ok: false as const, code: r.reason === "late" ? "approval_not_pending" as const : "approval_not_found" as const };
+      if (r.changed) {
+        try {
+          const item = await this.#approvalItem(rt, r.record, { providerAgentId: agentId, ...ids });
+          await d1ApprovalIndex(this.env.CONTROL_DB).setDelivery(tenantId, agentId, operationId, item);
+        } catch (e) {
+          console.warn(`the provider copy of ${tenantId}/${agentId} ${operationId}'s delivery was not written: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+        }
+      }
+      return { ok: true as const, changed: r.changed, delivery: r.record.delivery! };
+    });
+  }
+
   async startTask(tenantId: string, agentId: string, taskId: string, text: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("startTask", async () => {
@@ -3870,6 +3898,8 @@ function provisionDeps(env: Env): ProvisionDeps {
       list: (tenantId, agentId, ids, status) => stub(tenantId, agentId).provisionApprovals(tenantId, agentId, ids, status) as Promise<ApprovalItem[] | null>,
       decide: (tenantId, agentId, ids, operationId, decision, decidedBy) =>
         stub(tenantId, agentId).provisionDecide(tenantId, agentId, ids, operationId, decision, decidedBy) as Promise<ProvisionDecideResult | null>,
+      delivery: (tenantId, agentId, ids, operationId, report) =>
+        stub(tenantId, agentId).provisionDelivery(tenantId, agentId, ids, operationId, report) as Promise<ProvisionDeliveryResult | null>,
       index: d1ApprovalIndex(env.CONTROL_DB),
     },
     egressResidue: d1EgressResidue(env.CONTROL_DB),

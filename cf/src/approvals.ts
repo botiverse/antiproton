@@ -8,7 +8,7 @@
  * or forged one costs a pull and nothing else; a failed hint is retried a bounded number of times and then left to
  * Raft's reconcile, and never holds up the hold itself.
  */
-import type { ApprovalRecord, ApprovalState, DecidedBy, Json } from "../../src/core/types.ts";
+import type { ApprovalDelivery, ApprovalHandoff, ApprovalRecord, ApprovalState, DecidedBy, Json } from "../../src/core/types.ts";
 import type { ProvisionedAgent } from "./control-plane.ts";
 import { logEvent } from "../../src/core/log.ts";
 import { mapApproval } from "../../src/store/approvals-schema.ts";
@@ -45,6 +45,10 @@ export interface ApprovalItem {
   expiresAt: string | null;
   decidedAt: string | null;
   decidedBy: DecidedBy | null;
+  /** What Raft reported of the card (`…/delivery`): `delivered` and when it went out, `no_recipient` and when Raft checked. */
+  delivery: { outcome: ApprovalDelivery["outcome"]; at: string } | null;
+  /** How antiproton's `approval.requested` hint went (`ApprovalHandoff`); null before it was tried. */
+  handoff: ApprovalHandoff | null;
 }
 
 export const ARGS_SUMMARY_MAX = 800;
@@ -95,19 +99,24 @@ export function outcomeSummary(text: string, redact: Redact): { summary: string;
 
 /** The one-line description of what deciding does, or what was decided. */
 export function approvalDescription(a: { status: ApprovalState; mount: string; tool: string; service: string | null; action: string | null;
-  route: Json | null; expiresAt: string | null }): string {
+  route: Json | null; expiresAt: string | null; delivery?: { outcome: ApprovalDelivery["outcome"] } | null }): string {
   const what = a.service && a.action ? `${a.service} ${a.action} (${a.mount}.${a.tool})` : `${a.mount}.${a.tool}`;
   const route = a.route && typeof a.route === "object" ? a.route as Record<string, unknown> : null;
   const via = route ? `, sending ${String(route.method ?? "")} ${String(route.path ?? "")}` : "";
   if (a.status === "pending") {
     return `Approving runs ${what} once, exactly as shown, with this agent's ${a.mount} mount${via}; denying runs nothing. ` +
-      `Either way the agent is told.${a.expiresAt ? ` Undecided at ${a.expiresAt}, it is denied as expired.` : ""}`;
+      `Either way the agent is told.${a.expiresAt ? ` Undecided at ${a.expiresAt}, it expires and nothing runs.` : ""}`;
   }
   if (a.status === "approved") return `Approved: ${what} is being run once, as shown; the agent is told the result when it ends.`;
   if (a.status === "executed") return `Approved and executed: ${what} was run once, as shown, and the agent was told the result.`;
   if (a.status === "failed") return `Approved, but the run failed: ${what} did not succeed, and the agent was told why.`;
   if (a.status === "denied") return `Denied: ${what} was not run, and the agent was told.`;
-  return `Expired: nobody decided in time, so ${what} was not run, and the agent was told.`;
+  // As recorded now, unlike the agent's notice, which says what was recorded when the hold expired.
+  if (a.delivery?.outcome === "delivered") return `Expired: it reached an approver, but nobody decided in time, so ${what} was not run, and the agent was told.`;
+  if (a.delivery?.outcome === "no_recipient") {
+    return `Expired: it never reached any approver, because Raft had nobody to send it to, so ${what} was not run, and the agent was told.`;
+  }
+  return `Expired: nobody decided in time, so ${what} was not run, and the agent was told; whether it reached an approver is not known.`;
 }
 
 /** The item for one row. `plugin` is the mount's, read by the caller (null: the mount is gone). */
@@ -125,9 +134,18 @@ export function approvalItem(a: ApprovalRecord, ids: { providerAgentId: string; 
     policyKey: typeof req.policyKey === "string" ? req.policyKey : null,
     route: s.route,
     createdAt: iso(a.createdAt)!, expiresAt: iso(a.expiresAt), decidedAt: iso(a.decidedAt), decidedBy: a.decidedBy,
+    delivery: deliveryView(a.delivery), handoff: a.handoff,
   };
   return { ...base, description: approvalDescription(base) };
 }
+
+/** A recorded delivery as the item and the delivery route show it. */
+export const deliveryView = (d: ApprovalDelivery | null) => d === null ? null : { outcome: d.outcome, at: iso(d.at)! };
+
+/** What Raft's delivery report came to (AgentDO `provisionDelivery`): what is recorded now, or why nothing was. */
+export type ProvisionDeliveryResult =
+  | { ok: true; changed: boolean; delivery: ApprovalDelivery }
+  | { ok: false; code: "approval_not_found" | "approval_not_pending" };
 
 /** What a provider's decision came to (AgentDO `provisionDecide`), before it is an HTTP answer. */
 export type ProvisionDecideResult =
@@ -169,6 +187,12 @@ export interface ApprovalIndex {
    * listed, without the arguments' text (`AUDIT_DROPS`). Repeating it keeps the first `at`.
    */
   markAgentDeleted(tenantId: string, agentId: string, at: number): Promise<void>;
+  /**
+   * A delivery report the agent's object recorded, onto the copy's item (and its description, which says it). Not a
+   * change Raft is hinted of or reconciles by (`updated_at` stays): Raft made the report. The next state's write
+   * carries it anyway, being built from the object's row.
+   */
+  setDelivery(tenantId: string, agentId: string, operationId: string, item: ApprovalItem): Promise<void>;
   /**
    * A live agent's ended holds whose last change is before `ended`; a deleted agent's holds whose delete is before
    * `deleted`. First marks the holds of an agent the registry says is deleted whose delete did not mark them.
@@ -254,6 +278,15 @@ export function d1ApprovalIndex(db: D1Database): ApprovalIndex {
       await db.prepare(
         `UPDATE provider_approvals SET agent_deleted_at = COALESCE(agent_deleted_at, ?), item = json_remove(item, ${AUDIT_DROPS}) WHERE tenant_id = ? AND agent_id = ?`,
       ).bind(at, tenantId, agentId).run();
+    },
+    async setDelivery(tenantId, agentId, operationId, item) {
+      // Only these fields, onto whatever the copy holds, so a deleted agent's item stays without its arguments' text. The
+      // description only while the copy is at the item's state: it describes a state, and the copy may not have caught up.
+      const delivery = JSON.stringify(item.delivery);
+      await db.prepare(
+        "UPDATE provider_approvals SET item = CASE WHEN status = ? THEN json_set(item, '$.delivery', json(?), '$.description', ?) " +
+        "ELSE json_set(item, '$.delivery', json(?)) END WHERE tenant_id = ? AND agent_id = ? AND operation_id = ?",
+      ).bind(item.status, delivery, item.description, delivery, tenantId, agentId, operationId).run();
     },
     async prune(before) {
       // Each spelled as its partial index (migration 0029). The mark first, from the registry's deleted agents (a few
@@ -377,6 +410,11 @@ export async function publishApprovals(d: PublishDeps): Promise<{ published: num
     sql.exec("UPDATE approvals SET published_state = ? WHERE tenant_id = ? AND operation_id = ?", r.state, d.tenantId, r.operation_id);
     sql.exec("DELETE FROM approval_publish WHERE operation_id = ?", r.operation_id);
   };
+  // How the `approval.requested` hint went, on the row (`ApprovalRecord.handoff`): only a pending state's publish is
+  // the hand-off, and a later state's hint says nothing about whether Raft was asked.
+  const handoff = (r: any, v: ApprovalHandoff) => {
+    if (r.state === "pending") sql.exec("UPDATE approvals SET handoff = ? WHERE tenant_id = ? AND operation_id = ?", v, d.tenantId, r.operation_id);
+  };
   let published = 0, failed = 0;
   if (due.length) {
     let reg: ProvisionedAgent | null;
@@ -396,6 +434,7 @@ export async function publishApprovals(d: PublishDeps): Promise<{ published: num
     for (const r of due) {
       const attempts = fresh(r) ? Number(r.p_attempts ?? 0) : 0;
       let indexed = fresh(r) && Number(r.p_indexed ?? 0) === 1;
+      let hinting = false;
       try {
         if (!indexed) {
           const a = mapApproval(r);
@@ -410,6 +449,7 @@ export async function publishApprovals(d: PublishDeps): Promise<{ published: num
           const body = JSON.stringify({ type: hintType(r.state), operationId: r.operation_id, providerAgentId: d.agentId,
             raftAgentId: reg.raftAgentId, raftServerId: reg.raftServerId, status: r.state });
           const ts = Math.floor(d.now() / 1000);
+          hinting = true;
           const res = await d.fetch(target.url, {
             method: "POST", body, redirect: "manual", signal: AbortSignal.timeout(HINT_TIMEOUT_MS),
             headers: { "content-type": "application/json", [TIMESTAMP_HEADER]: String(ts), [SIGNATURE_HEADER]: await signHint(target.secret, ts, body), [DELIVERY_HEADER]: d.newId() },
@@ -417,11 +457,13 @@ export async function publishApprovals(d: PublishDeps): Promise<{ published: num
           await res.body?.cancel().catch(() => {});
           if (!res.ok) throw new HintRefused(`Raft answered the hint with HTTP ${res.status}`);
         }
+        if (!deleted) handoff(r, target ? "accepted" : "not_sent");
         markPublished(r);
         published++;
         logEvent("approval.published", { tenantId: d.tenantId, agentId: d.agentId, operationId: r.operation_id, state: r.state, hinted: target !== null });
       } catch (e) {
         failed++;
+        if (hinting) handoff(r, "failed");
         const n = attempts + 1;
         const why = String((e as Error)?.message ?? e).slice(0, 200);
         // Bounded only once the copy is in D1: Raft's reconcile reads that, so a hint that never lands loses nothing.
