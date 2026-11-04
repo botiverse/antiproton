@@ -84,11 +84,18 @@ run_suite() {
   echo "ok ($n)"
 }
 
+visited=" "
 for f in test/*.ts; do
   t=$(basename "$f" .ts)
+  visited="$visited$t "
   # The suites that need a live service: suite_needs_service, one list for both gates.
   if suite_needs_service "$t"; then suite_name "$t"; echo "skipped (needs a live service)"; continue; fi
   run_suite "$t" node "$f"
+done
+# A tracked suite the loop above never reached is a failure: narrowing that glob, or moving the loop, would otherwise
+# switch suites off with every line here still green. git's own list is the independent count.
+for t in $(git ls-files 'test/*.ts' | sed -n 's#^test/\([^/]*\)\.ts$#\1#p'); do
+  case "$visited" in *" $t "*) ;; *) suite_name "$t"; echo "FAIL (tracked but never run by this gate)"; fails=$((fails+1)) ;; esac
 done
 run_suite pi-storage-do bash test/pi-storage-do.sh
 run_suite pi-durable-do bash test/pi-durable-do.sh
