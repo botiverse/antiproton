@@ -95,7 +95,7 @@ done
 # A tracked suite the loop above never reached is a failure: narrowing that glob, or moving the loop, would otherwise
 # switch suites off with every line here still green. git's own list is the independent count.
 for t in $(git ls-files 'test/*.ts' | sed -n 's#^test/\([^/]*\)\.ts$#\1#p'); do
-  case "$visited" in *" $t "*) ;; *) suite_name "$t"; echo "FAIL (tracked but never run by this gate)"; fails=$((fails+1)) ;; esac
+  case "$visited" in *" $t "*) ;; *) suite_name "$t"; echo "FAIL (tracked but never run by this gate: the test/*.ts loop above no longer reaches it)"; fails=$((fails+1)) ;; esac
 done
 run_suite pi-storage-do bash test/pi-storage-do.sh
 run_suite pi-durable-do bash test/pi-durable-do.sh
