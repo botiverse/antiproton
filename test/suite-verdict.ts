@@ -74,6 +74,10 @@ check("the suites needing a live service are named once, and only they are skipp
   for (const name of ["appworld", "live-e2e", "live-github"]) {
     if (skipped(name) !== "skip") throw new Error(`${name} is not skipped`);
   }
+  // The list itself, written out: a skipped suite still counts as visited by the gate, so a name added here is a suite
+  // switched off with CI green, and must turn this red.
+  const listed = sh('printf %s "$GATE_NEEDS_SERVICE"', "", "");
+  if (listed !== "appworld live-e2e live-github") throw new Error(`GATE_NEEDS_SERVICE changed: ${JSON.stringify(listed)}`);
   // Substrings of a listed name, and suites beside them, still run.
   for (const name of ["live", "e2e", "app", "suite-verdict", ""]) {
     if (skipped(name) !== "run") throw new Error(`${JSON.stringify(name)} would be skipped`);
