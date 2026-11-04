@@ -96,12 +96,16 @@ run_suite() {  # name, command...
   if [ -z "$n" ] || [ "$n" -eq 0 ]; then echo "FAIL (asserted nothing: ${n:-no pass count})"; exit 1; fi
   echo "ok ($n)"
 }
+visited=" "
 for f in test/*.ts; do
   t=$(basename "$f" .ts)
+  visited="$visited$t "
   # The suites that need a live service: suite_needs_service (cf/scripts/suite-verdict.sh), one list for both gates.
   if suite_needs_service "$t"; then suite_name "$t"; echo "skipped (needs a live service)"; continue; fi
   run_suite "$t" node "$f"
 done
+# A tracked suite the loop above never reached is a failure (suite_unvisited, cf/scripts/suite-verdict.sh).
+if ! suite_unvisited "$visited"; then echo "FAIL (a tracked suite was not run, above)"; exit 1; fi
 # The storage conformance suite on real Durable Object SQLite (local workerd, no network).
 run_suite pi-storage-do bash test/pi-storage-do.sh
 # pi-durable's conformance and the SQLite facade's own cases on real Durable Object SQLite (local workerd, no network).
