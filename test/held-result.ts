@@ -513,7 +513,7 @@ await check("/ui/approvals lists every held call of the agent, a second conversa
 
 await check("the card's account is escaped: a tool name cannot write markup into the panel", () => {
   const html = approvals([{ tenantId: "t", operationId: "op<x>", agentId: "a", taskId: "main", mountAlias: "m", tool: "<b>t</b>",
-    request: { args: {} }, state: "pending", approver: null, decidedAt: null, createdAt: 0, expiresAt: null, decidedBy: null, outcome: null, runAt: null }]);
+    request: { args: {} }, state: "pending", approver: null, decidedAt: null, createdAt: 0, expiresAt: null, decidedBy: null, outcome: null, runAt: null, delivery: null, handoff: null }]);
   must(!html.includes("<b>t</b>") && html.includes("&lt;b&gt;t&lt;/b&gt;") && html.includes("op&lt;x&gt;"), html);
 });
 

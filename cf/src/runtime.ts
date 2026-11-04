@@ -961,7 +961,7 @@ export interface RuntimeDeps {
    */
   runJsResumeMs?: number;
   /**
-   * How long a held call waits for a decision before it is denied as expired (APPROVAL_TTL_HOURS, cf/src/index.ts).
+   * How long a held call waits for a decision before it expires (APPROVAL_TTL_HOURS, cf/src/index.ts).
    * Absent: the default, 24 hours (src/store/approvals-schema.ts).
    */
   approvalTtlMs?: number;

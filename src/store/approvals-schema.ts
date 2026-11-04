@@ -2,9 +2,9 @@
  * The parts of the `approvals` table both stores share (src/store/sqlite.ts, src/store/durable-object.ts): the columns
  * added after the table first shipped, what a row reads as, and the one rule for whether a decision may land.
  */
-import type { ApprovalRecord, ApprovalState, DecidedBy } from "../core/types.ts";
+import type { ApprovalDelivery, ApprovalHandoff, ApprovalRecord, ApprovalState, DecidedBy } from "../core/types.ts";
 
-/** How long a hold waits for a decision before it is denied as `expired`, unless the deployment says otherwise. */
+/** How long a hold waits for a decision before it ends as `expired`, unless the deployment says otherwise. */
 export const DEFAULT_APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
@@ -40,6 +40,11 @@ export const APPROVAL_ALTERS: ReadonlyArray<{ alter: string; then: string[] }> =
       WHERE state = 'approved'`,
       "UPDATE approvals SET published_state = state WHERE published_state IS NOT NULL"] },
   { alter: "ALTER TABLE approvals ADD COLUMN outcome TEXT", then: [] },
+  // Raft's delivery report (`deliveryStep`) and the hint's hand-off: a hold from before them has neither, which reads as
+  // "not known", the truth about it.
+  { alter: "ALTER TABLE approvals ADD COLUMN delivery_outcome TEXT", then: [] },
+  { alter: "ALTER TABLE approvals ADD COLUMN delivery_at INTEGER", then: [] },
+  { alter: "ALTER TABLE approvals ADD COLUMN handoff TEXT", then: [] },
 ];
 
 /**
@@ -58,6 +63,7 @@ export const APPROVAL_COLUMNS = `tenant_id TEXT NOT NULL, operation_id TEXT NOT 
   task_id TEXT NOT NULL, mount_alias TEXT NOT NULL, tool TEXT NOT NULL,
   request TEXT NOT NULL, state TEXT NOT NULL, approver TEXT, decided_at INTEGER,
   created_at INTEGER NOT NULL, expires_at INTEGER, decided_by TEXT, notice TEXT, told_at INTEGER, published_state TEXT, run_at INTEGER, outcome TEXT,
+  delivery_outcome TEXT, delivery_at INTEGER, handoff TEXT,
   PRIMARY KEY (tenant_id, operation_id)`;
 
 export function mapApproval(r: any): ApprovalRecord {
@@ -71,8 +77,38 @@ export function mapApproval(r: any): ApprovalRecord {
     decidedBy: r.decided_by == null ? null : JSON.parse(r.decided_by) as DecidedBy,
     outcome: r.outcome == null ? null : JSON.parse(r.outcome) as { summary: string },
     runAt: r.run_at == null ? null : Number(r.run_at),
+    delivery: r.delivery_outcome == null || r.delivery_at == null ? null
+      : { outcome: r.delivery_outcome as ApprovalDelivery["outcome"], at: Number(r.delivery_at) },
+    handoff: r.handoff == null ? null : r.handoff as ApprovalHandoff,
   };
 }
+
+/**
+ * How late after a hold ended a delivery report may say its card went out, for the clocks of Raft and antiproton to
+ * disagree by: a card Raft sent just before the end can carry a time just after it.
+ */
+export const DELIVERY_SKEW_MS = 60_000;
+
+/**
+ * What a delivery report does to a row: `keep` what is recorded (a `delivered` is first and final; a second
+ * `no_recipient` keeps the first one's time), `write` the report, or refuse it as `late`, timed more than
+ * DELIVERY_SKEW_MS after the hold ended. A hold ends at its deadline when it expired (a decision past the deadline was
+ * already refused then), at its decision otherwise; a pending one ends at its deadline. Asked after `keep`, so a
+ * repeated report of what is recorded is answered with it however late it arrives.
+ */
+export function deliveryStep(r: { state: string; expires_at?: number | null; decided_at?: number | null; delivery_outcome?: string | null },
+  report: ApprovalDelivery): "keep" | "write" | "late" {
+  if (r.delivery_outcome === "delivered") return "keep";
+  if (r.delivery_outcome === "no_recipient" && report.outcome === "no_recipient") return "keep";
+  const end = r.state === "pending" || r.state === "expired" ? (r.expires_at ?? (r.state === "expired" ? r.decided_at : null)) : r.decided_at;
+  return end != null && report.at > Number(end) + DELIVERY_SKEW_MS ? "late" : "write";
+}
+
+/** What a delivery report came to (StorageAdapter.recordApprovalDelivery): the row as it now stands. */
+export type DeliveryOutcome =
+  | { ok: true; changed: boolean; record: ApprovalRecord }
+  | { ok: false; reason: "not_found" }
+  | { ok: false; reason: "late"; record: ApprovalRecord };
 
 /**
  * Why a decision may not land on this row now, or null when it may. Decided once: a row that is not pending keeps its

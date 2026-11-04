@@ -7,7 +7,8 @@ Decided 2026-10-29 (#raft-antiproton):
 
 - Raft shows each held call to the person who decides, as an existing Raft action card in that person's DM.
 - A click calls Raft's server. Raft's server checks who clicked, then decides through antiproton.
-- A hold that nobody decides within the TTL (24 hours by default) is denied as `expired`.
+- A hold that nobody decides within the TTL (24 hours by default) ends as `expired`, a state of its own: nobody
+  refused it.
 - The agent is told every outcome.
 
 ## The flow
@@ -24,7 +25,9 @@ Decided 2026-10-29 (#raft-antiproton):
 2. **Raft is told.** Antiproton writes the hold to its provider-wide copy. If hints are configured, it also sends
    Raft a signed hint, `approval.requested`. The hint carries ids only.
 3. **The card is posted.** Raft fetches the hold with its provider token (`GET …/approvals`), finds who may
-   decide, and posts the action card to that person's DM.
+   decide, and posts the action card to that person's DM. It then reports the delivery
+   (`POST …/approvals/{operationId}/delivery`): `delivered` once the first card went out, or `no_recipient` when
+   there was nobody to send one to. The agent's expiry notice is worded from that report.
 4. **The person decides.** Raft's server checks that the clicking user may decide for this agent, then calls
    `POST …/approvals/{operationId}/decide`.
 5. **The decision is recorded.** Antiproton records it once and answers at once:
@@ -97,13 +100,13 @@ for no other reason. `decidedBy` is a **claim relayed by the provider**.
   `{operationId, providerAgentId, decision, raftUserId, role, iat, jti}`. Antiproton verifies it, records the
   `jti` once, and keeps the assertion. With that, antiproton could answer "who approved this?" from its own data.
 
-### Errors common to all three routes
+### Errors common to the per-agent routes
 
 | Status | Code | When |
 |---|---|---|
 | `401` | `unauthorized` | There is no token, it is malformed, it is unknown, or it was revoked. |
 | `422` | `missing` (`param: raftServerId`) | A platform token was sent on a per-agent route without `?raftServerId=`. |
-| `404` | `not_found` | One of these: the agent is not this token's tenant's; it was made at another Raft origin; it was deleted. All answer the same, so "not yours" and "does not exist" look alike. |
+| `404` | `not_found` | One of these: the agent is not this token's tenant's; it was made at another Raft origin; it was deleted. All answer the same, so "not yours" and "does not exist" look alike. On `…/delivery` the code is `approval_not_found` instead (see that route). |
 
 An agent is addressed by its antiproton id (`raft_<raftAgentId>`, returned as `providerAgentId` when it was
 created) or by Raft's own id, as `/provision/agents/by-raft-agent/{raftAgentId}/…`.
@@ -130,11 +133,13 @@ needs the raw arguments.
   "heldBy": "policy",
   "policyKey": null,
   "route": null,
-  "description": "Approving runs gh.create_pull_request once, exactly as shown, with this agent's gh mount; denying runs nothing. Either way the agent is told. Undecided at 2026-10-30T06:20:00.000Z, it is denied as expired.",
+  "description": "Approving runs gh.create_pull_request once, exactly as shown, with this agent's gh mount; denying runs nothing. Either way the agent is told. Undecided at 2026-10-30T06:20:00.000Z, it expires and nothing runs.",
   "createdAt": "2026-10-29T06:20:00.000Z",
   "expiresAt": "2026-10-30T06:20:00.000Z",
   "decidedAt": null,
-  "decidedBy": null
+  "decidedBy": null,
+  "delivery": { "outcome": "delivered", "at": "2026-10-29T06:20:03.000Z" },
+  "handoff": "accepted"
 }
 ```
 
@@ -153,9 +158,11 @@ needs the raw arguments.
 | `heldBy` | `policy`: the mount's policy holds this tool. `agent`: the agent asked for a person itself. |
 | `policyKey` | For a bridged call, the second policy name the call was decided under, or `null`. |
 | `route` | For a bridged request: `method`, `path`, `repo` and `pr` when known, `contentType`, and `body`, redacted and cut at the card limit (with `bodyTruncated` and `bodySize`). Otherwise `null`. |
-| `description` | One line built by antiproton. For a pending hold it says what approving does and when the hold expires; after that, what happened. |
+| `description` | One line built by antiproton. For a pending hold it says what approving does and when the hold expires; after that, what happened. An expired hold's says whether it reached an approver, from `delivery` as recorded now. |
 | `createdAt`, `expiresAt`, `decidedAt` | ISO 8601. `expiresAt` is `null` only if the deployment turned expiry off. |
 | `decidedBy` | `null` while pending. Then one of: `{ "via": "raft", "raftUserId", "role" }`; `{ "via": "console", "approver" }` for a decision on the antiproton console; or `{ "via": "expiry" }`. |
+| `delivery` | What Raft reported through `…/delivery`, as recorded: `{ "outcome": "delivered", "at" }` (when the first card went out) or `{ "outcome": "no_recipient", "at" }` (when Raft checked). `null` until a report lands. |
+| `handoff` | How antiproton's `approval.requested` hint went: `accepted` (Raft answered `2xx`), `failed` (the last attempt was refused or did not arrive; a later retry can still make it `accepted`), or `not_sent` (this deployment has no hint channel, and Raft finds the hold by reconciling). `null` before the hint was tried. In the provider-wide copy it can lag by one state, since the copy is written before the hint is sent. |
 
 ### States
 
@@ -231,6 +238,43 @@ operation id. Deciding is one atomic step in the agent's object.
 - If a request times out, retry the same decision. The retry answers `replay: true` with the recorded outcome.
 - If two people decide at once, one wins. The other gets `replay` if they made the same decision, or
   `409 approval_already_decided` if they made the opposite one, and either way sees who decided first.
+
+### `POST /provision/agents/{agentId}/approvals/{operationId}/delivery`
+
+Raft reports what became of the hold's approval card. Found and authorised exactly as `…/decide` is: the same
+token, the same tenant and origin binding, `?raftServerId=` for a platform token, and the same `401` and `422`.
+
+The request body is one of:
+
+```json
+{ "outcome": "delivered", "deliveredAt": "2026-10-29T06:20:03.000Z" }
+{ "outcome": "no_recipient", "checkedAt": "2026-10-29T06:20:03.000Z" }
+```
+
+- `delivered`: Raft sent this hold's first card at `deliveredAt`.
+- `no_recipient`: Raft checked at `checkedAt` and had nobody to send a card to.
+- The times are ISO 8601 instants with an offset (`Z` or `±hh:mm`).
+- Nothing else: no approver, no card or message id.
+
+What is recorded:
+
+- A `delivered` is first-wins. A later report, of either outcome, is answered with the recorded one and changes
+  nothing, `deliveredAt` included.
+- A `no_recipient` never replaces a `delivered`. A second `no_recipient` keeps the first `checkedAt`.
+- A `delivered` after a `no_recipient` replaces it.
+- A report is taken after the hold has ended (expired or decided) as long as its time is at most **60 seconds**
+  after the end, for the two clocks to disagree by. An expired hold ended at `expiresAt`; a decided one at
+  `decidedAt`. This applies to `checkedAt` as to `deliveredAt`: a "nobody to send it to" checked after the hold
+  ended says nothing about the hold. A repeat of what is already recorded is answered with it however late.
+- The agent's notice of an expiry is written at expiry, from what was recorded then. A report that lands after it
+  updates the record (and the item's `delivery` and `description`), not the notice.
+
+| Status | Body | When |
+|---|---|---|
+| `200` | `{ "outcome": "delivered", "deliveredAt": "…" }` or `{ "outcome": "no_recipient", "checkedAt": "…" }` | What is recorded now, which is not always what was sent (see above). |
+| `409` | `{ "error": { "code": "approval_not_pending", "message", "param" } }` | The time is more than 60 seconds after the hold ended. Nothing was recorded. |
+| `404` | `{ "error": { "code": "approval_not_found", "message" } }` | No such hold on this agent (another agent's included), or no such agent for this token (another tenant's, another origin's, or deleted). Final: there is nothing a retry could record. |
+| `400` | `{ "error": { "code": "invalid" \| "missing" \| "invalid_outcome" \| "invalid_timestamp", "param" } }` | Not one of the two bodies above: an unknown or missing `outcome`, a missing or malformed time, or any other field (including the other outcome's time field). |
 
 ### `GET /provision/approvals`
 
@@ -441,12 +485,28 @@ Denied:
 Nothing was run. Do not call it again unless the person asks you to.
 ```
 
-Expired:
+Expired, worded by the delivery recorded at the moment of expiry (`…/delivery`). After the head and "You made this
+call at …", one of:
 
-```
-[approval op_… — gh.create_pull_request — expired; a notice from the harness, not a message from the user]
-Nobody decided within 24 hours, so it was denied as expired and nothing was run. If it still matters you may call it again, which asks for a new approval.
-```
+- `delivered` recorded:
+
+  ```
+  It reached an approver, but nobody decided within 24 hours, so it expired and nothing was run. If it still matters you may call it again, which asks for a new approval.
+  ```
+
+- `no_recipient` recorded, and no `delivered`:
+
+  ```
+  It never reached any approver, because Raft had nobody to send it to, so it expired after 24 hours and nothing was run. If it still matters you may call it again, which asks for a new approval. That one reaches nobody either unless Raft has someone to send it to by then.
+  ```
+
+- nothing recorded:
+
+  ```
+  Nobody decided within 24 hours, so it expired and nothing was run; whether it reached an approver is not known. If it still matters you may call it again, which asks for a new approval.
+  ```
+
+"It never reached any approver" is written only on a recorded `no_recipient`, never inferred from a missing report.
 
 The decider is named by role: "your owner in Raft", "the Raft server's owner" or "a Raft server admin". A
 decision made on the antiproton console is named by its console sign-in. Raft user ids are never shown to the
@@ -461,6 +521,7 @@ agent.
 | Raft's `decide` call times out | The decision may have landed. Retry the same decision: the answer is `replay` with the current status. |
 | Two people decide at once | One wins. The other gets `replay` (same decision) or `409 approval_already_decided` with the first decision and who made it. |
 | A click arrives after the deadline | `409 approval_expired`. Nothing runs. Retire the card. |
+| Raft's delivery report is lost or late | The hold is unaffected. If it expires with nothing recorded, the agent is told it is not known whether the request reached an approver. A report timed more than 60 seconds after the end is `409 approval_not_pending`. |
 | The owner switches the mount to `deny` after the hold | The approved call is not run. The hold ends `failed` with `policy_denied` in `outcome`, and the agent is told. |
 | The object stops while an approved call runs | The run is never started again. 15 minutes after it was claimed, the hold ends `failed` with outcome "not known", and the agent is told to check before calling it again. |
 | The agent's sealed values cannot be opened | `args.withheld: true` with an empty summary, and likewise for `outcome`. The hold can still be decided. |
@@ -478,11 +539,12 @@ agent.
 
 ## Where it lives
 
-- `cf/src/provision/handlers.ts`: the three routes.
+- `cf/src/provision/handlers.ts`: the routes.
 - `cf/src/approvals.ts`: the item, the D1 copy and its retention, the hint and its signature.
 - `cf/src/index.ts` (`AgentDO`):
   - `provisionApprovals`;
   - `provisionDecide`;
+  - `provisionDelivery`;
   - publishing from the alarm, before and after the step.
 - `src/runtime/gateway.ts`:
   - `heldMessage`;
@@ -491,7 +553,7 @@ agent.
   - `expireApproval`, `expireDue`.
 - `cf/src/runtime.ts`: `#approvalPass` (it expires, runs and tells) and `#tellApprovals`.
 - `src/runtime/approval-notice.ts`: the notice text and the run's outcome.
-- `src/store/approvals-schema.ts`: the columns and their migration.
+- `src/store/approvals-schema.ts`: the columns and their migration, and the delivery report's rule (`deliveryStep`).
 - `cf/migrations/0028_provider_approvals.sql`: the provider-wide copy.
 - `cf/migrations/0029_provider_approvals_audit.sql`: a deleted agent's rows kept as a record, and the prunes' indexes.
 - `test/raft-approvals.ts`, `test/held-result.ts`: the tests.

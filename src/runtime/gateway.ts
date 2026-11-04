@@ -652,7 +652,7 @@ export class ToolGateway {
     opts: {
       credentialRejected?: CredentialRejected;
       heldPlace?: (ctx: CallContext) => HeldPlace | Promise<HeldPlace>;
-      /** How long a held call waits for a decision before it is denied as expired; 0 keeps holds open. */
+      /** How long a held call waits for a decision before it expires; 0 keeps holds open. */
       approvalTtlMs?: number;
       /** Whether the agent was deleted: told to every plugin as `PluginContext.agentDeleted`. */
       agentDeleted?: (tenantId: string, agentId: string) => boolean;
@@ -834,8 +834,9 @@ export class ToolGateway {
   }
 
   /**
-   * Deny a hold nobody decided in time, as `expired`: the operation ends `rejected` with `approval_expired`, nothing
-   * runs, and the agent is told at its next step. Refused (`not_due`) before the deadline, and for a decided row.
+   * End a hold nobody decided in time as `expired`: the operation ends `rejected` with `approval_expired`, nothing
+   * runs, and the agent is told at its next step, in words chosen by the delivery recorded now (`expiredNotice`).
+   * Refused (`not_due`) before the deadline, and for a decided row.
    */
   async expireApproval(tenantId: string, operationId: string):
     Promise<{ ok: true; record: ApprovalRecord } | { ok: false; reason: string; record?: ApprovalRecord }> {

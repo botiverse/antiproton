@@ -51,14 +51,26 @@ export function deniedNotice(a: ApprovalRecord): string {
   return `${head(a, `denied by ${deciderWords(a.decidedBy, a.approver)}`)}\nNothing was run. Do not call it again unless the person asks you to.`;
 }
 
-export function expiredNotice(a: Pick<ApprovalRecord, "operationId" | "mountAlias" | "tool" | "createdAt" | "expiresAt">): string {
+/**
+ * Worded from what Raft reported of the card when the hold expired (`ApprovalRecord.delivery`), since an expiry is
+ * nobody's refusal and the agent should know which silence it was: it reached an approver who did not decide; it reached nobody, because Raft had nobody to send it to; or it
+ * is not known which. The second is said only on a recorded `no_recipient`, never inferred from silence. Written once,
+ * at expiry: a report that lands later updates the record, not this notice.
+ */
+export function expiredNotice(a: Pick<ApprovalRecord, "operationId" | "mountAlias" | "tool" | "createdAt" | "expiresAt" | "delivery">): string {
   const ms = a.expiresAt === null ? null : a.expiresAt - a.createdAt;
-  const within = ms === null ? "" : ms >= 3_600_000 ? ` within ${Math.round(ms / 3_600_000)} hours` : ` within ${Math.max(1, Math.round(ms / 60_000))} minutes`;
+  const span = ms === null ? null : ms >= 3_600_000 ? `${Math.round(ms / 3_600_000)} hours` : `${Math.max(1, Math.round(ms / 60_000))} minutes`;
+  const within = span === null ? "" : ` within ${span}`;
+  const again = "If it still matters you may call it again, which asks for a new approval.";
+  const what = a.delivery?.outcome === "delivered"
+    ? `It reached an approver, but nobody decided${within}, so it expired and nothing was run. ${again}`
+    : a.delivery?.outcome === "no_recipient"
+      ? `It never reached any approver, because Raft had nobody to send it to, so it expired${span === null ? "" : ` after ${span}`} and nothing was run. ` +
+        `${again} That one reaches nobody either unless Raft has someone to send it to by then.`
+      : `Nobody decided${within}, so it expired and nothing was run; whether it reached an approver is not known. ${again}`;
   // The call may be hours old and long out of the agent's mind (holds already waiting when expiry arrived get their
   // deadline then, and expire together), so the notice says when it was made.
-  return `${head(a, "expired")}\nYou made this call at ${new Date(a.createdAt).toISOString()}. ` +
-    `Nobody decided${within}, so it was denied as expired and nothing was run. ` +
-    "If it still matters you may call it again, which asks for a new approval.";
+  return `${head(a, "expired")}\nYou made this call at ${new Date(a.createdAt).toISOString()}. ${what}`;
 }
 
 /** A decided call whose notice was never written (the object stopped while it ran): what is still true to say. */

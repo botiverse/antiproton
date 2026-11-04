@@ -7,12 +7,12 @@ import { AGENT_SCOPE_ALIAS, PluginDbTables } from "./plugin-db.ts";
 import { appendUsage, type UsageRow } from "../usage/outbox.ts";
 import { completedPayload, type CompletedFacts } from "./operation-event.ts";
 import type {
-  AdvanceTxn, ApprovalRecord, ApprovalState, CommitResult, DecidedBy, Json, Lease, ModelBinding, MountPolicy, MountRecord,
+  AdvanceTxn, ApprovalDelivery, ApprovalRecord, ApprovalState, CommitResult, DecidedBy, Json, Lease, ModelBinding, MountPolicy, MountRecord,
   OperationRecord, OperationStatus, RuntimeEvent, TaskRecord, WaitSpec,
 } from "../core/types.ts";
 import { appendTrace, type TraceRow } from "../trace/outbox.ts";
 import { approvalRow, operationEnds, toolCallRow } from "../trace/seams.ts";
-import { APPROVAL_COLUMNS, decisionProblem, FINAL_STATES, mapApproval, migrateApprovals, type UntoldApproval } from "./approvals-schema.ts";
+import { APPROVAL_COLUMNS, decisionProblem, deliveryStep, FINAL_STATES, mapApproval, migrateApprovals, type DeliveryOutcome, type UntoldApproval } from "./approvals-schema.ts";
 import {
   applySeedPass, markSeedsChosen, pendingSeedNotices, readSeedRecord, returnSeedNotices, SEED_RECORD_SCHEMA, takeSeedNotices, voidSeedNotices,
   type SeedNoticeRow, type SeedPlan,
@@ -750,7 +750,7 @@ export class DurableObjectStore implements StorageAdapter {
     };
   }
 
-  async requireApproval(a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt" | "decidedBy" | "expiresAt" | "outcome" | "runAt"> & { expiresAt?: number | null }) {
+  async requireApproval(a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt" | "decidedBy" | "expiresAt" | "outcome" | "runAt" | "delivery" | "handoff"> & { expiresAt?: number | null }) {
     this.#sql.exec(
       `INSERT INTO approvals(tenant_id, operation_id, agent_id, task_id, mount_alias, tool,
          request, state, approver, decided_at, created_at, expires_at)
@@ -760,7 +760,7 @@ export class DurableObjectStore implements StorageAdapter {
       j(a.request), this.#now(), a.expiresAt ?? null);
   }
 
-  async holdApproval(a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt" | "decidedBy" | "expiresAt" | "outcome" | "runAt"> & { expiresAt?: number | null }, same: (held: ApprovalRecord) => boolean) {
+  async holdApproval(a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt" | "decidedBy" | "expiresAt" | "outcome" | "runAt" | "delivery" | "handoff"> & { expiresAt?: number | null }, same: (held: ApprovalRecord) => boolean) {
     // One synchronous transaction: no await between the lookup and the insert (StorageAdapter `holdApproval`).
     return this.#tx(() => {
       const existing = (this.#all(
@@ -831,6 +831,18 @@ export class DurableObjectStore implements StorageAdapter {
       this.#sql.exec("UPDATE approvals SET state=?, outcome=?, notice=? WHERE tenant_id=? AND operation_id=?",
         state, JSON.stringify(outcome), notice, tenantId, operationId);
       return true;
+    });
+  }
+
+  async recordApprovalDelivery(tenantId: string, operationId: string, report: ApprovalDelivery): Promise<DeliveryOutcome> {
+    return this.#tx(() => {
+      const r = this.#one("SELECT * FROM approvals WHERE tenant_id=? AND operation_id=?", tenantId, operationId);
+      if (!r) return { ok: false as const, reason: "not_found" as const };
+      const step = deliveryStep(r, report);
+      if (step === "late") return { ok: false as const, reason: "late" as const, record: mapApproval(r) };
+      if (step === "keep") return { ok: true as const, changed: false, record: mapApproval(r) };
+      this.#sql.exec("UPDATE approvals SET delivery_outcome=?, delivery_at=? WHERE tenant_id=? AND operation_id=?", report.outcome, report.at, tenantId, operationId);
+      return { ok: true as const, changed: true, record: mapApproval({ ...r, delivery_outcome: report.outcome, delivery_at: report.at }) };
     });
   }
 

@@ -20,6 +20,7 @@ import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts
 import { sessionCookieFor } from "../cf/src/auth.ts";
 import { PROVIDER_HOME } from "../cf/src/provision/steps.ts";
 import { verifyHint, SIGNATURE_HEADER, TIMESTAMP_HEADER, hintTarget, publishBackoffMs } from "../cf/src/approvals.ts";
+import { expiredNotice } from "../src/runtime/approval-notice.ts";
 import { DurableObjectStore } from "../src/store/durable-object.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { DEFAULT_APPROVAL_TTL_MS } from "../src/store/approvals-schema.ts";
@@ -244,7 +245,7 @@ await check("list: a pending hold, with its mapping, what approving does, its de
   must(!r.text.includes(LEAKED) && a.args.redactions >= 1 && a.args.withheld === false, `the credential reached the card: ${a.args.summary}`);
   const created = Date.parse(a.createdAt), expires = Date.parse(a.expiresAt);
   must(created >= before - 5 && expires - created >= DEFAULT_APPROVAL_TTL_MS - 5 && expires - created <= DEFAULT_APPROVAL_TTL_MS + 5, `deadline: ${a.createdAt} ${a.expiresAt}`);
-  must(a.description.startsWith("Approving runs state.put once, exactly as shown") && a.description.includes(`Undecided at ${a.expiresAt}, it is denied as expired`), a.description);
+  must(a.description.startsWith("Approving runs state.put once, exactly as shown") && a.description.includes(`Undecided at ${a.expiresAt}, it expires and nothing runs.`), a.description);
   // By Raft's own id too, and `status` narrows: none approved yet.
   const byRaft = await call(w, "GET", `agents/by-raft-agent/${RAFT_ID}/approvals`);
   must(byRaft.status === 200 && byRaft.body.approvals.length === 1, `by-raft-agent: ${byRaft.status} ${byRaft.text}`);
@@ -433,6 +434,223 @@ await check("notice: expired, the agent is told nobody decided and that it may a
   const said = await noticeSent(w, op);
   must(said.includes(`[approval ${op} — state.put — expired;`) && said.includes("Nobody decided within 24 hours") && said.includes("you may call it again") &&
     said.includes(`You made this call at ${new Date(now - 1 - DEFAULT_APPROVAL_TTL_MS).toISOString()}.`), said);
+});
+
+// ---- Raft's delivery report ---------------------------------------------------------------------------------
+
+const deliver = (w: World, op: string, body: unknown, auth?: string | null, agent = `by-raft-agent/${RAFT_ID}`, server = "") =>
+  call(w, "POST", `agents/${agent}/approvals/${op}/delivery${server}`, { body, auth });
+const delivered = (t: number) => ({ outcome: "delivered", deliveredAt: new Date(t).toISOString() });
+const noRecipient = (t: number) => ({ outcome: "no_recipient", checkedAt: new Date(t).toISOString() });
+const recorded = (w: World, op: string) => { const r = row(w, op); return r.delivery_outcome === null ? null : `${r.delivery_outcome}@${r.delivery_at}`; };
+/** A hold that expired at `endedAt`: deadline there, then the alarm's sweep. */
+async function expiredHold(w: World, endedAt: number) {
+  const op = await hold(w);
+  w.raw.sql.exec("UPDATE approvals SET created_at = ?, expires_at = ? WHERE operation_id = ?", endedAt - DEFAULT_APPROVAL_TTL_MS, endedAt, op);
+  await w.D.alarm();
+  must(row(w, op).state === "expired", `not expired: ${show(row(w, op))}`);
+  return op;
+}
+
+await check("delivery: refused exactly where decide is refused: no token, a forged one, another tenant, another origin, a platform token without the server", async () => {
+  const w = await world();
+  const op = await hold(w);
+  const p = await platformAgent(w);
+  const t = Date.now();
+  // The same request through both routes, so a difference in how they are authorised shows as a difference here.
+  const cases: Array<[string, string | null, string, string]> = [
+    ["no token", null, `by-raft-agent/${RAFT_ID}`, ""],
+    ["a forged token", newProviderToken(), `by-raft-agent/${RAFT_ID}`, ""],
+    ["another tenant's token", w.other, `by-raft-agent/${RAFT_ID}`, ""],
+    ["another origin's platform token, this agent's server", w.elsewhere, `by-raft-agent/${RAFT_ID}`, "?raftServerId=srv-1"],
+    ["another origin's platform token, a platform agent", w.elsewhere, "by-raft-agent/01JPLATFORM", "?raftServerId=srv-1"],
+    ["a platform token with no server", w.platform, "by-raft-agent/01JPLATFORM", ""],
+  ];
+  for (const [name, auth, agent, server] of cases) {
+    const target = agent.endsWith("01JPLATFORM") ? p.op : op;
+    const d = await call(w, "POST", `agents/${agent}/approvals/${target}/decide${server}`, { body: { decision: "approve", decidedBy: OWNER }, auth });
+    const r = await deliver(w, target, delivered(t), auth, agent, server);
+    must(r.status === d.status && [401, 404, 422].includes(r.status), `${name}: delivery ${r.status} ${r.text}, decide ${d.status} ${d.text}`);
+    // Raft stops on a 404 only with this code, and an agent it cannot see is one it should stop on.
+    if (r.status === 404) must(r.body.error.code === "approval_not_found", `${name}: ${r.text}`);
+    if (r.status === 401) must(r.body.error.code === d.body.error.code, `${name}: ${r.text} vs ${d.text}`);
+  }
+  must(recorded(w, op) === null && row(w, op).state === "pending" && await p.state() === "pending", `a refused report or decision landed: ${show(row(w, op))}`);
+  // Control: the right tokens are taken, the tenant's and the agent's own origin's platform token with its server.
+  const mine = await deliver(w, op, delivered(t));
+  must(mine.status === 200 && mine.body.outcome === "delivered" && mine.body.deliveredAt === new Date(t).toISOString(), `control: ${mine.status} ${mine.text}`);
+  const plat = await deliver(w, p.op, noRecipient(t), w.platform, "raft_01JPLATFORM", "?raftServerId=srv-1");
+  must(plat.status === 200 && plat.body.outcome === "no_recipient" && plat.body.checkedAt === new Date(t).toISOString(), `platform control: ${plat.status} ${plat.text}`);
+});
+
+await check("delivery: a body that is not the contract's is 400 with a code, and records nothing", async () => {
+  const w = await world();
+  const op = await hold(w);
+  const at = new Date().toISOString();
+  const bad: Array<[string, unknown, string, string | undefined]> = [
+    ["not an object", [], "invalid", undefined],
+    ["no outcome", { deliveredAt: at }, "missing", "outcome"],
+    ["an unknown outcome", { outcome: "read", deliveredAt: at }, "invalid_outcome", "outcome"],
+    ["delivered without deliveredAt", { outcome: "delivered" }, "missing", "deliveredAt"],
+    ["no_recipient without checkedAt", { outcome: "no_recipient" }, "missing", "checkedAt"],
+    ["delivered with checkedAt", { outcome: "delivered", checkedAt: at }, "invalid", "checkedAt"],
+    ["an approver named", { outcome: "delivered", deliveredAt: at, approver: "u-1" }, "invalid", "approver"],
+    ["a card id", { outcome: "delivered", deliveredAt: at, cardId: "c-1" }, "invalid", "cardId"],
+    ["a date without a time", { outcome: "delivered", deliveredAt: "2026-11-04" }, "invalid_timestamp", "deliveredAt"],
+    ["a time without an offset", { outcome: "delivered", deliveredAt: "2026-11-04T10:00:00" }, "invalid_timestamp", "deliveredAt"],
+    ["a number", { outcome: "delivered", deliveredAt: Date.now() }, "invalid_timestamp", "deliveredAt"],
+    ["month 13", { outcome: "no_recipient", checkedAt: "2026-13-04T10:00:00Z" }, "invalid_timestamp", "checkedAt"],
+  ];
+  for (const [name, body, code, param] of bad) {
+    const r = await deliver(w, op, body);
+    must(r.status === 400 && r.body.error.code === code && r.body.error.param === param, `${name}: ${r.status} ${r.text}`);
+  }
+  must(recorded(w, op) === null, `a refused body was recorded: ${recorded(w, op)}`);
+});
+
+await check("delivery: delivered is first-wins, and a no_recipient after it is answered with the delivered and changes nothing", async () => {
+  const w = await world();
+  const op = await hold(w);
+  const t1 = Date.now() - 5_000, t2 = Date.now();
+  const first = await deliver(w, op, delivered(t1));
+  must(first.status === 200 && show(first.body) === show({ outcome: "delivered", deliveredAt: new Date(t1).toISOString() }), first.text);
+  const second = await deliver(w, op, delivered(t2));
+  must(second.status === 200 && second.body.deliveredAt === new Date(t1).toISOString(), `a second delivered moved it: ${second.text}`);
+  const none = await deliver(w, op, noRecipient(t2));
+  must(none.status === 200 && show(none.body) === show({ outcome: "delivered", deliveredAt: new Date(t1).toISOString() }), `no_recipient over delivered: ${none.text}`);
+  must(recorded(w, op) === `delivered@${t1}`, `row: ${recorded(w, op)}`);
+  // The read view says what is recorded.
+  const listed = await call(w, "GET", `agents/${A}/approvals`);
+  must(show(listed.body.approvals[0].delivery) === show({ outcome: "delivered", at: new Date(t1).toISOString() }), show(listed.body.approvals[0]));
+});
+
+await check("delivery: no_recipient keeps its first time, a delivered after it replaces it, and the provider copy follows", async () => {
+  const w = await world();
+  const op = await hold(w);
+  await w.D.alarm();
+  must(JSON.parse(indexRow(w, op).item).delivery === null, `copy before any report: ${indexRow(w, op).item}`);
+  const c1 = Date.now() - 9_000, c2 = Date.now() - 8_000, d1 = Date.now() - 1_000;
+  must((await deliver(w, op, noRecipient(c1))).body.checkedAt === new Date(c1).toISOString(), "first no_recipient");
+  const again = await deliver(w, op, noRecipient(c2));
+  must(again.status === 200 && again.body.checkedAt === new Date(c1).toISOString(), `a second no_recipient moved it: ${again.text}`);
+  must(show(JSON.parse(indexRow(w, op).item).delivery) === show({ outcome: "no_recipient", at: new Date(c1).toISOString() }), `copy: ${indexRow(w, op).item}`);
+  const over = await deliver(w, op, delivered(d1));
+  must(over.status === 200 && show(over.body) === show({ outcome: "delivered", deliveredAt: new Date(d1).toISOString() }), `delivered over no_recipient: ${over.text}`);
+  must(recorded(w, op) === `delivered@${d1}`, `row: ${recorded(w, op)}`);
+  must(show(JSON.parse(indexRow(w, op).item).delivery) === show({ outcome: "delivered", at: new Date(d1).toISOString() }), `copy: ${indexRow(w, op).item}`);
+});
+
+await check("delivery: after the hold ended, a report within 60 s of the end is recorded; later is 409 approval_not_pending and records nothing", async () => {
+  const w = await world();
+  const end = Date.now() - 10 * 60_000;
+  const op = await expiredHold(w, end);
+  const notice = row(w, op).notice;
+  must(String(notice).includes("whether it reached an approver is not known"), `notice at expiry: ${notice}`);
+  const late = await deliver(w, op, delivered(end + 60_001));
+  must(late.status === 409 && late.body.error.code === "approval_not_pending" && late.body.error.param === "deliveredAt", `${late.status} ${late.text}`);
+  const lateNone = await deliver(w, op, noRecipient(end + 60_001));
+  must(lateNone.status === 409 && lateNone.body.error.code === "approval_not_pending", `no_recipient: ${lateNone.status} ${lateNone.text}`);
+  must(recorded(w, op) === null, `a late report was recorded: ${recorded(w, op)}`);
+  const inTime = await deliver(w, op, delivered(end + 60_000));
+  must(inTime.status === 200 && inTime.body.deliveredAt === new Date(end + 60_000).toISOString(), `within the skew: ${inTime.status} ${inTime.text}`);
+  must(recorded(w, op) === `delivered@${end + 60_000}`, `row: ${recorded(w, op)}`);
+  // The record moves; the notice the expiry wrote does not.
+  must(row(w, op).notice === notice, `the notice was rewritten: ${row(w, op).notice}`);
+  const listed = await call(w, "GET", `agents/${A}/approvals?status=expired`);
+  must(listed.body.approvals[0].description.startsWith("Expired: it reached an approver, but nobody decided in time"), listed.body.approvals[0].description);
+  // A repeat of what is recorded is answered with it, however late it comes.
+  const repeat = await deliver(w, op, delivered(end + DAY));
+  must(repeat.status === 200 && repeat.body.deliveredAt === new Date(end + 60_000).toISOString(), `repeat: ${repeat.status} ${repeat.text}`);
+  // A decided hold ends at its decision.
+  const op2 = await hold(w);
+  must((await decide(w, op2, "deny")).status === 200, "deny");
+  const decidedAt = Number(row(w, op2).decided_at);
+  must((await deliver(w, op2, noRecipient(decidedAt + 61_000))).status === 409, "after a decision, beyond the skew");
+  must((await deliver(w, op2, noRecipient(decidedAt + 59_000))).status === 200 && recorded(w, op2) === `no_recipient@${decidedAt + 59_000}`, "after a decision, within the skew");
+});
+
+await check("delivery: an unknown hold, another agent's hold, and an unknown agent are 404 approval_not_found, in decide's error format", async () => {
+  const w = await world();
+  const other = await secondAgent(w);
+  const at = Date.now();
+  for (const [name, op, agent] of [["unknown hold", "op_doesnotexist000000", `by-raft-agent/${RAFT_ID}`], ["another agent's hold", other.op, `by-raft-agent/${RAFT_ID}`],
+    ["unknown agent", "op_doesnotexist000000", "by-raft-agent/01JNOBODY"], ["an operation id out of shape", "op%20bad", `by-raft-agent/${RAFT_ID}`]] as const) {
+    const r = await deliver(w, op, delivered(at), undefined, agent);
+    must(r.status === 404 && r.body.error.code === "approval_not_found" && typeof r.body.error.message === "string" && Object.keys(r.body).length === 1,
+      `${name}: ${r.status} ${r.text}`);
+  }
+  const theirs = (w.objects.get(agentObjectName(T, other.B)) as any).runtime();
+  must((await theirs.store.getApproval(T, other.op)).delivery === null, "another agent's hold took the report");
+});
+
+await check("notice: an expiry is worded by what was recorded then: reached an approver, reached nobody, or not known", async () => {
+  const w = await world();
+  const now = Date.now();
+  const opD = await hold(w), opN = await hold(w, "second"), opU = await hold(w, "third");
+  // Held earlier with the default deadline, so each expires at the next sweep.
+  for (const op of [opD, opN, opU]) {
+    w.raw.sql.exec("UPDATE approvals SET created_at = ?, expires_at = ? WHERE operation_id = ?", now - 1 - DEFAULT_APPROVAL_TTL_MS, now - 1, op);
+  }
+  must((await deliver(w, opD, delivered(now - DAY + 1000))).status === 200, "delivered");
+  must((await deliver(w, opN, noRecipient(now - DAY + 1000))).status === 200, "no_recipient");
+  await w.D.alarm();
+  const made = `You made this call at ${new Date(now - 1 - DEFAULT_APPROVAL_TTL_MS).toISOString()}. `;
+  const notices = [opD, opN, opU].map((op) => String(row(w, op).notice));
+  must(notices[0]!.endsWith(made + "It reached an approver, but nobody decided within 24 hours, so it expired and nothing was run. " +
+    "If it still matters you may call it again, which asks for a new approval."), `delivered: ${notices[0]}`);
+  must(notices[1]!.endsWith(made + "It never reached any approver, because Raft had nobody to send it to, so it expired after 24 hours and nothing was run. " +
+    "If it still matters you may call it again, which asks for a new approval. That one reaches nobody either unless Raft has someone to send it to by then."),
+    `no_recipient: ${notices[1]}`);
+  must(notices[2]!.endsWith(made + "Nobody decided within 24 hours, so it expired and nothing was run; whether it reached an approver is not known. " +
+    "If it still matters you may call it again, which asks for a new approval."), `nothing recorded: ${notices[2]}`);
+  // "Reached nobody" is said on a recorded no_recipient and on nothing else.
+  must(notices.filter((n) => n.includes("never reached")).length === 1, show(notices));
+  const base = { operationId: "op_x", mountAlias: "m", tool: "t", createdAt: 0, expiresAt: 3_600_000 };
+  must(!expiredNotice({ ...base, delivery: null }).includes("never reached") && !expiredNotice({ ...base, delivery: { outcome: "delivered", at: 1 } }).includes("never reached"),
+    "never reached without a no_recipient");
+  const listed = (await call(w, "GET", `agents/${A}/approvals?status=expired`)).body.approvals as any[];
+  const desc = (op: string) => listed.find((a) => a.operationId === op).description as string;
+  must(desc(opD).startsWith("Expired: it reached an approver") && desc(opN).startsWith("Expired: it never reached any approver, because Raft had nobody")
+    && desc(opU).endsWith("whether it reached an approver is not known."), show(listed.map((a) => a.description)));
+});
+
+await check("wording: no notice, description, error or doc says an expired hold was denied", async () => {
+  const w = await world();
+  const op = await expiredHold(w, Date.now() - 1);
+  const late = await decide(w, op, "approve");
+  const listed = await call(w, "GET", `agents/${A}/approvals`);
+  const texts = [String(row(w, op).notice), late.text, listed.text];
+  for (const f of ["src/runtime/approval-notice.ts", "cf/src/approvals.ts", "cf/src/provision/handlers.ts", "docs/raft-approvals.md"]) {
+    texts.push(readFileSync(new URL(`../${f}`, import.meta.url), "utf8"));
+  }
+  must(texts.every((t) => !t.includes("denied as expired") && !t.includes("denied as `expired`")), texts.find((t) => t.includes("denied as"))?.slice(0, 300) ?? "");
+  must(late.status === 409 && late.body.error.message.includes("nothing was run"), late.text);
+});
+
+await check("hand-off: the approval.requested hint is recorded accepted, failed, or not_sent when this deployment has no hint channel", async () => {
+  const sent = await world({ hints: true });
+  const opA = await hold(sent);
+  must(row(sent, opA).handoff === null, "a hand-off recorded before it was tried");
+  await sent.D.alarm();
+  must(row(sent, opA).handoff === "accepted", `accepted: ${row(sent, opA).handoff}`);
+  hintStatus = 503;
+  let opF = "";
+  try { opF = await hold(sent, "second"); await sent.D.alarm(); } finally { hintStatus = 200; }
+  must(row(sent, opF).handoff === "failed", `failed: ${row(sent, opF).handoff}`);
+  // A retry that lands is the hand-off's last word.
+  sent.raw.sql.exec("UPDATE approval_publish SET next_at = 0 WHERE operation_id = ?", opF);
+  await sent.D.alarm();
+  must(row(sent, opF).handoff === "accepted", `after the retry: ${row(sent, opF).handoff}`);
+  // A later state's hint is not the hand-off.
+  hintStatus = 503;
+  try { must((await decide(sent, opA, "deny")).status === 200, "deny"); await sent.D.alarm(); } finally { hintStatus = 200; }
+  must(row(sent, opA).handoff === "accepted", `a decided hint's failure moved it: ${row(sent, opA).handoff}`);
+  const quiet = await world();
+  const opN = await hold(quiet);
+  await quiet.D.alarm();
+  must(row(quiet, opN).handoff === "not_sent", `not_sent: ${row(quiet, opN).handoff}`);
+  const listed = await call(quiet, "GET", `agents/${A}/approvals`);
+  must(listed.body.approvals[0].handoff === "not_sent" && listed.body.approvals[0].delivery === null, show(listed.body.approvals[0]));
 });
 
 // ---- publishing: the D1 copy and the hint -------------------------------------------------------------------
@@ -907,6 +1125,19 @@ await check("migration: an older approvals table gets deadlines for pending hold
   await sq.init();
   must((await sq.getApproval("t", "op_old_pending"))?.expiresAt === 1000 + DEFAULT_APPROVAL_TTL_MS, "sqlite pending");
   must((await sq.untoldApprovals("t")).length === 0, "sqlite would announce an old decision");
+  // An older table gains the delivery columns, empty ("not known"), and both stores apply one rule to them.
+  for (const [name, st] of [["DO", store], ["sqlite", sq]] as const) {
+    must((await st.getApproval("t", "op_old_pending"))?.delivery === null && (await st.getApproval("t", "op_old_pending"))?.handoff === null, `${name}: an old hold has a delivery`);
+    const none = await st.recordApprovalDelivery("t", "op_old_pending", { outcome: "no_recipient", at: 5000 });
+    must(none.ok && none.changed && show(none.record.delivery) === show({ outcome: "no_recipient", at: 5000 }), `${name} no_recipient: ${show(none)}`);
+    const over = await st.recordApprovalDelivery("t", "op_old_pending", { outcome: "delivered", at: 6000 });
+    must(over.ok && over.changed && over.record.delivery?.outcome === "delivered", `${name} delivered over no_recipient: ${show(over)}`);
+    const kept = await st.recordApprovalDelivery("t", "op_old_pending", { outcome: "delivered", at: 7000 });
+    must(kept.ok && !kept.changed && kept.record.delivery?.at === 6000, `${name} first-wins: ${show(kept)}`);
+    const late = await st.recordApprovalDelivery("t", "op_old_denied", { outcome: "delivered", at: 2000 + 60_001 });
+    must(!late.ok && late.reason === "late" && (await st.getApproval("t", "op_old_denied"))?.delivery === null, `${name} late: ${show(late)}`);
+    must((await st.recordApprovalDelivery("t", "op_nope", { outcome: "delivered", at: 1 })).ok === false, `${name} unknown`);
+  }
 });
 
 globalThis.fetch = realFetch;
