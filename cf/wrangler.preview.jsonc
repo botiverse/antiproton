@@ -65,6 +65,11 @@
     "USER_KEY_PROVIDERS": "kimi-code",
     "ARTIFACT_BUCKET": "antiproton-preview-artifacts",
     "HOOK_ORIGIN": "https://preview.antiproton.ai",
+    // Where approval hints go on the Raft origin that made the agent (cf/src/approvals.ts `hintTarget`), signed with the
+    // Worker secret RAFT_APPROVAL_SIGNING_KEY (docs/raft-approvals.md). Raft staging's route, read from its running code;
+    // its verifying public key is the preview one, key id 250de9a859da8887. Unset in cf/wrangler.jsonc until Raft
+    // production holds that deployment's public key.
+    "RAFT_APPROVAL_CALLBACK_PATH": "/api/integrations/antiproton/approvals",
     // Open to look at until the Access application exists; the write routes
     // refuse the anonymous viewer regardless, and there are no keys to spend.
     "UI_ALLOW_ANONYMOUS": "1",
