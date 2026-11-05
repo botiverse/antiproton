@@ -11,6 +11,8 @@
 import { register } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { createHash, generateKeyPairSync } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
@@ -19,7 +21,7 @@ import { d1ProviderTokens } from "../cf/src/control-plane.ts";
 import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts";
 import { sessionCookieFor } from "../cf/src/auth.ts";
 import { PROVIDER_HOME } from "../cf/src/provision/steps.ts";
-import { verifyHint, SIGNATURE_HEADER, TIMESTAMP_HEADER, hintTarget, publishBackoffMs } from "../cf/src/approvals.ts";
+import { verifyHint, signHint, importSigningKey, hintKeyId, SIGNATURE_HEADER, TIMESTAMP_HEADER, hintTarget, publishBackoffMs } from "../cf/src/approvals.ts";
 import { expiredNotice } from "../src/runtime/approval-notice.ts";
 import { DurableObjectStore } from "../src/store/durable-object.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
@@ -48,7 +50,14 @@ const RAFT_CRED = "sk_agent_" + "R".repeat(32);
 /** A credential-shaped value the agent put in its arguments: the card must never show it. */
 const LEAKED = "sk_agent_" + "L".repeat(32);
 const SESSION = "s".repeat(32);
-const HINT_SECRET = "hint-secret-" + "h".repeat(32);
+/** A fresh Ed25519 key for the world's hints, as RAFT_APPROVAL_SIGNING_KEY holds it, and Raft's {key id: public key}. */
+function newHintKey() {
+  const jwk = generateKeyPairSync("ed25519").privateKey.export({ format: "jwk" });
+  const pub = Buffer.from(jwk.x!, "base64url");
+  return { secret: JSON.stringify({ kty: jwk.kty, crv: jwk.crv, d: jwk.d, x: jwk.x }), keyId: createHash("sha256").update(pub).digest("hex").slice(0, 16), pub: pub.toString("base64") };
+}
+const HINT_KEY = newHintKey(), OTHER_KEY = newHintKey();
+const HINT_KEYS = { [HINT_KEY.keyId]: HINT_KEY.pub };
 const USAGE = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 
 /** D1 as node:sqlite, with every migration in cf/migrations applied (test/provision-model.ts). */
@@ -114,7 +123,7 @@ async function world(opts: { hints?: boolean; keepTrace?: boolean } = {}) {
     ARTIFACT_BUCKET: "b", CONTROL_DB: DB, HARNESS_MODEL: "deepseek-flash", DEEPSEEK_BASE_URL: "https://api.deepseek.com",
     DEEPSEEK_API_KEY: "dk-test-key", AUTOMATION_TOKEN: AUTOMATION, SESSION_SECRET: SESSION,
     SECRET_KEK: Buffer.from(new Uint8Array(32).fill(3)).toString("base64"),
-    ...(opts.hints ? { RAFT_APPROVAL_CALLBACK_PATH: "/hooks/antiproton/approvals", RAFT_APPROVAL_CALLBACK_SECRET: HINT_SECRET } : {}),
+    ...(opts.hints ? { RAFT_APPROVAL_CALLBACK_PATH: "/hooks/antiproton/approvals", RAFT_APPROVAL_SIGNING_KEY: HINT_KEY.secret } : {}),
     AGENT: { idFromName: (n: string) => n, get: (n: string) => objects.get(n) ?? another(n) },
   };
   const D = new AgentDO(ctx as never, env as never);
@@ -667,10 +676,12 @@ await check("publish: the hold and each change reach D1, and a signed hint names
   const body = JSON.parse(h[0]!.body);
   must(body.type === "approval.requested" && body.operationId === op && body.providerAgentId === A && body.raftAgentId === RAFT_ID && body.status === "pending", h[0]!.body);
   must(!h[0]!.body.includes("plan") && !h[0]!.body.includes(LEAKED), `the hint carries more than ids: ${h[0]!.body}`);
-  const ok = await verifyHint(HINT_SECRET, { signature: h[0]!.headers.get(SIGNATURE_HEADER), timestamp: h[0]!.headers.get(TIMESTAMP_HEADER) }, h[0]!.body, Math.floor(Date.now() / 1000));
+  const sent = { signature: h[0]!.headers.get(SIGNATURE_HEADER), timestamp: h[0]!.headers.get(TIMESTAMP_HEADER) };
+  must(sent.signature?.startsWith(`keyid=${HINT_KEY.keyId}; ed25519=`), `the header: ${sent.signature}`);
+  const ok = await verifyHint(HINT_KEYS, sent, h[0]!.body, Math.floor(Date.now() / 1000));
   must(ok, "the hint's signature does not verify");
-  must(!(await verifyHint("another-secret", { signature: h[0]!.headers.get(SIGNATURE_HEADER), timestamp: h[0]!.headers.get(TIMESTAMP_HEADER) }, h[0]!.body, Math.floor(Date.now() / 1000))), "a wrong secret verified");
-  must(!(await verifyHint(HINT_SECRET, { signature: h[0]!.headers.get(SIGNATURE_HEADER), timestamp: h[0]!.headers.get(TIMESTAMP_HEADER) }, h[0]!.body, Math.floor(Date.now() / 1000) + 301)), "a stale hint verified");
+  must(!(await verifyHint({ [HINT_KEY.keyId]: OTHER_KEY.pub }, sent, h[0]!.body, Math.floor(Date.now() / 1000))), "another public key verified");
+  must(!(await verifyHint(HINT_KEYS, sent, h[0]!.body, Math.floor(Date.now() / 1000) + 301)), "a stale hint verified");
   // Raft is down: the decision still lands, D1 still moves, and the hint is kept with when to retry.
   // (The approve → executed path's hints are checked in the case after this one.)
   hintStatus = 503;
@@ -701,7 +712,7 @@ await check("publish: an approval sends a hint for each transition, approved the
   const types = hints().map((h) => JSON.parse(h.body)).filter((b) => b.operationId === op).map((b) => `${b.type}/${b.status}`);
   must(show(types) === show(["approval.decided/approved", "approval.executed/executed"]), `hints: ${show(types)}`);
   for (const h of hints()) {
-    must(await verifyHint(HINT_SECRET, { signature: h.headers.get(SIGNATURE_HEADER), timestamp: h.headers.get(TIMESTAMP_HEADER) }, h.body, Math.floor(Date.now() / 1000)), "unsigned hint");
+    must(await verifyHint(HINT_KEYS, { signature: h.headers.get(SIGNATURE_HEADER), timestamp: h.headers.get(TIMESTAMP_HEADER) }, h.body, Math.floor(Date.now() / 1000)), "unsigned hint");
   }
   must(indexRow(w, op)?.status === "executed" && JSON.parse(indexRow(w, op).item).outcome !== null, `index: ${show(indexRow(w, op))}`);
   // A late write of an earlier state does not move the copy back.
@@ -712,12 +723,17 @@ await check("publish: an approval sends a hint for each transition, approved the
   must(indexRow(w, op).status === "executed", "the copy moved back to approved");
 });
 
-await check("publish: hints go only to the agent's own Raft origin, and only when both the path and the secret are set", () => {
+await check("publish: hints go only to the agent's own Raft origin, and only when both the path and the signing key are set", () => {
+  const k = HINT_KEY.secret;
   must(hintTarget({}, ORIGIN) === null, "unset");
-  must(hintTarget({ RAFT_APPROVAL_CALLBACK_PATH: "/x" }, ORIGIN) === null, "no secret");
-  must(hintTarget({ RAFT_APPROVAL_CALLBACK_PATH: "https://evil.example/x", RAFT_APPROVAL_CALLBACK_SECRET: "s" }, ORIGIN) === null, "an absolute URL");
-  must(hintTarget({ RAFT_APPROVAL_CALLBACK_PATH: "//evil.example/x", RAFT_APPROVAL_CALLBACK_SECRET: "s" }, ORIGIN) === null, "a scheme-relative URL");
-  must(hintTarget({ RAFT_APPROVAL_CALLBACK_PATH: "/x", RAFT_APPROVAL_CALLBACK_SECRET: "s" }, ORIGIN)?.url === `${ORIGIN}/x`, "the agent's own origin");
+  must(hintTarget({ RAFT_APPROVAL_CALLBACK_PATH: "/x" }, ORIGIN) === null, "no signing key");
+  must(hintTarget({ RAFT_APPROVAL_CALLBACK_PATH: "/x", RAFT_APPROVAL_SIGNING_KEY: " " }, ORIGIN) === null, "a blank signing key");
+  must(hintTarget({ RAFT_APPROVAL_SIGNING_KEY: k }, ORIGIN) === null, "no path");
+  // The secret it replaced is not read at all: a deployment that still has it sends nothing.
+  must(hintTarget({ RAFT_APPROVAL_CALLBACK_PATH: "/x", RAFT_APPROVAL_CALLBACK_SECRET: "s" } as never, ORIGIN) === null, "the old HMAC secret");
+  must(hintTarget({ RAFT_APPROVAL_CALLBACK_PATH: "https://evil.example/x", RAFT_APPROVAL_SIGNING_KEY: k }, ORIGIN) === null, "an absolute URL");
+  must(hintTarget({ RAFT_APPROVAL_CALLBACK_PATH: "//evil.example/x", RAFT_APPROVAL_SIGNING_KEY: k }, ORIGIN) === null, "a scheme-relative URL");
+  must(hintTarget({ RAFT_APPROVAL_CALLBACK_PATH: "/x", RAFT_APPROVAL_SIGNING_KEY: k }, ORIGIN)?.url === `${ORIGIN}/x`, "the agent's own origin");
 });
 
 await check("provider-wide list: scoped by token, paginated, filtered by status and updatedSince; no other provider's rows", async () => {
@@ -856,16 +872,137 @@ await check("policy at run time: a mount switched to deny after the hold refuses
   must(row(w, op3).state === "failed", `console path's row: ${row(w, op3).state}`);
 });
 
-await check("hints: a tampered body, a tampered signature, or no timestamp do not verify", async () => {
+await check("hints: a tampered body, a tampered signature, another timestamp, or no timestamp do not verify", async () => {
   const ts = Math.floor(Date.now() / 1000);
   const body = JSON.stringify({ type: "approval.requested", operationId: "op_1", providerAgentId: A, raftAgentId: RAFT_ID, raftServerId: "srv-1", status: "pending" });
-  const { signHint } = await import("../cf/src/approvals.ts");
-  const sig = await signHint(HINT_SECRET, ts, body);
-  must(await verifyHint(HINT_SECRET, { signature: sig, timestamp: String(ts) }, body, ts), "control: the genuine hint does not verify");
-  must(!(await verifyHint(HINT_SECRET, { signature: sig, timestamp: String(ts) }, body.replace("op_1", "op_2"), ts)), "a changed body verified");
-  must(!(await verifyHint(HINT_SECRET, { signature: sig.replace(/.$/, (c) => (c === "0" ? "1" : "0")), timestamp: String(ts) }, body, ts)), "a changed signature verified");
-  must(!(await verifyHint(HINT_SECRET, { signature: sig, timestamp: String(ts + 1) }, body, ts)), "another timestamp verified");
-  must(!(await verifyHint(HINT_SECRET, { signature: sig, timestamp: null }, body, ts)), "no timestamp verified");
+  const { key, keyId } = await importSigningKey(HINT_KEY.secret);
+  must(keyId === HINT_KEY.keyId, `the key id from the secret: ${keyId} (node: ${HINT_KEY.keyId})`);
+  const sig = await signHint(key, keyId, ts, body);
+  must(await verifyHint(HINT_KEYS, { signature: sig, timestamp: String(ts) }, body, ts), "control: the genuine hint does not verify");
+  must(!(await verifyHint(HINT_KEYS, { signature: sig, timestamp: String(ts) }, body.replace("op_1", "op_2"), ts)), "a changed body verified");
+  // A changed byte of the signature: a character in the middle, which carries six bits of it.
+  const at = sig.indexOf("ed25519=") + 8 + 40;
+  const flipped = sig.slice(0, at) + (sig[at] === "A" ? "B" : "A") + sig.slice(at + 1);
+  must(flipped !== sig, "control: the signature was not changed");
+  must(!(await verifyHint(HINT_KEYS, { signature: flipped, timestamp: String(ts) }, body, ts)), "a changed signature verified");
+  // The last character before "==" carries two bits of the signature and four of padding: one that differs only in
+  // the padding decodes to the same bytes, and is refused because it is not the canonical encoding.
+  const last = sig.at(-3)!, ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const loose = sig.slice(0, -3) + ALPHA[ALPHA.indexOf(last) ^ 1] + "==";
+  must(Buffer.from(loose.split("ed25519=")[1]!, "base64").equals(Buffer.from(sig.split("ed25519=")[1]!, "base64")), "control: the loose encoding decodes differently");
+  must(!(await verifyHint(HINT_KEYS, { signature: loose, timestamp: String(ts) }, body, ts)), "a non-canonical encoding of the signature verified");
+  must(!(await verifyHint(HINT_KEYS, { signature: sig, timestamp: String(ts + 1) }, body, ts)), "another timestamp verified");
+  must(!(await verifyHint(HINT_KEYS, { signature: sig, timestamp: null }, body, ts)), "no timestamp verified");
+  must(!(await verifyHint(HINT_KEYS, { signature: null, timestamp: String(ts) }, body, ts)), "no signature verified");
+  must(!(await verifyHint({}, { signature: sig, timestamp: String(ts) }, body, ts)), "verified with no keys configured");
+});
+
+await check("hints: a malformed signing key fails the hint without quoting the key", async () => {
+  const notJson = "MC4CAQAwBQYDK2VwBCIEI" + "secretmaterial".repeat(3);
+  for (const bad of [notJson, '{"kty":"RSA"}', '{"kty":"OKP","crv":"Ed25519","x":"' + HINT_KEY.pub + '"}']) {
+    let msg = "";
+    try { await importSigningKey(bad); } catch (e) { msg = String((e as Error).message); }
+    must(msg.startsWith("RAFT_APPROVAL_SIGNING_KEY is not"), `${bad.slice(0, 10)}: ${msg}`);
+    must(!msg.includes("secretmaterial") && !msg.includes("MC4C"), `the error quotes the key: ${msg}`);
+  }
+});
+
+await check("hints: the timestamp window is 300 s either way, and a hint outside it is refused though its signature is good", async () => {
+  const ts = 1_800_000_000;
+  const body = '{"type":"approval.expired"}';
+  const { key, keyId } = await importSigningKey(HINT_KEY.secret);
+  const h = { signature: await signHint(key, keyId, ts, body), timestamp: String(ts) };
+  must(await verifyHint(HINT_KEYS, h, body, ts + 300) && await verifyHint(HINT_KEYS, h, body, ts - 300), "control: the window's edges were refused");
+  must(!(await verifyHint(HINT_KEYS, h, body, ts + 301)), "a hint 301 s old verified");
+  must(!(await verifyHint(HINT_KEYS, h, body, ts - 301)), "a hint 301 s ahead verified");
+});
+
+await check("hints: the key id picks the key; an unknown one is refused and never tried against the configured keys", async () => {
+  const ts = Math.floor(Date.now() / 1000);
+  const body = '{"type":"approval.decided"}';
+  const { key } = await importSigningKey(HINT_KEY.secret);
+  // Signed with the configured key but naming another id: the signature is good under HINT_KEYS' only key, so only
+  // the key-id lookup can refuse it.
+  const unknownId = OTHER_KEY.keyId;
+  const sig = await signHint(key, unknownId, ts, body);
+  must(await verifyHint({ [unknownId]: HINT_KEY.pub }, { signature: sig, timestamp: String(ts) }, body, ts), "control: the signature is not good under the right public key");
+  must(!(await verifyHint(HINT_KEYS, { signature: sig, timestamp: String(ts) }, body, ts)), "an unknown key id verified against a configured key");
+  // A wrong key id that is configured, for another key: refused too.
+  must(!(await verifyHint({ ...HINT_KEYS, [unknownId]: OTHER_KEY.pub }, { signature: sig, timestamp: String(ts) }, body, ts)), "verified with the key the id names, which did not sign");
+  // Rotation: two keys configured, each hint verifies under the one its id names.
+  const { key: k2, keyId: id2 } = await importSigningKey(OTHER_KEY.secret);
+  const both = { ...HINT_KEYS, [OTHER_KEY.keyId]: OTHER_KEY.pub };
+  must(await verifyHint(both, { signature: await signHint(k2, id2, ts, body), timestamp: String(ts) }, body, ts), "the new key, during a rotation");
+  must(await verifyHint(both, { signature: await signHint(key, HINT_KEY.keyId, ts, body), timestamp: String(ts) }, body, ts), "the old key, during a rotation");
+  // Ids that are object properties rather than configured keys.
+  for (const id of ["__proto__", "constructor", "toString"]) {
+    must(!(await verifyHint(HINT_KEYS, { signature: sig.replace(`keyid=${unknownId}`, `keyid=${id}`), timestamp: String(ts) }, body, ts)), `keyid=${id} verified`);
+  }
+});
+
+// The vector docs/raft-approvals.md publishes ("Test vector"), for Raft to put in its own tests. TEST-ONLY KEY: it
+// is published, so it must never be configured anywhere.
+const VECTOR = {
+  privateKeyJwk: '{"kty":"OKP","crv":"Ed25519","d":"x_qwznyTeNjGjnhzhNnuUD9qNvphU0-F5iTbBiD26mw","x":"Qh0z7hW_fenoBF-qTen6HVDqIJuJq6qUsKmxxpTeaZk"}',
+  publicKey: "Qh0z7hW/fenoBF+qTen6HVDqIJuJq6qUsKmxxpTeaZk=",
+  keyId: "ed95939c506fd5c5",
+  timestamp: 1767225600,
+  body: '{"type":"approval.requested","operationId":"op_test_vector","providerAgentId":"raft_01TESTVECTOR","raftAgentId":"01TESTVECTOR","raftServerId":"srv-test","status":"pending"}',
+  header: "keyid=ed95939c506fd5c5; ed25519=HKqyRp+2SGY4L0Fpdl3JGP4j+vGq0JWTbPUYwBJpqy+VFJjTTPC47vonSyDQoU42C0MzEIW08bQ0pex6eU4CBQ==",
+};
+
+await check("hints: the published test vector reproduces exactly, and the docs carry the same values", async () => {
+  const { key, keyId } = await importSigningKey(VECTOR.privateKeyJwk);
+  must(keyId === VECTOR.keyId, `key id ${keyId}`);
+  must(await hintKeyId(Buffer.from(VECTOR.publicKey, "base64")) === VECTOR.keyId, "the key id from the public key alone");
+  must(createHash("sha256").update(Buffer.from(VECTOR.publicKey, "base64")).digest("hex").slice(0, 16) === VECTOR.keyId, "the key id by node:crypto");
+  const header = await signHint(key, keyId, VECTOR.timestamp, VECTOR.body);
+  must(header === VECTOR.header, `header ${header}`);
+  must(await verifyHint({ [VECTOR.keyId]: VECTOR.publicKey }, { signature: VECTOR.header, timestamp: String(VECTOR.timestamp) }, VECTOR.body, VECTOR.timestamp + 10), "the vector does not verify");
+  const doc = readFileSync(new URL("../docs/raft-approvals.md", import.meta.url), "utf8");
+  for (const v of [VECTOR.publicKey, VECTOR.keyId, String(VECTOR.timestamp), VECTOR.body, VECTOR.header]) must(doc.includes(v), `the docs do not carry ${v}`);
+  // The private half is in the docs too, as test-only, so Raft can sign as well as verify.
+  must(doc.includes(VECTOR.privateKeyJwk), "the docs do not carry the vector's private key");
+});
+
+await check("approval-signing-key.mjs: the child gets a private key that matches the printed public key, and nothing prints it", () => {
+  const dir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "signing-key-"));
+  const got = join(dir, "received");
+  const script = new URL("../cf/scripts/approval-signing-key.mjs", import.meta.url).pathname;
+  // The child stands in for `wrangler secret put`: it keeps what its stdin received, and says something on stdout
+  // the way wrangler does, which must not reach the script's own stdout.
+  const childSrc = `let s="";process.stdin.on("data",(c)=>s+=c).on("end",()=>{require("fs").writeFileSync(${JSON.stringify(got)},s);console.log("Success! Uploaded secret")})`;
+  const r = spawnSync(process.execPath, [script, "--dry-run", "--", process.execPath, "-e", childSrc], { encoding: "utf8" });
+  must(r.status === 0, `exit ${r.status}: ${r.stderr}`);
+  const lines = r.stdout.trim().split("\n");
+  must(lines.length === 2 && /^publicKey=[A-Za-z0-9+/]{43}=$/.test(lines[0]!) && /^keyId=[0-9a-f]{16}$/.test(lines[1]!), `stdout: ${r.stdout}`);
+  const pub = lines[0]!.slice("publicKey=".length), kid = lines[1]!.slice("keyId=".length);
+  must(r.stderr.includes("Success! Uploaded secret"), `the child's output was not passed on: ${r.stderr}`);
+  const received = readFileSync(got, "utf8");
+  const jwk = JSON.parse(received);
+  must(jwk.kty === "OKP" && jwk.crv === "Ed25519" && typeof jwk.d === "string" && jwk.d.length === 43, `received: ${Object.keys(jwk)}`);
+  for (const [where, out] of [["stdout", r.stdout], ["stderr", r.stderr]] as const) {
+    must(!out.includes(jwk.d), `${where} carries the private key`);
+    must(!/PRIVATE KEY|"d"\s*:|MC4CAQAwBQYDK2Vw/.test(out), `${where} carries something private-key shaped`);
+  }
+  must(Buffer.from(jwk.x, "base64url").toString("base64") === pub, "the printed public key is not the received key's");
+  must(createHash("sha256").update(Buffer.from(pub, "base64")).digest("hex").slice(0, 16) === kid, "the printed key id is not the public key's");
+  must(readdirSync(dir).length === 1, `the script left files: ${readdirSync(dir)}`);
+  return (async () => {
+    const { key, keyId } = await importSigningKey(received);
+    const ts = Math.floor(Date.now() / 1000);
+    must(keyId === kid, "the received key's id");
+    must(await verifyHint({ [kid]: pub }, { signature: await signHint(key, keyId, ts, "{}"), timestamp: String(ts) }, "{}", ts), "a hint signed with the received key does not verify with the printed public key");
+  })();
+});
+
+await check("approval-signing-key.mjs: a child that fails stores nothing, and no public key is printed", () => {
+  const script = new URL("../cf/scripts/approval-signing-key.mjs", import.meta.url).pathname;
+  const r = spawnSync(process.execPath, [script, "--dry-run", "--", process.execPath, "-e", "process.stdin.resume();process.stdin.on('end',()=>process.exit(3))"], { encoding: "utf8" });
+  must(r.status === 1 && r.stdout === "", `exit ${r.status}, stdout ${r.stdout}`);
+  must(/not stored/.test(r.stderr), `stderr: ${r.stderr}`);
+  const none = spawnSync(process.execPath, [script], { encoding: "utf8" });
+  must(none.status === 2 && none.stdout === "", `no mode: exit ${none.status}, stdout ${none.stdout}`);
 });
 
 await check("deleted agent: its rows are kept as the record of who decided what, and neither list shows them", async () => {

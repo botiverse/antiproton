@@ -638,6 +638,19 @@ It cannot see run9's egress registrations themselves, only the residue already r
 not list agents that were not provisioned (console agents). Its counts are a stock at the time read: they say what is
 there now, not when or by which build it got there.
 
+## Setting or rotating the approval hint signing key
+
+Approval hints to Raft are signed with the Ed25519 key in the Worker secret `RAFT_APPROVAL_SIGNING_KEY`
+([`raft-approvals.md`](raft-approvals.md), "The signing key"). Make and store a new one from the repository root:
+
+    node cf/scripts/approval-signing-key.mjs --put cf/wrangler.preview.jsonc
+
+(`cf/wrangler.jsonc` for production.) The private key goes only to `wrangler secret put`'s standard input; it is
+never printed or written to a file. Standard output is two lines, `publicKey=…` and `keyId=…`, printed only after
+the secret was stored. Give both to Raft as plain configuration. When rotating, Raft adds the new entry **before**
+the `--put` and removes the old one afterwards. Until Raft has the key id, its hints are refused, and the reconcile
+recovers them.
+
 ## Moving a Raft server's agents to a new tenant
 
 A platform token acts in the tenant its request's server id derives (`derivedTenant`, cf/src/provision/handlers.ts).

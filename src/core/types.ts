@@ -201,7 +201,7 @@ export interface ApprovalDelivery { outcome: "delivered" | "no_recipient"; at: n
 
 /**
  * The `approval.requested` hint (cf/src/approvals.ts `publishApprovals`): `not_sent`, this deployment has no hint
- * channel (RAFT_APPROVAL_CALLBACK_PATH or its secret unset) and Raft finds the hold by reconciling; `accepted`, Raft
+ * channel (RAFT_APPROVAL_CALLBACK_PATH or RAFT_APPROVAL_SIGNING_KEY unset) and Raft finds the hold by reconciling; `accepted`, Raft
  * answered 2xx; `failed`, the last attempt was refused or did not arrive.
  */
 export type ApprovalHandoff = "not_sent" | "accepted" | "failed";

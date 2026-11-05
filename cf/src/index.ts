@@ -237,12 +237,15 @@ export interface Env {
   APPROVAL_TTL_HOURS?: string;
   /**
    * The path on an agent's own Raft origin that is sent a signed "go pull" hint when one of its held calls changes
-   * (cf/src/approvals.ts `hintTarget`, docs/raft-approvals.md). Unset, or without RAFT_APPROVAL_CALLBACK_SECRET: no
+   * (cf/src/approvals.ts `hintTarget`, docs/raft-approvals.md). Unset, or without RAFT_APPROVAL_SIGNING_KEY: no
    * hints are sent, and Raft finds holds by reconciling `GET /provision/approvals`.
    */
   RAFT_APPROVAL_CALLBACK_PATH?: string;
-  /** The HMAC-SHA256 key the hints are signed with, shared with Raft (a Worker secret). */
-  RAFT_APPROVAL_CALLBACK_SECRET?: string;
+  /**
+   * The Ed25519 private key the hints are signed with, as a private JWK (a Worker secret, set by
+   * cf/scripts/approval-signing-key.mjs). Only antiproton holds it; Raft holds the public key as configuration.
+   */
+  RAFT_APPROVAL_SIGNING_KEY?: string;
   /** "1" opens the demo UI with no identity at all. Off by default. */
   UI_ALLOW_ANONYMOUS?: string;
   /**

@@ -59,8 +59,8 @@ are the same tokens and the same check as every other raft-agent-provider.v1 rou
   - `platform`: one token for a whole Raft deployment. The tenant is derived from the Raft server, so per-agent
     routes need `?raftServerId=<server>`.
 - **What Raft uses.** Raft uses a **platform-scoped** token for these routes.
-- **Where Raft keeps it.** Raft keeps the token in its server-side secret configuration, together with the hint
-  HMAC secret below.
+- **Where Raft keeps it.** Raft keeps the token in its server-side secret configuration. The hint's public key
+  (below) is not secret and needs no such place.
   - The token is never passed to, through or into any agent. That includes an agent's `sk_agent` credential, its
     environment and its messages.
   - An agent cannot read it.
@@ -330,7 +330,7 @@ credential, through the agent's `raft` mount. This contract adds one.
 - **Where it goes.** To the agent's own `raftOrigin` (from its provisioning record) plus antiproton's
   `RAFT_APPROVAL_CALLBACK_PATH`, for example `/api/integrations/antiproton/approvals`.
   - The origin is never configured separately, so a hint about one Raft's agents cannot go anywhere else.
-  - If either `RAFT_APPROVAL_CALLBACK_PATH` or `RAFT_APPROVAL_CALLBACK_SECRET` is unset, no hints are sent, and
+  - If either `RAFT_APPROVAL_CALLBACK_PATH` or `RAFT_APPROVAL_SIGNING_KEY` is unset, no hints are sent, and
     Raft relies on the reconcile alone.
 - **When it is sent.** After every change of a hold's state, whichever path made the change: this API, the
   antiproton console, the run, or expiry.
@@ -355,24 +355,78 @@ credential, through the agent's `raft` mount. This contract adds one.
 
   | Header | Value |
   |---|---|
-  | `X-Antiproton-Timestamp` | Unix seconds |
-  | `X-Antiproton-Signature-256` | `sha256=` followed by the lowercase hex of HMAC-SHA256(secret, `"<timestamp>.<body>"`) |
+  | `X-Antiproton-Timestamp` | Unix seconds, as decimal digits |
+  | `X-Antiproton-Signature` | `keyid=<key id>; ed25519=<signature>` (below) |
   | `X-Antiproton-Delivery-Id` | a fresh UUID for each attempt |
 
-- **Verification on Raft's side.**
+- **The signature.** Ed25519 (RFC 8032), so Raft holds only a public key and nothing secret is shared between
+  the two sides.
+  - The signed bytes are the UTF-8 of `<timestamp>.<body>`: the `X-Antiproton-Timestamp` value exactly as sent,
+    a `.`, and the raw body bytes.
+  - `<signature>` is the standard base64 (with `=` padding) of the 64-byte Ed25519 signature: 88 characters. Only
+    the canonical encoding is accepted: one whose unused padding bits are not zero is malformed.
+  - `<key id>` names the public key that verifies it: the **first 16 lowercase hex characters of SHA-256 over the
+    raw 32-byte public key**. Anyone holding the public key can recompute it (`cf/src/approvals.ts` `hintKeyId`).
+  - The header is exactly `keyid=`, the id, `; ed25519=`, the signature: one space, no other parameters, in that
+    order. Anything else is a malformed header.
+- **Verification on Raft's side.** Raft is configured with a map of key id to public key (the base64 of the raw
+  32 bytes), normally one entry, two during a rotation.
   1. Read the raw body bytes.
-  2. Reject the hint if the timestamp is more than **300 seconds** from Raft's clock, either way.
-  3. Compute the HMAC over `timestamp + "." + body` with the shared secret.
-  4. Compare it with the hex after `sha256=`, in constant time.
-  5. Answer `401` on any mismatch.
+  2. Reject the hint if the timestamp is not decimal digits, or is more than **300 seconds** from Raft's clock,
+     either way.
+  3. Parse the signature header. Reject it if it is malformed, or if its key id is not in the map. An unknown key
+     id is a rejection; never try the hint against the other configured keys.
+  4. Verify the Ed25519 signature over `timestamp + "." + body` with the public key the key id names.
+  5. Answer `401` on any failure.
   6. Otherwise answer `2xx` quickly. Then fetch with `GET /provision/agents/{providerAgentId}/approvals`, adding
      `?raftServerId=` because the token is platform-scoped. Create, update or retire the card from the item's
      `status`.
 
   `cf/src/approvals.ts` `verifyHint` is the same check as code.
-- **The secret.** `RAFT_APPROVAL_CALLBACK_SECRET` is a Worker secret on antiproton's side. Raft keeps the same
-  value in its server-side secret configuration, next to the provider token. To rotate it, set the new value on
-  both sides. Hints signed with the old value fail in between, and the reconcile recovers them.
+- **The signing key.** `RAFT_APPROVAL_SIGNING_KEY` is a Worker secret on antiproton's side, and the only place the
+  private key exists. Its value is a private Ed25519 JWK, `{"kty":"OKP","crv":"Ed25519","d":"…","x":"…"}`. JWK
+  rather than PKCS#8 because it carries the public half, so the Worker computes the key id without exporting the
+  private key.
+  - Make it with `cf/scripts/approval-signing-key.mjs`, which needs only node. It generates the keypair, writes the
+    private key to the standard input of `wrangler secret put`, and prints the public key and key id to standard
+    output. It never prints the private key and never writes it to a file:
+
+    ```sh
+    node cf/scripts/approval-signing-key.mjs --put cf/wrangler.jsonc          # production
+    node cf/scripts/approval-signing-key.mjs --put cf/wrangler.preview.jsonc  # preview
+    ```
+
+    The output is two lines, `publicKey=<base64>` and `keyId=<hex>`, printed only after `wrangler` has stored the
+    secret. `--dry-run -- <command> [args…]` pipes the private key to `<command>` instead, which is what the tests
+    use.
+  - Give Raft the two printed values. They are not secret: Raft keeps them as plain configuration.
+  - **Rotation.** Add the new public key to Raft's map next to the old one. Then run the script with `--put` to
+    replace the Worker secret. Hints already signed with the old key still verify, because each names its own key
+    id. Remove the old entry from Raft's map once the new key id is seen. Hints refused during a mistake are
+    recovered by the reconcile.
+- **Test vector.** Ed25519 signatures are deterministic, so these values are fixed. `test/raft-approvals.ts`
+  checks that antiproton reproduces them exactly, and Raft's tests can use the same values. **The private key below
+  is test-only.** It is published, so it must never be configured anywhere.
+
+  | | |
+  |---|---|
+  | Private key (JWK, test-only) | `{"kty":"OKP","crv":"Ed25519","d":"x_qwznyTeNjGjnhzhNnuUD9qNvphU0-F5iTbBiD26mw","x":"Qh0z7hW_fenoBF-qTen6HVDqIJuJq6qUsKmxxpTeaZk"}` |
+  | Public key (base64, raw 32 bytes) | `Qh0z7hW/fenoBF+qTen6HVDqIJuJq6qUsKmxxpTeaZk=` |
+  | Key id | `ed95939c506fd5c5` |
+  | `X-Antiproton-Timestamp` | `1767225600` |
+
+  Body, exactly these bytes:
+
+  ```
+  {"type":"approval.requested","operationId":"op_test_vector","providerAgentId":"raft_01TESTVECTOR","raftAgentId":"01TESTVECTOR","raftServerId":"srv-test","status":"pending"}
+  ```
+
+  Expected `X-Antiproton-Signature`:
+
+  ```
+  keyid=ed95939c506fd5c5; ed25519=HKqyRp+2SGY4L0Fpdl3JGP4j+vGq0JWTbPUYwBJpqy+VFJjTTPC47vonSyDQoU42C0MzEIW08bQ0pex6eU4CBQ==
+  ```
+
 - **Retries.** A hint not answered `2xx` within 5 seconds is retried by the agent's alarm after 30 s, then 1, 2, 4
   and 8 minutes: six attempts in all.
   - After the sixth it is dropped, and a log line `approval.hint_given_up` is written.
@@ -531,9 +585,9 @@ agent.
 ## Follow-ups (not in this version)
 
 - **A signed decider assertion from Raft.** See "The trust anchor for decisions".
-- **A hint secret per Raft origin, with two-key rotation.** Today every origin shares one
-  `RAFT_APPROVAL_CALLBACK_SECRET`, and the hint body does not name its destination. A forged hint can therefore
-  cause a pull at another origin that shares the secret. This is low impact: a pull only reads.
+- **A signing key per Raft origin.** Today every origin is sent hints signed with the one `RAFT_APPROVAL_SIGNING_KEY`,
+  and the hint body does not name its destination. A hint sent to one origin can therefore be replayed to another
+  that trusts the same public key, within the timestamp window. This is low impact: a pull only reads.
 - **The length of the result excerpt in the approved notice.** It is up to 1,500 characters of the tool's own
   result inside harness-framed text. Whether to shorten it, or to frame it differently, is still open.
 
@@ -541,6 +595,7 @@ agent.
 
 - `cf/src/provision/handlers.ts`: the routes.
 - `cf/src/approvals.ts`: the item, the D1 copy and its retention, the hint and its signature.
+- `cf/scripts/approval-signing-key.mjs`: makes the hint's signing key and stores it as the Worker secret.
 - `cf/src/index.ts` (`AgentDO`):
   - `provisionApprovals`;
   - `provisionDecide`;
