@@ -42,6 +42,7 @@
  */
 import { UNACCEPTED_TOKENS } from "../../src/usage/outbox.ts";
 import { errorMessage, SPEND_LIMIT_ERROR, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
+import { userKeyProvider } from "../../src/model/user-key.ts";
 import { logEvent } from "../../src/core/log.ts";
 import { DAY_MS, priceFor, usagePrices } from "./usage-d1.ts";
 
@@ -717,12 +718,20 @@ export function spendAdmit(gate: Pick<SpendGate, "admit">, defaultModel: string)
   return async (job: unknown, m: { tenantId: string; agentId: string; jobId: string }): Promise<AnsweredMessage | null> => {
     const verdict = await gate.admit(m.tenantId, m.agentId);
     if (verdict.admit) return null;
-    const j = job as { model?: { api?: unknown; provider?: unknown }; operatorModel?: unknown; userModel?: { model?: unknown } } | null;
-    return refusalAnswer(verdict.text, m.jobId, {
+    const j = job as { model?: { api?: unknown; provider?: unknown }; operatorModel?: unknown; userModel?: { model?: unknown; provider?: unknown } } | null;
+    // On the owner's own key the refusal is ours, not their vendor's: said first, so it is not read as their quota.
+    const own = j?.userModel ? `${ownKeySpendPrefix(String(j.userModel.provider ?? ""))} ` : "";
+    return refusalAnswer(`${own}${verdict.text}`, m.jobId, {
       api: String(j?.model?.api ?? "offloaded"), provider: String(j?.model?.provider ?? "openai-compatible"),
       id: String(j?.operatorModel ?? j?.userModel?.model ?? defaultModel),
     });
   };
+}
+
+/** What a spend refusal of a call on the owner's own key opens with: whose limit it is, and whose it is not. */
+export function ownKeySpendPrefix(provider: string): string {
+  const label = userKeyProvider(provider)?.label ?? "your model provider";
+  return `This is this deployment's daily limit on the compute it pays for (this agent's turns, tools and containers), not your ${label} quota: the model calls on your key cost it nothing, but the work around them does.`;
 }
 
 /**

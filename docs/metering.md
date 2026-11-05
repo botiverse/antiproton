@@ -259,13 +259,20 @@ still runs our queue, the agent's object, and whatever tools it calls. So:
   limit; but once the tenant's priced usage — containers, tool calls, any
   model call on our account — reaches the limit, `spendAdmit` refuses a call on
   the owner's key as it refuses any other.
-- **A call rate.** At most `USER_KEY_CALLS_PER_MINUTE` (60,
-  `src/model/user-key.ts`) calls on the owner's key per agent per minute,
-  counted in the agent's object where the key is opened
-  (`AgentRuntime.modelKeyFor`), so the count is exact without a shared counter.
-  Past it the turn ends with "too many calls on your own model key this minute"
-  and nothing is called. It is per agent, not per tenant: a tenant-wide count
-  would need a counter every agent's object reaches.
+- **An attempt rate.** At most `USER_KEY_CALLS_PER_MINUTE` (60,
+  `src/model/user-key.ts`) provider attempts on the owner's key per agent per
+  minute. An attempt is each time the queue consumer opens the key
+  (`AgentRuntime.modelKeyFor`): a call, and again each queue retry of it after a
+  5xx, a timeout or a network error. Attempts rather than jobs, because that is
+  what the vendor sees and a run of retries is what the cap bounds. Counted in
+  the agent's object, so the count is exact without a shared counter. Past it
+  the turn ends with "too many attempts on your own model key this minute" and
+  nothing is called. It is per agent, not per tenant: a tenant-wide count would
+  need a counter every agent's object reaches.
+- **The refusal says whose limit it is.** When the daily limit refuses a call
+  on the owner's key, the turn's error opens by saying it is this deployment's
+  limit on the compute it pays for, not the owner's quota with their vendor
+  (`spendAdmit`).
 
 ## Daily limits
 

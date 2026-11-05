@@ -104,7 +104,7 @@ const form = (o: Record<string, string>) => { const f = new FormData(); for (con
  * through the model card's route when `withKey`, a first turn dispatched, and the consumer's deps wired the way
  * cf/src/index.ts wires them: the key from the object's own `modelKeyFor`, never from the message or the job.
  */
-async function agentOn(engine: "pi085" | "pd", opts: { withKey?: boolean } = {}) {
+async function agentOn(engine: "pi085" | "pd", opts: { withKey?: boolean; firstTurnOff?: boolean } = {}) {
   const host = sqliteHost();
   if (engine === "pd") {
     const ap = new ApStore(host, prefixedNamespace("ap"));
@@ -125,6 +125,12 @@ async function agentOn(engine: "pi085" | "pd", opts: { withKey?: boolean } = {})
   const rt: any = o.runtime();
   await rt.ready();
   await rt.bindOperatorModel("t", "a", null);
+  // An agent made to answer its first message with reasoning off (src/runtime/prewarm.ts `firstTurnOf`).
+  if (opts.firstTurnOff) {
+    const config = { ...((await rt.store.loadAgent("t", "a"))?.config ?? {}), firstTurn: { reasoning: "off" } };
+    if (await rt.store.loadAgent("t", "a")) await rt.store.updateAgentConfig("t", "a", config);
+    else await rt.store.createAgent("t", "a", config);
+  }
   const routeDeps: AgentModelKeyDeps = {
     ...unlocked,
     agent: {
@@ -307,7 +313,7 @@ for (const engine of ["pi085", "pd"] as const) {
   });
 }
 
-await check("a 503 that quotes the key goes back to the queue on the same key; the consumer's log line holds no key", async () => {
+await check("a 503 that quotes the key goes back to the queue on the same key; the consumer's log line holds no key; the retry is a second attempt against the cap", async () => {
   const a = await agentOn("pi085");
   try {
     const body = JSON.stringify({ error: { message: `upstream down for ${USER_KEY}`, type: "server_error" } });
@@ -317,10 +323,16 @@ await check("a 503 that quotes the key goes back to the queue on the same key; t
     });
     must(f.seen.length === 3 && f.seen.every((c) => c.url.startsWith("https://api.kimi.com/")) && a.q.retried === 1, `calls ${f.seen.length}, queue ${show(a.q)}`);
     must(out.includes("model call failed") && out.includes("model 503") && !out.includes(USER_KEY), out);
+    // The queue's retry opens the key again, and that is a second attempt against the cap.
+    const attempts = () => Number((a.host.sql.exec("SELECT COUNT(*) AS n FROM model_key_calls").toArray()[0] as any).n);
+    must(attempts() === 1, `after the first delivery: ${attempts()}`);
+    const ok = fetchAs(() => new Response(OK_BODY, { status: 200 }));
+    try { await consumeModelCalls({ queue: "model-calls", messages: [a.msg()] }, a.deps, 10); } finally { ok.restore(); }
+    must(ok.seen.length === 1 && attempts() === 2, `the retry: ${ok.seen.length} calls, ${attempts()} attempts counted`);
   } finally { a.host.dispose(); }
 });
 
-await check("the rate cap: the key is opened at most USER_KEY_CALLS_PER_MINUTE times a minute per agent; past it the turn ends saying so and nothing is called", async () => {
+await check("the attempt cap: the key is opened at most USER_KEY_CALLS_PER_MINUTE times a minute per agent, a queue retry counting again; past it the turn ends saying so and nothing is called", async () => {
   const a = await agentOn("pi085");
   try {
     const t0 = Date.now();
@@ -336,6 +348,21 @@ await check("the rate cap: the key is opened at most USER_KEY_CALLS_PER_MINUTE t
     // A minute later the window has moved on.
     must((await a.rt.modelKeyFor("t", "a", "kimi-code", t0 + 61_000)).kind === "key", "the cap did not reopen");
   } finally { a.host.dispose(); }
+});
+
+await check("what a job on the owner's key is decided for is the Kimi model, not the deployment's: a first turn made to run without reasoning is marked off on DeepSeek, and not on Kimi, which has no field for it", async () => {
+  // The control: the same agent on the operator's default model (deepseek-flash, which can switch reasoning off).
+  const ops = await agentOn("pi085", { withKey: false, firstTurnOff: true });
+  try {
+    const job: any = await ops.rt.takeJob("t", "a", ops.sent.at(-1)!, "taker-ops");
+    must(job?.reasoning === "off", `the operator's first turn was not marked off: ${show(job?.reasoning)}`);
+  } finally { ops.host.dispose(); }
+  const own = await agentOn("pi085", { firstTurnOff: true });
+  try {
+    const job: any = await own.rt.takeJob("t", "a", own.sent.at(-1)!, "taker-own");
+    must(job?.userModel?.model === "kimi-for-coding" && job.operatorModel === null, show({ userModel: job?.userModel, operatorModel: job?.operatorModel }));
+    must(!("reasoning" in job), `decided for the deployment's model rather than Kimi's: reasoning ${show(job.reasoning)}`);
+  } finally { own.host.dispose(); }
 });
 
 // ---- without the binding -------------------------------------------------------------------------------------------
@@ -388,6 +415,12 @@ await check("spend: own: model tokens add nothing to the tenant's or the platfor
   const admit2 = spendAdmit(new SpendGate((t, at) => readDaySpend(db, t, at), limits, () => now), "deepseek-flash");
   const refused: any = await admit2(job, m);
   must(refused?.stopReason === "error" && refused.model === "kimi-for-coding", show(refused));
+  // It says whose limit this is: the deployment's, on its compute, not the owner's Kimi quota.
+  must(refused.providerError.startsWith("This is this deployment's daily limit on the compute it pays for") && refused.providerError.includes("not your Kimi Code quota"),
+    refused.providerError);
+  // A job on the operator's account is refused with the sentence it always had.
+  const opsRefused: any = await admit2({ operatorModel: "deepseek-flash" }, m);
+  must(!opsRefused.providerError.includes("Kimi") && !opsRefused.providerError.startsWith("This is this deployment's"), opsRefused.providerError);
 });
 
 await check("the usage page: own: model tokens are a third state, \"metered; billed by your provider\", never $0 or not priced yet, and are left out of the dollar headline", async () => {

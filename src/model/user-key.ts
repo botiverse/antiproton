@@ -115,9 +115,12 @@ export function userKeyContextWindow(model: string): number | undefined {
 }
 
 /**
- * How many calls one agent may make on its owner's key in a minute. The vendor bills the tokens, but each call
- * still runs our queue and our object; this bounds a loop that would otherwise only stop at the vendor's own
- * rate limit. Counted in the agent's object, where the key is opened, so it is exact without a shared counter.
+ * How many provider attempts one agent may make on its owner's key in a minute. An attempt is each time the queue
+ * consumer opens the key: a call, and each queue retry of it after a 5xx, a timeout or a network error, counts again
+ * (a 429 ends the turn rather than going back to the queue). Counting attempts, not jobs, is deliberate: it is what
+ * the vendor sees, and a run of retries is what this exists to bound. The vendor bills the tokens, but each attempt
+ * still runs our queue and our object. Counted in the agent's object, where the key is opened, so it is exact
+ * without a shared counter.
  */
 export const USER_KEY_CALLS_PER_MINUTE = 60;
 
@@ -131,7 +134,7 @@ export const USER_KEY_ERRORS = {
   refused: "your own model key was not accepted; see the turn's error",
   missing: "no own model key is stored for this agent; see the turn's error",
   limited: "your own model account is over its plan's limit (out of budget); see the turn's error",
-  paced: "too many calls on your own model key this minute (out of budget); see the turn's error",
+  paced: "too many attempts on your own model key this minute (out of budget); see the turn's error",
 } as const;
 
 /** The owner-facing sentence for each failure, carried in `providerError`. */
@@ -145,6 +148,6 @@ export function userKeyTurnError(kind: keyof typeof USER_KEY_ERRORS, provider: s
     case "limited":
       return `${label} says your account is over its rate or plan limit${status ? ` (HTTP ${status})` : ""}. Wait for it to reset, or raise the plan with ${label}; this agent does not fall back to another account.`;
     case "paced":
-      return `This agent made more than ${USER_KEY_CALLS_PER_MINUTE} model calls on your ${label} key in the last minute, the most it may. Send the next message in a minute.`;
+      return `This agent made more than ${USER_KEY_CALLS_PER_MINUTE} attempts at model calls on your ${label} key in the last minute (retries of a failed call count too), the most it may. Send the next message in a minute.`;
   }
 }

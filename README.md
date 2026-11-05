@@ -357,7 +357,7 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    `k3` or `k3-256k`, and a User-Agent naming antiproton. The queue consumer opens the key from the agent's
    object for each call and never falls back to the operator's: a key the vendor refuses (401/403) is
    marked refused and the turn ends asking the owner to reconnect it; the vendor's rate or plan limit (429)
-   ends the turn saying so; a call rate of 60 a minute per agent applies. An admin's agent or tenant row
+   ends the turn saying so; at most 60 provider attempts a minute per agent (a queue retry is an attempt) are made on it. An admin's agent or tenant row
    refuses a key as it refuses a pick. Its tokens are metered as the owner's (`own:` keys, docs/metering.md
    "Who pays").
 

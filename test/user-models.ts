@@ -395,6 +395,8 @@ await check("route: only the owner — another person is told 404 for read and w
   must(read.status === 404 && /no such agent/.test(read.text), `read: ${read.status} ${read.text}`);
   const write = await postModel({ agentId: A, choice: LUNA.id }, { cookie: theirs });
   must(write.status === 404, `write: ${write.status} ${write.text}`);
+  // A 404 says nothing about the agent's model, its own key included.
+  must(!/ownKey|keyProviders|effective/.test(read.text) && !/ownKey|keyProviders|effective/.test(write.text), `a 404 carries the model state: ${read.text} ${write.text}`);
   must(!DB.raw.prepare("SELECT 1 FROM model_choices WHERE agent_id = ?").get(A), "another person's write was stored");
   // Control: the same requests as the owner are answered.
   must((await getModel(A)).status === 200 && (await getModel(MINE)).status === 200, "control: the owner was refused");
