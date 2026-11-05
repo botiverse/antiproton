@@ -96,6 +96,10 @@
     "ADMIN_ORIGIN": "https://admin.antiproton.ai",
     // Where hook URLs a plugin makes point (Raft push). antiproton.ai has no Access gate in front.
     "HOOK_ORIGIN": "https://antiproton.ai",
+    // Where approval hints go on the Raft origin that made the agent (cf/src/approvals.ts `hintTarget`), signed with the
+    // Worker secret RAFT_APPROVAL_SIGNING_KEY, key id 5199d46cf7c8ffa5, whose public key Raft production holds
+    // (slock-deployment-secrets #149, Raft v1.21.54). The same route as Raft staging (cf/wrangler.preview.jsonc).
+    "RAFT_APPROVAL_CALLBACK_PATH": "/api/integrations/antiproton/approvals",
     // The container lease (tygg, 2026-09-15 11:28Z: a container is destroyed by
     // the agent's own release, not by the end of a turn). Kept between turns;
     // after 30 idle minutes it is released, and 5 minutes before that the agent
