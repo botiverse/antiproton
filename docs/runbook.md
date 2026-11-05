@@ -646,8 +646,8 @@ Approval hints to Raft are signed with the Ed25519 key in the Worker secret `RAF
     node cf/scripts/approval-signing-key.mjs --put cf/wrangler.preview.jsonc
 
 (`cf/wrangler.jsonc` for production.) The private key goes only to `wrangler secret put`'s standard input; it is
-never printed or written to a file. Standard output is two lines, `publicKey=…` and `keyId=…`, printed only after
-the secret was stored. Give both to Raft as plain configuration. When rotating, Raft adds the new entry **before**
+never printed or written to a file. Standard output is one line, `{"<key id>":"<public key>"}`, printed only after
+the secret was stored: the entry for Raft's key map. Give it to Raft as plain configuration. When rotating, Raft adds the new entry **before**
 the `--put` and removes the old one afterwards. Until Raft has the key id, its hints are refused, and the reconcile
 recovers them.
 

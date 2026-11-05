@@ -915,6 +915,14 @@ await check("hints: the timestamp window is 300 s either way, and a hint outside
   must(await verifyHint(HINT_KEYS, h, body, ts + 300) && await verifyHint(HINT_KEYS, h, body, ts - 300), "control: the window's edges were refused");
   must(!(await verifyHint(HINT_KEYS, h, body, ts + 301)), "a hint 301 s old verified");
   must(!(await verifyHint(HINT_KEYS, h, body, ts - 301)), "a hint 301 s ahead verified");
+  // 1 to 12 digits: a zero-padded timestamp names the same second but is not the one the signer wrote.
+  must(!(await verifyHint(HINT_KEYS, { ...h, timestamp: `0${ts}`.padStart(13, "0") }, body, ts)), "a 13-digit timestamp verified");
+  must(!(await verifyHint(HINT_KEYS, { ...h, timestamp: `${ts}.0` }, body, ts)), "a timestamp with a fraction verified");
+  // Signed over the padded text itself, so the signature is good and only the 1-12 digit rule can refuse it.
+  const padded = `000${ts}`, { key: k } = await importSigningKey(HINT_KEY.secret);
+  const raw = Buffer.from(await crypto.subtle.sign({ name: "Ed25519" }, k, new TextEncoder().encode(`${padded}.${body}`))).toString("base64");
+  const paddedHint = { signature: `keyid=${HINT_KEY.keyId}; ed25519=${raw}`, timestamp: padded };
+  must(!(await verifyHint(HINT_KEYS, paddedHint, body, ts)), "a 13-digit timestamp with a good signature verified");
 });
 
 await check("hints: the key id picks the key; an unknown one is refused and never tried against the configured keys", async () => {
@@ -959,8 +967,12 @@ await check("hints: the published test vector reproduces exactly, and the docs c
   const header = await signHint(key, keyId, VECTOR.timestamp, VECTOR.body);
   must(header === VECTOR.header, `header ${header}`);
   must(await verifyHint({ [VECTOR.keyId]: VECTOR.publicKey }, { signature: VECTOR.header, timestamp: String(VECTOR.timestamp) }, VECTOR.body, VECTOR.timestamp + 10), "the vector does not verify");
+  must(SIGNATURE_HEADER === "x-antiproton-signature", `header name ${SIGNATURE_HEADER}`);
+  must(/^[A-Za-z0-9._-]{1,64}$/.test(VECTOR.keyId) && VECTOR.publicKey.length === 44, "the key id's charset or the public key's length");
+  const mapEntry = JSON.stringify({ [VECTOR.keyId]: VECTOR.publicKey });
   const doc = readFileSync(new URL("../docs/raft-approvals.md", import.meta.url), "utf8");
-  for (const v of [VECTOR.publicKey, VECTOR.keyId, String(VECTOR.timestamp), VECTOR.body, VECTOR.header]) must(doc.includes(v), `the docs do not carry ${v}`);
+  for (const v of [VECTOR.publicKey, VECTOR.keyId, String(VECTOR.timestamp), VECTOR.body, `X-Antiproton-Signature: ${VECTOR.header}`,
+    `X-Antiproton-Timestamp: ${VECTOR.timestamp}`, mapEntry]) must(doc.includes(v), `the docs do not carry ${v}`);
   // The private half is in the docs too, as test-only, so Raft can sign as well as verify.
   must(doc.includes(VECTOR.privateKeyJwk), "the docs do not carry the vector's private key");
 });
@@ -974,9 +986,11 @@ await check("approval-signing-key.mjs: the child gets a private key that matches
   const childSrc = `let s="";process.stdin.on("data",(c)=>s+=c).on("end",()=>{require("fs").writeFileSync(${JSON.stringify(got)},s);console.log("Success! Uploaded secret")})`;
   const r = spawnSync(process.execPath, [script, "--dry-run", "--", process.execPath, "-e", childSrc], { encoding: "utf8" });
   must(r.status === 0, `exit ${r.status}: ${r.stderr}`);
-  const lines = r.stdout.trim().split("\n");
-  must(lines.length === 2 && /^publicKey=[A-Za-z0-9+/]{43}=$/.test(lines[0]!) && /^keyId=[0-9a-f]{16}$/.test(lines[1]!), `stdout: ${r.stdout}`);
-  const pub = lines[0]!.slice("publicKey=".length), kid = lines[1]!.slice("keyId=".length);
+  // Exactly one line, the JSON map entry Raft configures: {"<key id>":"<public key>"}.
+  const m = /^\{"([0-9a-f]{16})":"([A-Za-z0-9+/]{43}=)"\}\n$/.exec(r.stdout);
+  must(m, `stdout: ${r.stdout}`);
+  const kid = m[1]!, pub = m[2]!;
+  must(JSON.stringify(JSON.parse(r.stdout)) === r.stdout.trim(), "stdout is not exactly a JSON object");
   must(r.stderr.includes("Success! Uploaded secret"), `the child's output was not passed on: ${r.stderr}`);
   const received = readFileSync(got, "utf8");
   const jwk = JSON.parse(received);

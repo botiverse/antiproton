@@ -355,25 +355,30 @@ credential, through the agent's `raft` mount. This contract adds one.
 
   | Header | Value |
   |---|---|
-  | `X-Antiproton-Timestamp` | Unix seconds, as decimal digits |
+  | `X-Antiproton-Timestamp` | Unix seconds, 1 to 12 decimal digits |
   | `X-Antiproton-Signature` | `keyid=<key id>; ed25519=<signature>` (below) |
+
+  Header names are case-insensitive; antiproton sends them lowercase. The signature header replaces
+  `X-Antiproton-Signature-256`, which is no longer sent.
   | `X-Antiproton-Delivery-Id` | a fresh UUID for each attempt |
 
 - **The signature.** Ed25519 (RFC 8032), so Raft holds only a public key and nothing secret is shared between
   the two sides.
   - The signed bytes are the UTF-8 of `<timestamp>.<body>`: the `X-Antiproton-Timestamp` value exactly as sent,
-    a `.`, and the raw body bytes.
+    a `.`, and the exact body bytes sent (UTF-8).
   - `<signature>` is the standard base64 (with `=` padding) of the 64-byte Ed25519 signature: 88 characters. Only
     the canonical encoding is accepted: one whose unused padding bits are not zero is malformed.
   - `<key id>` names the public key that verifies it: the **first 16 lowercase hex characters of SHA-256 over the
     raw 32-byte public key**. Anyone holding the public key can recompute it (`cf/src/approvals.ts` `hintKeyId`).
-  - The header is exactly `keyid=`, the id, `; ed25519=`, the signature: one space, no other parameters, in that
-    order. Anything else is a malformed header.
-- **Verification on Raft's side.** Raft is configured with a map of key id to public key (the base64 of the raw
-  32 bytes), normally one entry, two during a rotation.
+    A verifier accepts key ids matching `[A-Za-z0-9._-]{1,64}`; antiproton's are always 16 lowercase hex characters.
+  - The header is exactly `keyid=`, the id, `; ed25519=`, the signature: in that order, exactly one `; ` between
+    them, no quotes, no other fields. Anything else is a malformed header.
+- **Verification on Raft's side.** Raft is configured with a JSON map of key id to public key, `{"<key id>":"<public
+  key>"}`. The public key is the standard base64, with padding, of the raw 32 bytes: 44 characters. The map
+  normally has one entry, and two during a rotation.
   1. Read the raw body bytes.
-  2. Reject the hint if the timestamp is not decimal digits, or is more than **300 seconds** from Raft's clock,
-     either way.
+  2. Reject the hint if the timestamp is not 1 to 12 decimal digits, or is more than **300 seconds** from Raft's
+     clock, either way.
   3. Parse the signature header. Reject it if it is malformed, or if its key id is not in the map. An unknown key
      id is a rejection; never try the hint against the other configured keys.
   4. Verify the Ed25519 signature over `timestamp + "." + body` with the public key the key id names.
@@ -396,10 +401,10 @@ credential, through the agent's `raft` mount. This contract adds one.
     node cf/scripts/approval-signing-key.mjs --put cf/wrangler.preview.jsonc  # preview
     ```
 
-    The output is two lines, `publicKey=<base64>` and `keyId=<hex>`, printed only after `wrangler` has stored the
-    secret. `--dry-run -- <command> [args…]` pipes the private key to `<command>` instead, which is what the tests
+    The output is one line, the entry for Raft's map, `{"<key id>":"<public key>"}`, printed only after `wrangler`
+    has stored the secret. `--dry-run -- <command> [args…]` pipes the private key to `<command>` instead, which is what the tests
     use.
-  - Give Raft the two printed values. They are not secret: Raft keeps them as plain configuration.
+  - Give Raft the printed entry. It is not secret: Raft keeps it as plain configuration.
   - **Rotation.** Add the new public key to Raft's map next to the old one. Then run the script with `--put` to
     replace the Worker secret. Hints already signed with the old key still verify, because each names its own key
     id. Remove the old entry from Raft's map once the new key id is seen. Hints refused during a mistake are
@@ -411,9 +416,10 @@ credential, through the agent's `raft` mount. This contract adds one.
   | | |
   |---|---|
   | Private key (JWK, test-only) | `{"kty":"OKP","crv":"Ed25519","d":"x_qwznyTeNjGjnhzhNnuUD9qNvphU0-F5iTbBiD26mw","x":"Qh0z7hW_fenoBF-qTen6HVDqIJuJq6qUsKmxxpTeaZk"}` |
-  | Public key (base64, raw 32 bytes) | `Qh0z7hW/fenoBF+qTen6HVDqIJuJq6qUsKmxxpTeaZk=` |
+  | Public key (standard base64 of the raw 32 bytes) | `Qh0z7hW/fenoBF+qTen6HVDqIJuJq6qUsKmxxpTeaZk=` |
   | Key id | `ed95939c506fd5c5` |
-  | `X-Antiproton-Timestamp` | `1767225600` |
+  | Raft's map entry | `{"ed95939c506fd5c5":"Qh0z7hW/fenoBF+qTen6HVDqIJuJq6qUsKmxxpTeaZk="}` |
+  | Timestamp | `1767225600` |
 
   Body, exactly these bytes:
 
@@ -421,10 +427,11 @@ credential, through the agent's `raft` mount. This contract adds one.
   {"type":"approval.requested","operationId":"op_test_vector","providerAgentId":"raft_01TESTVECTOR","raftAgentId":"01TESTVECTOR","raftServerId":"srv-test","status":"pending"}
   ```
 
-  Expected `X-Antiproton-Signature`:
+  Expected headers, the signature over `1767225600.` followed by that body:
 
   ```
-  keyid=ed95939c506fd5c5; ed25519=HKqyRp+2SGY4L0Fpdl3JGP4j+vGq0JWTbPUYwBJpqy+VFJjTTPC47vonSyDQoU42C0MzEIW08bQ0pex6eU4CBQ==
+  X-Antiproton-Timestamp: 1767225600
+  X-Antiproton-Signature: keyid=ed95939c506fd5c5; ed25519=HKqyRp+2SGY4L0Fpdl3JGP4j+vGq0JWTbPUYwBJpqy+VFJjTTPC47vonSyDQoU42C0MzEIW08bQ0pex6eU4CBQ==
   ```
 
 - **Retries.** A hint not answered `2xx` within 5 seconds is retried by the agent's alarm after 30 s, then 1, 2, 4

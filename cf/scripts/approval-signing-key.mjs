@@ -10,9 +10,9 @@
 //   node cf/scripts/approval-signing-key.mjs --dry-run -- <command> [args...]
 //       the same, piping the private key to <command> instead (what test/raft-approvals.ts runs).
 //
-// The child's own output goes to standard error, so standard output stays exactly these two lines:
-//   publicKey=<base64 of the raw 32-byte public key>
-//   keyId=<first 16 hex characters of SHA-256 over those 32 bytes>
+// The child's own output goes to standard error, so standard output is exactly one line, the entry for Raft's
+// {key id: public key} JSON map:
+//   {"<first 16 hex characters of SHA-256 over the raw public key>":"<standard base64 of the raw 32-byte public key>"}
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { spawn } from "node:child_process";
 
@@ -56,5 +56,5 @@ child.on("close", (code, signal) => {
     process.stderr.write(`${command.join(" ")} ended with ${signal ?? `exit ${code}`}; the key was not stored, and this public key is void\n`);
     process.exit(1);
   }
-  process.stdout.write(`publicKey=${raw.toString("base64")}\nkeyId=${keyId}\n`);
+  process.stdout.write(`${JSON.stringify({ [keyId]: raw.toString("base64") })}\n`);
 });

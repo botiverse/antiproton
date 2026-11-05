@@ -357,7 +357,7 @@ const SIGNATURE_VALUE = /^keyid=([0-9a-f]{16}); ed25519=([A-Za-z0-9+/]{86}==)$/;
  */
 export async function verifyHint(keys: Record<string, string>, headers: { signature: string | null; timestamp: string | null }, body: string, nowS: number): Promise<boolean> {
   const ts = Number(headers.timestamp);
-  if (!headers.timestamp || !/^\d+$/.test(headers.timestamp) || !Number.isSafeInteger(ts) || Math.abs(nowS - ts) > SIGNATURE_WINDOW_S) return false;
+  if (!headers.timestamp || !/^\d{1,12}$/.test(headers.timestamp) || !Number.isSafeInteger(ts) || Math.abs(nowS - ts) > SIGNATURE_WINDOW_S) return false;
   const m = SIGNATURE_VALUE.exec(headers.signature ?? "");
   if (!m || !Object.hasOwn(keys, m[1]!)) return false;
   try {
