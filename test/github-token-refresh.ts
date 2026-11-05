@@ -1130,7 +1130,10 @@ await check("another tenant's connector, and one deleted after the link was made
   const g2 = await w.gh.code();
   await a.rt.holdConnection(TENANT, a.agentId, "github", g2.grant, "pend_R6_gone0001", Date.now() + 600_000, "u_owner", w.links.at(-1).reconnect);
   const gone = await w.call("POST", `/agents/by-raft-agent/R6/connections/github/confirm`, { pending: "pend_R6_gone0001", raftUserId: "u_owner" });
-  must(gone.status === 404 && gone.body.error.code === "not_found", `deleted: ${gone.status} ${gone.text}`);
+  must(gone.status === 404 && gone.body.error.code === "connector_gone", `deleted: ${gone.status} ${gone.text}`);
+  // A spent or expired pending id stays not_found: only a connector that went away is connector_gone, so Raft can drop it.
+  const spent = await w.call("POST", `/agents/by-raft-agent/R6/connections/github/confirm`, { pending: "pend_R6_gone0001", raftUserId: "u_owner" });
+  must(spent.status === 404 && spent.body.error.code === "not_found", `spent: ${spent.status} ${spent.text}`);
   must(connectorCount(w) === n0 && (await w.stored(a)).token === null && (await w.status("R6")).body.connected === false, "a reconnect of a deleted connector made one, or attached the token");
   w.dispose();
 });

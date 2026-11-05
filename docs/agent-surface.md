@@ -1028,8 +1028,9 @@ mount's own broken flag, and onto this agent. This agent is pointed at the conne
 - `failed`: agents the pair did not reach in this call. The connector is mended regardless. Each one's next GitHub
   call asks the connector, finds it healthy and takes the pair. `connected` is `false` only when this agent is among
   them.
-- Other errors at confirm: `404 not_found` for a connector deleted since the link was made (nothing is created or
-  attached), `403 not_creator` as above, and `422 connect_failed` when GitHub's `GET /user` did not say which account
+- Other errors at confirm: `404 connector_gone` for a connector deleted since the link was made (nothing is created or
+  attached; the connection can be dropped from any list), `404 not_found` for a pending id that expired or was
+  already used, `403 not_creator` as above, and `422 connect_failed` when GitHub's `GET /user` did not say which account
   was authorized (nothing changes). The pending id is spent either way, so a retry starts from the `POST`.
 - A renewal in flight when the reconnect lands cannot undo it. Its write expects the old refresh token, and so does
   its refusal, so neither matches any more: the connector keeps the reconnect's pair and is not marked broken.
