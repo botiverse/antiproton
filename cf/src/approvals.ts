@@ -306,29 +306,67 @@ export function d1ApprovalIndex(db: D1Database): ApprovalIndex {
 
 // ---- the signed hint to Raft ---------------------------------------------------------------------------------
 
-export const SIGNATURE_HEADER = "x-antiproton-signature-256";
+export const SIGNATURE_HEADER = "x-antiproton-signature";
 export const TIMESTAMP_HEADER = "x-antiproton-timestamp";
 export const DELIVERY_HEADER = "x-antiproton-delivery-id";
 /** How far a hint's timestamp may be from the receiver's clock, either way. */
 export const SIGNATURE_WINDOW_S = 300;
 
-const hex = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
-const hmacKey = (secret: string, use: "sign" | "verify") =>
-  crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [use]);
+// Ed25519 rather than a shared HMAC secret: the private key exists only in antiproton's Worker secret
+// (RAFT_APPROVAL_SIGNING_KEY), and Raft verifies with a public key it can hold as plain configuration, so nothing secret
+// has to travel between the two operators. docs/raft-approvals.md, "The signing key", is the contract.
 
-/** `sha256=<hex HMAC-SHA256(secret, "<timestamp>.<body>")>`: the value of SIGNATURE_HEADER. */
-export async function signHint(secret: string, timestamp: number, body: string): Promise<string> {
-  return `sha256=${hex(await crypto.subtle.sign("HMAC", await hmacKey(secret, "sign"), new TextEncoder().encode(`${timestamp}.${body}`)))}`;
+const b64 = (b: ArrayBuffer | Uint8Array) => btoa(String.fromCharCode(...new Uint8Array(b)));
+const unb64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+const unb64url = (s: string) => unb64(s.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (s.length % 4)) % 4));
+const hex = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
+const utf8 = (s: string) => new TextEncoder().encode(s);
+
+/** The key id of a public key: the first 16 lowercase hex characters of SHA-256 over its raw 32 bytes. */
+export async function hintKeyId(publicKeyRaw: Uint8Array): Promise<string> {
+  return hex(await crypto.subtle.digest("SHA-256", publicKeyRaw)).slice(0, 16);
 }
 
-/** What Raft does with a hint, as code: the timestamp within the window, then the signature over exactly those bytes. */
-export async function verifyHint(secret: string, headers: { signature: string | null; timestamp: string | null }, body: string, nowS: number): Promise<boolean> {
+/**
+ * RAFT_APPROVAL_SIGNING_KEY's value, a private Ed25519 JWK (`{"kty":"OKP","crv":"Ed25519","d":…,"x":…}`, as
+ * cf/scripts/approval-signing-key.mjs writes it), as a signing key and its key id. JWK rather than PKCS#8 because it
+ * carries the public half (`x`), so the key id is computed without exporting the private key. Throws on anything else.
+ */
+export async function importSigningKey(secret: string): Promise<{ key: CryptoKey; keyId: string }> {
+  // JSON.parse's own error quotes the text it failed on, and that message reaches the log: the secret's would.
+  let jwk: JsonWebKey;
+  try { jwk = JSON.parse(secret); } catch { throw new Error("RAFT_APPROVAL_SIGNING_KEY is not JSON"); }
+  if (jwk?.kty !== "OKP" || jwk.crv !== "Ed25519" || typeof jwk.d !== "string" || typeof jwk.x !== "string") {
+    throw new Error("RAFT_APPROVAL_SIGNING_KEY is not a private Ed25519 JWK");
+  }
+  const key = await crypto.subtle.importKey("jwk", { kty: "OKP", crv: "Ed25519", d: jwk.d, x: jwk.x }, { name: "Ed25519" }, false, ["sign"]);
+  return { key, keyId: await hintKeyId(unb64url(jwk.x)) };
+}
+
+/** `keyid=<key id>; ed25519=<base64 Ed25519 signature over "<timestamp>.<body>">`: the value of SIGNATURE_HEADER. */
+export async function signHint(privateKey: CryptoKey, keyId: string, timestamp: number, body: string): Promise<string> {
+  return `keyid=${keyId}; ed25519=${b64(await crypto.subtle.sign({ name: "Ed25519" }, privateKey, utf8(`${timestamp}.${body}`)))}`;
+}
+
+const SIGNATURE_VALUE = /^keyid=([0-9a-f]{16}); ed25519=([A-Za-z0-9+/]{86}==)$/;
+
+/**
+ * What Raft does with a hint, as code. `keys` is the verifier's configuration, key id to the base64 of a raw 32-byte
+ * public key. The timestamp within the window; then the header's key id must be one of `keys` (an unknown id is
+ * refused, never tried against the other keys); then the signature over exactly `"<timestamp>.<body>"`.
+ */
+export async function verifyHint(keys: Record<string, string>, headers: { signature: string | null; timestamp: string | null }, body: string, nowS: number): Promise<boolean> {
   const ts = Number(headers.timestamp);
-  if (!headers.timestamp || !Number.isInteger(ts) || Math.abs(nowS - ts) > SIGNATURE_WINDOW_S) return false;
-  const m = /^sha256=([0-9a-f]{64})$/.exec(headers.signature ?? "");
-  if (!m) return false;
-  const sig = new Uint8Array(m[1]!.match(/../g)!.map((h) => parseInt(h, 16)));
-  return crypto.subtle.verify("HMAC", await hmacKey(secret, "verify"), sig, new TextEncoder().encode(`${ts}.${body}`));
+  if (!headers.timestamp || !/^\d{1,12}$/.test(headers.timestamp) || !Number.isSafeInteger(ts) || Math.abs(nowS - ts) > SIGNATURE_WINDOW_S) return false;
+  const m = SIGNATURE_VALUE.exec(headers.signature ?? "");
+  if (!m || !Object.hasOwn(keys, m[1]!)) return false;
+  try {
+    // Only the canonical encoding: base64 decoders ignore the padding bits, so one signature has several spellings.
+    const sig = unb64(m[2]!);
+    if (b64(sig) !== m[2]) return false;
+    const pub = await crypto.subtle.importKey("raw", unb64(keys[m[1]!]!), { name: "Ed25519" }, false, ["verify"]);
+    return await crypto.subtle.verify({ name: "Ed25519" }, pub, sig, utf8(`${headers.timestamp}.${body}`));
+  } catch { return false; }
 }
 
 /** The hint's `type`, by the state published. */
@@ -336,17 +374,18 @@ export const hintType = (s: ApprovalState) => s === "pending" ? "approval.reques
   : s === "executed" ? "approval.executed" : s === "failed" ? "approval.failed" : "approval.decided";
 
 /**
- * Where hints go for an agent made at `raftOrigin`: that origin plus RAFT_APPROVAL_CALLBACK_PATH, signed with
- * RAFT_APPROVAL_CALLBACK_SECRET. Null (no hints; Raft reconciles by polling) unless both are set. The origin is the
- * agent's own, never configured, so a hint about one Raft's agents cannot be sent to another address.
+ * Where hints go for an agent made at `raftOrigin`: that origin plus RAFT_APPROVAL_CALLBACK_PATH, signed with the
+ * Ed25519 key in RAFT_APPROVAL_SIGNING_KEY (`importSigningKey`). Null (no hints; Raft reconciles by polling) unless both
+ * are set. The origin is the agent's own, never configured, so a hint about one Raft's agents cannot be sent to another
+ * address.
  */
-export function hintTarget(env: { RAFT_APPROVAL_CALLBACK_PATH?: string; RAFT_APPROVAL_CALLBACK_SECRET?: string }, raftOrigin: string):
-  { url: string; secret: string } | null {
-  const path = env.RAFT_APPROVAL_CALLBACK_PATH?.trim(), secret = env.RAFT_APPROVAL_CALLBACK_SECRET;
-  if (!path || !path.startsWith("/") || path.startsWith("//") || !secret) return null;
+export function hintTarget(env: { RAFT_APPROVAL_CALLBACK_PATH?: string; RAFT_APPROVAL_SIGNING_KEY?: string }, raftOrigin: string):
+  { url: string; signingKey: string } | null {
+  const path = env.RAFT_APPROVAL_CALLBACK_PATH?.trim(), signingKey = env.RAFT_APPROVAL_SIGNING_KEY?.trim();
+  if (!path || !path.startsWith("/") || path.startsWith("//") || !signingKey) return null;
   try {
     const url = new URL(path, raftOrigin);
-    return url.origin === new URL(raftOrigin).origin ? { url: url.toString(), secret } : null;
+    return url.origin === new URL(raftOrigin).origin ? { url: url.toString(), signingKey } : null;
   } catch { return null; }
 }
 
@@ -371,7 +410,7 @@ export interface PublishDeps {
   item(a: ApprovalRecord, reg: ProvisionedAgent): Promise<ApprovalItem>;
   index: ApprovalIndex;
   /** Where hints go; null: none are sent. */
-  target(reg: ProvisionedAgent): { url: string; secret: string } | null;
+  target(reg: ProvisionedAgent): { url: string; signingKey: string } | null;
   fetch: typeof fetch;
   newId(): string;
 }
@@ -450,9 +489,11 @@ export async function publishApprovals(d: PublishDeps): Promise<{ published: num
             raftAgentId: reg.raftAgentId, raftServerId: reg.raftServerId, status: r.state });
           const ts = Math.floor(d.now() / 1000);
           hinting = true;
+          // Imported per hint: a malformed key fails this hint (logged, retried, then given up) rather than every publish.
+          const { key, keyId } = await importSigningKey(target.signingKey);
           const res = await d.fetch(target.url, {
             method: "POST", body, redirect: "manual", signal: AbortSignal.timeout(HINT_TIMEOUT_MS),
-            headers: { "content-type": "application/json", [TIMESTAMP_HEADER]: String(ts), [SIGNATURE_HEADER]: await signHint(target.secret, ts, body), [DELIVERY_HEADER]: d.newId() },
+            headers: { "content-type": "application/json", [TIMESTAMP_HEADER]: String(ts), [SIGNATURE_HEADER]: await signHint(key, keyId, ts, body), [DELIVERY_HEADER]: d.newId() },
           });
           await res.body?.cancel().catch(() => {});
           if (!res.ok) throw new HintRefused(`Raft answered the hint with HTTP ${res.status}`);

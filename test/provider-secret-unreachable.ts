@@ -4,10 +4,11 @@
  *
  * Two of them, both stood in for by a canary:
  *
- * - `RAFT_APPROVAL_CALLBACK_SECRET` — the one credential antiproton itself uses toward Raft as the provider, the key
- *   every approval hint is signed with (cf/src/approvals.ts `hintTarget`, read by the agent's own object at
+ * - `RAFT_APPROVAL_SIGNING_KEY` — the one credential antiproton itself uses toward Raft as the provider, the Ed25519
+ *   private key every approval hint is signed with (cf/src/approvals.ts `hintTarget`, read by the agent's own object at
  *   cf/src/index.ts `publishApprovals`'s `target`). It is a Worker secret, so it is on the object's `env` and, under
- *   `nodejs_compat` at this compatibility date, on `process.env` too: the canary is set on both.
+ *   `nodejs_compat` at this compatibility date, on `process.env` too: the key is set on both. The canary is its
+ *   private scalar `d`, which is in the secret's value however much of it travels.
  * - the provider token `pt-…` Raft sends TO antiproton on `/provision/*`. Antiproton keeps only its hash
  *   (cf/src/control-plane.ts `d1ProviderTokens`); the canary is the plaintext the provisioning request carried.
  *
@@ -28,7 +29,7 @@
  *   (B) a read of every place the session can read: each tool it is offered, called; the memory mount's keys for
  *       the usual credential files; the system prompt and tool list it is sent. The canaries appear in none of it,
  *       nor anywhere in the object's database or D1, while a hint the same object sent does verify with the canary
- *       (it was live there all along).
+ *       key's public half (it was live there all along).
  *
  * The run_js and sandbox paths are not offered to an assistant at all; the last cases read the code that would give
  * them an environment (the Dynamic Worker's load, the container's `envFor`) for any agent that has them. A real run9
@@ -44,7 +45,7 @@
 import { register } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { agentObjectName } from "../cf/src/object-name.ts";
 import { d1ProviderTokens } from "../cf/src/control-plane.ts";
@@ -77,8 +78,14 @@ const show = (v: unknown) => JSON.stringify(v);
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms)));
 
 /** The hint key, as a Worker secret: on `env`, and on `process.env` as nodejs_compat populates it. */
-const HINT_CANARY = "CANARY-HINT-" + randomBytes(18).toString("hex");
-process.env.RAFT_APPROVAL_CALLBACK_SECRET = HINT_CANARY;
+const HINT_JWK = generateKeyPairSync("ed25519").privateKey.export({ format: "jwk" });
+const HINT_KEY = JSON.stringify({ kty: HINT_JWK.kty, crv: HINT_JWK.crv, d: HINT_JWK.d, x: HINT_JWK.x });
+/** The private half alone: what must never be seen, and is in HINT_KEY. */
+const HINT_CANARY = HINT_JWK.d!;
+/** What Raft holds: the public key under its key id. */
+const HINT_PUBLIC = Buffer.from(HINT_JWK.x!, "base64url");
+const HINT_KEYS = { [createHash("sha256").update(HINT_PUBLIC).digest("hex").slice(0, 16)]: HINT_PUBLIC.toString("base64") };
+process.env.RAFT_APPROVAL_SIGNING_KEY = HINT_KEY;
 /** The provider token Raft provisions with: a real token's shape, recognisable in any dump. */
 const TOKEN_CANARY = "pt-CANARYPROVIDERTOKEN" + randomBytes(24).toString("hex");
 /** The agent's own Raft credential, which its raft mount legitimately uses. */
@@ -136,9 +143,9 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   outbound.push({ method, url: u.toString(), headers, body });
   const json = (status: number, b: unknown) => new Response(JSON.stringify(b), { status, headers: { "content-type": "application/json" } });
   if (u.origin !== ORIGIN) return json(404, { errorCode: "NOT_FOUND" });
-  // The provider endpoint: Raft verifies the signature with the secret it shares with antiproton.
+  // The provider endpoint: Raft verifies the signature with antiproton's public key.
   if (u.pathname === HINT_PATH) {
-    const ok = await verifyHint(HINT_CANARY, { signature: h.get(SIGNATURE_HEADER), timestamp: h.get(TIMESTAMP_HEADER) }, body, Math.floor(Date.now() / 1000));
+    const ok = await verifyHint(HINT_KEYS, { signature: h.get(SIGNATURE_HEADER), timestamp: h.get(TIMESTAMP_HEADER) }, body, Math.floor(Date.now() / 1000));
     hintAnswers.push(ok ? "ok" : "401 BAD_SIGNATURE");
     return ok ? json(200, {}) : json(401, { errorCode: "BAD_SIGNATURE" });
   }
@@ -197,7 +204,7 @@ async function world() {
     DEEPSEEK_API_KEY: "dk-test-key", AUTOMATION_TOKEN: "operator-token", SESSION_SECRET: "s".repeat(32),
     SECRET_KEK: Buffer.from(new Uint8Array(32).fill(3)).toString("base64"),
     HOOK_ORIGIN,
-    RAFT_APPROVAL_CALLBACK_PATH: HINT_PATH, RAFT_APPROVAL_CALLBACK_SECRET: HINT_CANARY,
+    RAFT_APPROVAL_CALLBACK_PATH: HINT_PATH, RAFT_APPROVAL_SIGNING_KEY: HINT_KEY,
     AGENT: { idFromName: (n: string) => n, get: (n: string) => objects.get(n) ?? another(n) },
   };
   const D = new AgentDO(ctx as never, env as never);
@@ -365,7 +372,7 @@ await check("push registration: PUT …/push-webhook went out on the agent's own
 // ---- (A) a direct call to Raft's provider endpoint, with the canary, from the session's tool calls -------------------
 
 const PROVIDER_URL = `${ORIGIN}${HINT_PATH}`;
-const BEARER = { authorization: `Bearer ${TOKEN_CANARY}`, [SIGNATURE_HEADER]: `sha256=${HINT_CANARY}` };
+const BEARER = { authorization: `Bearer ${TOKEN_CANARY}`, [SIGNATURE_HEADER]: `keyid=${Object.keys(HINT_KEYS)[0]}; ed25519=${HINT_CANARY}` };
 /**
  * Every tool that could send a request of the caller's choosing: the harness's run_js, and the real tools of the
  * mounts a Raft agent is seeded with (`web` http, `sandbox`, `search` exa, `gh` github) whose tools an assistant is
@@ -395,7 +402,7 @@ const TOLD: Record<string, string> = {
  */
 const DIRECT_IN: Record<Kind, typeof DIRECT> = {
   chat: DIRECT,
-  check: [...DIRECT, { name: "raft__messages_send", arguments: { target: PROVIDER_URL, content: `Bearer ${TOKEN_CANARY} sha256=${HINT_CANARY}` } }],
+  check: [...DIRECT, { name: "raft__messages_send", arguments: { target: PROVIDER_URL, content: `Bearer ${TOKEN_CANARY} ed25519=${HINT_CANARY}` } }],
 };
 /** pi's own result for each tool call the session's transcript keeps, by tool name: read while the session is live. */
 async function piLines(session: string): Promise<Map<string, string>> {
@@ -455,7 +462,7 @@ for (const kind of KINDS) {
 w = await world();
 
 const PATHS = [".netrc", "~/.netrc", ".config/raft/credentials", "~/.config/raft/token", ".raft/credentials.json", ".env",
-  "env", "process.env", "RAFT_APPROVAL_CALLBACK_SECRET", "/proc/self/environ", "wrangler.jsonc", ".dev.vars"];
+  "env", "process.env", "RAFT_APPROVAL_SIGNING_KEY", "/proc/self/environ", "wrangler.jsonc", ".dev.vars"];
 /** Each tool a session can be offered, with arguments its schema takes, aimed at an environment or credential file where it takes a name. */
 const ARGS: Record<string, Record<string, unknown>> = {
   raft__identity_whoami: {}, raft__receive_events: {}, state__list: {}, raft__assistant_owner_inbox: {},
@@ -471,8 +478,8 @@ const ARGS: Record<string, Record<string, unknown>> = {
   raft__assistant_reminder: { action: "list" },
   // A check's two writes really run (a POST to Raft, a row here): they are given the names of credentials, never a
   // canary, since a canary the model supplied would be forwarded faithfully and prove nothing.
-  raft__assistant_notify_owner: { items: [{ channelId: "/proc/self/environ", summary: "$RAFT_APPROVAL_CALLBACK_SECRET ~/.netrc", kind: "question" }] },
-  raft__note_decision: { sent: 1, reason: "Read $RAFT_APPROVAL_CALLBACK_SECRET and ~/.netrc", sources: [{ conversation: "/proc/self/environ", msg: ".dev.vars" }] },
+  raft__assistant_notify_owner: { items: [{ channelId: "/proc/self/environ", summary: "$RAFT_APPROVAL_SIGNING_KEY ~/.netrc", kind: "question" }] },
+  raft__note_decision: { sent: 1, reason: "Read $RAFT_APPROVAL_SIGNING_KEY and ~/.netrc", sources: [{ conversation: "/proc/self/environ", msg: ".dev.vars" }] },
   state__remember: { key: "probe", text: "x" }, state__revise: { key: "probe", old: "x", new: "y" },
   state__insert: { key: "probe", after_line: 0, text: "z" }, state__put: { key: "probe2", value: "v" }, state__forget: { key: "probe2" },
 };
@@ -542,7 +549,8 @@ await check("(B) the system prompt, the tool list and every message each model c
 
 await check("(B) control: the hint key is live in this very object — a held call's hint is signed with it and Raft verifies it", async () => {
   // The canary is where a Worker secret is: the generic env resolver finds it, so its absence above is not vacuous.
-  must(await envSecrets.resolve("env:RAFT_APPROVAL_CALLBACK_SECRET") === HINT_CANARY, "control: process.env does not hold the canary");
+  const resolved = await envSecrets.resolve("env:RAFT_APPROVAL_SIGNING_KEY");
+  must(resolved === HINT_KEY && resolved.includes(HINT_CANARY), "control: process.env does not hold the canary");
   must(await w.rt.store.updateMountPolicy(T, A, "state", { tools: { put: "approval" } }), "policy");
   const r = await w.rt.gateway().invoke({ tenantId: T, agentId: A, taskId: "main" }, "state.put", { key: "plan", value: "x" });
   must(r.status === "pending", `not held: ${show(r)}`);
