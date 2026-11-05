@@ -1727,7 +1727,7 @@ async function reconnectInPlace(
   const c = deps.connections!;
   const acting: Acting = { actingRaftUserId: raftUserId, actingRole: target.actingRole };
   const k = await ownConnector(c, tenantId, target.connectorId, row.raftOrigin);
-  if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${target.connectorId} in this tenant; it may have been disconnected since the link was made` });
+  if (!k || k.provider !== p) return fail({ status: 404, code: "connector_gone", message: `no ${p} connector ${target.connectorId} in this tenant; it may have been disconnected since the link was made` });
   const refused = creatorRefused(k, acting);
   if (refused) return fail(refused);
   if (!r.accountId) return fail({ status: 422, code: "connect_failed", message: "GitHub did not say which account was authorized, so the connector was not changed" });
@@ -1741,7 +1741,7 @@ async function reconnectInPlace(
     grantedScope: r.grantedScope, requestedScope: r.requestedScope }))) {
     // Gone, or given another account's id, between the read and the write.
     const now = await ownConnector(c, tenantId, k.id, row.raftOrigin);
-    return now ? mismatch() : fail({ status: 404, code: "not_found", message: `no ${p} connector ${k.id} in this tenant; it was disconnected meanwhile` });
+    return now ? mismatch() : fail({ status: 404, code: "connector_gone", message: `no ${p} connector ${k.id} in this tenant; it was disconnected meanwhile` });
   }
   await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, action: "reconnect", ...acting, at });
   const updated: string[] = [];
