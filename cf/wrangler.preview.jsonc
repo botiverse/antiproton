@@ -59,6 +59,10 @@
       { "id": "deepseek-flash", "label": "DeepSeek Flash", "provider": "deepseek", "model": "deepseek-flash" },
       { "id": "gpt-5.6-luna", "label": "GPT-5.6 Luna", "provider": "cloudflare", "model": "openai/gpt-5.6-luna" }
     ],
+    // The vendors an owner may run their agent on with their own key (src/model/user-key.ts), comma-separated.
+    // On here so the path can be observed; unset in cf/wrangler.jsonc, because Kimi Code's edge answered a request
+    // from this Worker with an HTML 403 block page (measured 2026-11-05), so no key could work from production yet.
+    "USER_KEY_PROVIDERS": "kimi-code",
     "ARTIFACT_BUCKET": "antiproton-preview-artifacts",
     "HOOK_ORIGIN": "https://preview.antiproton.ai",
     // Open to look at until the Access application exists; the write routes

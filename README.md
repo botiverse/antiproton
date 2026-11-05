@@ -351,12 +351,21 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    vendor instead of the operator's: the agent's model card in the console (`POST /ui/agent/model-key`
    with `provider`, `model` and `key`, or `remove=1`; `cf/src/agent-model.ts`) seals the key in the agent's
    object (`model:` rows, `src/runtime/secrets.ts`, which no mount reference, tool or listing reaches) and
-   binds the agent to `user:model:<provider>`. The vendors are code, not configuration
-   (`src/model/user-key.ts`): first Kimi Code, a key made in the Kimi Code console, called at
+   binds the agent to `user:model:<provider>`. The vendors are code (`src/model/user-key.ts`), and each
+   deployment switches them on by id in `USER_KEY_PROVIDERS` (comma-separated; unset or empty is none).
+   Preview sets `kimi-code`; production leaves it unset, because Kimi Code's edge answered a request from a
+   Cloudflare Worker with an HTML 403 block page (measured on preview, 2026-11-05). A vendor not switched on is
+   not offered on the card, a key for it is refused (409 `provider_off`) before anything is stored, and an
+   agent already bound to it makes no model call: the turn ends saying own keys for that vendor are switched
+   off on this deployment, and nothing falls back to the operator's key. The first vendor is Kimi Code, a key made in the Kimi Code console, called at
    `https://api.kimi.com/coding/v1` (OpenAI-compatible) with `kimi-for-coding`, `kimi-for-coding-highspeed`,
    `k3` or `k3-256k`, and a User-Agent naming antiproton. The queue consumer opens the key from the agent's
-   object for each call and never falls back to the operator's: a key the vendor refuses (401/403) is
-   marked refused and the turn ends asking the owner to reconnect it; the vendor's rate or plan limit (429)
+   object for each call and never falls back to the operator's: a key the vendor refuses (401/403 with a JSON
+   body) is marked refused and the turn ends asking the owner to reconnect it; a 401/403 that is not JSON (an
+   edge's block page) ends the turn saying it is not about the key, and leaves the key unmarked so the next
+   message tries it again; every non-2xx answer on an owner's key logs one `model_key.http` line (status,
+   content type, body length and its first 40 characters after redaction, and the `server`, `cf-ray`,
+   `cf-mitigated`, `x-amz-cf-id` and `via` headers, never the key or a request header); the vendor's rate or plan limit (429)
    ends the turn saying so; at most 60 provider attempts a minute per agent (a queue retry is an attempt) are made on it. An admin's agent or tenant row
    refuses a key as it refuses a pick. Its tokens are metered as the owner's (`own:` keys, docs/metering.md
    "Who pays").

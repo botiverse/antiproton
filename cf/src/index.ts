@@ -135,6 +135,7 @@ import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
 import type { FirstTurn } from "../../src/runtime/prewarm.ts";
 import { callPrewarm, operatorModelOf, queuedCall, planBinding, resolveModel } from "./model-request.ts";
 import { userModelsFrom } from "../../src/model/user-models.ts";
+import { userKeyOffProblem, userKeyProviderEnabled } from "../../src/model/user-key.ts";
 import { subagentsDisabledBy } from "../../src/runtime/agent-settings.ts";
 import { DEFAULT_PROVIDER, providerStatus, type ModelChoice } from "../../src/model/providers.ts";
 import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
@@ -175,6 +176,12 @@ export interface Env {
    * lists no options.
    */
   USER_MODELS?: unknown;
+  /**
+   * The vendors an owner may run their agent on with their own key, by id, comma-separated (`enabledUserKeyProviders`,
+   * src/model/user-key.ts). Unset or empty: none is offered, a key is not stored, and an agent already bound to one
+   * makes no model call (and never falls back to the operator's account).
+   */
+  USER_KEY_PROVIDERS?: string;
   DEEPSEEK_BASE_URL: string;
   HARNESS_MODEL: string;
   /**
@@ -835,6 +842,9 @@ export class AgentDO extends DurableObject<Env> {
 
   // The console's model-key writes (`/ui/agent/model-key*`), the owner's counterparts of `uiPutSecret`.
   async uiPutModelKey(tenantId: string, agentId: string, provider: string, model: string, key: string) {
+    // The route refuses a switched-off vendor first (agentModelKey); this is the object's own check, for any other
+    // caller, made before anything in the object is written.
+    if (!userKeyProviderEnabled(this.env.USER_KEY_PROVIDERS, provider)) return { ok: false as const, error: userKeyOffProblem(provider) };
     this.#claim(tenantId, agentId);
     return this.#busy("uiPutModelKey", () => this.runtime().putModelKey(tenantId, agentId, provider, model, key));
   }
@@ -4925,6 +4935,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
               defaultModel: env.HARNESS_MODEL,
               now: Date.now,
               ownKey: () => agentStub.uiModelKeyState(gate.tenantId, agentId),
+              userKeyProviders: env.USER_KEY_PROVIDERS,
             });
           // A stored pick is bound at once (AgentDO.rebindModel), so whatever starts the agent's next turn runs
           // on it. Not the request's failure: the pick is stored, and a page open or a message binds it anyway.
@@ -4955,6 +4966,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
               userModels: userModelsFrom(env as unknown as Record<string, unknown>, operatorModelOf(env).providers),
               defaultModel: env.HARNESS_MODEL,
               now: Date.now,
+              userKeyProviders: env.USER_KEY_PROVIDERS,
               agent: {
                 put: (provider, model, key) => stub.uiPutModelKey(gate.tenantId, agentId, provider, model, key),
                 remove: () => stub.uiRemoveModelKey(gate.tenantId, agentId),

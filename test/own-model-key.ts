@@ -46,7 +46,8 @@ const show = (v: unknown) => JSON.stringify(v);
 const USER_KEY = "sk-kimi-OWNERS-OWN-KEY-0123456789abcdef";
 const OPERATOR_KEY = "operator-deepseek-key-xyz";
 const KEK = Buffer.alloc(32, 7).toString("base64");
-const ENV = { DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: OPERATOR_KEY, HARNESS_MODEL: "deepseek-flash" };
+// Own keys switched on for Kimi Code (USER_KEY_PROVIDERS), as on preview; the switched-off cases unset it on the agent's env.
+const ENV = { DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: OPERATOR_KEY, HARNESS_MODEL: "deepseek-flash", USER_KEY_PROVIDERS: "kimi-code" };
 const OK_BODY = JSON.stringify({ choices: [{ message: { content: "Sunny." }, finish_reason: "stop" }], usage: { prompt_tokens: 100, completion_tokens: 7 } });
 
 /** Every request `fetch` was asked to make, answered by `answer`. */
@@ -95,7 +96,7 @@ function d1() {
 /** The model-card route's deps with no admin row and no owner pick. */
 const unlocked = {
   choices: { layers: async () => ({ agent: null, tenant: null, deployment: null, owner: null }), put: async () => {}, remove: async () => {} } as any,
-  userModels: { offered: [] }, defaultModel: "deepseek-flash", now: Date.now,
+  userModels: { offered: [] }, defaultModel: "deepseek-flash", now: Date.now, userKeyProviders: "kimi-code",
 };
 const form = (o: Record<string, string>) => { const f = new FormData(); for (const [k, v] of Object.entries(o)) f.set(k, v); return f; };
 
@@ -104,7 +105,7 @@ const form = (o: Record<string, string>) => { const f = new FormData(); for (con
  * through the model card's route when `withKey`, a first turn dispatched, and the consumer's deps wired the way
  * cf/src/index.ts wires them: the key from the object's own `modelKeyFor`, never from the message or the job.
  */
-async function agentOn(engine: "pi085" | "pd", opts: { withKey?: boolean; firstTurnOff?: boolean } = {}) {
+async function agentOn(engine: "pi085" | "pd", opts: { withKey?: boolean; firstTurnOff?: boolean; key?: string } = {}) {
   const host = sqliteHost();
   if (engine === "pd") {
     const ap = new ApStore(host, prefixedNamespace("ap"));
@@ -133,6 +134,8 @@ async function agentOn(engine: "pi085" | "pd", opts: { withKey?: boolean; firstT
   }
   const routeDeps: AgentModelKeyDeps = {
     ...unlocked,
+    // Read from the agent's env at each request, so a test can switch own keys off after storing one.
+    get userKeyProviders() { return env.USER_KEY_PROVIDERS; },
     agent: {
       put: (p, m, k) => o.uiPutModelKey("t", "a", p, m, k),
       remove: () => o.uiRemoveModelKey("t", "a"),
@@ -141,7 +144,7 @@ async function agentOn(engine: "pi085" | "pd", opts: { withKey?: boolean; firstT
   };
   let stored: Response | null = null;
   if (opts.withKey !== false) {
-    stored = await agentModelKey("POST", form({ provider: "kimi-code", model: "kimi-for-coding", key: USER_KEY }), { tenantId: "t", agentId: "a", actor: "owner" }, routeDeps);
+    stored = await agentModelKey("POST", form({ provider: "kimi-code", model: "kimi-for-coding", key: opts.key ?? USER_KEY }), { tenantId: "t", agentId: "a", actor: "owner" }, routeDeps);
   }
   await rt.postMessage("t", "a", "What's the weather in Oslo?");
   await rt.step("t", "a");
@@ -157,12 +160,12 @@ async function agentOn(engine: "pi085" | "pd", opts: { withKey?: boolean; firstT
   });
   const deps: ModelQueueDeps = {
     stub: () => stub,
-    call: (taken, m) => callQueuedModel(ENV, taken, m.jobId, undefined, undefined, keysFor(m)),
+    call: (taken, m) => callQueuedModel(env as typeof ENV, taken, m.jobId, undefined, undefined, keysFor(m)),
     givenUp: (m) => ({ role: "assistant", content: [], stopReason: "error", errorMessage: "given up", jobId: m.jobId }),
   };
   const q = { acked: 0, retried: 0 };
   const msg = (jobId = sent.at(-1)!): ModelQueueMessage => ({ body: { doId: "do-1", tenantId: "t", agentId: "a", jobId }, ack() { q.acked++; }, retry() { q.retried++; } });
-  return { host, rt, o, deps, msg, q, sent, stored, routeDeps };
+  return { host, rt, o, deps, msg, q, sent, stored, routeDeps, env };
 }
 
 /** Steps the agent until it has nothing due soon, so a harness retry (pd's waits 2 s) would have happened. */
@@ -268,7 +271,7 @@ for (const engine of ["pi085", "pd"] as const) {
     const a = await agentOn(engine);
     try {
       const body = JSON.stringify({ error: { message: `Invalid Authentication: ${USER_KEY}`, type: "invalid_authentication_error" } });
-      const f = fetchAs(() => new Response(body, { status: 401 }));
+      const f = fetchAs(() => new Response(body, { status: 401, headers: { "content-type": "application/json" } }));
       const { out } = await captured(async () => {
         try { await consumeModelCalls({ queue: "model-calls", messages: [a.msg()] }, a.deps); await settle(a.rt); } finally { f.restore(); }
       });
@@ -291,6 +294,73 @@ for (const engine of ["pi085", "pd"] as const) {
       // Storing a key again clears the mark.
       await agentModelKey("POST", form({ provider: "kimi-code", model: "kimi-for-coding", key: USER_KEY }), { tenantId: "t", agentId: "a", actor: "owner" }, a.routeDeps);
       must((await a.o.uiModelKeyState("t", "a"))?.refusedAt === null, "a new key is still marked refused");
+    } finally { a.host.dispose(); }
+  });
+
+  await check(`${engine}: an HTML 403 from Kimi's edge ends the turn once saying it is not about the key, without marking it refused; the next turn calls Kimi again; the model_key.http line names the edge`, async () => {
+    const a = await agentOn(engine);
+    try {
+      const page = `<!DOCTYPE html>\n<!--[if lt IE 7]> <html class="no-js ie6 oldie" lang="en-US"> <![endif]-->\n<title>Attention Required! | Cloudflare</title>`;
+      const f = fetchAs(() => new Response(page, { status: 403, headers: { "content-type": "text/html; charset=UTF-8", server: "cloudflare", "cf-ray": "8f00ba11-HKG", "set-cookie": "__cf_bm=xyz" } }));
+      const { out } = await captured(async () => {
+        try { await consumeModelCalls({ queue: "model-calls", messages: [a.msg()] }, a.deps); await settle(a.rt); } finally { f.restore(); }
+      });
+      must(f.seen.length === 1 && f.seen[0]!.url.startsWith("https://api.kimi.com/"), `calls ${show(f.seen.map((c) => c.url))}`);
+      must(a.q.acked === 1 && a.q.retried === 0 && a.sent.length === 1, `queue ${show(a.q)}, sent ${a.sent.length}`);
+      const last = lastMessage(a.host.sql);
+      must(last?.stopReason === "error" && last.errorMessage === USER_KEY_ERRORS.edge, show(last));
+      must(last.providerError === "Kimi Code's network edge refused this request (HTTP 403, not a JSON answer): this is not about your key, which is kept and tried again on the next message. Nothing fell back to another account.", last.providerError);
+      must(!/create a new key|reconnect/.test(last.providerError), last.providerError);
+      for (const [name, isRetryable] of [["pi-ai 0.85.1", retryable085], ["pi-ai 1.0.0", retryable1]] as const) must(!isRetryable(last), `${name} retries it`);
+      // Not marked: no refusal on the card, and nothing in the object's refusal table.
+      must((await a.o.uiModelKeyState("t", "a"))?.refusedAt === null, "an edge block marked the key refused");
+      must(a.host.sql.exec("SELECT 1 FROM model_key_state WHERE broken_at IS NOT NULL").toArray().length === 0, "broken_at was written");
+      const html = agentModelBlock(await (await agentModel("GET", null, { tenantId: "t", agentId: "a", actor: "owner" }, { ...unlocked, ownKey: () => a.o.uiModelKeyState("t", "a") })).json() as any);
+      must(!html.includes("refused") && html.includes("your own key"), html);
+      // One diagnostic line: status, content type, the page's opening, the edge's headers; no other header, no key.
+      const line = out.split("\n").map((l) => { try { return JSON.parse(l); } catch { return null; } }).find((l) => l?.evt === "model_key.http");
+      must(line && line.status === 403 && line.contentType === "text/html; charset=UTF-8" && line.bodyHead === "<!DOCTYPE html> <!--[if lt IE 7]> <html "
+        && line.bodyBytes === new TextEncoder().encode(page).length && line.edgeErrorCode === false
+        && show(line.headers) === show({ server: "cloudflare", "cf-ray": "8f00ba11-HKG" }), show(line));
+      must(!out.includes("__cf_bm") && !out.includes(USER_KEY) && !out.includes("Bearer"), out);
+      // The next turn tries the key again, and it works.
+      await a.rt.postMessage("t", "a", "And tomorrow?");
+      await a.rt.step("t", "a");
+      const g = fetchAs(() => new Response(OK_BODY, { status: 200 }));
+      try { await consumeModelCalls({ queue: "model-calls", messages: [a.msg()] }, a.deps); await settle(a.rt); } finally { g.restore(); }
+      must(g.seen.length === 1 && g.seen[0]!.headers.authorization === `Bearer ${USER_KEY}`, `next turn: ${g.seen.length} calls`);
+      must(lastMessage(a.host.sql)?.stopReason !== "error" && lastMessage(a.host.sql)?.payer === "own", show(lastMessage(a.host.sql)));
+    } finally { a.host.dispose(); }
+  });
+
+  await check(`${engine}: own keys switched off with a binding already stored: the turn ends saying so, no call is made (Kimi's or the operator's), the card offers nothing and says switched off, and a new key is refused`, async () => {
+    const a = await agentOn(engine);
+    try {
+      must(a.stored?.status === 200, `stored while on: ${a.stored?.status}`);
+      delete a.env.USER_KEY_PROVIDERS;
+      const f = fetchAs(() => new Response(OK_BODY, { status: 200 }));
+      const { out } = await captured(async () => {
+        try { await consumeModelCalls({ queue: "model-calls", messages: [a.msg()] }, a.deps); await settle(a.rt); } finally { f.restore(); }
+      });
+      must(f.seen.length === 0, `called ${show(f.seen.map((c) => c.url))}`);
+      must(a.q.acked === 1 && a.q.retried === 0, `queue ${show(a.q)}`);
+      const last = lastMessage(a.host.sql);
+      must(last?.stopReason === "error" && last.errorMessage === USER_KEY_ERRORS.off && last.payer === "own", show(last));
+      must(last.providerError === "Own keys for Kimi Code are switched off on this deployment, so this agent made no model call. Nothing fell back to another account. Remove your key on this agent's model card to run it on the deployment's model.", last.providerError);
+      for (const [name, isRetryable] of [["pi-ai 0.85.1", retryable085], ["pi-ai 1.0.0", retryable1]] as const) must(!isRetryable(last), `${name} retries it`);
+      // Not opened: no attempt was counted against the cap.
+      must(Number((a.host.sql.exec("SELECT COUNT(*) AS n FROM model_key_calls").toArray()[0] as any).n) === 0, "the key was opened");
+      must(out.includes('"reason":"switched_off"'), out);
+      const card = await (await agentModel("GET", null, { tenantId: "t", agentId: "a", actor: "owner" }, { ...a.routeDeps, ownKey: () => a.o.uiModelKeyState("t", "a") })).json() as any;
+      must(show(card.keyProviders) === "[]" && card.ownKey?.off === true && card.effective.source === "own", show(card));
+      const html = agentModelBlock(card);
+      must(html.includes("own Kimi Code keys are switched off here") && !html.includes('type="password"') && html.includes("remove your key"), html);
+      const again = await agentModelKey("POST", form({ provider: "kimi-code", model: "k3", key: USER_KEY }), { tenantId: "t", agentId: "a", actor: "owner" }, a.routeDeps);
+      must(again.status === 409 && (await again.json() as any).error.code === "provider_off", `${again.status}`);
+      must((await a.rt.store.getModelBinding("t", "a"))?.model === "kimi-for-coding", "the refused write moved the binding");
+      // Removing it is still allowed, and puts the agent back on the operator's account.
+      const rm = await agentModelKey("POST", form({ remove: "1" }), { tenantId: "t", agentId: "a", actor: "owner" }, a.routeDeps);
+      must(rm.status === 200 && (await rm.json() as any).ownKey === null, `remove: ${rm.status}`);
     } finally { a.host.dispose(); }
   });
 
@@ -329,6 +399,24 @@ await check("a 503 that quotes the key goes back to the queue on the same key; t
     const ok = fetchAs(() => new Response(OK_BODY, { status: 200 }));
     try { await consumeModelCalls({ queue: "model-calls", messages: [a.msg()] }, a.deps, 10); } finally { ok.restore(); }
     must(ok.seen.length === 1 && attempts() === 2, `the retry: ${ok.seen.length} calls, ${attempts()} attempts counted`);
+  } finally { a.host.dispose(); }
+});
+
+await check("model_key.http: a key with no sk- shape, echoed at the very start of a failed answer's body, never reaches the log", async () => {
+  const PLAIN_KEY = "PlainOwnerKey0123456789ABCDEFGHIJKLMNOPQRSTUV";
+  must(!/\b(sk|pk|rk)-/.test(PLAIN_KEY), "the key must not be caught by the prefix rule");
+  const a = await agentOn("pi085", { key: PLAIN_KEY });
+  try {
+    must(a.stored?.status === 200, `stored: ${a.stored?.status}`);
+    const f = fetchAs(() => new Response(`${PLAIN_KEY} is not allowed here`, { status: 403, headers: { "content-type": "text/plain", server: PLAIN_KEY } }));
+    const { out } = await captured(async () => {
+      try { await consumeModelCalls({ queue: "model-calls", messages: [a.msg()] }, a.deps); await settle(a.rt); } finally { f.restore(); }
+    });
+    must(f.seen.length === 1 && f.seen[0]!.headers.authorization === `Bearer ${PLAIN_KEY}`, "the key was not the one called with");
+    const line = out.split("\n").map((l) => { try { return JSON.parse(l); } catch { return null; } }).find((l) => l?.evt === "model_key.http");
+    must(line?.bodyHead === "[redacted] is not allowed here" && line.headers.server === "[redacted]", show(line));
+    for (const piece of [PLAIN_KEY, PLAIN_KEY.slice(0, 20), PLAIN_KEY.slice(-20)]) must(!out.includes(piece), `the key reached the log: ${out}`);
+    must(lastMessage(a.host.sql)?.errorMessage === USER_KEY_ERRORS.edge, show(lastMessage(a.host.sql)));
   } finally { a.host.dispose(); }
 });
 

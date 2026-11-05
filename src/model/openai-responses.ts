@@ -39,7 +39,7 @@
  * reasoning tokens it lists in `reasoning_tokens` (as `completion_tokens` does).
  */
 import { OPENAI_MODELS } from "pi-ai-1/providers/openai.models";
-import { MODEL_CALL_DEADLINE_MS, REASONING_CHARS, parseArguments, postModelRequest } from "./openai-compatible.ts";
+import { MODEL_CALL_DEADLINE_MS, REASONING_CHARS, parseArguments, postModelRequest, type FailedAnswer } from "./openai-compatible.ts";
 import type { ModelResponse, ToolDefinition } from "./types.ts";
 
 const OPENAI_VENDOR = "openai/";
@@ -102,6 +102,8 @@ export class OpenAiResponsesModel {
     input: ResponsesInputItem[],
     opts: {
       tools?: ToolDefinition[]; reasoning?: "off" | "low" | "high"; maxTokens?: number; onStatus?: (status: number) => void;
+      /** As OpenAiCompatibleModel's: shown each non-2xx answer before it is thrown or retried. */
+      onFailedAnswer?: (a: FailedAnswer) => void;
       /**
        * Write the prompt cache for this input and generate nothing (`prompt_cache_options.prewarm`, GPT-5.6 and later:
        * https://developers.openai.com/api/docs/guides/prompt-caching). Sent through Cloudflare AI Gateway's /compat, it
@@ -124,7 +126,7 @@ export class OpenAiResponsesModel {
       ...(opts.prewarm ? { prompt_cache_options: { prewarm: true } } : {}),
     });
     return postModelRequest(
-      { url: `${this.#baseUrl}/responses`, apiKey: this.#apiKey, model: this.#model, headers: this.#headers, deadlineMs: this.#deadlineMs, onStatus: opts.onStatus },
+      { url: `${this.#baseUrl}/responses`, apiKey: this.#apiKey, model: this.#model, headers: this.#headers, deadlineMs: this.#deadlineMs, onStatus: opts.onStatus, onFailedAnswer: opts.onFailedAnswer },
       body,
       readResponse,
     );

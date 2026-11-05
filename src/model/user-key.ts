@@ -18,6 +18,8 @@
  * pasted one, resolved at the same point.
  */
 
+import { redacted } from "./openai-compatible.ts";
+
 export interface UserKeyModel { id: string; label: string; contextWindow: number }
 
 export interface UserKeyProvider {
@@ -58,6 +60,28 @@ export const USER_KEY_PROVIDERS: readonly UserKeyProvider[] = [
     ],
   },
 ];
+
+/**
+ * The vendors this deployment lets an owner run on their own key: the ids named in its `USER_KEY_PROVIDERS` setting,
+ * comma-separated, that are also in the catalogue above. Absent or empty is none. A vendor in the catalogue is code
+ * that can call it; whether the call can work from where this deployment runs is not, and is learned per deployment:
+ * Kimi Code's edge answered a request from a Cloudflare Worker with an HTML 403 block page where the same request
+ * from an ordinary server got a JSON 401 (measured on preview, 2026-11-05). So the switch is off unless named, and an
+ * id that is not named is not offered, not stored, and not called, even for an agent already bound to it.
+ */
+export function enabledUserKeyProviders(setting: unknown): readonly UserKeyProvider[] {
+  const ids = typeof setting === "string" ? setting.split(",").map((s) => s.trim()).filter(Boolean) : [];
+  return USER_KEY_PROVIDERS.filter((p) => ids.includes(p.id));
+}
+
+export function userKeyProviderEnabled(setting: unknown, id: string): boolean {
+  return enabledUserKeyProviders(setting).some((p) => p.id === id);
+}
+
+/** Why a key for `provider` cannot be stored or used on this deployment, said to the owner. */
+export function userKeyOffProblem(provider: string): string {
+  return `own keys for ${userKeyProvider(provider)?.label ?? provider} are switched off on this deployment`;
+}
 
 export const USER_MODEL_REF = "user:model";
 
@@ -135,6 +159,8 @@ export const USER_KEY_ERRORS = {
   missing: "no own model key is stored for this agent; see the turn's error",
   limited: "your own model account is over its plan's limit (out of budget); see the turn's error",
   paced: "too many attempts on your own model key this minute (out of budget); see the turn's error",
+  off: "own model keys for this provider are switched off on this deployment; see the turn's error",
+  edge: "the provider's edge turned the request away before it reached your key; see the turn's error",
 } as const;
 
 /** The owner-facing sentence for each failure, carried in `providerError`. */
@@ -149,5 +175,40 @@ export function userKeyTurnError(kind: keyof typeof USER_KEY_ERRORS, provider: s
       return `${label} says your account is over its rate or plan limit${status ? ` (HTTP ${status})` : ""}. Wait for it to reset, or raise the plan with ${label}; this agent does not fall back to another account.`;
     case "paced":
       return `This agent made more than ${USER_KEY_CALLS_PER_MINUTE} attempts at model calls on your ${label} key in the last minute (retries of a failed call count too), the most it may. Send the next message in a minute.`;
+    case "off":
+      return `Own keys for ${label} are switched off on this deployment, so this agent made no model call. Nothing fell back to another account. Remove your key on this agent's model card to run it on the deployment's model.`;
+    case "edge":
+      return `${label}'s network edge refused this request${status ? ` (HTTP ${status}, not a JSON answer)` : " (not a JSON answer)"}: this is not about your key, which is kept and tried again on the next message. Nothing fell back to another account.`;
   }
+}
+
+/**
+ * The response headers that tell a block by something in front of the vendor (a CDN or WAF page) from the vendor's
+ * own answer. Only these are ever logged: never a request header, and never the rest of the response's.
+ */
+const EDGE_HEADERS = ["server", "cf-ray", "cf-mitigated", "x-amz-cf-id", "via"] as const;
+/** How much of a failed answer's body is logged: enough to tell `<!DOCTYPE html>`, `error code:` and `{` apart. */
+const BODY_HEAD_CHARS = 40;
+
+/**
+ * The `model_key.http` log line for one non-2xx answer on an owner's key: status, content type, body length and its
+ * first characters, EDGE_HEADERS, and whether an edge's error-code marker opens the body. The body head and every
+ * header value are redacted of `secrets` (the key and the request's headers) and of anything shaped like a key
+ * before they are cut, so a vendor that echoes the key back does not put it in the log.
+ */
+export function userKeyHttpLine(a: { status: number; headers: Headers; body: string }, secrets: string[]): Record<string, unknown> {
+  const clean = (v: string, n: number) => redacted(v, secrets).replace(/\s+/g, " ").trim().slice(0, n);
+  const headers: Record<string, string> = {};
+  for (const h of EDGE_HEADERS) {
+    const v = a.headers.get(h);
+    if (v !== null) headers[h] = clean(v, 120);
+  }
+  return {
+    status: a.status,
+    contentType: clean(a.headers.get("content-type") ?? "", 120) || null,
+    bodyBytes: new TextEncoder().encode(a.body).length,
+    bodyHead: clean(a.body, BODY_HEAD_CHARS),
+    edgeErrorCode: /cf-error-code|error code:/i.test(a.body.slice(0, 200)),
+    headers,
+  };
 }

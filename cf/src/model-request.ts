@@ -1,8 +1,8 @@
 import { operatorRequest, providerOfRef, type OperatorModel } from "../../src/model/operator-request.ts";
 import { DEFAULT_PROVIDER, modelProblem, providersFrom, type ModelChoice, type ModelProviders } from "../../src/model/providers.ts";
 import type { UserModel, UserModels } from "../../src/model/user-models.ts";
-import { ModelHttpError, ModelRequestRefused, OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
-import { USER_KEY_ERRORS, userKeyProvider, userKeyRequest, userKeyTurnError } from "../../src/model/user-key.ts";
+import { ModelHttpError, ModelRequestRefused, OpenAiCompatibleModel, type FailedAnswer } from "../../src/model/openai-compatible.ts";
+import { USER_KEY_ERRORS, userKeyHttpLine, userKeyProvider, userKeyProviderEnabled, userKeyRequest, userKeyTurnError } from "../../src/model/user-key.ts";
 import { OpenAiResponsesModel, usesResponses } from "../../src/model/openai-responses.ts";
 import { errorMessage, fromResponse, toRequest, toResponsesInput, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
@@ -19,6 +19,8 @@ import { logEvent } from "../../src/core/log.ts";
  */
 export type ModelEnv = {
   DEEPSEEK_BASE_URL?: string; DEEPSEEK_API_KEY?: string; HARNESS_MODEL: string; MODEL_PROVIDERS?: unknown; USER_MODELS?: unknown;
+  /** The own-key vendors this deployment calls (`enabledUserKeyProviders`, src/model/user-key.ts); unset is none. */
+  USER_KEY_PROVIDERS?: string;
   /**
    * Where the Responses API path puts a tool result's images (`toResponsesInput`, src/model/pi-bridge.ts): `output`
    * (the default, pi's way) or `user`, a user message after the results. Both were answered correctly through the
@@ -246,6 +248,12 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
   };
   let request: ReturnType<typeof operatorRequest>;
   if (user) {
+    // Switched off on this deployment (USER_KEY_PROVIDERS): the key is not opened and nothing is called, the
+    // operator's account included. The binding stays, so the owner sees why on their card and can remove it.
+    if (!userKeyProviderEnabled(env.USER_KEY_PROVIDERS, user.provider)) {
+      logEvent("model_job.own_key_unavailable", { jobId, provider, model: called, reason: "switched_off" });
+      return userKeyAnswer("off", provider, identity, jobId);
+    }
     const got = keys ? await keys.get(user.provider) : null;
     if (got?.kind !== "key") {
       const kind = got?.kind === "paced" ? "paced" : "missing";
@@ -270,7 +278,14 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
   }
   // Told the status of each HTTP answer only when it is recorded, so a call that is not is the call it always was.
   let lastStatus: number | undefined;
-  const observe = recording ? { onStatus: (s: number) => { lastStatus = s; } } : {};
+  const observe = {
+    ...(recording ? { onStatus: (s: number) => { lastStatus = s; } } : {}),
+    // On the owner's key every non-2xx answer is logged with what tells a vendor's answer from an edge's block page
+    // (`userKeyHttpLine`): never the body past its first characters, never a request header, never the key.
+    ...(user ? { onFailedAnswer: (a: FailedAnswer) => logEvent("model_key.http", {
+      jobId, provider, model: called, ...userKeyHttpLine(a, [request.apiKey, ...Object.values(request.headers)]),
+    }) } : {}),
+  };
   // The options a job may carry, each marked by its object (`AgentRuntime.takeJob`): reasoning off for a first turn
   // made to run without, and the output cap and reasoning level of an agent whose profile sets them. A job without them is sent exactly the
   // request it always was.
@@ -308,6 +323,13 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
       // The owner's key was refused: marked, so no call is made on it again until they store another, and the turn
       // ends saying so. A rate or plan limit ends the turn too, rather than going back to the queue to meet the
       // same limit four more times. Anything else is retried by the queue on the same key.
+      // Only the vendor's own answer can refuse the key: a 401/403 that is not JSON came from something in front of
+      // it (an edge's HTML block page), which would have turned a valid key away too. That turn still ends, and
+      // nothing else is called, but the key is not marked, so the next message tries it again.
+      if (e instanceof ModelRequestRefused && (e.status === 401 || e.status === 403) && !e.answeredJson) {
+        logEvent("model_job.own_key_edge", { jobId, provider, model: called, status: e.status });
+        return userKeyAnswer("edge", provider, identity, jobId, { status: e.status });
+      }
       if (e instanceof ModelRequestRefused && (e.status === 401 || e.status === 403)) {
         await keys!.refused(user.provider, e.status);
         logEvent("model_job.own_key_refused", { jobId, provider, model: called, status: e.status });
