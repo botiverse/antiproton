@@ -62,7 +62,7 @@ const COUNTERS = ["input", "output", "cacheRead", "cacheWrite", "cacheWrite1h", 
 type Tokens = Partial<Record<(typeof COUNTERS)[number], number>>;
 
 type Raw = { exec(query: string, ...bindings: Array<string | number | null>): { toArray(): Array<Record<string, unknown>> } };
-type MessageLike = { role?: unknown; model?: unknown; provider?: unknown; jobId?: unknown; stopReason?: unknown; usage?: Tokens };
+type MessageLike = { role?: unknown; model?: unknown; provider?: unknown; jobId?: unknown; stopReason?: unknown; usage?: Tokens; payer?: unknown };
 
 interface BookContext {
   /** Whose rows these are. Null when the host is not bound yet: then no trace row is written. */
@@ -311,7 +311,7 @@ function bookRebuilds(exec: SqliteSyncExecutor, writes: readonly StorageWrite[],
  */
 export function deliveryRows(owner: { tenantId: string; agentId: string }, now: number, answer: MessageLike, accepted: boolean): UsageRow[] {
   if (!answer.usage) return [];
-  const rows = modelTokenRows({ at: now, ...owner }, typeof answer.model === "string" ? answer.model : "unknown", answer.usage);
+  const rows = modelTokenRows({ at: now, ...owner }, typeof answer.model === "string" ? answer.model : "unknown", answer.usage, answer.payer === "own");
   return accepted ? rows : rows.map((r) => ({ ...r, resource: UNACCEPTED_TOKENS }));
 }
 

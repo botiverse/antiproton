@@ -707,14 +707,20 @@ function refuse(status: number, code: string, message: string): Response {
 /**
  * The queue consumer's `admit` (cf/src/model-queue.ts): null to call the provider, or the refusal to deliver. The
  * refusal names the model the call would have reached, as `callQueuedModel` (cf/src/model-request.ts) would.
+ *
+ * A call on the owner's own key is asked too. Its tokens are `own:` and priced at nothing (`priceFor`), so they never
+ * bring the tenant nearer a limit; but each of its turns still runs our object, our queue and the tools it calls, and
+ * a tenant whose priced usage has reached its limit is stopped here whichever account its model is on. How often such
+ * a call may be made is a separate cap, counted in the agent's object (USER_KEY_CALLS_PER_MINUTE, src/model/user-key.ts).
  */
 export function spendAdmit(gate: Pick<SpendGate, "admit">, defaultModel: string) {
   return async (job: unknown, m: { tenantId: string; agentId: string; jobId: string }): Promise<AnsweredMessage | null> => {
     const verdict = await gate.admit(m.tenantId, m.agentId);
     if (verdict.admit) return null;
-    const j = job as { model?: { api?: unknown; provider?: unknown }; operatorModel?: unknown } | null;
+    const j = job as { model?: { api?: unknown; provider?: unknown }; operatorModel?: unknown; userModel?: { model?: unknown } } | null;
     return refusalAnswer(verdict.text, m.jobId, {
-      api: String(j?.model?.api ?? "offloaded"), provider: String(j?.model?.provider ?? "openai-compatible"), id: String(j?.operatorModel ?? defaultModel),
+      api: String(j?.model?.api ?? "offloaded"), provider: String(j?.model?.provider ?? "openai-compatible"),
+      id: String(j?.operatorModel ?? j?.userModel?.model ?? defaultModel),
     });
   };
 }

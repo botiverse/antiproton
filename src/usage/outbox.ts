@@ -133,6 +133,8 @@ export function modelTokenRows(
   base: { at: number; tenantId: string; agentId: string },
   model: string,
   usage: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cacheWrite1h?: number; reasoning?: number },
+  /** The answer was paid with the owner's own key (`payer: "own"`, src/model/pi-bridge.ts): its keys are `own:`. */
+  own = false,
 ): UsageRow[] {
   const kinds: Array<[string, number | undefined]> = [
     ["input", usage.input], ["output", usage.output], ["cache_read", usage.cacheRead],
@@ -141,7 +143,7 @@ export function modelTokenRows(
   ];
   return kinds
     .filter(([, n]) => typeof n === "number" && n !== 0)
-    .map(([kind, n]) => ({ ...base, resource: "model.tokens", key: `${model || "unknown"}:${kind}`, quantity: n!, unit: "tokens" }));
+    .map(([kind, n]) => ({ ...base, resource: "model.tokens", key: payerKey(`${model || "unknown"}:${kind}`, own), quantity: n!, unit: "tokens" }));
 }
 
 /**
@@ -161,8 +163,9 @@ export const UNACCEPTED_TOKENS = "model.tokens.unaccepted";
  *
  * A key prefix rather than a resource of its own (as `UNACCEPTED_TOKENS` is): an unaccepted answer is kept OUT of
  * the tenant's views, and a resource of its own is what lets one predicate do that; own-credential usage is kept
- * IN them, and a prefix is what needs no reader to learn a second resource name. Model calls never carry it: every
- * model call is made on the operator's account (cf/src/runtime.ts takeJob, docs/metering.md "Who pays").
+ * IN them, and a prefix is what needs no reader to learn a second resource name. A model call carries it when it was
+ * made on the owner's own key (`payer: "own"` on the answer, set by the queue consumer's `callQueuedModel`,
+ * cf/src/model-request.ts): `own:<model>:<kind>`, metered at the same delivery as any answer (docs/metering.md "Who pays").
  */
 export const OWN_KEY_PREFIX = "own:";
 

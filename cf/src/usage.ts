@@ -14,7 +14,8 @@
  *   sandbox.container   "<plugin>"                  seconds, execs
  *
  * A key paid with the tenant's own credential starts with "own:" (src/usage/outbox.ts OWN_KEY_PREFIX):
- * the same resource, so the tiles count it, at a cost of 0.
+ * the same resource, so the tiles count it, and it carries `paidBy: "own"` and no cost — a third state beside
+ * priced and not priced yet, shown as OWN_PAID_TEXT and left out of every dollar figure.
  *   object.active       ""                          ms
  *
  * `group` is the agent id, model or tool the rows were split by, "" when the
@@ -47,6 +48,8 @@ export type UsageRow = {
   quantity: number;
   unit: string;
   cost?: number | null;
+  /** `own`: paid with the tenant's own credential (an `own:` key); no `cost`, and shown as OWN_PAID_TEXT. */
+  paidBy?: "own";
 };
 
 export type UsageData = {
@@ -149,13 +152,30 @@ const sum = (rows: UsageRow[], unit: string, pred: (r: UsageRow) => boolean = ()
  * same mistake as an empty chart reading as "nothing was used". So every place
  * that shows dollars also knows how many rows had no price.
  */
+/**
+ * A row paid with the tenant's own credential (`paidBy`, from an `own:` key): the third state beside priced and
+ * not priced yet. It is metered here and billed by the provider that holds the credential, so it is neither "$0"
+ * (free) nor "not priced yet" (a price owed), and no headline or column total includes it.
+ */
+export const OWN_PAID_TEXT = "metered; billed by your provider";
+const ownPaid = (r: UsageRow) => r.paidBy === "own" || r.key.startsWith("own:");
+
 const money = (rows: UsageRow[], pred: (r: UsageRow) => boolean = () => true) => {
-  let credits = 0, priced = 0, unpriced = 0;
+  let credits = 0, priced = 0, unpriced = 0, own = 0;
   for (const r of rows) {
     if (!pred(r)) continue;
-    if (typeof r.cost === "number") { credits += r.cost; priced++; } else unpriced++;
+    if (ownPaid(r)) own++;
+    else if (typeof r.cost === "number") { credits += r.cost; priced++; } else unpriced++;
   }
-  return { credits, priced, unpriced };
+  return { credits, priced, unpriced, own };
+};
+/** One amount as the page says it: dollars, not priced yet, or billed by the tenant's provider, and any mix of them. */
+const amount = (c: ReturnType<typeof money>, short = false): string => {
+  if (!c.priced && !c.unpriced) return c.own ? (short ? `<span class="faint">your provider</span>` : OWN_PAID_TEXT) : dollars(0);
+  const own = c.own ? (short ? `<span class="faint" title="${OWN_PAID_TEXT}"> + yours</span>` : `, plus some ${OWN_PAID_TEXT.replace("; ", ", ")}`) : "";
+  if (c.unpriced === 0) return `${dollars(c.credits)}${own}`;
+  if (c.priced === 0) return short ? `<span class="faint">not priced</span>${own}` : `not priced yet${own}`;
+  return short ? `${dollars(c.credits)}<span class="faint" title="some amounts here are not priced yet"> +</span>${own}` : `${dollars(c.credits)}, some not priced yet${own}`;
 };
 const kind = (r: UsageRow) => r.key.slice(r.key.lastIndexOf(":") + 1);
 
@@ -298,7 +318,8 @@ export function usagePanel(d: UsageData): string {
   const left = unpricedNames(d.rows);
   const headline = d.priced
     ? `<div class="u-credits"><span class="u-big">${dollars(whole.credits)}</span> estimated cost in this window, at rough prices${
-      left.length ? `. Not priced yet, so not in this number: ${esc(left.join(", "))}` : ""}</div>`
+      left.length ? `. Not priced yet, so not in this number: ${esc(left.join(", "))}` : ""}${
+      whole.own ? `. Usage on your own provider keys is ${OWN_PAID_TEXT}, so not in this number` : ""}</div>`
     : `<div class="u-credits"><span class="u-big">free</span> no prices are set yet, so nothing here is charged. The amounts are real and kept for audit.</div>`;
 
   // Where the record itself starts inside the window: the window reaches
@@ -352,10 +373,7 @@ export function usagePanel(d: UsageData): string {
     const c = money(rows);
     return `<section class="u-tile">
   <h3>${res.title}</h3>
-  <div class="u-num">${res.fmt(total)}${d.priced ? `<span class="u-cost">${
-      c.unpriced === 0 ? dollars(c.credits)
-        : c.priced === 0 ? "not priced yet"
-        : `${dollars(c.credits)}, some not priced yet`}</span>` : ""}</div>
+  <div class="u-num">${res.fmt(total)}${d.priced ? `<span class="u-cost">${amount(c)}</span>` : ""}</div>
   <div class="u-detail">${esc(res.detail(rows)) || "&nbsp;"}</div>
   ${chart(d, res, rows, named, times)}
 </section>`;
@@ -378,10 +396,7 @@ export function usagePanel(d: UsageData): string {
   const table = groups.length
     ? `<div class="u-wrap"><table class="u-table"><thead><tr><th>${d.by === "total" ? "" : esc(d.by)}</th>${RESOURCES.map((r) => `<th class="num">${r.title}</th>`).join("")}${d.priced ? `<th class="num">$ (estimated)</th>` : ""}</tr></thead>
 <tbody>${groups.map((g) => `<tr><td>${name(g)}</td>${RESOURCES.map((res) => cell(g, res)).join("")}${d.priced
-      ? `<td class="num">${((m) => m.unpriced === 0
-        ? dollars(m.credits)
-        : m.priced === 0 ? `<span class="faint">not priced</span>`
-        : `${dollars(m.credits)}<span class="faint" title="some amounts here are not priced yet"> +</span>`)(money(d.rows, (r) => r.group === g))}</td>` : ""}</tr>`).join("")}</tbody></table></div>`
+      ? `<td class="num">${amount(money(d.rows, (r) => r.group === g), true)}</td>` : ""}</tr>`).join("")}</tbody></table></div>`
     : "";
 
   // An empty window is the whole page for everyone who opens it before the

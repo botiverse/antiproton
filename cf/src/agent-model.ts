@@ -28,6 +28,10 @@
 import type { ModelChoices } from "./control-plane.ts";
 import { resolveModel } from "./model-request.ts";
 import { optionFor, type UserModels } from "../../src/model/user-models.ts";
+import { USER_KEY_PROVIDERS, userChoiceProblem, userKeyProblem } from "../../src/model/user-key.ts";
+
+/** What the card says about the owner's own key (`AgentRuntime.modelKeyState`): never the key. */
+export interface OwnKeyState { provider: string; label: string; model: string; storedAt: string | null; refusedAt: string | null }
 
 export interface AgentModelDeps {
   choices: ModelChoices;
@@ -35,6 +39,8 @@ export interface AgentModelDeps {
   /** The deployment's default model (HARNESS_MODEL), under DEFAULT_PROVIDER. */
   defaultModel: string;
   now(): number;
+  /** The agent's own-key binding, when it has one; absent where the route does not ask. */
+  ownKey?(): Promise<OwnKeyState | null>;
 }
 
 export async function agentModel(
@@ -50,6 +56,8 @@ export async function agentModel(
     // what runs, and saying "stored" would claim it does.
     const now = resolveModel(await deps.choices.layers(who.tenantId, who.agentId), deps.userModels, deps.defaultModel);
     if (now.locked) return refuse(409, "locked", "an administrator has set this agent's model, so it cannot be chosen here");
+    // On the owner's own key, no pick here would run (planBinding never moves that binding): said rather than stored.
+    if (await deps.ownKey?.()) return refuse(409, "own_key", "this agent runs on your own model key; remove the key to choose one of the deployment's models");
     if (choice === "default") {
       await deps.choices.remove(who.tenantId, who.agentId);
     } else {
@@ -66,14 +74,22 @@ export async function agentModel(
 
 async function stateOf(who: { tenantId: string; agentId: string }, deps: AgentModelDeps) {
   const r = resolveModel(await deps.choices.layers(who.tenantId, who.agentId), deps.userModels, deps.defaultModel);
+  const own = (await deps.ownKey?.()) ?? null;
   return {
-    effective: {
-      // An option's label when what runs is one — whoever chose it — else the model's own name.
-      label: optionFor(deps.userModels, r.choice)?.label ?? r.choice.model,
-      provider: r.choice.provider,
-      model: r.choice.model,
-      source: r.source,
-    },
+    effective: own
+      // What runs is the binding on the owner's key, which no row above decides.
+      ? { label: `${own.model} (${own.label}, your key)`, provider: own.provider, model: own.model, source: "own" as const }
+      : {
+        // An option's label when what runs is one — whoever chose it — else the model's own name.
+        label: optionFor(deps.userModels, r.choice)?.label ?? r.choice.model,
+        provider: r.choice.provider,
+        model: r.choice.model,
+        source: r.source,
+      },
+    ownKey: own,
+    // The vendors an owner may run this agent on with their own key, and their models: code, not configuration
+    // (src/model/user-key.ts), so they are offered whatever the deployment lists. Ids and labels only.
+    keyProviders: USER_KEY_PROVIDERS.map((p) => ({ id: p.id, label: p.label, keyFrom: p.keyFrom, models: p.models.map((m) => ({ id: m.id, label: m.label })) })),
     // Each field named rather than spread: an option's provider and model are the operator's mapping, and a
     // field added to UserModel later must not reach the page by default.
     options: deps.userModels.offered.map((o) => ({ id: o.id, label: o.label })),
@@ -84,4 +100,46 @@ async function stateOf(who: { tenantId: string; agentId: string }, deps: AgentMo
 
 function refuse(status: number, code: string, message: string): Response {
   return Response.json({ error: { code, message } }, { status, headers: { "cache-control": "no-store" } });
+}
+
+export interface AgentModelKeyDeps extends Omit<AgentModelDeps, "ownKey"> {
+  agent: {
+    put(provider: string, model: string, key: string): Promise<{ ok: true } | { ok: false; error: string }>;
+    remove(): Promise<{ ok: true; removed: boolean }>;
+    state(): Promise<OwnKeyState | null>;
+  };
+}
+
+/**
+ * `/ui/agent/model-key`: the owner runs their agent on their own key with a model vendor (src/model/user-key.ts).
+ *
+ *   POST provider, model, key  → the model card's state (`agentModel`'s), the agent bound to that model on that key
+ *   POST remove=1              → the same, the key deleted and the agent back on the deployment's model
+ *
+ * The caller has been found to own the agent (the console's gate). An admin's agent or tenant row refuses a key as it
+ * refuses a pick (409): a model an admin set for cost or compliance is not undone by paying for another. The key is
+ * checked, sealed in the agent's object and never answered back, logged or put in an error: a refusal says what is
+ * wrong with it in words of its own.
+ */
+export async function agentModelKey(
+  method: string, form: FormData | null,
+  who: { tenantId: string; agentId: string; actor: string },
+  deps: AgentModelKeyDeps,
+): Promise<Response> {
+  if (method !== "POST") return refuse(405, "method", "POST");
+  if (!form) return refuse(400, "invalid", "expected a form body");
+  const state = () => stateOf(who, { ...deps, ownKey: () => deps.agent.state() });
+  if (String(form.get("remove") ?? "") === "1") {
+    await deps.agent.remove();
+    return Response.json(await state(), { headers: { "cache-control": "no-store" } });
+  }
+  const now = resolveModel(await deps.choices.layers(who.tenantId, who.agentId), deps.userModels, deps.defaultModel);
+  if (now.locked) return refuse(409, "locked", "an administrator has set this agent's model, so it cannot run on your own key");
+  const provider = String(form.get("provider") ?? "").trim();
+  const model = String(form.get("model") ?? "").trim();
+  const bad = userChoiceProblem(provider, model) ?? userKeyProblem(form.get("key"));
+  if (bad) return refuse(422, "invalid", bad);
+  const put = await deps.agent.put(provider, model, String(form.get("key")));
+  if (!put.ok) return refuse(422, "invalid", put.error);
+  return Response.json(await state(), { headers: { "cache-control": "no-store" } });
 }

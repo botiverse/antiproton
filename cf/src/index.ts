@@ -18,7 +18,7 @@ import { nextAlarm } from "./alarm-next.ts";
 import { agentPrefixes, needleProblem, scanObjects, scanTables, type ScanBucket, type StorageScan } from "./storage-scan.ts";
 import type { AgentProfile } from "../../src/runtime/agent-profile.ts";
 import { adminModels } from "./admin-models.ts";
-import { agentModel } from "./agent-model.ts";
+import { agentModel, agentModelKey } from "./agent-model.ts";
 import { html, conditional, holds, notModified } from "./version.ts";
 import type { ApprovalDelivery, ApprovalRecord, ApprovalState, DecidedBy, Json } from "../../src/core/types.ts";
 import { approvalItem, d1ApprovalIndex, hintTarget, publishApprovals, type ApprovalItem, type ProvisionDecideResult, type ProvisionDeliveryResult } from "./approvals.ts";
@@ -415,7 +415,13 @@ function modelQueueDeps(env: Env): ModelQueueDeps {
     // Images are read from the agent the message names (`queuedCall`), so a job reaches only its own agent's; and
     // their evidence, for a job its object marked, goes back to that object (cf/src/image-evidence.ts).
     call: queuedCall(env, env.ARTIFACTS, (m) => (report) =>
-      env.AGENT.get(env.AGENT.idFromString(m.doId)).recordImageAttempt(m.tenantId, m.agentId, m.jobId, report)),
+      env.AGENT.get(env.AGENT.idFromString(m.doId)).recordImageAttempt(m.tenantId, m.agentId, m.jobId, report),
+    // The owner's key, for a job on it, from the agent the message names, which answers only for its own agent
+    // (AgentDO.modelKeyFor); never carried on the message or the job.
+    (m) => ({
+      get: (provider) => env.AGENT.get(env.AGENT.idFromString(m.doId)).modelKeyFor(m.tenantId, m.agentId, provider),
+      refused: (provider, status) => env.AGENT.get(env.AGENT.idFromString(m.doId)).modelKeyRefused(m.tenantId, m.agentId, provider, status),
+    })),
     // A given-up call is still this job's answer, so the entry it becomes names
     // the job like any other (see `jobId` on fromResponse).
     givenUp: (m) => ({
@@ -809,6 +815,44 @@ export class AgentDO extends DurableObject<Env> {
     if (!this.#isAgent(tenantId, agentId)) return false;
     try { return await this.#activeRuntime().recordModelAttempt(tenantId, agentId, jobId, attempt); }
     catch (e) { console.error(`recording the failed attempt of ${jobId} failed:`, e); return false; }
+  }
+
+  /**
+   * The owner's model key for one queued call on it (`AgentRuntime.modelKeyFor`), for this object's own agent only:
+   * asked with any other tenant and agent it answers null and opens nothing. The plaintext goes back to the queue
+   * consumer over this call and nowhere else.
+   */
+  async modelKeyFor(tenantId: string, agentId: string, provider: string) {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return this.#activeRuntime().modelKeyFor(tenantId, agentId, provider);
+  }
+
+  /** The provider refused the owner's key (`AgentRuntime.modelKeyRefused`); for this object's own agent only. */
+  async modelKeyRefused(tenantId: string, agentId: string, provider: string, status: number): Promise<boolean> {
+    if (!this.#isAgent(tenantId, agentId)) return false;
+    return this.#activeRuntime().modelKeyRefused(tenantId, agentId, provider, status);
+  }
+
+  // The console's model-key writes (`/ui/agent/model-key*`), the owner's counterparts of `uiPutSecret`.
+  async uiPutModelKey(tenantId: string, agentId: string, provider: string, model: string, key: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("uiPutModelKey", () => this.runtime().putModelKey(tenantId, agentId, provider, model, key));
+  }
+
+  async uiRemoveModelKey(tenantId: string, agentId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("uiRemoveModelKey", async () => {
+      const rt = this.runtime();
+      const r = await rt.removeModelKey(tenantId, agentId);
+      // Back on the operator's account: the owner's pick, if they have one, rather than the default it was left on.
+      await this.#bindModel(rt, tenantId, agentId, { onlyIfStale: true });
+      return r;
+    });
+  }
+
+  async uiModelKeyState(tenantId: string, agentId: string) {
+    this.#claim(tenantId, agentId);
+    return this.runtime().modelKeyState(tenantId, agentId);
   }
 
   /** A taker's failed call gives its take back, so the queue's retry can take the job (cf/src/model-queue.ts). */
@@ -3400,7 +3444,7 @@ async function formOf(request: Request): Promise<FormData | null> {
  *  authorised as (credential, credential/remove). */
 // What a held call in the first conversation is recorded under (runtime.ts LEGACY_TASK).
 const LEGACY_TASK_ID = MAIN_SESSION;
-const UI_WRITE_ROUTES = new Set(["/ui/agent/model", "/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/agent", "/ui/api-keys/new", "/ui/api-keys/revoke", "/ui/sandbox/release", "/ui/plugin/choice", "/ui/mount/add", "/ui/mount/refresh", "/ui/mount/remove", "/ui/secret", "/ui/secret/remove"]);
+const UI_WRITE_ROUTES = new Set(["/ui/agent/model", "/ui/agent/model-key", "/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/agent", "/ui/api-keys/new", "/ui/api-keys/revoke", "/ui/sandbox/release", "/ui/plugin/choice", "/ui/mount/add", "/ui/mount/refresh", "/ui/mount/remove", "/ui/secret", "/ui/secret/remove"]);
 
 /**
  * Why a console write is refused as one this console's pages did not send, or
@@ -4873,12 +4917,14 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? gate.agentId;
           const providers = operatorModelOf(env).providers;
+          const agentStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(gate.tenantId, agentId)));
           const answered = await agentModel(request.method, request.method === "POST" ? await formOf(request) : null,
             { tenantId: gate.tenantId, agentId, actor: gate.viewer.sub ?? gate.viewer.email }, {
               choices: d1ModelChoices(env.CONTROL_DB),
               userModels: userModelsFrom(env as unknown as Record<string, unknown>, providers),
               defaultModel: env.HARNESS_MODEL,
               now: Date.now,
+              ownKey: () => agentStub.uiModelKeyState(gate.tenantId, agentId),
             });
           // A stored pick is bound at once (AgentDO.rebindModel), so whatever starts the agent's next turn runs
           // on it. Not the request's failure: the pick is stored, and a page open or a message binds it anyway.
@@ -4893,6 +4939,30 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           if (!answered.ok || !request.headers.get("hx-request")) return answered;
           const data = await answered.json();
           return new Response(agentModelBlock(data as Parameters<typeof agentModelBlock>[0]), {
+            headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" },
+          });
+        }
+        // The owner's own model key (cf/src/agent-model.ts agentModelKey): the form posts here and the model card is
+        // swapped back in, which never carries the key.
+        case "/ui/agent/model-key": {
+          const gate = await requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiSelected?.agentId ?? gate.agentId;
+          const stub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(gate.tenantId, agentId)));
+          const answered = await agentModelKey(request.method, request.method === "POST" ? await formOf(request) : null,
+            { tenantId: gate.tenantId, agentId, actor: gate.viewer.sub ?? gate.viewer.email }, {
+              choices: d1ModelChoices(env.CONTROL_DB),
+              userModels: userModelsFrom(env as unknown as Record<string, unknown>, operatorModelOf(env).providers),
+              defaultModel: env.HARNESS_MODEL,
+              now: Date.now,
+              agent: {
+                put: (provider, model, key) => stub.uiPutModelKey(gate.tenantId, agentId, provider, model, key),
+                remove: () => stub.uiRemoveModelKey(gate.tenantId, agentId),
+                state: () => stub.uiModelKeyState(gate.tenantId, agentId),
+              },
+            });
+          if (!answered.ok || !request.headers.get("hx-request")) return answered;
+          return new Response(agentModelBlock(await answered.json() as Parameters<typeof agentModelBlock>[0]), {
             headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" },
           });
         }

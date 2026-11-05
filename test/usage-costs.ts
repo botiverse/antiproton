@@ -367,7 +367,7 @@ await check("/admin/usage-costs: per tenant, period and resource, with the unacc
 
 // ---- whose credential paid ---------------------------------------------------------------------------
 
-await check("a box on the tenant's own run9 credential is counted under an own: key and priced 0; the operator's is charged", async () => {
+await check("a box on the tenant's own run9 credential is counted under an own: key, priced 0 and shown as paid by the tenant; the operator's is charged", async () => {
   const host = sqliteHost();
   hosts.push(host);
   const report = (id: string) => ({ activity: null, usage: [{ id, startedAt: AT, endedAt: AT + 1000_000 }] });
@@ -386,7 +386,8 @@ await check("a box on the tenant's own run9 credential is counted under an own: 
   const { rows: read } = await tenantRead(db);
   const own = read.filter((r) => r.key === `${OWN_KEY_PREFIX}sandbox` && r.unit === "seconds");
   const ops = read.filter((r) => r.key === "sandbox" && r.unit === "seconds");
-  must(own.length && own.every((r) => r.cost === 0), `own box: ${show(own)}`);
+  // The tenant's view gives it no price at all, not "$0": it is billed by their own provider (cf/src/usage.ts OWN_PAID_TEXT).
+  must(own.length && own.every((r) => r.cost === undefined && r.paidBy === "own"), `own box: ${show(own)}`);
   must(near(sumCost(ops), 1000 * 0.00004), `operator box: ${show(ops)}`);
   // Counted as the tenant's container time all the same: the tile totals the resource.
   must(read.filter((r) => r.resource === "sandbox.container" && r.unit === "seconds").reduce((a, r) => a + r.quantity, 0) === 2000, "own seconds left the resource");
@@ -395,7 +396,7 @@ await check("a box on the tenant's own run9 credential is counted under an own: 
   must(priceFor(prices, { bucket: AT, resource: "sandbox.container", key: `${OWN_KEY_PREFIX}sandbox`, unit: "seconds" }) === 0, "an own: key was priced");
 });
 
-await check("a tool call through a mount holding the agent's own key is counted under an own: key and priced 0", async () => {
+await check("a tool call through a mount holding the agent's own key is counted under an own: key and shown as paid by the tenant", async () => {
   const store = new SqliteStore(":memory:");
   await store.init();
   await store.createAgent("t", "a");
@@ -413,8 +414,10 @@ await check("a tool call through a mount holding the agent's own key is counted 
   const db = d1();
   put(db, store.usageOutbox().map((r: UsageRow) => ({ ...r, at: AT })));
   const { rows } = await tenantRead(db);
-  const cost = (k: string) => rows.find((r) => r.key === k && r.unit === "calls")?.cost;
-  must(cost(`${OWN_KEY_PREFIX}exa.search`) === 0 && near(cost("exa.search"), 0.007), `own ${cost(`${OWN_KEY_PREFIX}exa.search`)}, operator ${cost("exa.search")}`);
+  const at = (k: string) => rows.find((r) => r.key === k && r.unit === "calls");
+  const cost = (k: string) => at(k)?.cost;
+  must(cost(`${OWN_KEY_PREFIX}exa.search`) === undefined && at(`${OWN_KEY_PREFIX}exa.search`)?.paidBy === "own" && near(cost("exa.search"), 0.007),
+    `own ${show(at(`${OWN_KEY_PREFIX}exa.search`))}, operator ${cost("exa.search")}`);
 });
 
 // ---- retention: the Cron Trigger ---------------------------------------------------------------------

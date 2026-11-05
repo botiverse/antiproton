@@ -320,8 +320,9 @@ export class PiSqliteStorage implements Storage {
           // Into the usage outbox in the same transaction, so a counted reply
           // and its outbox row land together or not at all.
           if (this.#usageOwner) {
+            const message = this.#messageOf(row.entryId, writes);
             appendUsage(this.#host.sql, modelTokenRows(
-              { at: this.#now(), ...this.#usageOwner }, this.#modelOf(row.entryId, writes), row.usage as any,
+              { at: this.#now(), ...this.#usageOwner }, modelNameOf(message), row.usage as any, message?.payer === "own",
             ));
           }
           break;
@@ -361,15 +362,15 @@ export class PiSqliteStorage implements Storage {
   }
 
   /** Which model a usage row was for: the assistant entry it names, from this commit or one before. */
-  #modelOf(entryId: string | undefined, writes: readonly CommittedWrite[]): string {
-    if (!entryId) return "unknown";
+  /** The message of the entry a usage write counts: its model names the usage, and its `payer` says whose account paid. */
+  #messageOf(entryId: string | undefined, writes: readonly CommittedWrite[]): any {
+    if (!entryId) return null;
     const inCommit: any = writes.find((w: any) => w.kind === "entry" && w.id === entryId);
     const entry: any = inCommit ?? (() => {
       const r = this.#one(`SELECT body FROM ${this.#t.entries} WHERE id = ?`, entryId);
       return r ? JSON.parse(r.body) : null;
     })();
-    const model = entry?.message?.model;
-    return typeof model === "string" && model ? model : "unknown";
+    return entry?.message ?? null;
   }
 
   getEntries(ids: string[], _context: Context): Promise<Map<string, Entry>> {
@@ -547,4 +548,9 @@ function parsedPrefix(text: unknown): Record<string, unknown> | null {
 function limitClause(limit: number | undefined): string {
   if (limit === undefined) return "";
   return `LIMIT ${Math.max(0, Math.trunc(limit))}`;
+}
+
+function modelNameOf(message: any): string {
+  const model = message?.model;
+  return typeof model === "string" && model ? model : "unknown";
 }

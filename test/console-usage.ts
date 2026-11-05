@@ -157,14 +157,27 @@ check("an amount is an estimate in dollars, a fraction of a cent keeps its digit
   // A negative amount (a credit, or a ledger that disagrees with itself) keeps its size and wears a real minus.
   const negative: Array<[number, string]> = [[-0.5, "≈−$0.50"], [-0.0123, "≈−$0.0123"], [-0.00004, "<−$0.0001"], [-1.75, "≈−$1.75"]];
   for (const [n, s] of negative) must(dollars(n) === s, `${n} reads ${dollars(n)}, not ${s}`);
-  // Container time on the tenant's own run9 account: priced, at nothing — not "not priced yet".
+  // A priced zero is $0, not "not priced yet".
   const html = usagePanel(data([
-    row("a1", "sandbox.container", "own:sandbox", "seconds", 600, 1, 0),
+    row("a1", "sandbox.container", "sandbox", "seconds", 600, 1, 0),
     row("a1", "model.tokens", "m:input", "tokens", 1000, 1, 0.0034),
   ], { priced: true }));
-  must(/<span class="u-cost">\$0<\/span>/.test(tile(html, "container time")), "own-credential container time reads $0");
+  must(/<span class="u-cost">\$0<\/span>/.test(tile(html, "container time")), "a priced zero reads $0");
   must(/<span class="u-cost">≈\$0\.0034<\/span>/.test(tile(html, "model tokens")), "a third of a cent keeps its digits");
   must(!/not priced/.test(html), "a zero price is a price");
+});
+
+check("usage on the tenant's own credential is a third state: billed by their provider, never $0 or not priced yet, and out of the headline", () => {
+  // As the route hands it (cf/src/usage-d1.ts readUsage): an own: key with `paidBy` and no cost.
+  const html = usagePanel(data([
+    { ...row("a1", "sandbox.container", "own:sandbox", "seconds", 600), paidBy: "own" as const },
+    { ...row("a1", "model.tokens", "own:kimi-for-coding:input", "tokens", 1000), paidBy: "own" as const },
+    row("a1", "model.tokens", "m:input", "tokens", 1000, 1, 0.0034),
+  ], { priced: true }));
+  must(/<span class="u-cost">metered; billed by your provider<\/span>/.test(tile(html, "container time")), "own container time is not the third state");
+  must(/<span class="u-cost">≈\$0\.0034, plus some metered, billed by your provider<\/span>/.test(tile(html, "model tokens")), "a mixed tile does not say which part is the tenant's");
+  must(/<span class="u-big">≈\$0\.0034<\/span>/.test(html) && /your own provider keys is metered; billed by your provider, so not in this number/.test(html), "the headline counts own usage");
+  must(!/not priced/.test(html), "own usage read as not priced yet");
 });
 
 check("many unpriced rows of one resource are named once, not counted", () => {

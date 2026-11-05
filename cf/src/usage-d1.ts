@@ -140,8 +140,10 @@ export interface UsageReadRow {
   key: string;
   quantity: number;
   unit: string;
-  /** Credits — US dollars, 1 credit = $1 (migration 0016) — once any price exists; absent before. */
+  /** Credits — US dollars, 1 credit = $1 (migration 0016) — once any price exists; absent before, and on a `paidBy` row. */
   cost?: number | null;
+  /** `own`: an `own:` key, paid with the tenant's own credential and billed by its provider; never priced here. */
+  paidBy?: "own";
 }
 
 export interface UsageQuery { window: string; from: number; to: number; bucket: "1h" | "1d"; by: UsageGroupBy }
@@ -282,7 +284,10 @@ export async function readUsage(db: D1Database, tenantId: string, q: UsageQuery)
       group: usageGroup(q.by, { agentId: String(r.agent_id), resource: String(r.resource), key: String(r.key) }),
       resource: String(r.resource), key: String(r.key), quantity: Number(r.quantity), unit: String(r.unit),
     };
-    if (priced) {
+    // Paid with the tenant's own credential: no price is looked up, and none is set — the page says who bills it
+    // (cf/src/usage.ts OWN_PAID_TEXT) rather than "$0" or "not priced yet".
+    if (row.key.startsWith(OWN_KEY_PREFIX)) row.paidBy = "own";
+    else if (priced) {
       const p = priceFor(prices, row);
       row.cost = p === null ? null : p * row.quantity;
     }

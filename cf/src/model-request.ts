@@ -1,7 +1,8 @@
 import { operatorRequest, providerOfRef, type OperatorModel } from "../../src/model/operator-request.ts";
 import { DEFAULT_PROVIDER, modelProblem, providersFrom, type ModelChoice, type ModelProviders } from "../../src/model/providers.ts";
 import type { UserModel, UserModels } from "../../src/model/user-models.ts";
-import { ModelRequestRefused, OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
+import { ModelHttpError, ModelRequestRefused, OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
+import { USER_KEY_ERRORS, userKeyProvider, userKeyRequest, userKeyTurnError } from "../../src/model/user-key.ts";
 import { OpenAiResponsesModel, usesResponses } from "../../src/model/openai-responses.ts";
 import { errorMessage, fromResponse, toRequest, toResponsesInput, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
@@ -169,9 +170,38 @@ export function planBinding(
  * key the tool host stored them under. `evidence`, when given, is where an attempt's image evidence goes for that
  * message (cf/src/image-evidence.ts); it is used only for a job its object marked (`imageEvidence`).
  */
-export function queuedCall(env: ModelEnv, bucket: Parameters<typeof imageLoaderFor>[0], evidence?: (m: QueuedModelCall) => ImageEvidenceSink) {
+export function queuedCall(env: ModelEnv, bucket: Parameters<typeof imageLoaderFor>[0], evidence?: (m: QueuedModelCall) => ImageEvidenceSink,
+  keys?: (m: QueuedModelCall) => UserKeys) {
   return (taken: unknown, m: QueuedModelCall) =>
-    callQueuedModel(env, taken, m.jobId, imageLoaderFor(bucket, { tenantId: m.tenantId, agentId: m.agentId }), evidence?.(m));
+    callQueuedModel(env, taken, m.jobId, imageLoaderFor(bucket, { tenantId: m.tenantId, agentId: m.agentId }), evidence?.(m), keys?.(m));
+}
+
+/**
+ * The owner's key for one queued call on a user-key binding, from the agent's own object (AgentDO.modelKeyFor, which
+ * answers only for its own agent): `get` opens it for this call or says why not, `refused` marks it refused so no
+ * call is made on it again until the owner stores another. The key exists in the consumer's memory for the call
+ * alone; it is never on the queue message, the job, the answer or a log line.
+ */
+export interface UserKeys {
+  get(provider: string): Promise<{ kind: "key"; key: string } | { kind: "missing" | "refused" | "paced" } | null>;
+  refused(provider: string, status: number): Promise<unknown>;
+}
+
+/** The provider and model a taken job is to be called on with the owner's key (`AgentRuntime.takeJob`), or null. */
+function userModelOf(job: any): { provider: string; model: string } | null {
+  const u = job?.userModel;
+  return u && typeof u.provider === "string" && typeof u.model === "string" ? { provider: u.provider, model: u.model } : null;
+}
+
+/**
+ * An answer that the call on the owner's key could not be made, or was ended by the provider: the fixed text
+ * (`USER_KEY_ERRORS`) where the harness's retry check reads, the owner's sentence in `providerError`, and `payer`
+ * so it is metered as theirs like any answer on their key. The turn ends once; nothing is called instead.
+ */
+function userKeyAnswer(kind: keyof typeof USER_KEY_ERRORS, provider: string, identity: { api: string; provider: string; id: string }, jobId: string,
+  extra: { status?: number; detail?: string } = {}): AnsweredMessage {
+  const said = userKeyTurnError(kind, provider, extra.status);
+  return { ...errorMessage(USER_KEY_ERRORS[kind], identity), providerError: extra.detail ? `${said} (${userKeyProvider(provider)?.label ?? provider} said: ${extra.detail})` : said, jobId, payer: "own" };
 }
 
 /**
@@ -179,6 +209,11 @@ export function queuedCall(env: ModelEnv, bucket: Parameters<typeof imageLoaderF
  * the binding's provider and model when it spends that account (`operatorProvider`, `operatorModel`) and the
  * deployment's otherwise. A job taken before providers existed carries no provider, which is the default one. The answer
  * names the model this call reached, not the one the binding named: that is the model the ledger meters (docs/metering.md).
+ *
+ * A job taken for a binding on the owner's own key (`userModel`, src/model/user-key.ts) is the exception: it is called
+ * at that vendor with the key `keys` opens from the agent's object, its answer is marked `payer: "own"`, and every way it
+ * can fail — no key, a refused key, the vendor's limit, our call rate — is answered as such (`userKeyAnswer`) or thrown
+ * back to the queue to be tried again on the same key. Nothing on that path reaches the operator's request.
  *
  * An OpenAI reasoning model (`usesResponses`) is called through the Responses API at the same provider, with its
  * reasoning on and its earlier reasoning replayed (src/model/openai-responses.ts); every other model through
@@ -198,10 +233,29 @@ export function queuedCall(env: ModelEnv, bucket: Parameters<typeof imageLoaderF
  * reference once the request is built, and how the provider call ended (cf/src/image-evidence.ts). That write runs
  * beside the call and is bounded, and its failure is only logged.
  */
-export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, images?: ImageLoader, evidence?: ImageEvidenceSink): Promise<AnsweredMessage> {
-  const called = String(job.operatorModel ?? env.HARNESS_MODEL);
-  const provider = job.operatorModel ? String(job.operatorProvider ?? DEFAULT_PROVIDER) : DEFAULT_PROVIDER;
-  const request = operatorRequest(operatorModelOf(env), { provider, model: called });
+export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, images?: ImageLoader, evidence?: ImageEvidenceSink, keys?: UserKeys): Promise<AnsweredMessage> {
+  // A job on the owner's key (src/model/user-key.ts) is called with that key at that provider, or answered with why
+  // not: never with the operator's request below, whatever happens.
+  const user = userModelOf(job);
+  const called = user ? user.model : String(job.operatorModel ?? env.HARNESS_MODEL);
+  const provider = user ? user.provider : job.operatorModel ? String(job.operatorProvider ?? DEFAULT_PROVIDER) : DEFAULT_PROVIDER;
+  const identity = {
+    api: String(job.model?.api ?? "offloaded"),
+    provider: String(job.model?.provider ?? "openai-compatible"),
+    id: called,
+  };
+  let request: ReturnType<typeof operatorRequest>;
+  if (user) {
+    const got = keys ? await keys.get(user.provider) : null;
+    if (got?.kind !== "key") {
+      const kind = got?.kind === "paced" ? "paced" : "missing";
+      logEvent("model_job.own_key_unavailable", { jobId, provider, model: called, reason: got?.kind ?? "no_resolver" });
+      return userKeyAnswer(kind, provider, identity, jobId);
+    }
+    request = userKeyRequest(user.provider, user.model, got.key);
+  } else {
+    request = operatorRequest(operatorModelOf(env), { provider, model: called });
+  }
   const sees = acceptsImages(called);
   const window = imageWindowOf(env);
   const recording = !!evidence && job?.imageEvidence === true && hasImageRefs(job.context ?? {});
@@ -232,11 +286,6 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
     const { messages, tools } = toRequest(context, { images: sees });
     call = () => model.complete(messages, { ...(tools ? { tools } : {}), ...observe, ...options });
   }
-  const identity = {
-    api: String(job.model?.api ?? "offloaded"),
-    provider: String(job.model?.provider ?? "openai-compatible"),
-    id: called,
-  };
   const attempt = recording && report ? imageAttemptWriter(evidence!, {
     attemptId: crypto.randomUUID(),
     budget: { ...window, step: windowStep(window) },
@@ -255,12 +304,28 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
     // as an error, it fails the turn once. `errorMessage` is the refusal's fixed text, the one string the
     // harness's retry check scans; the provider's status and message go in `providerError`, which the turn's
     // readers show (`failureText`, src/model/pi-bridge.ts). Anything else is thrown, so the queue retries it.
+    if (user) {
+      // The owner's key was refused: marked, so no call is made on it again until they store another, and the turn
+      // ends saying so. A rate or plan limit ends the turn too, rather than going back to the queue to meet the
+      // same limit four more times. Anything else is retried by the queue on the same key.
+      if (e instanceof ModelRequestRefused && (e.status === 401 || e.status === 403)) {
+        await keys!.refused(user.provider, e.status);
+        logEvent("model_job.own_key_refused", { jobId, provider, model: called, status: e.status });
+        return userKeyAnswer("refused", provider, identity, jobId, { status: e.status, detail: e.detail });
+      }
+      if (e instanceof ModelHttpError && e.status === 429) {
+        logEvent("model_job.own_key_limited", { jobId, provider, model: called, status: e.status });
+        return userKeyAnswer("limited", provider, identity, jobId, { status: e.status });
+      }
+    }
     if (!(e instanceof ModelRequestRefused)) throw e;
     logEvent("model_job.refused", { jobId, provider, model: called, status: e.status });
-    return { ...errorMessage(e.message, identity), providerError: e.turnError, jobId };
+    return { ...errorMessage(e.message, identity), providerError: e.turnError, jobId, ...(user ? { payer: "own" as const } : {}) };
   }
   await attempt?.ended(providerOutcome(undefined, lastStatus, new Date()));
-  return fromResponse(res, identity, jobId);
+  const answer = fromResponse(res, identity, jobId);
+  // Metered as the owner's (`OWN_KEY_PREFIX`, src/usage/outbox.ts): counted like any answer, billed by their provider.
+  return user ? { ...answer, payer: "own" } : answer;
 }
 
 const REASONING_LEVELS: ReadonlySet<unknown> = new Set(["off", "low", "high"]);
