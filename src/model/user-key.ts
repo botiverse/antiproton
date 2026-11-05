@@ -111,11 +111,17 @@ export function userChoiceProblem(provider: string, model: string): string | nul
 
 /** Longest key accepted. Kimi's are far shorter; this bounds what is sealed, not what a vendor issues. */
 export const USER_KEY_MAX_CHARS = 512;
+/**
+ * Shorter than any real provider key, and below this the value redaction (`redacted`, src/model/openai-compatible.ts)
+ * would not match it, so a provider echoing it would put it in a log line.
+ */
+export const USER_KEY_MIN_CHARS = 20;
 
 /** Why `key` is not a key, or null. Never repeats the value. */
 export function userKeyProblem(key: unknown): string | null {
   if (typeof key !== "string" || !key.trim()) return "paste the API key";
   if (key.length > USER_KEY_MAX_CHARS) return `that is longer than ${USER_KEY_MAX_CHARS} characters, so it is not an API key`;
+  if (key.trim().length < USER_KEY_MIN_CHARS) return `that is shorter than ${USER_KEY_MIN_CHARS} characters, so it is not an API key`;
   // A header value: a newline or a space inside would be refused by fetch, or worse, split the header.
   if (/[\s\u0000-\u001f\u007f]/.test(key.trim())) return "an API key has no spaces or line breaks in it; paste the key alone";
   return null;

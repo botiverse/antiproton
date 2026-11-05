@@ -509,6 +509,23 @@ await check("own key switched off (USER_KEY_PROVIDERS unset): the card offers no
   must(await obj(T, A).uiModelKeyState(T, A) === null, "the control's key was not removed");
 });
 
+await check("own key: a value shorter than USER_KEY_MIN_CHARS is refused 422 and stores nothing, since value redaction would not match it", async () => {
+  const saved = env.USER_KEY_PROVIDERS;
+  env.USER_KEY_PROVIDERS = "kimi-code";
+  await nextRun(T, A);
+  try {
+    const before = tablesOf(T, A);
+    const short = await postKey({ agentId: A, provider: "kimi-code", model: "k3", key: "k3x" });
+    must(short.status === 422 && /shorter than 20 characters/.test(short.text) && !short.text.includes("k3x\"") && tablesOf(T, A) === before, `${short.status} ${short.text}`);
+    // The control: a key of the minimum length is stored.
+    const ok = await postKey({ agentId: A, provider: "kimi-code", model: "k3", key: "k".repeat(20) });
+    must(ok.status === 200 && ok.json().ownKey?.provider === "kimi-code", `${ok.status} ${ok.text}`);
+  } finally {
+    await postKey({ agentId: A, remove: "1" });
+    env.USER_KEY_PROVIDERS = saved;
+  }
+});
+
 await check("admin: a refused USER_MODELS is said on /admin/models, and a valid one is not called refused", async () => {
   const admin = async () => (await (await worker.fetch(new Request("https://console.test/admin/models", { headers: { "x-harness-token": "operator-token" } }), env as never)).json()) as any;
   must(!("userModelsError" in await admin()), "a valid declaration was reported refused");
