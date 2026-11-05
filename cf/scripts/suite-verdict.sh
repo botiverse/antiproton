@@ -23,12 +23,18 @@ suite_passed_count() {
 }
 
 # suite_failed_cases: reads a suite's output on stdin and prints each failed
-# case's line (a "✗", colours stripped) and the three lines after it, at most
-# 40 lines. A gate prints this before the output's tail: the tail of a suite
+# case's line (a "✗" or "not ok", colours stripped) and the lines after it up
+# to the next case's line (a "✓", "✗", "ok" or "not ok"), at most 6 per case
+# and 40 in all. Up to the next case, not a fixed count of lines: a short error
+# left a fixed window ending in the next, passing, case (Rex, review of #1169). A gate prints this before the output's tail: the tail of a suite
 # with one failure among many is its passing cases and the summary, and the
 # failure itself, the one thing a reader of a CI log needs, was cut off.
 suite_failed_cases() {
-  sed 's/\x1b\[[0-9;]*m//g' | grep -A3 -E '^[[:space:]]*(✗|not ok)' | head -40 || true
+  sed 's/\x1b\[[0-9;]*m//g' | awk '
+    /^[[:space:]]*(✗|not ok)/ { on = 1; n = 0; print; next }
+    /^[[:space:]]*(✓|ok )/ { on = 0; next }
+    on && n < 5 { print; n++ }
+  ' | head -40 || true
 }
 
 # typecheck_result FILE: prints the last line of `npm run typecheck`'s output

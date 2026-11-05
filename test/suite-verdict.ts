@@ -260,7 +260,12 @@ check("a failing suite's failed cases are printed, colours stripped, even when t
   const failed = sh("suite_failed_cases", out);
   if (!failed.includes("\u2717 the park survives a restart") || !failed.includes("expected 2 calls, got 3")) throw new Error(`not printed: ${JSON.stringify(failed)}`);
   if (failed.includes("\x1b[")) throw new Error("colour codes left in");
-  if (failed.includes("passing case 19")) throw new Error("printed passing cases from the tail");
+  // No passing case at all, not even the one right after the failure, whatever the error's length.
+  for (let i = 0; i < 20; i++) if (failed.includes(`passing case ${i}`)) throw new Error(`printed passing case ${i}: ${JSON.stringify(failed)}`);
+  // Two failures, each with its error, and nothing between them that is not theirs.
+  const two = sh("suite_failed_cases", ["  \u2717 first fails", "    error one", "  \u2713 passes", "  \u2717 second fails", "    error two", "  \u2713 passes too"].join("\n"));
+  // (sh trims the output, so the first line has lost its indent.)
+  if (two !== "\u2717 first fails\n    error one\n  \u2717 second fails\n    error two") throw new Error(`two failures: ${JSON.stringify(two)}`);
   if (sh("suite_failed_cases", "  3 passed, 0 failed") !== "") throw new Error("printed something for a clean run");
   // Both gates print it in each of their three failure branches (timeout, suite error, non-zero exit).
   for (const file of ["cf/scripts/gate.sh", "cf/scripts/verify-and-deploy.sh"]) {
