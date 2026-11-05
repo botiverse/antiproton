@@ -347,6 +347,20 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    check scans the error text for words like `timeout` that a provider's message can contain. 408, 409,
    429, 5xx and network errors are retried, and then dead-lettered, as before.
 
+   **The owner's own model key.** An owner can run their agent on a key from their own account with a
+   vendor instead of the operator's: the agent's model card in the console (`POST /ui/agent/model-key`
+   with `provider`, `model` and `key`, or `remove=1`; `cf/src/agent-model.ts`) seals the key in the agent's
+   object (`model:` rows, `src/runtime/secrets.ts`, which no mount reference, tool or listing reaches) and
+   binds the agent to `user:model:<provider>`. The vendors are code, not configuration
+   (`src/model/user-key.ts`): first Kimi Code, a key made in the Kimi Code console, called at
+   `https://api.kimi.com/coding/v1` (OpenAI-compatible) with `kimi-for-coding`, `kimi-for-coding-highspeed`,
+   `k3` or `k3-256k`, and a User-Agent naming antiproton. The queue consumer opens the key from the agent's
+   object for each call and never falls back to the operator's: a key the vendor refuses (401/403) is
+   marked refused and the turn ends asking the owner to reconnect it; the vendor's rate or plan limit (429)
+   ends the turn saying so; at most 60 provider attempts a minute per agent (a queue retry is an attempt) are made on it. An admin's agent or tenant row
+   refuses a key as it refuses a pick. Its tokens are metered as the owner's (`own:` keys, docs/metering.md
+   "Who pays").
+
    **Daily spend limits.** Model calls on the operator's accounts stop for the day once a tenant's priced
    usage reaches its limit — the `dailyBudgetCents` Raft sends for its server, and only while Raft has sent none the
    plan's fallback, `FREE_DAILY_LIMIT_USD` ($3 when unset) for `free` and `PRO_DAILY_LIMIT_USD` ($10) for `pro`,

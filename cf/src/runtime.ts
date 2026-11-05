@@ -138,7 +138,8 @@ import { ToolGateway, type HeldPlace, type InvokeOpts } from "../../src/runtime/
 import { assertMountConfig, configFromForm, mergeMountSettings, repeatsMount, validateMount, type SettingValue } from "../../src/runtime/mount-config.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { OPERATOR_EXA_REF, OPERATOR_RUN9_REF, resolveOperatorRef } from "./operator-ref.ts";
-import { agentSecrets, agentKeyName, agentRef, importKek, isAgentRef, mountKeyName, open, OWNER_PREFIX, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
+import { agentSecrets, agentKeyName, agentRef, importKek, isAgentRef, MODEL_KEY_PREFIX, mountKeyName, open, OWNER_PREFIX, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
+import { modelKeyName, USER_KEY_CALLS_PER_MINUTE, USER_KEY_PROVIDERS, userChoiceProblem, userKeyContextWindow, userKeyProblem, userKeyProvider, userProviderOfRef, userRefFor } from "../../src/model/user-key.ts";
 import {
   acceptInbound, claimPendingInbound, ensureInboundTable, hasPendingInbound, hookSecretName, inboundMessage, markPostingInbound, newHookId, newHookSecret,
   nextPendingInbound, pendingInboundCount, recentInbound, recordInbound, requeueInbound, seenBefore, settleInbound, underRate,
@@ -3647,6 +3648,113 @@ export class AgentRuntime {
   }
 
   /**
+   * The owner's own model key (src/model/user-key.ts), from the agent's model card (`/ui/agent/model-key`): sealed
+   * under MODEL_KEY_PREFIX like an owner's secret, and the agent bound to `provider`/`model` on it at once, so its
+   * next model call is made, and billed, there. A key stored again replaces the last and clears its refusal. Whether
+   * the owner may (an admin's lock) is the route's to decide before this. The key is never returned or logged.
+   */
+  async putModelKey(tenantId: string, agentId: string, provider: string, model: string, key: string):
+    Promise<{ ok: true; provider: string; model: string } | { ok: false; error: string }> {
+    await this.ready();
+    const bad = userChoiceProblem(provider, model) ?? userKeyProblem(key);
+    if (bad) return { ok: false, error: bad };
+    const kek = await this.#kek;
+    if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a key" };
+    await keptPut(this.store, kek, tenantId, agentId, modelKeyName(provider), key.trim(), MODEL_KEY_PREFIX);
+    this.#modelKeyTables();
+    this.#deps.ctx.storage.sql.exec("DELETE FROM model_key_state WHERE provider = ?", provider);
+    await this.store.setModelBinding({
+      tenantId, agentId, provider: "openai-compatible", model, baseUrl: userKeyProvider(provider)!.baseUrl, secretRef: userRefFor(provider),
+    });
+    logEvent("model_key.stored", { tenantId, agentId, provider, model });
+    return { ok: true, provider, model };
+  }
+
+  /**
+   * The owner takes their key back: every model key is deleted and, when the agent ran on one, it is bound to the
+   * deployment's default on the operator's account — the caller then rebinds the owner's pick (`rebindModel`), which
+   * may only move an operator binding (planBinding).
+   */
+  async removeModelKey(tenantId: string, agentId: string): Promise<{ ok: true; removed: boolean }> {
+    await this.ready();
+    let removed = false;
+    for (const p of USER_KEY_PROVIDERS) removed = (await keptDelete(this.store, tenantId, agentId, modelKeyName(p.id), MODEL_KEY_PREFIX)) || removed;
+    this.#modelKeyTables();
+    this.#deps.ctx.storage.sql.exec("DELETE FROM model_key_state");
+    const b = await this.store.getModelBinding(tenantId, agentId);
+    if (b && userProviderOfRef(b.secretRef)) await this.bindOperatorModel(tenantId, agentId, null);
+    logEvent("model_key.removed", { tenantId, agentId, removed });
+    return { ok: true, removed };
+  }
+
+  /** What the model card says about the owner's key: which provider and model, when it was stored, whether it was refused. Never the key. */
+  async modelKeyState(tenantId: string, agentId: string):
+    Promise<{ provider: string; label: string; model: string; storedAt: string | null; refusedAt: string | null } | null> {
+    await this.ready();
+    const b = await this.store.getModelBinding(tenantId, agentId);
+    const provider = userProviderOfRef(b?.secretRef);
+    if (!b || !provider) return null;
+    const stored = (await this.store.listSecretNames(tenantId, agentId, MODEL_KEY_PREFIX)).find((r) => r.name === MODEL_KEY_PREFIX + modelKeyName(provider));
+    this.#modelKeyTables();
+    const broken = this.#deps.ctx.storage.sql.exec("SELECT broken_at FROM model_key_state WHERE provider = ?", provider).toArray()[0] as { broken_at?: number } | undefined;
+    return {
+      provider, label: userKeyProvider(provider)!.label, model: b.model,
+      storedAt: stored ? new Date(stored.updatedAt).toISOString() : null,
+      refusedAt: typeof broken?.broken_at === "number" ? new Date(broken.broken_at).toISOString() : null,
+    };
+  }
+
+  /**
+   * The owner's key for one queued call on a user-key binding, opened for the queue consumer (`callQueuedModel`) and
+   * nobody else: the AgentDO method that answers this checks the object is this agent's before asking. `provider` is
+   * the one the job was taken for (`takeJob`'s `userModel`); a binding moved since answers `missing`, never another key.
+   *
+   * Each `key` answer is one call counted against USER_KEY_CALLS_PER_MINUTE; past it the answer is `paced` and the key
+   * is not opened. A key refused before (`modelKeyRefused`) answers `refused` until the owner stores one again. The
+   * secret's last-read time is not stamped: that would be a write on every model call.
+   */
+  async modelKeyFor(tenantId: string, agentId: string, provider: string, now = Date.now()):
+    Promise<{ kind: "key"; key: string } | { kind: "missing" | "refused" | "paced" }> {
+    await this.ready();
+    const b = await this.store.getModelBinding(tenantId, agentId);
+    if (!b || userProviderOfRef(b.secretRef) !== provider) return { kind: "missing" };
+    this.#modelKeyTables();
+    const sql = this.#deps.ctx.storage.sql;
+    if (sql.exec("SELECT 1 FROM model_key_state WHERE provider = ? AND broken_at IS NOT NULL", provider).toArray().length) return { kind: "refused" };
+    const kek = await this.#kek;
+    const row = kek ? await this.store.getSecret(tenantId, agentId, MODEL_KEY_PREFIX + modelKeyName(provider)) : null;
+    if (!kek || !row) return { kind: "missing" };
+    sql.exec("DELETE FROM model_key_calls WHERE at <= ?", now - 60_000);
+    const n = Number((sql.exec("SELECT COUNT(*) AS n FROM model_key_calls").toArray()[0] as { n?: number } | undefined)?.n ?? 0);
+    if (n >= USER_KEY_CALLS_PER_MINUTE) {
+      logEvent("model_key.paced", { tenantId, agentId, provider, calls: n });
+      return { kind: "paced" };
+    }
+    sql.exec("INSERT INTO model_key_calls(at) VALUES (?)", now);
+    return { kind: "key", key: await open(kek, row) };
+  }
+
+  /** The provider refused the owner's key (401/403): no call is made on it again until the owner stores a key. */
+  async modelKeyRefused(tenantId: string, agentId: string, provider: string, status: number, now = Date.now()): Promise<boolean> {
+    await this.ready();
+    const b = await this.store.getModelBinding(tenantId, agentId);
+    if (!b || userProviderOfRef(b.secretRef) !== provider) return false;
+    this.#modelKeyTables();
+    this.#deps.ctx.storage.sql.exec(
+      "INSERT INTO model_key_state(provider, broken_at, broken_status) VALUES (?,?,?) ON CONFLICT(provider) DO UPDATE SET broken_at = excluded.broken_at, broken_status = excluded.broken_status",
+      provider, now, Number.isInteger(status) ? status : null);
+    logEvent("model_key.refused", { tenantId, agentId, provider, status });
+    return true;
+  }
+
+  /** The owner's key's refusal mark, and the calls counted against USER_KEY_CALLS_PER_MINUTE. Times only, never a key. */
+  #modelKeyTables(): void {
+    const sql = this.#deps.ctx.storage.sql;
+    sql.exec("CREATE TABLE IF NOT EXISTS model_key_state (provider TEXT PRIMARY KEY, broken_at INTEGER, broken_status INTEGER)");
+    sql.exec("CREATE TABLE IF NOT EXISTS model_key_calls (at INTEGER NOT NULL)");
+  }
+
+  /**
    * Point a tenant at the operator's model account, explicitly.
    *
    * This exists so a demo or a benchmark can be set up in one call. It is a
@@ -4119,13 +4227,14 @@ export class AgentRuntime {
   }
 
   /** The model an engine registers for a binding. */
-  #modelOf(binding: { provider: string; model: string }) {
+  #modelOf(binding: { provider: string; model: string; secretRef?: string }) {
     return {
       provider: binding.provider,
       id: binding.model,
       // The bound model's own window when the table knows it: an agent can be on another model than
-      // the deployment's (model_overrides).
-      contextWindow: contextWindowFor(binding.model, this.#deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW),
+      // the deployment's (model_overrides). A model on the owner's key has its window in that provider's list.
+      contextWindow: (userProviderOfRef(binding.secretRef) ? userKeyContextWindow(binding.model) : undefined)
+        ?? contextWindowFor(binding.model, this.#deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW),
     };
   }
 
@@ -6965,6 +7074,10 @@ This call was made by your subagent ${a.taskId}.`;
     // at the deployment's default, which is also what an agent with its own credential got before.
     const b = await this.store.getModelBinding(tenantId, agentId);
     const provider = b ? providerOfRef(b.secretRef) : null;
+    // A binding on the owner's own key (src/model/user-key.ts) names the provider and model the consumer calls with
+    // that key, and no operator model at all: the consumer has nothing of ours to fall back to. A subagent's model
+    // option is not applied — the options are the operator's account, which this agent's owner chose not to run on.
+    const own = b ? userProviderOfRef(b.secretRef) : null;
     // Marked where model-input evidence is on, so the consumer describes this call's images back to this object
     // (`recordImageAttempt`); the flag is the object's, and the consumer has no other way to know it. Not on pd,
     // whose calls have no input record for the evidence to join.
@@ -6980,7 +7093,7 @@ This call was made by your subagent ${a.taskId}.`;
     // spawn's, or the last call's), rather than moving the subagent on a read that failed. A move is a trace row
     // (`subagent.model_changed`), and the subagent's next report says it, so the parent knows what answered.
     let chosen: { model: string; provider: string } | null = null;
-    if (child?.modelOption) {
+    if (child?.modelOption && !own) {
       let why: string;
       try {
         const r = await this.#subagentModel(tenantId, agentId, child.modelOption, { cached: true });
@@ -7003,7 +7116,10 @@ This call was made by your subagent ${a.taskId}.`;
     }
     // A profile caps every call's output (src/runtime/agent-profile.ts); the consumer sends it as the call's limit.
     const profile = profileOf((await this.store.loadAgent(tenantId, agentId))?.config);
-    return { ...job, operatorModel: chosen?.model ?? (provider ? b!.model : null), operatorProvider: chosen?.provider ?? provider,
+    const target = own
+      ? { operatorModel: null, operatorProvider: null, userModel: { provider: own, model: b!.model } }
+      : { operatorModel: chosen?.model ?? (provider ? b!.model : null), operatorProvider: chosen?.provider ?? provider };
+    return { ...job, ...target,
       ...(mark ? { imageEvidence: true } : {}), ...(reasoning ? { reasoning } : {}), ...(profile ? { maxTokens: profileSpec(profile).maxTokens } : {}) };
   }
 
@@ -7037,11 +7153,11 @@ This call was made by your subagent ${a.taskId}.`;
 
   /**
    * The model a queued call for this binding runs on, as `takeJob` above hands it to `callQueuedModel`: the binding's
-   * own when it spends the operator's account, else the deployment's default (HARNESS_MODEL), which is what an agent
-   * with its own credential runs on. Asked, rather than the binding's model, by whatever must agree with the call.
+   * own when it spends the operator's account or the owner's own key (src/model/user-key.ts), else the deployment's
+   * default (HARNESS_MODEL). Asked, rather than the binding's model, by whatever must agree with the call.
    */
   #calledModel(b: { model: string; secretRef: string } | null): string | undefined {
-    return b && providerOfRef(b.secretRef) !== null ? b.model : this.#deps.operatorModel?.model;
+    return b && (providerOfRef(b.secretRef) !== null || userProviderOfRef(b.secretRef) !== null) ? b.model : this.#deps.operatorModel?.model;
   }
 
   /** A taker's failed call gives its take back (`AgentEngine.releaseJob`); false where nothing was held. */

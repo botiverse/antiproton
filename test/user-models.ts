@@ -242,11 +242,20 @@ const nextRun = (t: string, a: string) => obj(t, a).uiEnsure(t, a, `t_${a}`);
 // A second agent of the owner's, in their directory, the way `/ui/agent` records one.
 await obj(T, A).uiRecordAgent(T, A, { agentId: MINE, name: "second", description: "", avatar: "", createdAt: 1 });
 
+/**
+ * The vendors the card offers for the owner's own key (src/model/user-key.ts), pinned exactly: ids, labels and where to
+ * make the key, never an endpoint or a credential.
+ */
+const KEY_PROVIDERS = [{ id: "kimi-code", label: "Kimi Code", keyFrom: "the Kimi Code console (API keys)", models: [
+  { id: "kimi-for-coding", label: "Kimi for Coding" }, { id: "kimi-for-coding-highspeed", label: "Kimi for Coding HighSpeed" },
+  { id: "k3", label: "Kimi K3" }, { id: "k3-256k", label: "Kimi K3-256K" }] }];
+
 await check("route: GET answers the exact shape — the default, both options, nothing selected, unlocked", async () => {
   const r = await getModel(A);
   must(r.status === 200, `${r.status} ${r.text}`);
   must(r.text === show({
     effective: { label: "DeepSeek Flash", provider: "deepseek", model: "deepseek-flash", source: "default" },
+    ownKey: null, keyProviders: KEY_PROVIDERS,
     options: [{ id: "deepseek-flash", label: "DeepSeek Flash" }, { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }],
     selected: null, locked: false,
   }), r.text);
@@ -258,6 +267,7 @@ await check("route: POST a pick answers the new state and stores it with who set
   const r = await postModel({ agentId: A, choice: LUNA.id });
   must(r.status === 200 && show(r.json()) === show({
     effective: { label: "GPT-5.6 Luna", provider: "cloudflare", model: "openai/gpt-5.6-luna", source: "owner" },
+    ownKey: null, keyProviders: KEY_PROVIDERS,
     options: [{ id: "deepseek-flash", label: "DeepSeek Flash" }, { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }],
     selected: "gpt-5.6-luna", locked: false,
   }), `${r.status} ${r.text}`);
@@ -385,6 +395,8 @@ await check("route: only the owner — another person is told 404 for read and w
   must(read.status === 404 && /no such agent/.test(read.text), `read: ${read.status} ${read.text}`);
   const write = await postModel({ agentId: A, choice: LUNA.id }, { cookie: theirs });
   must(write.status === 404, `write: ${write.status} ${write.text}`);
+  // A 404 says nothing about the agent's model, its own key included.
+  must(!/ownKey|keyProviders|effective/.test(read.text) && !/ownKey|keyProviders|effective/.test(write.text), `a 404 carries the model state: ${read.text} ${write.text}`);
   must(!DB.raw.prepare("SELECT 1 FROM model_choices WHERE agent_id = ?").get(A), "another person's write was stored");
   // Control: the same requests as the owner are answered.
   must((await getModel(A)).status === 200 && (await getModel(MINE)).status === 200, "control: the owner was refused");
@@ -401,6 +413,59 @@ await check("route: only the owner — another person is told 404 for read and w
   must((DB.raw.prepare("SELECT agent_id FROM model_choices WHERE tenant_id = 'demo'").get() as any)?.agent_id === uiAgent("automation"), "the operator's pick is not on its own agent");
   must((await getModel(A, { token: "operator-token" })).status === 404, "the operator's token reached a person's agent through the console");
   must((await worker.fetch(new Request("https://console.test/ui/agent/model", { method: "PUT", headers: { cookie: mine, "sec-fetch-site": "same-origin" } }), env as never)).status === 405, "PUT");
+});
+
+/** A form post to the owner's own-key route (`/ui/agent/model-key`), as the console's page sends one. */
+async function postKey(fields: Record<string, string>, who: Who = {}) {
+  const r = await worker.fetch(new Request("https://console.test/ui/agent/model-key", { method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", "sec-fetch-site": "same-origin", ...headersFor(who) }, body: new URLSearchParams(fields) }), env as never);
+  const text = await r.text();
+  responses.push(text);
+  return { status: r.status, text, json: () => JSON.parse(text) };
+}
+
+await check("own key: one agent's key state never shows in another agent's model answer, and a non-owner cannot tell whether a key is set", async () => {
+  const KEY_B = "sk-kimi-AGENT-B-KEY-0123456789", KEY_THEIRS = "sk-kimi-OTHER-TENANT-KEY-98765";
+  // Agent B (the owner's second agent) and another tenant's agent each run on a key; agent A has none.
+  const b = await postKey({ agentId: MINE, provider: "kimi-code", model: "k3", key: KEY_B });
+  must(b.status === 200 && b.json().ownKey?.model === "k3" && !b.text.includes(KEY_B), `B: ${b.status} ${b.text}`);
+  const t2 = await postKey({ agentId: OTHER_A, provider: "kimi-code", model: "kimi-for-coding", key: KEY_THEIRS }, { cookie: theirs });
+  must(t2.status === 200 && t2.json().ownKey?.model === "kimi-for-coding", `other tenant: ${t2.status} ${t2.text}`);
+  try {
+    // A's read and write answers carry A's state alone: no key, the default, nothing of B's or the other tenant's.
+    for (const r of [await getModel(A), await postModel({ agentId: A, choice: LUNA.id }), await postModel({ agentId: A, choice: "default" })]) {
+      must(r.status === 200 && r.json().ownKey === null && r.json().effective.source !== "own", `A: ${r.status} ${r.text}`);
+      must(!/"model":"k3"|own key|refused|storedAt/.test(r.text) && !r.text.includes(KEY_B) && !r.text.includes(KEY_THEIRS), `A's answer shows another agent's key: ${r.text}`);
+    }
+    // B's own answer does show it, so the check above is not passing for want of anything to show.
+    must((await getModel(MINE)).json().ownKey?.provider === "kimi-code", "B's own answer does not show its key");
+    // A person of another tenant: the same 404, word for word, for an agent with a key (B) and one without (A), on every
+    // route and method; and no write of theirs moves B's key.
+    const asked = async (agentId: string) => [
+      await getModel(agentId, { cookie: theirs }),
+      await postModel({ agentId, choice: LUNA.id }, { cookie: theirs }),
+      await postKey({ agentId, provider: "kimi-code", model: "k3", key: "sk-kimi-INTRUDER-KEY-1111" }, { cookie: theirs }),
+      await postKey({ agentId, remove: "1" }, { cookie: theirs }),
+    ];
+    const withKey = await asked(MINE), without = await asked(A);
+    // The 404 names the agent asked for; with that masked, the two answers must be the same bytes.
+    const masked = (text: string, id: string) => text.split(id).join("<agent>");
+    for (const [i, r] of withKey.entries()) {
+      must(r.status === 404 && without[i]!.status === 404 && masked(r.text, MINE) === masked(without[i]!.text, A),
+        `request ${i}: ${r.status} ${r.text} vs ${without[i]!.status} ${without[i]!.text}`);
+      must(!/ownKey|kimi|k3|storedAt|refused/i.test(r.text), `request ${i} says something about a key: ${r.text}`);
+    }
+    const stillB = await obj(T, MINE).uiModelKeyState(T, MINE);
+    must(stillB?.model === "k3" && stillB.provider === "kimi-code", `another tenant's write moved B's key: ${show(stillB)}`);
+    must(await obj(T, A).uiModelKeyState(T, A) === null, "another tenant's write put a key on A");
+    // Anonymous may read the page but not write a key.
+    const anon = await postKey({ provider: "kimi-code", model: "k3", key: "sk-kimi-ANON-KEY-2222" }, "anonymous");
+    must(anon.status === 403, `anonymous key write: ${anon.status} ${anon.text}`);
+  } finally {
+    await postKey({ agentId: MINE, remove: "1" });
+    await postKey({ agentId: OTHER_A, remove: "1" }, { cookie: theirs });
+  }
+  must(await obj(T, MINE).uiModelKeyState(T, MINE) === null, "B's key was not removed");
 });
 
 await check("admin: a refused USER_MODELS is said on /admin/models, and a valid one is not called refused", async () => {
@@ -421,7 +486,10 @@ await check("route: no answer carries an endpoint, a gateway, a secret's name or
     }
   }
   const g = (await getModel(A)).json();
-  must(show(Object.keys(g)) === show(["effective", "options", "selected", "locked"]) && g.options.every((o: any) => show(Object.keys(o)) === show(["id", "label"])), show(g));
+  must(show(Object.keys(g)) === show(["effective", "ownKey", "keyProviders", "options", "selected", "locked"]) && g.options.every((o: any) => show(Object.keys(o)) === show(["id", "label"])), show(g));
+  // The own-key vendors: named fields only, so a field added to the catalogue (its base URL) cannot reach the page by default.
+  must(g.keyProviders.every((p: any) => show(Object.keys(p)) === show(["id", "label", "keyFrom", "models"])
+    && p.models.every((m: any) => show(Object.keys(m)) === show(["id", "label"]))), show(g.keyProviders));
 });
 
 for (const h of hosts) h.dispose();

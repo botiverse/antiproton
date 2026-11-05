@@ -2366,13 +2366,17 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
  * page's write-error line.
  */
 export function agentModelBlock(d: {
-  effective: { label: string; provider: string; model: string; source: "default" | "owner" | "admin" };
+  effective: { label: string; provider: string; model: string; source: "default" | "owner" | "admin" | "own" };
   options: Array<{ id: string; label: string }>;
   selected: string | null;
   locked: boolean;
+  ownKey?: { provider: string; label: string; model: string; storedAt: string | null; refusedAt: string | null } | null;
+  keyProviders?: Array<{ id: string; label: string; keyFrom: string; models: Array<{ id: string; label: string }> }>;
 }): string {
   const source = d.effective.source === "admin"
     ? `<span class="tag">set by an admin — an admin choice wins</span>`
+    : d.effective.source === "own"
+      ? (d.ownKey?.refusedAt ? `<span class="tag bad">your key was refused — reconnect it</span>` : `<span class="tag ok">your own key</span>`)
     : d.effective.source === "owner"
       ? `<span class="tag ok">your choice</span>`
       : `<span class="tag">the deployment default</span>`;
@@ -2386,15 +2390,33 @@ export function agentModelBlock(d: {
     `<option value="default"${shown === null ? " selected" : ""}>deployment default</option>`,
     ...d.options.map((o) => `<option value="${esc(o.id)}"${shown === o.id ? " selected" : ""}>${esc(o.label)}</option>`),
   ].join("");
+  // The owner's own key: one form per vendor that takes one (src/model/user-key.ts). The key field is a password
+  // input that this page never fills: nothing the server answers carries a key back.
+  const own = d.ownKey ?? null;
+  const keyForms = d.locked ? "" : (d.keyProviders ?? []).map((p) => `<details class="model-key"${own?.refusedAt && own.provider === p.id ? " open" : ""}>
+    <summary>${own?.provider === p.id ? `reconnect your ${esc(p.label)} key` : `run on your own ${esc(p.label)} key`}</summary>
+    <form hx-post="/ui/agent/model-key" hx-target="closest .card" hx-swap="outerHTML">
+      <input type="hidden" name="provider" value="${esc(p.id)}">
+      <label><span>model</span><select name="model">${p.models.map((m) => `<option value="${esc(m.id)}"${own?.provider === p.id && own.model === m.id ? " selected" : ""}>${esc(m.label)}</option>`).join("")}</select></label>
+      <label><span>API key</span><input type="password" name="key" autocomplete="off" required></label>
+      <button type="submit">save key</button>
+    </form>
+    <div class="hint">a key from ${esc(p.keyFrom)}; ${esc(p.label)} bills you for this agent's model calls, and it never falls back to the deployment's account</div>
+  </details>`).join("");
+  const removeKey = own ? `<form hx-post="/ui/agent/model-key" hx-target="closest .card" hx-swap="outerHTML">
+      <input type="hidden" name="remove" value="1"><button type="submit" class="ghost">remove your key and use the deployment's model</button></form>` : "";
   return `<div class="card">
   <div class="state"><b>${esc(d.effective.label)}</b><span class="sub">${esc(d.effective.provider)}</span>${source}</div>
   <form class="model-choice" hx-post="/ui/agent/model">
     <label><span>model</span>
-      <select name="choice" hx-post="/ui/agent/model" hx-target="closest .card" hx-swap="outerHTML" hx-trigger="change"${d.locked ? " disabled" : ""}>${opts}</select></label>
+      <select name="choice" hx-post="/ui/agent/model" hx-target="closest .card" hx-swap="outerHTML" hx-trigger="change"${d.locked || own ? " disabled" : ""}>${opts}</select></label>
   </form>
   ${d.locked
     ? `<div class="hint" style="padding-top:4px">an admin chose this agent's model; it changes here only when the admin lifts the override</div>`
-    : `<div class="hint" style="padding-top:4px">your choice takes effect the next time the agent runs</div>`}
+    : own
+      ? `<div class="hint" style="padding-top:4px">this agent runs on your own ${esc(own.label)} key${own.refusedAt ? `, which ${esc(own.label)} refused at ${esc(own.refusedAt.slice(0, 16).replace("T", " "))}Z; save a new key to resume` : ""}</div>`
+      : `<div class="hint" style="padding-top:4px">your choice takes effect the next time the agent runs</div>`}
+  ${keyForms}${removeKey}
 </div>`;
 }
 

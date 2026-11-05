@@ -45,6 +45,13 @@ export const KEPT_PREFIX = "kept:";
  * does, for a value sent where a mount's own settings say.
  */
 export const OWNER_PREFIX = "owner:";
+/**
+ * The owner's own model keys (src/model/user-key.ts), one per provider, written from the agent's model card.
+ * Apart from `owner:` on purpose: a mount's `{{name}}` slot (`ctx.ownerSecret`) sends an `owner:` value wherever
+ * that mount's settings say, and a model key must reach only the vendor that issued it. Nothing reads under this
+ * prefix but the queue consumer's call (`AgentRuntime.modelKeyFor`), and no listing shows it.
+ */
+export const MODEL_KEY_PREFIX = "model:";
 /** A name the agent may keep a secret under. */
 export const KEPT_NAME = /^[A-Za-z0-9._-]{1,64}$/;
 export function agentRef(name: string): string { return AGENT_REF + name; }
@@ -124,6 +131,8 @@ export function agentSecrets(
       if (!scope) return null;              // no owner, no lookup: the reference alone names nothing
       if (!kek) throw new Error("agent secrets are configured but the Worker has no SECRET_KEK");
       const name = agentKeyName(ref)!;
+      // An owner's model key is opened for its vendor alone (MODEL_KEY_PREFIX): no mount, tool or sandbox reference reaches it.
+      if (name.startsWith(MODEL_KEY_PREFIX)) return null;
       const row = await store.getSecret(scope.tenantId, scope.agentId, name);
       if (!row) return null;
       const value = await open(kek, row);

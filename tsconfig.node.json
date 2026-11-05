@@ -85,6 +85,7 @@
     "test/operator-message.ts",
     "test/capability-notice.ts",
     "test/agents-api-model.ts",
+    "test/own-model-key.ts",
     "test/usage-costs.ts",
     "test/bench-tau2-api.ts",
     "test/bench-tau2-api-local.ts",

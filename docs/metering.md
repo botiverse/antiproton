@@ -44,8 +44,9 @@ metered for a day, so a replayed RPC for the same attempt returns the first
 verdict and meters nothing.
 
 The row names the model that was **actually called**. The consumer calls the
-operator's model when the binding spends the operator's account and the
-deployment's model otherwise, and it stamps that model on the answer, so the
+operator's model when the binding spends the operator's account, the owner's
+model on the owner's own key when the binding is one (below, "Who pays"), and
+the deployment's model otherwise, and it stamps that model on the answer, so the
 ledger, the transcript and `pi.usage` all name it.
 
 pi085 shares the consumer, and meters an answer under the model its entry
@@ -222,11 +223,56 @@ table holds, so a `*` meant for our account cannot reach it.
   `operator:exa` is `exa.search` and is priced. This also renames the calls
   of a GitHub mount with the person's own token (`own:github.…`): those were
   unpriced before and are 0 now.
-- **A model call has no own-credential case.** Every call is a queued job made
-  on the operator's account (`callQueuedModel`); an agent bound to a
-  credential of its own is called on the deployment's default model with the
-  operator's key (`takeJob`, `cf/src/runtime.ts`). So all `model.tokens` are
-  ours to pay and are priced.
+- **A model call on the owner's own key** is `model.tokens` /
+  `own:<model>:<kind>` — `own:kimi-for-coding:output` for a Kimi Code key.
+  **The metering boundary is unchanged**: the row is written at the same
+  delivery, by the same code, as any answer's (`deliver`, and pi085's commit);
+  what changes is who pays. The owner stores the key on the agent's model card
+  (`/ui/agent/model-key`, `cf/src/agent-model.ts`), which binds the agent to
+  `user:model:<provider>` (`src/model/user-key.ts`); `takeJob` hands the queue
+  consumer that provider and model and no operator model, the consumer opens the
+  key from the agent's object for the call (`AgentDO.modelKeyFor`) and marks
+  the answer `payer: "own"`, and the metering of that answer prefixes its keys.
+  Such a call is never made on the operator's key: a key that is missing,
+  refused by the provider (401/403: marked refused until the owner stores
+  another), over the provider's limit (429) or over our call rate (below) ends
+  the turn with a sentence saying which, and nothing else is called. Every
+  other model call is on the operator's account and its `model.tokens` are ours
+  to pay and priced.
+
+`priceFor` returning 0 is what keeps own usage out of every dollar sum — the
+daily limits' figures, the operator's cost views. Where usage is **shown** to
+the tenant (`/ui/usage`, `readUsage`), an `own:` row is a third state beside
+priced and "not priced yet": it carries `paidBy: "own"` and no cost, and the page
+says "metered; billed by your provider" (`OWN_PAID_TEXT`, `cf/src/usage.ts`)
+rather than "$0", which would read as free, and leaves it out of the dollar
+headline. The agent's own usage read (`cf/src/agent-surface/usage.ts`) still
+gives such a row a cost of 0.
+
+## Own keys are not unlimited
+
+A model call on the owner's own key costs us nothing in tokens, but its turn
+still runs our queue, the agent's object, and whatever tools it calls. So:
+
+- **The daily limits still apply to it.** Its own tokens add nothing to any
+  figure below (they are priced at 0), so they never bring a tenant nearer its
+  limit; but once the tenant's priced usage — containers, tool calls, any
+  model call on our account — reaches the limit, `spendAdmit` refuses a call on
+  the owner's key as it refuses any other.
+- **An attempt rate.** At most `USER_KEY_CALLS_PER_MINUTE` (60,
+  `src/model/user-key.ts`) provider attempts on the owner's key per agent per
+  minute. An attempt is each time the queue consumer opens the key
+  (`AgentRuntime.modelKeyFor`): a call, and again each queue retry of it after a
+  5xx, a timeout or a network error. Attempts rather than jobs, because that is
+  what the vendor sees and a run of retries is what the cap bounds. Counted in
+  the agent's object, so the count is exact without a shared counter. Past it
+  the turn ends with "too many attempts on your own model key this minute" and
+  nothing is called. It is per agent, not per tenant: a tenant-wide count would
+  need a counter every agent's object reaches.
+- **The refusal says whose limit it is.** When the daily limit refuses a call
+  on the owner's key, the turn's error opens by saying it is this deployment's
+  limit on the compute it pays for, not the owner's quota with their vendor
+  (`spendAdmit`).
 
 ## Daily limits
 

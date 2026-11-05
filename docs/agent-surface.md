@@ -61,7 +61,8 @@ names the window it covers:
   usage it has not yet sent to the ledger, the time of the oldest such usage.
 - `cost` is the row's estimated cost in US dollars (one credit is one dollar), from rough prices
   (docs/metering.md, "Prices"); `null` when nothing prices that row — which is not the same as free. Usage
-  paid with the agent's own credential (a tool `own:<plugin>.<tool>`, a container `own:sandbox`) is `0`.
+  paid with the agent's own credential (a tool `own:<plugin>.<tool>`, a container `own:sandbox`, a model call on
+  the owner's own key `own:<model>`) is `0`.
   The costs of a bucket's rows can be summed even where the quantities cannot (`input`, below).
 - `partial` is `true` when the window ends after `asOf` (a bucket in it is not finished, or holds usage
   not yet counted), when the agent's unsent usage could not be read, or when the ledger marks part of

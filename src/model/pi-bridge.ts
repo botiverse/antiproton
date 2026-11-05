@@ -321,7 +321,14 @@ function usageOf(res: ModelResponse): Usage {
  * "the field is still there when it is read back" is said by the type, not
  * only by the test that reads the stored entry.
  */
-export type AnsweredMessage = AssistantMessage & { jobId?: string; providerError?: string; errorCode?: AnswerErrorCode };
+export type AnsweredMessage = AssistantMessage & { jobId?: string; providerError?: string; errorCode?: AnswerErrorCode; payer?: AnswerPayer };
+
+/**
+ * Who paid for the call an answer came from, when it was not us: `own`, the agent owner's own key with the provider
+ * (src/model/user-key.ts). Read where the answer's tokens are metered, which marks their usage key as the owner's
+ * (`OWN_KEY_PREFIX`, src/usage/outbox.ts). Absent on every answer made on the operator's account.
+ */
+export type AnswerPayer = "own";
 
 /**
  * Why a failed answer failed, where the model layer knows it as a fact rather than as text: `output_limit`, the call

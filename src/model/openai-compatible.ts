@@ -87,17 +87,25 @@ function refusalDetail(body: string, secrets: string[]): string {
       text = kind ? `${message} (${kind})` : message;
     }
   } catch { /* not JSON: the body as sent */ }
+  text = redacted(text, secrets).replace(/\s+/g, " ").trim();
+  return text.length > REFUSAL_DETAIL_CHARS ? `${text.slice(0, REFUSAL_DETAIL_CHARS)}…` : text;
+}
+
+/**
+ * A provider's text with the request's own credentials blanked (exact values), and anything shaped like a key or a
+ * bearer token. Every provider text that leaves a call goes through it — a refusal's detail and the message of any
+ * other failed answer — because an error body can quote what it was sent, and that message is logged by the queue
+ * consumer and kept on a retried attempt's trace.
+ */
+export function redacted(text: string, secrets: string[]): string {
   for (const s of secrets) {
     // The credential is the part after the scheme; a header value is `Bearer <token>`.
     const bare = s.replace(/^Bearer\s+/i, "");
     if (bare.length >= 4) text = text.split(bare).join("[redacted]");
   }
-  text = text
+  return text
     .replace(/Bearer\s+[A-Za-z0-9._~+\/=-]+/gi, "Bearer [redacted]")
-    .replace(/\b(sk|pk|rk)-[A-Za-z0-9_*-]{8,}/g, "[redacted]")
-    .replace(/\s+/g, " ")
-    .trim();
-  return text.length > REFUSAL_DETAIL_CHARS ? `${text.slice(0, REFUSAL_DETAIL_CHARS)}…` : text;
+    .replace(/\b(sk|pk|rk)-[A-Za-z0-9_*-]{8,}/g, "[redacted]");
 }
 
 /**
@@ -281,7 +289,7 @@ export async function postModelRequest(
           throw new ModelRequestRefused(res.status, text, [cfg.apiKey, ...Object.values(cfg.headers)],
             gatewayKeyed ? GATEWAY_401_HINT : undefined);
         }
-        const err = new ModelHttpError(res.status, `model ${res.status}: ${text.slice(0, 300)}`);
+        const err = new ModelHttpError(res.status, `model ${res.status}: ${redacted(text, [cfg.apiKey, ...Object.values(cfg.headers)]).slice(0, 300)}`);
         if (res.status >= 500 || res.status === 429) {
           lastErr = err;
           await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
