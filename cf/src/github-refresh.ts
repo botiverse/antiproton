@@ -251,7 +251,8 @@ export async function renewConnector(d: ConnectorDeps, tenantId: string, id: str
     const pair = { ok: true as const, accessToken: r.grant.accessToken, refreshToken: r.grant.refreshToken, expiresAt: r.grant.expiresAt, refreshExpiresAt: r.grant.refreshExpiresAt, rotated: true };
     let landed = false;
     for (let attempt = 1; ; attempt++) {
-      try { landed = await d.grants.rotate(tenantId, id, { sealed, refresh, at: d.now() }, k.refresh.sealed.ciphertext, holder); break; }
+      // GitHub's scope for the renewed grant goes with it; `rotate` keeps the recorded one when the answer has none.
+      try { landed = await d.grants.rotate(tenantId, id, { sealed, refresh, at: d.now(), grantedScope: r.grant.scope ?? null }, k.refresh.sealed.ciphertext, holder); break; }
       catch (e) {
         report({ tenantId, connectorId: id, why, outcome: "store-failed", attempt, reason: String((e as Error)?.message ?? e).slice(0, 120), code: "d1-write-failed" }, d.note);
         // The lease is left held: a renewal behind it would trade the spent token and mark the connection broken.

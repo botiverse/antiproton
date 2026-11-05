@@ -118,8 +118,7 @@ import { cleanupResidue, d1EgressResidue, residueUnknownMessage, withResidue } f
 import { adminCredentialInventory, layoutMissing, readConnectionHoldings } from "./credential-inventory.ts";
 import { errorClassOf } from "./error-class.ts";
 import { renewalAudience, d1ConnectorGrants, d1Connections, d1Connectors, type ConnectorRefresh, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
-import type { GithubGrant } from "./github-token.ts";
-import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps, type ReconnectTarget } from "./provision/connect.ts";
+import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps, type HeldGrant, type ReconnectTarget } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, IMPORT_REQUEST_MAX_BYTES, IMPORT_ROUTE, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
 import { sharedUsageCache } from "./provision/usage.ts";
@@ -2089,7 +2088,7 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /** Connect flow (provision/connect.ts): a finished flow's token, held until Raft confirms its initiator. */
-  async connectionHold(tenantId: string, agentId: string, plugin: string, grant: GithubGrant, id: string, exp: number, raftUserId: string,
+  async connectionHold(tenantId: string, agentId: string, plugin: string, grant: HeldGrant, id: string, exp: number, raftUserId: string,
     reconnect: ReconnectTarget | null = null) {
     this.#claim(tenantId, agentId);
     return this.#busy("connectionHold", () => this.runtime().holdConnection(tenantId, agentId, plugin, grant, id, exp, raftUserId, reconnect));

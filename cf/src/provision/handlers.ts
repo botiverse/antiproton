@@ -27,7 +27,7 @@ import {
   MAIN_SESSION_ID, redactCredentials, TRACE_LIMIT_DEFAULT, TRACE_LIMIT_MAX, TRACE_WINDOW_MAX_MS, TRANSCRIPT_LIMIT_DEFAULT, TRANSCRIPT_LIMIT_MAX,
   type EvalTranscript, type TraceQuery, type TraceWindow,
 } from "../eval-read.ts";
-import { AGENT_BUDGETS, LIVE_AGENT_STATUSES, SYSTEM_ACTOR, type AgentBudget, type ConnectionRegistry, type ConnectorRefresh, type ConnectorStore, type ProviderTokenIdentity, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
+import { AGENT_BUDGETS, LIVE_AGENT_STATUSES, SYSTEM_ACTOR, type AgentBudget, type ConnectionRegistry, type ConnectorRefresh, type ConnectorScope, type ConnectorStore, type ProviderTokenIdentity, scopeList, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
 import { MAX_BUDGET_CENTS, PLANS, type BudgetWrite, type Plan, type TenantPlanStore } from "../spend-limit.ts";
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider, type ReconnectTarget } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
@@ -207,7 +207,7 @@ export interface ProvisionDeps {
     confirm(tenantId: string, agentId: string, provider: ConnectionProvider, pending: string, raftUserId: string, connectorId?: string):
       Promise<{ ok: true; account: string | null; accountId?: string | null; sealed: { ciphertext: string; iv: string }; refresh?: ConnectorRefresh | null;
         /** Present for a reconnect in place: the hold was not attached, and the handler decides (`reconnectInPlace`). */
-        reconnect?: ReconnectTarget | null }
+        reconnect?: ReconnectTarget | null } & Partial<ConnectorScope>
         | { ok: false; error: string; missing?: true }>;
   };
   /**
@@ -1552,13 +1552,15 @@ async function connection(
         : fail({ status: 422, code: "connect_failed", message: r.error });
     }
     // The connector to mend came from the hold, sealed in from the signed link, never from this body.
-    if (r.reconnect) return reconnectInPlace(tenantId, row, p, b.raftUserId, r.reconnect, { ...r, accountId: r.accountId ?? null, refresh: r.refresh ?? null }, deps);
+    // What GitHub granted and what was asked, from the hold; null where it does not say (connectorScope in GET).
+    const scope: ConnectorScope = { grantedScope: r.grantedScope ?? null, requestedScope: r.requestedScope ?? null };
+    if (r.reconnect) return reconnectInPlace(tenantId, row, p, b.raftUserId, r.reconnect, { ...r, accountId: r.accountId ?? null, refresh: r.refresh ?? null, ...scope }, deps);
     // A finished authorization is a new connector of the tenant, created by whoever confirmed it.
     // A plain connect again mends only this agent: a new connector, and this agent's row written afresh, which clears
     // its broken state. A reconnect in place (above) mends the connector for every agent on it.
     const connectedAt = deps.now();
     await c.connectors.create({ id: connectorId, tenantId, provider: p, account: r.account, accountId: r.accountId ?? null, creatorRaftUserId: b.raftUserId,
-      raftOrigin: row.raftOrigin, sealed: r.sealed, refresh: r.refresh ?? null, createdAt: connectedAt });
+      raftOrigin: row.raftOrigin, sealed: r.sealed, refresh: r.refresh ?? null, createdAt: connectedAt, ...scope });
     if (!(await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: b.raftUserId, connectedAt, connectorId }))) {
       // Deleted while its connection was confirmed: the connector made for it alone goes with the copy on its mount.
       await c.connectors.remove(tenantId, connectorId);
@@ -1611,7 +1613,7 @@ async function connection(
     const all = await ownConnectors(c, tenantId, p, row.raftOrigin);
     const connectors = all.map((k) => ({
       id: k.id, account: k.account, creatorRaftUserId: k.creatorRaftUserId, createdAt: new Date(k.createdAt).toISOString(), current: k.id === current,
-      ...oauthState(k.brokenAt ?? null, k.lastCheckedAt ?? k.brokenAt ?? k.createdAt),
+      ...oauthState(k.brokenAt ?? null, k.lastCheckedAt ?? k.brokenAt ?? k.createdAt), ...connectorScope(k),
     }));
     // A connection GitHub refused to renew is not connected, though its row stays: which account it was, and that
     // only connecting again mends it, in the words Raft's own OAuth connectors use (`oauthStatus`).
@@ -1621,8 +1623,11 @@ async function connection(
     const checkedAt = k ? (k.lastCheckedAt ?? k.brokenAt ?? k.createdAt) : (got?.brokenAt ?? got?.connectedAt ?? null);
     return ok({
       ...(got
-        ? { connected: brokenAt === null, connectorId: current, account: got.account, connectedAt: new Date(got.connectedAt).toISOString(), connectedBy: got.connectedBy, ...oauthState(brokenAt, checkedAt) }
-        : { connected: false, connectorId: null, account: null, connectedAt: null, connectedBy: null, oauthStatus: "disconnected" as OAuthStatus, lastCheckError: null, lastCheckedAt: null }),
+        ? { connected: brokenAt === null, connectorId: current, account: got.account, connectedAt: new Date(got.connectedAt).toISOString(), connectedBy: got.connectedBy, ...oauthState(brokenAt, checkedAt),
+            // A connection made before connectors has no recorded scope.
+            ...connectorScope(k) }
+        : { connected: false, connectorId: null, account: null, connectedAt: null, connectedBy: null, oauthStatus: "disconnected" as OAuthStatus, lastCheckError: null, lastCheckedAt: null,
+            ...connectorScope(undefined) }),
       connectors,
     });
   }
@@ -1705,9 +1710,18 @@ async function connection(
  * pointed at it if it was not. An agent the pair does not reach here is named in `failed`: its mount still says
  * broken, and its next GitHub call asks the connector, finds it healthy and takes the pair (github-refresh.ts).
  */
+/**
+ * A connector's recorded scope as Raft reads it (docs/agent-surface.md): `scopes`, what GitHub's token response named;
+ * `requestedScopes`, what the connect flow asked for. Null: not recorded (before migration 0034), never "none".
+ */
+function connectorScope(k: { grantedScope?: string | null; requestedScope?: string | null } | undefined):
+  { scopes: string[] | null; requestedScopes: string[] | null } {
+  return { scopes: scopeList(k?.grantedScope), requestedScopes: scopeList(k?.requestedScope) };
+}
+
 async function reconnectInPlace(
   tenantId: string, row: ProvisionedAgent, p: ConnectionProvider, raftUserId: string, target: ReconnectTarget,
-  r: { account: string | null; accountId: string | null; sealed: { ciphertext: string; iv: string }; refresh: ConnectorRefresh | null },
+  r: { account: string | null; accountId: string | null; sealed: { ciphertext: string; iv: string }; refresh: ConnectorRefresh | null } & ConnectorScope,
   deps: ProvisionDeps,
 ): Promise<Response> {
   const c = deps.connections!;
@@ -1722,7 +1736,9 @@ async function reconnectInPlace(
     message: `this connector is GitHub account ${k.account ?? "(unknown)"}, and the authorization was for ${r.account ?? "another account"}; nothing was changed. Sign in to GitHub as ${k.account ?? "the connector's account"} and reconnect, or connect without connectorId to make a new connector` });
   if (!same) return mismatch();
   const at = deps.now();
-  if (!(await c.connectors.reconnect(tenantId, k.id, { sealed: r.sealed, refresh: r.refresh, account: r.account, accountId: r.accountId, at }))) {
+  // The new grant's scope replaces the old one's, null included: the old grant is gone.
+  if (!(await c.connectors.reconnect(tenantId, k.id, { sealed: r.sealed, refresh: r.refresh, account: r.account, accountId: r.accountId, at,
+    grantedScope: r.grantedScope, requestedScope: r.requestedScope }))) {
     // Gone, or given another account's id, between the read and the write.
     const now = await ownConnector(c, tenantId, k.id, row.raftOrigin);
     return now ? mismatch() : fail({ status: 404, code: "not_found", message: `no ${p} connector ${k.id} in this tenant; it was disconnected meanwhile` });

@@ -79,6 +79,12 @@ export interface ConnectLink {
 /** The connector a reconnect mends, and the capacity Raft said the initiator acts in (checked again at confirm). */
 export interface ReconnectTarget { connectorId: string; actingRole: "creator" | "admin" }
 
+/**
+ * What a finished flow holds until confirm: GitHub's grant, and the scopes this flow asked for (`ConnectLink.scopes`),
+ * so the connector can record what was asked beside what GitHub granted (`scope`). Absent on a hold from before.
+ */
+export interface HeldGrant extends GithubGrant { requested?: string[] }
+
 /** The link Raft hands the browser, signed with the deployment's session secret. */
 export async function connectLink(
   origin: string, secret: string, spec: Omit<ConnectLink, "v" | "nonce" | "exp">, now: number,
@@ -96,7 +102,7 @@ export interface ConnectDeps {
   github: { clientId: string; clientSecret: string };
   registry: Pick<ConnectionRegistry, "consumeLink">;
   /** Keep the grant sealed in the agent's own object until Raft confirms who finished the flow. */
-  hold(tenantId: string, agentId: string, plugin: string, grant: GithubGrant, id: string, exp: number, raftUserId: string,
+  hold(tenantId: string, agentId: string, plugin: string, grant: HeldGrant, id: string, exp: number, raftUserId: string,
     reconnect?: ReconnectTarget | null): Promise<{ ok: true } | { ok: false; error: string }>;
   /** The grant behind a code, and the names of the keys GitHub's answer carried (never their values). */
   exchange(code: string, redirectUri: string): Promise<{ grant: GithubGrant; keys: string[] }>;
@@ -179,7 +185,7 @@ export async function connectCallback(request: Request, url: URL, deps: ConnectD
     return done(back(link, "failed", { reason: "exchange" }));
   }
   const id = randomToken(18);
-  const held = await deps.hold(link.tenantId, link.agentId, CONNECTION_PLUGIN[link.provider], grant, id, deps.now() + CONNECT_HOLD_TTL_MS, link.raftUserId,
+  const held = await deps.hold(link.tenantId, link.agentId, CONNECTION_PLUGIN[link.provider], { ...grant, requested: link.scopes }, id, deps.now() + CONNECT_HOLD_TTL_MS, link.raftUserId,
     link.reconnect ?? null);
   if (!held.ok) {
     console.error(`connect: holding ${link.provider} for ${link.tenantId}/${link.agentId} failed: ${held.error}`);

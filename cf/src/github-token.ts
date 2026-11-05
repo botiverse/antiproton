@@ -19,6 +19,11 @@ export interface GithubGrant {
   /** ms since the epoch; null: the access token does not expire. */
   expiresAt: number | null;
   refreshExpiresAt: number | null;
+  /**
+   * The answer's `scope`, verbatim: comma-separated OAuth scopes ("public_repo,read:org"), "" when GitHub named none.
+   * Null (or absent, on a grant built before this was kept) when the answer carried no `scope` string. Never a token.
+   */
+  scope?: string | null;
 }
 
 /** A response's grant, and the NAMES of the keys it carried (never a value), so a log can say which kind of token came back. */
@@ -35,6 +40,7 @@ export function grantOf(j: Record<string, unknown>, now: number): { grant: Githu
       refreshToken: exp !== null ? refresh : null,
       expiresAt: exp !== null ? now + exp * 1000 : null,
       refreshExpiresAt: exp !== null && rexp !== null ? now + rexp * 1000 : null,
+      scope: typeof j.scope === "string" ? j.scope : null,
     },
     keys: Object.keys(j).sort(),
   };

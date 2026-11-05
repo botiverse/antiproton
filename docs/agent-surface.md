@@ -890,9 +890,12 @@ route with other methods (`connection` in `cf/src/provision/handlers.ts`).
   "oauthStatus": "connected",
   "lastCheckError": null,
   "lastCheckedAt": "2026-10-17T13:26:02.504Z",
+  "scopes": ["public_repo", "read:org"],
+  "requestedScopes": ["public_repo", "read:org"],
   "connectors": [
     { "id": "con_…", "account": "octocat", "creatorRaftUserId": "<raftUserId>", "createdAt": "…", "current": true,
-      "oauthStatus": "connected", "lastCheckError": null, "lastCheckedAt": "…" }
+      "oauthStatus": "connected", "lastCheckError": null, "lastCheckedAt": "…",
+      "scopes": ["public_repo", "read:org"], "requestedScopes": ["public_repo", "read:org"] }
   ]
 }
 ```
@@ -907,6 +910,20 @@ alike. All three are always present, on the answer and on each connector in `con
 | `lastCheckedAt` | When the connection was last checked, whatever came of it: the connect, pointing an agent at the connector, each renewal, and the refusal that broke it. An ordinary tool call is not recorded. For a connection made before connectors, its connect or the refusal. `null` with `disconnected`. |
 
 `connectors` lists the tenant's GitHub connectors whether or not this agent uses one.
+
+**New for Raft: what a connection's authorization covers.** Two fields, always present, on the answer (from the
+connector this agent uses) and on each connector in `connectors`. Both are what was said at the time, never inferred:
+
+| Field | |
+|---|---|
+| `scopes` | The OAuth scopes GitHub's token response named for this connector's grant: its `scope`, split on commas, as GitHub said it. `[]`: GitHub's answer named none (`"scope": ""`), the shape GitHub documents for a GitHub App's user token, whose permissions come from the App's settings rather than from scopes. `null`: not recorded: the connector was made before this was kept (migration 0034), GitHub's answer carried no `scope` at all, or the agent has no connector (`disconnected`, or a connection made before connectors). `null` never means "no access". |
+| `requestedScopes` | The scopes the connect flow asked GitHub for: `["public_repo", "read:org"]`, or `["repo", "read:org"]` with `access: "private"` (`scopesFor` in `cf/src/provision/connect.ts`). What was asked, not what was granted: a person or GitHub can grant less. `null`: the connector was made before migration 0034, or the agent has no connector. |
+
+When they change: a connect records both; a reconnect in place replaces both with the new authorization's, a `null`
+included (the old grant is gone). A renewal of an expiring token replaces `scopes` only when GitHub's renewal answer
+names a non-empty `scope`: an answer without one, or with `""`, leaves `scopes` as it was, since a renewal does not
+re-ask the person and an empty answer there is not GitHub withdrawing the scopes. `requestedScopes` changes only with a
+connect or reconnect. Neither ever carries token material.
 
 **An expiring connection.** GitHub's user tokens from this deployment's App last 8 hours, with a refresh token that
 lasts about 6 months and is single-use. The token is renewed by the deployment: before a call when it expires within
@@ -975,7 +992,8 @@ POST /provision/agents/by-raft-agent/{raftAgentId}/connections/github
   **Raft must check owner/admin before it sends `admin`**: antiproton cannot see Raft's roles and takes `admin` on
   Raft's word. A `creator` claim is checked here against `creatorRaftUserId`, at the `POST` and again at confirm
   (`403`, `code: "not_creator"`).
-- The answer is the usual `{ url, expiresAt, scopes }` plus `"reconnect": "con_…"`. An unknown connector, or another
+- The answer is the usual `{ url, expiresAt, scopes }` plus `"reconnect": "con_…"`. A confirmed reconnect replaces the
+  connector's `scopes` and `requestedScopes` with the new authorization's. An unknown connector, or another
   tenant's, is `404 not_found`, and no link is made.
 - The browser comes back `status=pending&pending=…&by=…` as for a connect, and Raft confirms as for a connect:
   `POST …/confirm { pending, raftUserId }`.
