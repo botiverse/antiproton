@@ -249,6 +249,27 @@ check("both gates record every name their loop visits and call suite_unvisited a
   }
 });
 
+check("a failing suite's failed cases are printed, colours stripped, even when the tail is all passing cases", () => {
+  const out = [
+    "  engine",
+    "    \x1b[31m\u2717\x1b[0m the park survives a restart",
+    "      \x1b[31mexpected 2 calls, got 3\x1b[0m",
+    ...Array.from({ length: 20 }, (_, i) => `    \x1b[32m\u2713\x1b[0m passing case ${i}`),
+    "  30 passed, 1 failed",
+  ].join("\n");
+  const failed = sh("suite_failed_cases", out);
+  if (!failed.includes("\u2717 the park survives a restart") || !failed.includes("expected 2 calls, got 3")) throw new Error(`not printed: ${JSON.stringify(failed)}`);
+  if (failed.includes("\x1b[")) throw new Error("colour codes left in");
+  if (failed.includes("passing case 19")) throw new Error("printed passing cases from the tail");
+  if (sh("suite_failed_cases", "  3 passed, 0 failed") !== "") throw new Error("printed something for a clean run");
+  // Both gates print it in each of their three failure branches (timeout, suite error, non-zero exit).
+  for (const file of ["cf/scripts/gate.sh", "cf/scripts/verify-and-deploy.sh"]) {
+    const src = execFileSync("cat", [file], { encoding: "utf8" });
+    const n = src.split("| suite_failed_cases;").length - 1;
+    if (n !== 3) throw new Error(`${file} prints failed cases in ${n} of its 3 failure branches`);
+  }
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }

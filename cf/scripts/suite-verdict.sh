@@ -22,6 +22,15 @@ suite_passed_count() {
   sed 's/\x1b\[[0-9;]*m//g' | grep -oE '^[[:space:]]*[0-9]+(/[0-9]+)? passed' | tail -1 | grep -oE '[0-9]+' | head -1 || true
 }
 
+# suite_failed_cases: reads a suite's output on stdin and prints each failed
+# case's line (a "✗", colours stripped) and the three lines after it, at most
+# 40 lines. A gate prints this before the output's tail: the tail of a suite
+# with one failure among many is its passing cases and the summary, and the
+# failure itself, the one thing a reader of a CI log needs, was cut off.
+suite_failed_cases() {
+  sed 's/\x1b\[[0-9;]*m//g' | grep -A3 -E '^[[:space:]]*(✗|not ok)' | head -40 || true
+}
+
 # typecheck_result FILE: prints the last line of `npm run typecheck`'s output
 # that scripts/typecheck.mjs wrote as its verdict ("typecheck: ..."), or nothing.
 # Not the file's last line: npm writes into the same stream, and its update
