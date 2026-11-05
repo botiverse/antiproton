@@ -266,6 +266,12 @@ check("a failing suite's failed cases are printed, colours stripped, even when t
   const two = sh("suite_failed_cases", ["  \u2717 first fails", "    error one", "  \u2713 passes", "  \u2717 second fails", "    error two", "  \u2713 passes too"].join("\n"));
   // (sh trims the output, so the first line has lost its indent.)
   if (two !== "\u2717 first fails\n    error one\n  \u2717 second fails\n    error two") throw new Error(`two failures: ${JSON.stringify(two)}`);
+  // The other marking, "FAIL"/"ok"/"PASS" (about 100 suites), read the same way: the failure and its error, no passing case.
+  for (const pass of ["ok", "ok ", "PASS"]) {
+    const other = sh("suite_failed_cases", [`${pass}  first passes`, "FAIL  the hint is signed", "      Error: expected 202, got 401", "      at check (test/x.ts:1)",
+      `${pass}  after it`, `${pass}  last`, "46/47 passed"].join("\n"));
+    if (other !== "FAIL  the hint is signed\n      Error: expected 202, got 401\n      at check (test/x.ts:1)") throw new Error(`${JSON.stringify(pass)} marking: ${JSON.stringify(other)}`);
+  }
   if (sh("suite_failed_cases", "  3 passed, 0 failed") !== "") throw new Error("printed something for a clean run");
   // Both gates print it in each of their three failure branches (timeout, suite error, non-zero exit).
   for (const file of ["cf/scripts/gate.sh", "cf/scripts/verify-and-deploy.sh"]) {
