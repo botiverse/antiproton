@@ -190,10 +190,10 @@ export function hostCallOpts(call: { opts?: unknown; callId?: string }, offered?
   };
 }
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
-import type { ConnectorGrants, ConnectorRefresh, HookDirectory, HookRow } from "./control-plane.ts";
+import type { ConnectorGrants, ConnectorRefresh, ConnectorScope, HookDirectory, HookRow } from "./control-plane.ts";
 import { GithubRefresher, RECONNECT_REASON, type GithubApp, type MountGrant } from "./github-refresh.ts";
 import { githubUser, REFRESH_SKEW_MS } from "./github-token.ts";
-import type { ReconnectTarget } from "./provision/connect.ts";
+import type { HeldGrant, ReconnectTarget } from "./provision/connect.ts";
 import type { GithubGrant } from "./github-token.ts";
 import { appendUsage, jsRunRows, modelTokenRows } from "../../src/usage/outbox.ts";
 import {
@@ -2155,7 +2155,7 @@ export class AgentRuntime {
    * the flow was started for, not an account the credential grants: they are never a mount's credential.
    * `reconnect`, from the signed link, is sealed in with the grant: confirm reads the connector to mend from here.
    */
-  async holdConnection(tenantId: string, agentId: string, plugin: string, grant: GithubGrant | string, id: string, exp: number, raftUserId: string,
+  async holdConnection(tenantId: string, agentId: string, plugin: string, grant: HeldGrant | string, id: string, exp: number, raftUserId: string,
     reconnect: ReconnectTarget | null = null): Promise<{ ok: true } | { ok: false; error: string }> {
     await this.ready();
     const kek = await this.#kek;
@@ -2165,7 +2165,7 @@ export class AgentRuntime {
       if (Number(r.name.split(":")[2]) <= now) await this.store.removeSecret(tenantId, agentId, r.name);
     }
     // The whole grant, as JSON: an expiring token's refresh token and lifetimes have to reach the mount with it.
-    const g: GithubGrant | string = typeof grant === "string" && reconnect
+    const g: HeldGrant | string = typeof grant === "string" && reconnect
       ? { accessToken: grant, refreshToken: null, expiresAt: null, refreshExpiresAt: null } : grant;
     const sealed = await seal(kek, typeof g === "string" ? g : JSON.stringify({ v: 1, ...g, ...(reconnect ? { reconnect } : {}) }));
     await this.store.putSecret(tenantId, agentId, `pending:${plugin}:${exp}:${id}`, { ciphertext: sealed.ciphertext, iv: sealed.iv, account: raftUserId });
@@ -2183,6 +2183,7 @@ export class AgentRuntime {
    */
   async confirmConnection(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string, connectorId: string | null = null):
     Promise<{ ok: true; account: string | null; accountId: string | null; sealed: Sealed; refresh: ConnectorRefresh | null; reconnect: ReconnectTarget | null }
+      & ConnectorScope
       | { ok: false; error: string; missing?: true }> {
     await this.ready();
     const kek = await this.#kek;
@@ -2197,11 +2198,16 @@ export class AgentRuntime {
     }
     // A hold from before #935 is the bare token; one since is the grant as JSON. A token never begins with "{".
     const held = await open(kek, sealed);
-    const parsed = held.startsWith("{") ? JSON.parse(held) as GithubGrant & { reconnect?: ReconnectTarget } : null;
+    const parsed = held.startsWith("{") ? JSON.parse(held) as HeldGrant & { reconnect?: ReconnectTarget } : null;
     const grant: GithubGrant = parsed
       ? { accessToken: parsed.accessToken, refreshToken: parsed.refreshToken, expiresAt: parsed.expiresAt, refreshExpiresAt: parsed.refreshExpiresAt }
       : { accessToken: held, refreshToken: null, expiresAt: null, refreshExpiresAt: null };
     const reconnect = parsed?.reconnect ?? null;
+    // What GitHub granted and what the flow asked for, for the connector's record; null where the hold does not say.
+    const scope: ConnectorScope = {
+      grantedScope: typeof parsed?.scope === "string" ? parsed.scope : null,
+      requestedScope: Array.isArray(parsed?.requested) ? parsed.requested.filter((x) => typeof x === "string").join(" ") : null,
+    };
     const access = await seal(kek, grant.accessToken);
     const refresh: ConnectorRefresh | null = grant.refreshToken
       ? { sealed: await seal(kek, grant.refreshToken), expiresAt: grant.expiresAt, refreshExpiresAt: grant.refreshExpiresAt }
@@ -2209,7 +2215,7 @@ export class AgentRuntime {
     if (reconnect) {
       const who = await githubUser(grant.accessToken);
       if (!who) return { ok: false, error: "GitHub did not say which account was authorized, so the connector was not changed; reconnect again" };
-      return { ok: true, account: who.login, accountId: who.id, sealed: access, refresh, reconnect };
+      return { ok: true, account: who.login, accountId: who.id, sealed: access, refresh, reconnect, ...scope };
     }
     // Handed back sealed: the connection it becomes is the tenant's (cf/migrations/0012_connectors.sql), under the
     // id the caller is about to create it with, which is how this mount finds the pair when it needs renewing.
@@ -2218,7 +2224,7 @@ export class AgentRuntime {
     // The id a later reconnect in place compares, since a login can be renamed. Not a reason to refuse this connect:
     // a connector without one falls back to its login.
     const who = await githubUser(grant.accessToken);
-    return { ...r, accountId: who?.id ?? null, sealed: access, refresh, reconnect: null };
+    return { ...r, accountId: who?.id ?? null, sealed: access, refresh, reconnect: null, ...scope };
   }
 
   /**

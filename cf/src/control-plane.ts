@@ -609,6 +609,22 @@ export interface Connector {
   brokenReason?: string | null;
   /** When it was last checked, whatever came of it (0023); null on a row from before. */
   lastCheckedAt?: number | null;
+  /** GitHub's `scope` for its grant, and the scopes the flow asked for (0034, `ConnectorScope`); absent or null: not recorded. */
+  grantedScope?: string | null;
+  requestedScope?: string | null;
+}
+
+/**
+ * What a connector's authorization covers, as recorded (migration 0034). `grantedScope` is the `scope` of GitHub's
+ * token response verbatim (comma-separated; "" when GitHub named none); `requestedScope` the scopes the connect flow
+ * asked for, space-separated as sent. Null: not recorded (a connector from before 0034, a hold from before it, or an
+ * answer without `scope`). Neither is ever inferred from the other.
+ */
+export interface ConnectorScope { grantedScope: string | null; requestedScope: string | null }
+
+/** A recorded scope as a list: null stays null (not recorded), "" is [] (GitHub named none). Commas or spaces separate. */
+export function scopeList(s: string | null | undefined): string[] | null {
+  return s === null || s === undefined ? null : s.split(/[\s,]+/).filter(Boolean);
 }
 
 /** What renews a connector's access token. Times are ms since the epoch. */
@@ -649,8 +665,8 @@ export interface ConnectorStore {
   reconnect(tenantId: string, id: string, next: ConnectorReconnect): Promise<boolean>;
 }
 
-/** What a reconnect in place writes. */
-export interface ConnectorReconnect {
+/** What a reconnect in place writes: the new grant's scope replaces the old one's, null included. */
+export interface ConnectorReconnect extends ConnectorScope {
   sealed: { ciphertext: string; iv: string };
   refresh: ConnectorRefresh | null;
   account: string | null;
@@ -665,11 +681,12 @@ export function d1Connectors(db: D1Database): ConnectorStore {
       const f = c.refresh ?? null;
       await db.prepare(
         `INSERT INTO connectors (id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at,
-           refresh_ciphertext, refresh_iv, expires_at, refresh_expires_at, refreshed_at, last_checked_at, account_id, raft_origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           refresh_ciphertext, refresh_iv, expires_at, refresh_expires_at, refreshed_at, last_checked_at, account_id, raft_origin,
+           granted_scope, requested_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(c.id, c.tenantId, c.provider, c.account, c.creatorRaftUserId, c.sealed.ciphertext, c.sealed.iv, c.createdAt,
         f?.sealed.ciphertext ?? null, f?.sealed.iv ?? null, f?.expiresAt ?? null, f?.refreshExpiresAt ?? null, f ? c.createdAt : null,
         // Made from a confirm, whose attach has just checked the credential with GitHub.
-        c.createdAt, c.accountId ?? null, c.raftOrigin).run();
+        c.createdAt, c.accountId ?? null, c.raftOrigin, c.grantedScope ?? null, c.requestedScope ?? null).run();
     },
     async reconnect(tenantId, id, next) {
       const f = next.refresh;
@@ -679,12 +696,12 @@ export function d1Connectors(db: D1Database): ConnectorStore {
       const r = await db.prepare(
         `UPDATE connectors SET ciphertext = ?, iv = ?, refresh_ciphertext = ?, refresh_iv = ?, expires_at = ?, refresh_expires_at = ?,
            refreshed_at = ?, last_checked_at = ?, broken_at = NULL, broken_reason = NULL, refreshing_until = NULL, refreshing_by = NULL,
-           account = ?, account_id = ?
+           account = ?, account_id = ?, granted_scope = ?, requested_scope = ?
          WHERE tenant_id = ? AND id = ? AND (account_id IS NULL OR account_id = ?)
            -- With no id yet, the login has to match here too: a renamed login can be claimed by someone else.
            AND (account_id IS NOT NULL OR lower(account) = lower(?))`,
       ).bind(next.sealed.ciphertext, next.sealed.iv, f?.sealed.ciphertext ?? null, f?.sealed.iv ?? null, f?.expiresAt ?? null, f?.refreshExpiresAt ?? null,
-        f ? next.at : null, next.at, next.account, next.accountId, tenantId, id, next.accountId, next.account).run();
+        f ? next.at : null, next.at, next.account, next.accountId, next.grantedScope, next.requestedScope, tenantId, id, next.accountId, next.account).run();
       return Number(r.meta?.changes ?? 0) > 0;
     },
     async checked(tenantId, id, at) {
@@ -720,6 +737,8 @@ function connectorRow(r: any): Connector {
       : { sealed: { ciphertext: String(r.refresh_ciphertext), iv: String(r.refresh_iv) }, expiresAt: n(r.expires_at), refreshExpiresAt: n(r.refresh_expires_at) },
     brokenAt: n(r.broken_at), brokenReason: r.broken_reason == null ? null : String(r.broken_reason),
     lastCheckedAt: n(r.last_checked_at),
+    grantedScope: r.granted_scope == null ? null : String(r.granted_scope),
+    requestedScope: r.requested_scope == null ? null : String(r.requested_scope),
   };
 }
 
@@ -745,8 +764,13 @@ export interface ConnectorGrants {
   lease(tenantId: string, id: string, now: number, until: number, holder: string): Promise<boolean>;
   /** Give it back; only `holder`'s own lease is released. */
   release(tenantId: string, id: string, holder: string): Promise<void>;
-  /** The new pair, only over the refresh token it was traded from (`expect`); clears any broken state, and `holder`'s lease. */
-  rotate(tenantId: string, id: string, next: { sealed: { ciphertext: string; iv: string }; refresh: ConnectorRefresh; at: number }, expect: string, holder: string): Promise<boolean>;
+  /**
+   * The new pair, only over the refresh token it was traded from (`expect`); clears any broken state, and `holder`'s lease.
+   * `grantedScope` replaces the recorded scope only when it is a non-empty string: a renewal answered without a scope
+   * says nothing about the grant, and the scope the connect recorded stands (0034).
+   */
+  rotate(tenantId: string, id: string, next: { sealed: { ciphertext: string; iv: string }; refresh: ConnectorRefresh; at: number; grantedScope?: string | null },
+    expect: string, holder: string): Promise<boolean>;
   /**
    * Record that only a reconnect mends it, with a `broken` event, releasing `holder`'s lease. Only while the connector
    * still holds `spent` (the refresh token GitHub refused, sealed; null: whatever it holds), like `rotate`. False when
@@ -823,11 +847,12 @@ export function d1ConnectorGrants(db: D1Database): ConnectorGrants {
       const r = await db.prepare(
         `UPDATE connectors SET ciphertext = ?, iv = ?, refresh_ciphertext = ?, refresh_iv = ?, expires_at = ?, refresh_expires_at = ?,
            refreshed_at = ?, last_checked_at = ?, broken_at = NULL, broken_reason = NULL,
+           granted_scope = COALESCE(?, granted_scope),
            refreshing_until = CASE WHEN refreshing_by = ? THEN NULL ELSE refreshing_until END,
            refreshing_by = CASE WHEN refreshing_by = ? THEN NULL ELSE refreshing_by END
          WHERE tenant_id = ? AND id = ? AND refresh_ciphertext = ?`,
       ).bind(next.sealed.ciphertext, next.sealed.iv, next.refresh.sealed.ciphertext, next.refresh.sealed.iv, next.refresh.expiresAt,
-        next.refresh.refreshExpiresAt, next.at, next.at, holder, holder, tenantId, id, expect).run();
+        next.refresh.refreshExpiresAt, next.at, next.at, next.grantedScope ? next.grantedScope : null, holder, holder, tenantId, id, expect).run();
       return Number(r.meta?.changes ?? 0) > 0;
     },
     async markBroken(tenantId, id, reason, at, holder, spent) {

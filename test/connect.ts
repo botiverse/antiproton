@@ -98,7 +98,8 @@ await check("the callback holds the token in the agent's object and sends Raft o
 });
 
 await check("the callback logs which keys GitHub's answer carried, never a value, and holds the whole grant (#935)", async () => {
-  const grant = { accessToken: "ghu_" + "a".repeat(36), refreshToken: "ghr_" + "r".repeat(72), expiresAt: 1_800_028_800_000, refreshExpiresAt: 1_815_897_600_000 };
+  const grant = { accessToken: "ghu_" + "a".repeat(36), refreshToken: "ghr_" + "r".repeat(72), expiresAt: 1_800_028_800_000, refreshExpiresAt: 1_815_897_600_000,
+    scope: "public_repo" };
   const keys = ["access_token", "expires_in", "refresh_token", "refresh_token_expires_in", "scope", "token_type"];
   const x = deps({ async exchange() { return { grant, keys }; } });
   const lines: string[] = [];
@@ -113,7 +114,8 @@ await check("the callback logs which keys GitHub's answer carried, never a value
   const said = lines.map((l) => JSON.parse(l)).filter((l) => l.evt === "connect.exchange");
   must(said.length === 1 && said[0].keys === keys.join(" ") && said[0].expiring === true && said[0].agentId === "raft_a1", JSON.stringify(said));
   must(!lines.some((l) => l.includes(grant.accessToken) || l.includes(grant.refreshToken)), "a token value was logged");
-  must(JSON.stringify(x.held[0]?.grant) === JSON.stringify(grant), "the hold did not get the whole grant");
+  // The whole grant, GitHub's `scope` included, and beside it the scopes this flow's link asked for (0034).
+  must(JSON.stringify(x.held[0]?.grant) === JSON.stringify({ ...grant, requested: spec.scopes }), `the hold did not get the whole grant and the request: ${JSON.stringify({ ...x.held[0]?.grant, accessToken: "-", refreshToken: "-" })}`);
 });
 
 await check("a reconnect's connector travels signed from the link to the hold; a link respelled to name another connector starts nothing", async () => {

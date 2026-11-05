@@ -20,6 +20,7 @@ import { adminCredentialInventory, readConnectionHoldings } from "../cf/src/cred
 import { handleProvision, type ProvisionDeps } from "../cf/src/provision/handlers.ts";
 import { githubExchangeCode, GITHUB_TOKEN } from "../cf/src/auth.ts";
 import { OAUTH_PREFIX, RECONNECT_REASON, reasonCode } from "../cf/src/github-refresh.ts";
+import { scopesFor } from "../cf/src/provision/connect.ts";
 import { setLogSink } from "../src/core/log.ts";
 import { pendingTrace } from "../src/trace/outbox.ts";
 import { forwardRow } from "../cf/src/trace-forward.ts";
@@ -78,16 +79,19 @@ function github(opts: { expiring?: boolean } = {}) {
     /** Who the person signing in at GitHub is: the account the next code's tokens act as. A refresh keeps its pair's. */
     as: { login: "octocat", id: 1 } as { login: string; id: number },
     /** How many of the next `GET /user` calls answer 503, as an outage would. */
-    failUser: 0 };
+    failUser: 0,
+    /** The `scope` a code's answer carries, and a refresh's; null: the answer has no `scope` key at all. */
+    scope: "public_repo,read:org" as string | null, refreshScope: "public_repo,read:org" as string | null };
   const owner = new Map<string, { login: string; id: number }>(); // access token -> the account it acts as
-  const pair = (expiring: boolean, who = s.as) => {
+  const pair = (expiring: boolean, who = s.as, scope = s.scope) => {
+    const sc = scope === null ? {} : { scope };
     n++;
     const access = `ghu_${String(n).padStart(4, "0")}${"a".repeat(36)}`;
     const refresh = `ghr_${String(n).padStart(4, "0")}${"r".repeat(72)}`;
     live.add(access); issued.push(access); owner.set(access, { ...who });
-    if (!expiring) return { access_token: access, scope: "public_repo,read:org", token_type: "bearer" };
+    if (!expiring) return { access_token: access, ...sc, token_type: "bearer" };
     refreshes.set(refresh, access); issued.push(refresh);
-    return { access_token: access, expires_in: 28800, refresh_token: refresh, refresh_token_expires_in: 15897600, scope: "public_repo,read:org", token_type: "bearer" };
+    return { access_token: access, expires_in: 28800, refresh_token: refresh, refresh_token_expires_in: 15897600, ...sc, token_type: "bearer" };
   };
   const fetchImpl = async (url: any, init?: any) => {
     const u = String(url);
@@ -101,7 +105,7 @@ function github(opts: { expiring?: boolean } = {}) {
         const was = refreshes.get(b.refresh_token);
         if (s.refuse || was === undefined) { s.refused++; return json({ error: "bad_refresh_token", error_description: "The refresh token passed is incorrect or expired." }); }
         refreshes.delete(b.refresh_token); live.delete(was);
-        return json(pair(true, owner.get(was)));
+        return json(pair(true, owner.get(was), s.refreshScope));
       }
       return json(pair(opts.expiring !== false));
     }
@@ -316,7 +320,8 @@ async function world(opts: { expiring?: boolean; github?: boolean; run9?: Return
   /** The whole Connect GitHub flow for one agent: the code exchanged, held in its object, confirmed by Raft. */
   async function connect(a: { rt: AgentRuntime; agentId: string; raftAgentId: string }, pending = `pend_${a.raftAgentId}_0001`) {
     const { grant } = await gh.code();
-    await a.rt.holdConnection(TENANT, a.agentId, "github", grant, pending, Date.now() + 600_000, "u_owner");
+    // As connectCallback holds it: the grant, and the scopes the link asked for (a plain connect asks for public).
+    await a.rt.holdConnection(TENANT, a.agentId, "github", { ...grant, requested: scopesFor("public") }, pending, Date.now() + 600_000, "u_owner");
     const r = await call("POST", `/agents/by-raft-agent/${a.raftAgentId}/connections/github/confirm`, { pending, raftUserId: "u_owner" });
     must(r.status === 200 && r.body.connected === true, `confirm: ${r.status} ${r.text}`);
     return r.body.connectorId as string;
@@ -326,13 +331,14 @@ async function world(opts: { expiring?: boolean; github?: boolean; run9?: Return
    * exchanged as whoever `gh.s.as` is, held with the link's own `reconnect` as connect.ts carries it, and confirmed.
    */
   async function reconnect(a: { rt: AgentRuntime; agentId: string; raftAgentId: string }, connectorId: string,
-    by: { raftUserId?: string; actingRole?: "creator" | "admin" } = {}, pending = `pend_${a.raftAgentId}_re${links.length}`) {
+    by: { raftUserId?: string; actingRole?: "creator" | "admin"; access?: "public" | "private" } = {}, pending = `pend_${a.raftAgentId}_re${links.length}`) {
     const raftUserId = by.raftUserId ?? "u_owner";
     const asked = await call("POST", `/agents/by-raft-agent/${a.raftAgentId}/connections/github`,
-      { returnUrl: `${WHO.raftOrigin}/agents/${a.raftAgentId}`, initiatedBy: { raftUserId }, connectorId, actingRole: by.actingRole ?? "creator" });
+      { returnUrl: `${WHO.raftOrigin}/agents/${a.raftAgentId}`, initiatedBy: { raftUserId }, connectorId, actingRole: by.actingRole ?? "creator",
+        ...(by.access ? { access: by.access } : {}) });
     if (asked.status !== 200) return asked;
     const { grant } = await gh.code();
-    await a.rt.holdConnection(TENANT, a.agentId, "github", grant, pending, Date.now() + 600_000, raftUserId, links.at(-1).reconnect ?? null);
+    await a.rt.holdConnection(TENANT, a.agentId, "github", { ...grant, requested: links.at(-1).scopes }, pending, Date.now() + 600_000, raftUserId, links.at(-1).reconnect ?? null);
     return call("POST", `/agents/by-raft-agent/${a.raftAgentId}/connections/github/confirm`, { pending, raftUserId });
   }
   const status = (raftAgentId: string) => call("GET", `/agents/by-raft-agent/${raftAgentId}/connections/github`);
@@ -1012,7 +1018,7 @@ await check("the D1 write itself refuses another account's id, for an id that ch
   const a = await w.agent("R10");
   const id = await w.connect(a);
   const row0 = connectorRow(w, id);
-  const next = { sealed: { ciphertext: "x", iv: "y" }, refresh: null, account: "mallory", accountId: "2", at: Date.now() };
+  const next = { sealed: { ciphertext: "x", iv: "y" }, refresh: null, account: "mallory", accountId: "2", at: Date.now(), grantedScope: "repo", requestedScope: "repo" };
   must(!(await d1Connectors(w.db).reconnect(TENANT, id, next)), "another account's pair was written");
   must(!(await d1Connectors(w.db).reconnect("t-other", id, { ...next, accountId: "1" })), "another tenant wrote over the connector");
   must(JSON.stringify(connectorRow(w, id)) === JSON.stringify(row0), "the connector changed");
@@ -1025,7 +1031,7 @@ await check("the D1 write refuses a connector with no id yet whose login is anot
   const id = await w.connect(a);
   w.db.raw.prepare("UPDATE connectors SET account_id = NULL WHERE id = ?").run(id);
   const row0 = connectorRow(w, id);
-  const next = { sealed: { ciphertext: "x", iv: "y" }, refresh: null, account: "mallory", accountId: "2", at: Date.now() };
+  const next = { sealed: { ciphertext: "x", iv: "y" }, refresh: null, account: "mallory", accountId: "2", at: Date.now(), grantedScope: "repo", requestedScope: "repo" };
   must(!(await d1Connectors(w.db).reconnect(TENANT, id, next)), "another login's pair was written over a connector with no id");
   must(JSON.stringify(connectorRow(w, id)) === JSON.stringify(row0), "the connector changed");
   must(await d1Connectors(w.db).reconnect(TENANT, id, { ...next, account: "OctoCat", accountId: "1" }), "its own login, in another case, was refused");
@@ -2405,6 +2411,122 @@ await check("the operator's withdrawal alone (/admin/withdraw-egress): a live bo
   // A live agent: its next command wires its accounts again.
   await w.sandbox(a);
   must(fromBox(run9, boxId!).send()?.authorization === `token ${token}`, "a live agent's next command did not wire its accounts again");
+  w.dispose();
+});
+
+console.log(`\n  connector scope (0034)\n  ${"─".repeat(56)}`);
+
+/** The connector's recorded scope columns, as D1 holds them. */
+const scopeRow = (w: Awaited<ReturnType<typeof world>>, id: string) => {
+  const r = connectorRow(w, id);
+  return { granted: r.granted_scope as string | null, requested: r.requested_scope as string | null };
+};
+/** GitHub's tokens and the sealed columns, none of which a scope field may carry. */
+function noTokenIn(w: Awaited<ReturnType<typeof world>>, text: string, id: string) {
+  const row = connectorRow(w, id);
+  for (const v of [...w.gh.issued, row.ciphertext, row.iv, row.refresh_ciphertext, row.refresh_iv]) must(!v || !text.includes(v), "token material is in the answer");
+  must(!/gh[ur]_/.test(text), "a token is in the answer");
+}
+
+await check("the token response's scope is parsed verbatim, \"\" kept as \"\", and an answer without one is null", async () => {
+  const { grantOf } = await import("../cf/src/github-token.ts");
+  must(grantOf({ access_token: "ghu_x", scope: "repo,read:org" }, 0)!.grant.scope === "repo,read:org", "a scope was not kept as GitHub said it");
+  must(grantOf({ access_token: "ghu_x", scope: "" }, 0)!.grant.scope === "", "an empty scope was not kept as empty");
+  must(grantOf({ access_token: "ghu_x" }, 0)!.grant.scope === null, "a missing scope was not null");
+  must(grantOf({ access_token: "ghu_x", scope: 7 }, 0)!.grant.scope === null, "a scope that is not a string was kept");
+});
+
+await check("a connect records the scope GitHub granted and the scopes the flow asked for, and GET reports both per connector and on the connection, with no token", async () => {
+  const w = await world();
+  const a = await w.agent("SC1");
+  const none = await w.status("SC1");
+  must(none.body.scopes === null && none.body.requestedScopes === null, `disconnected: ${none.text}`);
+  w.gh.s.scope = "public_repo,read:org";
+  const id = await w.connect(a);
+  const sr = scopeRow(w, id);
+  must(sr.granted === "public_repo,read:org" && sr.requested === "public_repo read:org", JSON.stringify(sr));
+  const st = await w.status("SC1");
+  must(JSON.stringify(st.body.scopes) === '["public_repo","read:org"]' && JSON.stringify(st.body.requestedScopes) === '["public_repo","read:org"]', st.text);
+  const k = st.body.connectors.find((x: any) => x.id === id);
+  must(JSON.stringify(k.scopes) === '["public_repo","read:org"]' && JSON.stringify(k.requestedScopes) === '["public_repo","read:org"]', JSON.stringify(k));
+  noTokenIn(w, st.text, id);
+  // A second connector of the tenant, whose grant GitHub answered differently, reports its own.
+  const b = await w.agent("SC1b");
+  w.gh.s.scope = "";
+  const id2 = await w.connect(b);
+  const both = (await w.status("SC1")).body.connectors;
+  const k2 = both.find((x: any) => x.id === id2);
+  must(JSON.stringify(k2.scopes) === "[]" && JSON.stringify(both.find((x: any) => x.id === id).scopes) === '["public_repo","read:org"]', JSON.stringify(both));
+  // An answer with no `scope` at all is not recorded: null, not [].
+  const c = await w.agent("SC1c");
+  w.gh.s.scope = null;
+  const id3 = await w.connect(c);
+  must(scopeRow(w, id3).granted === null && (await w.status("SC1c")).body.scopes === null, JSON.stringify(scopeRow(w, id3)));
+  w.dispose();
+});
+
+await check("a reconnect in place replaces the recorded scope with the new grant's, and what it asked for", async () => {
+  const w = await world();
+  const a = await w.agent("SC2");
+  w.gh.s.scope = "public_repo,read:org";
+  const id = await w.connect(a);
+  w.gh.s.scope = "repo,read:org";
+  const r = await w.reconnect(a, id, { access: "private" });
+  must(r.status === 200 && r.body.reconnected === true, `${r.status} ${r.text}`);
+  const sr = scopeRow(w, id);
+  must(sr.granted === "repo,read:org" && sr.requested === "repo read:org", `not replaced: ${JSON.stringify(sr)}`);
+  const st = await w.status("SC2");
+  must(JSON.stringify(st.body.scopes) === '["repo","read:org"]' && JSON.stringify(st.body.connectors[0].requestedScopes) === '["repo","read:org"]', st.text);
+  noTokenIn(w, st.text, id);
+  // A reconnect whose answer has no scope leaves none recorded: the old grant's scope is not the new one's.
+  w.gh.s.scope = null;
+  must((await w.reconnect(a, id)).status === 200, "second reconnect");
+  must(scopeRow(w, id).granted === null && (await w.status("SC2")).body.scopes === null, JSON.stringify(scopeRow(w, id)));
+  w.dispose();
+});
+
+await check("a renewal keeps the recorded scope when its answer carries none or an empty one, and takes a scope it does carry", async () => {
+  const w = await world();
+  const a = await w.agent("SC3");
+  w.gh.s.scope = "public_repo,read:org";
+  const id = await w.connect(a);
+  for (const said of ["", null] as const) {
+    w.gh.s.refreshScope = said;
+    const n = w.gh.s.refreshes;
+    await w.expireAt(a, Date.now() + 60_000, id);
+    must(succeeded(await w.tool(a)) && w.gh.s.refreshes === n + 1, `no renewal for refreshScope ${JSON.stringify(said)}`);
+    must(scopeRow(w, id).granted === "public_repo,read:org", `a renewal answered with ${JSON.stringify(said)} changed the scope: ${JSON.stringify(scopeRow(w, id))}`);
+  }
+  // Control: a renewal that names a scope is recorded, so the two above are about the answer, not a write that never runs.
+  w.gh.s.refreshScope = "public_repo";
+  await w.expireAt(a, Date.now() + 60_000, id);
+  must(succeeded(await w.tool(a)), "renewal");
+  must(scopeRow(w, id).granted === "public_repo" && scopeRow(w, id).requested === "public_repo read:org", JSON.stringify(scopeRow(w, id)));
+  noTokenIn(w, (await w.status("SC3")).text, id);
+  w.dispose();
+});
+
+await check("a connector from before 0034 reads as not recorded: null scopes, not an empty list", async () => {
+  // The migrations up to 0033, a connector written as the code then wrote it, then 0034.
+  const db = new DatabaseSync(":memory:");
+  const dir = new URL("../cf/migrations/", import.meta.url);
+  const files = readdirSync(dir).filter((n) => n.endsWith(".sql")).sort();
+  must(files.some((f) => f.startsWith("0034_")), "no 0034 migration");
+  for (const f of files.filter((f) => f < "0034")) db.exec(readFileSync(new URL(f, dir), "utf8"));
+  db.prepare(`INSERT INTO connectors (id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at, raft_origin)
+    VALUES ('con_old', ?, 'github', 'octocat', 'u_owner', 'c', 'i', 1, ?)`).run(TENANT, WHO.raftOrigin);
+  for (const f of files.filter((f) => f >= "0034")) db.exec(readFileSync(new URL(f, dir), "utf8"));
+  const stmt = (q: string, b: unknown[] = []): any => ({ bind: (...v: unknown[]) => stmt(q, v), first: async () => (db.prepare(q).get(...(b as any[])) as any) ?? null,
+    all: async () => ({ results: db.prepare(q).all(...(b as any[])) }), run: async () => ({ meta: { changes: Number(db.prepare(q).run(...(b as any[])).changes) } }) });
+  const k = await d1Connectors({ prepare: (q: string) => stmt(q) } as any).get(TENANT, "con_old");
+  must(k && k.grantedScope === null && k.requestedScope === null, JSON.stringify(k));
+  // And through GET: the same row shape in the world's D1.
+  const w = await world();
+  const a = await w.agent("SC4");
+  const id = await w.connect(a);
+  w.db.raw.prepare("UPDATE connectors SET granted_scope = NULL, requested_scope = NULL WHERE id = ?").run(id);
+  const st = await w.status("SC4");
+  must(st.body.scopes === null && st.body.requestedScopes === null && st.body.connectors[0].scopes === null && st.body.connectors[0].requestedScopes === null, st.text);
   w.dispose();
 });
 
