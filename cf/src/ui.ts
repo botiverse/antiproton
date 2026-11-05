@@ -2370,13 +2370,15 @@ export function agentModelBlock(d: {
   options: Array<{ id: string; label: string }>;
   selected: string | null;
   locked: boolean;
-  ownKey?: { provider: string; label: string; model: string; storedAt: string | null; refusedAt: string | null } | null;
+  ownKey?: { provider: string; label: string; model: string; storedAt: string | null; refusedAt: string | null; off?: boolean } | null;
   keyProviders?: Array<{ id: string; label: string; keyFrom: string; models: Array<{ id: string; label: string }> }>;
 }): string {
   const source = d.effective.source === "admin"
     ? `<span class="tag">set by an admin — an admin choice wins</span>`
     : d.effective.source === "own"
-      ? (d.ownKey?.refusedAt ? `<span class="tag bad">your key was refused — reconnect it</span>` : `<span class="tag ok">your own key</span>`)
+      // "refused" only from refusedAt, which is set only when the vendor's own JSON answer turned the key down.
+      ? (d.ownKey?.off ? `<span class="tag bad">own ${esc(d.ownKey.label)} keys are switched off here</span>`
+        : d.ownKey?.refusedAt ? `<span class="tag bad">your key was refused — reconnect it</span>` : `<span class="tag ok">your own key</span>`)
     : d.effective.source === "owner"
       ? `<span class="tag ok">your choice</span>`
       : `<span class="tag">the deployment default</span>`;
@@ -2414,7 +2416,9 @@ export function agentModelBlock(d: {
   ${d.locked
     ? `<div class="hint" style="padding-top:4px">an admin chose this agent's model; it changes here only when the admin lifts the override</div>`
     : own
-      ? `<div class="hint" style="padding-top:4px">this agent runs on your own ${esc(own.label)} key${own.refusedAt ? `, which ${esc(own.label)} refused at ${esc(own.refusedAt.slice(0, 16).replace("T", " "))}Z; save a new key to resume` : ""}</div>`
+      ? own.off
+        ? `<div class="hint" style="padding-top:4px">this agent is set to run on your own ${esc(own.label)} key, and own ${esc(own.label)} keys are switched off on this deployment, so it makes no model calls; remove your key to use the deployment's model</div>`
+        : `<div class="hint" style="padding-top:4px">this agent runs on your own ${esc(own.label)} key${own.refusedAt ? `, which ${esc(own.label)} refused at ${esc(own.refusedAt.slice(0, 16).replace("T", " "))}Z; save a new key to resume` : ""}</div>`
       : `<div class="hint" style="padding-top:4px">your choice takes effect the next time the agent runs</div>`}
   ${keyForms}${removeKey}
 </div>`;

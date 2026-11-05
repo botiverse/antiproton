@@ -28,7 +28,7 @@
 import type { ModelChoices } from "./control-plane.ts";
 import { resolveModel } from "./model-request.ts";
 import { optionFor, type UserModels } from "../../src/model/user-models.ts";
-import { USER_KEY_PROVIDERS, userChoiceProblem, userKeyProblem } from "../../src/model/user-key.ts";
+import { enabledUserKeyProviders, userChoiceProblem, userKeyOffProblem, userKeyProblem } from "../../src/model/user-key.ts";
 
 /** What the card says about the owner's own key (`AgentRuntime.modelKeyState`): never the key. */
 export interface OwnKeyState { provider: string; label: string; model: string; storedAt: string | null; refusedAt: string | null }
@@ -41,6 +41,8 @@ export interface AgentModelDeps {
   now(): number;
   /** The agent's own-key binding, when it has one; absent where the route does not ask. */
   ownKey?(): Promise<OwnKeyState | null>;
+  /** This deployment's USER_KEY_PROVIDERS setting (`enabledUserKeyProviders`); absent is none offered. */
+  userKeyProviders?: unknown;
 }
 
 export async function agentModel(
@@ -74,7 +76,11 @@ export async function agentModel(
 
 async function stateOf(who: { tenantId: string; agentId: string }, deps: AgentModelDeps) {
   const r = resolveModel(await deps.choices.layers(who.tenantId, who.agentId), deps.userModels, deps.defaultModel);
-  const own = (await deps.ownKey?.()) ?? null;
+  const stored = (await deps.ownKey?.()) ?? null;
+  const enabled = enabledUserKeyProviders(deps.userKeyProviders);
+  // A binding to a vendor this deployment has switched off still shows, marked, so the owner can see why the agent
+  // makes no model call and remove it.
+  const own = stored ? { ...stored, ...(enabled.some((p) => p.id === stored.provider) ? {} : { off: true as const }) } : null;
   return {
     effective: own
       // What runs is the binding on the owner's key, which no row above decides.
@@ -87,9 +93,9 @@ async function stateOf(who: { tenantId: string; agentId: string }, deps: AgentMo
         source: r.source,
       },
     ownKey: own,
-    // The vendors an owner may run this agent on with their own key, and their models: code, not configuration
-    // (src/model/user-key.ts), so they are offered whatever the deployment lists. Ids and labels only.
-    keyProviders: USER_KEY_PROVIDERS.map((p) => ({ id: p.id, label: p.label, keyFrom: p.keyFrom, models: p.models.map((m) => ({ id: m.id, label: m.label })) })),
+    // The vendors an owner may run this agent on with their own key, and their models: the catalogue is code
+    // (src/model/user-key.ts), and the deployment switches each one on (USER_KEY_PROVIDERS). Ids and labels only.
+    keyProviders: enabled.map((p) => ({ id: p.id, label: p.label, keyFrom: p.keyFrom, models: p.models.map((m) => ({ id: m.id, label: m.label })) })),
     // Each field named rather than spread: an option's provider and model are the operator's mapping, and a
     // field added to UserModel later must not reach the page by default.
     options: deps.userModels.offered.map((o) => ({ id: o.id, label: o.label })),
@@ -137,7 +143,12 @@ export async function agentModelKey(
   if (now.locked) return refuse(409, "locked", "an administrator has set this agent's model, so it cannot run on your own key");
   const provider = String(form.get("provider") ?? "").trim();
   const model = String(form.get("model") ?? "").trim();
-  const bad = userChoiceProblem(provider, model) ?? userKeyProblem(form.get("key"));
+  const choiceBad = userChoiceProblem(provider, model);
+  if (choiceBad) return refuse(422, "invalid", choiceBad);
+  // The one place a key is written from (AgentDO.uiPutModelKey checks again): a vendor this deployment has not
+  // switched on is refused before anything is stored or bound, whatever the page offered.
+  if (!enabledUserKeyProviders(deps.userKeyProviders).some((p) => p.id === provider)) return refuse(409, "provider_off", userKeyOffProblem(provider));
+  const bad = userKeyProblem(form.get("key"));
   if (bad) return refuse(422, "invalid", bad);
   const put = await deps.agent.put(provider, model, String(form.get("key")));
   if (!put.ok) return refuse(422, "invalid", put.error);

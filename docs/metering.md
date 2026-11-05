@@ -234,9 +234,12 @@ table holds, so a `*` meant for our account cannot reach it.
   key from the agent's object for the call (`AgentDO.modelKeyFor`) and marks
   the answer `payer: "own"`, and the metering of that answer prefixes its keys.
   Such a call is never made on the operator's key: a key that is missing,
-  refused by the provider (401/403: marked refused until the owner stores
-  another), over the provider's limit (429) or over our call rate (below) ends
-  the turn with a sentence saying which, and nothing else is called. Every
+  refused by the provider (a JSON 401/403: marked refused until the owner
+  stores another), turned away by the provider's edge (a 401/403 that is not
+  JSON: not marked), for a vendor this deployment has not switched on
+  (`USER_KEY_PROVIDERS`, README), over the provider's limit (429) or over our
+  call rate (below) ends the turn with a sentence saying which, and nothing
+  else is called. Every
   other model call is on the operator's account and its `model.tokens` are ours
   to pay and priced.
 

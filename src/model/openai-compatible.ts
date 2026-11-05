@@ -59,10 +59,17 @@ export class ModelRequestRefused extends Error {
   /** The status and `detail`, and `hint` when one was given: the turn's error. */
   readonly turnError: string;
   readonly permanent = true;
-  constructor(status: number, body: string, secrets: string[] = [], hint?: string) {
+  /**
+   * The refusal came as a JSON document, the shape a provider's API answers in, rather than a page from something in
+   * front of it: an edge's HTML block page is a 403 too, and says nothing about the request's key. With no
+   * `contentType` given it is judged by the body alone.
+   */
+  readonly answeredJson: boolean;
+  constructor(status: number, body: string, secrets: string[] = [], hint?: string, contentType?: string | null) {
     super(`model refused (HTTP ${status}, permanent): see the turn's error`);
     this.name = "ModelRequestRefused";
     this.status = status;
+    this.answeredJson = (contentType === undefined || (contentType !== null && /json/i.test(contentType))) && parsesAsObject(body);
     this.detail = refusalDetail(body, secrets);
     this.turnError = `the model provider refused the request (HTTP ${status})${this.detail ? `: ${this.detail}` : ""}${hint ? ` ${hint}` : ""}`;
   }
@@ -75,6 +82,13 @@ export class ModelRequestRefused extends Error {
  * key" (measured 2026-10-04), which points at auth when the name is what is wrong.
  */
 export const GATEWAY_401_HINT = "(through the gateway, an unknown model id also comes back as 401; check the model name)";
+
+function parsesAsObject(body: string): boolean {
+  try { const v = JSON.parse(body); return v !== null && typeof v === "object"; } catch { return false; }
+}
+
+/** A non-2xx answer as it arrived, for an observer (`onFailedAnswer`): the caller decides what of it may be kept. */
+export interface FailedAnswer { status: number; headers: Headers; body: string }
 
 function refusalDetail(body: string, secrets: string[]): string {
   let text = body;
@@ -159,6 +173,8 @@ export class OpenAiCompatibleModel implements ModelAdapter {
       reasoning?: "off" | "low" | "high";
       /** Told the status of every HTTP answer, so a caller can name the one the call ended on. */
       onStatus?: (status: number) => void;
+      /** Shown each non-2xx answer, headers and body, before it is thrown or retried. */
+      onFailedAnswer?: (a: FailedAnswer) => void;
     } = {},
   ): Promise<ModelResponse> {
     // Reasoning tokens are billed against max_tokens, so the cap is a budget for
@@ -207,7 +223,7 @@ export class OpenAiCompatibleModel implements ModelAdapter {
         : {}),
     });
     return postModelRequest(
-      { url: `${this.#baseUrl}/chat/completions`, apiKey: this.#apiKey, model: this.#model, headers: this.#headers, deadlineMs: this.#deadlineMs, onStatus: opts.onStatus },
+      { url: `${this.#baseUrl}/chat/completions`, apiKey: this.#apiKey, model: this.#model, headers: this.#headers, deadlineMs: this.#deadlineMs, onStatus: opts.onStatus, onFailedAnswer: opts.onFailedAnswer },
       body,
       (data) => {
         const choice = data.choices?.[0];
@@ -258,7 +274,8 @@ export function parseArguments(raw: unknown): unknown {
  * into the answer.
  */
 export async function postModelRequest(
-  cfg: { url: string; apiKey: string; model: string; headers: Record<string, string>; deadlineMs: number; onStatus?: (status: number) => void },
+  cfg: { url: string; apiKey: string; model: string; headers: Record<string, string>; deadlineMs: number; onStatus?: (status: number) => void;
+    onFailedAnswer?: (a: FailedAnswer) => void },
   body: string,
   read: (data: any) => ModelResponse,
 ): Promise<ModelResponse> {
@@ -284,10 +301,11 @@ export async function postModelRequest(
       try { cfg.onStatus?.(res.status); } catch { /* ignored */ }
       if (!res.ok) {
         const text = await res.text();
+        try { cfg.onFailedAnswer?.({ status: res.status, headers: res.headers, body: text }); } catch { /* ignored */ }
         if (isPermanentRefusal(res.status, text)) {
           const gatewayKeyed = res.status === 401 && !cfg.apiKey && cfg.model.includes("/");
           throw new ModelRequestRefused(res.status, text, [cfg.apiKey, ...Object.values(cfg.headers)],
-            gatewayKeyed ? GATEWAY_401_HINT : undefined);
+            gatewayKeyed ? GATEWAY_401_HINT : undefined, res.headers.get("content-type"));
         }
         const err = new ModelHttpError(res.status, `model ${res.status}: ${redacted(text, [cfg.apiKey, ...Object.values(cfg.headers)]).slice(0, 300)}`);
         if (res.status >= 500 || res.status === 429) {

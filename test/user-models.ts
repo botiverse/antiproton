@@ -190,6 +190,8 @@ const env: Record<string, unknown> = {
   ARTIFACT_BUCKET: "b", CONTROL_DB: DB, HARNESS_MODEL: "deepseek-flash", DEEPSEEK_BASE_URL: "https://api.deepseek.com",
   MODEL_PROVIDERS: PROVIDERS, USER_MODELS: [FLASH, LUNA], DEEPSEEK_API_KEY: DK, AI_GATEWAY_TOKEN: GT,
   AUTOMATION_TOKEN: "operator-token", SESSION_SECRET: SESSION, SECRET_KEK: KEK, UI_ALLOW_ANONYMOUS: "1",
+  // Own keys switched on for Kimi Code, as on preview; the switched-off case below unsets it.
+  USER_KEY_PROVIDERS: "kimi-code",
   AGENT: { idFromName: (n: string) => n, get: (n: string) => objects.get(n) ?? fresh(n) },
 };
 function fresh(n: string) {
@@ -466,6 +468,62 @@ await check("own key: one agent's key state never shows in another agent's model
     await postKey({ agentId: OTHER_A, remove: "1" }, { cookie: theirs });
   }
   must(await obj(T, MINE).uiModelKeyState(T, MINE) === null, "B's key was not removed");
+});
+
+/** Every row of every table in an agent's object, as text: what a refused write must leave as it was. */
+function tablesOf(t: string, a: string): string {
+  const sql = obj(t, a).ctx.storage.sql;
+  const names = sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").toArray().map((r: any) => String(r.name));
+  return names.map((n: string) => `${n} ${show(sql.exec(`SELECT * FROM "${n}"`).toArray())}`).join("\n");
+}
+
+await check("own key switched off (USER_KEY_PROVIDERS unset): the card offers no vendor, and a hand-written key POST is refused 409 provider_off with the agent's binding and secrets untouched; switched on, the same POST is 200", async () => {
+  const KEY = "sk-kimi-SWITCHED-OFF-KEY-0123456789";
+  const saved = env.USER_KEY_PROVIDERS;
+  await nextRun(T, A);
+  try {
+    for (const off of [undefined, "", " , "]) {
+      if (off === undefined) delete env.USER_KEY_PROVIDERS; else env.USER_KEY_PROVIDERS = off;
+      const g = await getModel(A);
+      must(g.status === 200 && show(g.json().keyProviders) === "[]" && g.json().ownKey === null, `${show(off)}: ${g.text}`);
+      const before = tablesOf(T, A);
+      const bindingBefore = await bound(T, A);
+      const r = await postKey({ agentId: A, provider: "kimi-code", model: "k3", key: KEY });
+      must(r.status === 409 && r.json().error?.code === "provider_off" && r.json().error.message === "own keys for Kimi Code are switched off on this deployment",
+        `${show(off)}: ${r.status} ${r.text}`);
+      must(!r.text.includes(KEY), r.text);
+      must(await bound(T, A) === bindingBefore && bindingBefore.startsWith("operator:model"), `binding moved: ${await bound(T, A)}`);
+      must(tablesOf(T, A) === before, `${show(off)}: the refused write changed the object's tables`);
+      // The object refuses it too, for a caller that is not the route.
+      const direct = await obj(T, A).uiPutModelKey(T, A, "kimi-code", "k3", KEY);
+      must(direct.ok === false && /switched off/.test(direct.error) && tablesOf(T, A) === before, `the object stored it: ${show(direct)}`);
+    }
+    // The control: switched on, the very same request is stored.
+    env.USER_KEY_PROVIDERS = "kimi-code";
+    const on = await postKey({ agentId: A, provider: "kimi-code", model: "k3", key: KEY });
+    must(on.status === 200 && on.json().ownKey?.provider === "kimi-code" && (await bound(T, A)) === "user:model:kimi-code k3", `on: ${on.status} ${on.text}`);
+  } finally {
+    env.USER_KEY_PROVIDERS = saved;
+    await postKey({ agentId: A, remove: "1" });
+  }
+  must(await obj(T, A).uiModelKeyState(T, A) === null, "the control's key was not removed");
+});
+
+await check("own key: a value shorter than USER_KEY_MIN_CHARS is refused 422 and stores nothing, since value redaction would not match it", async () => {
+  const saved = env.USER_KEY_PROVIDERS;
+  env.USER_KEY_PROVIDERS = "kimi-code";
+  await nextRun(T, A);
+  try {
+    const before = tablesOf(T, A);
+    const short = await postKey({ agentId: A, provider: "kimi-code", model: "k3", key: "k3x" });
+    must(short.status === 422 && /shorter than 20 characters/.test(short.text) && !short.text.includes("k3x\"") && tablesOf(T, A) === before, `${short.status} ${short.text}`);
+    // The control: a key of the minimum length is stored.
+    const ok = await postKey({ agentId: A, provider: "kimi-code", model: "k3", key: "k".repeat(20) });
+    must(ok.status === 200 && ok.json().ownKey?.provider === "kimi-code", `${ok.status} ${ok.text}`);
+  } finally {
+    await postKey({ agentId: A, remove: "1" });
+    env.USER_KEY_PROVIDERS = saved;
+  }
 });
 
 await check("admin: a refused USER_MODELS is said on /admin/models, and a valid one is not called refused", async () => {
