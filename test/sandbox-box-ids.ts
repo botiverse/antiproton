@@ -20,6 +20,8 @@ import { BOX_KEY, BOX_STORE, MAIN_MACHINE, SPLIT_PREFIX, asMountState, boxIdFor,
 import { countHeldTime } from "../src/usage/container.ts";
 import { pendingUsage } from "../src/usage/outbox.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { SqliteStore } from "../src/store/sqlite.ts";
+import { ToolGateway } from "../src/runtime/gateway.ts";
 
 /** Which of two concurrent calls a request was made by, for the gated cases. */
 const whichCall = new AsyncLocalStorage<string>();
@@ -1152,6 +1154,12 @@ const gated = (name: string, open: (go: () => void) => void, ms = 3_000) => new 
  * mount and storage, and both expect the same record.
  */
 /**
+ * In production these pairs do not overlap: every entry that reaches a split on one mount (a tool call, `releaseTask`
+ * for the idle pass, an operator's release and a delete, `withdrawTask`) takes the gateway's per-mount lock
+ * (`#onMount`, src/runtime/gateway.ts), and the sandbox is exclusive. The gated cases below drive the plugin directly,
+ * past the lock, and guard the split's writes if a path ever bypasses the per-mount lock; the gateway case after them
+ * pins the lock itself.
+ *
  * A case can catch a sabotage only if a timeline exists where the two calls really overlap on the same provider and
  * the same record, and its failure does not depend on a timeout; the gate is necessary, not sufficient. So the overlap
  * is asserted, not assumed: two removals inside the provider at once, and a removal round sent by each call.
@@ -1257,7 +1265,7 @@ async function gatedPair(
 const ONLY_LEGACY = '[{"id":null,"name":"GH_LEGACY","state":"residue","reason":"wiring_without_ids"}]';
 
 for (const order of ["first released first", "second released first"] as const) {
-  await check(`a tool call and an idle release on one split, ${order}: every round counted, nothing either removed comes back`, async () => {
+  await check(`past the per-mount lock, a tool call and an idle release on one split, ${order}: every round counted, nothing either removed comes back`, async () => {
     const { p, b, first } = await gatedPair(order, {
       record: (A: string, B: string) => takerRecord([wiring([{ name: "GH_A", id: A }, { name: "GH_B", id: B }, { name: "GH_LEGACY", id: null }])]),
       first: (m) => m.plugin.invoke("shell", { command: "ls" }, m.ctx),
@@ -1271,7 +1279,7 @@ for (const order of ["first released first", "second released first"] as const) 
     must(count(queued, NOT_OURS) === 1 && !queued.includes(GIVEN_UP), `the split was not told exactly once, or told as given up: ${queued}`);
   });
 
-  await check(`a tool call's retry and a withdrawal's retry on one pending split, ${order}: every round counted, nothing either removed comes back`, async () => {
+  await check(`past the per-mount lock, a tool call's retry and a withdrawal's retry on one pending split, ${order}: every round counted, nothing either removed comes back`, async () => {
     // The split was made and told earlier; the record let go of the box. Both calls retry it (`retryForeign`).
     const { p, b, first } = await gatedPair(order, {
       record: { machines: {} },
@@ -1289,6 +1297,58 @@ for (const order of ["first released first", "second released first"] as const) 
     must(!/another agent|may remain|three times/.test(queued), `a note was queued: ${queued}`);
   });
 }
+
+await check("through the gateway, a tool call, a release and a withdrawal on one mount never overlap inside the provider", async () => {
+  // Pins the per-mount lock (`#onMount`) the cases above assume: removing it from `releaseTask` or `withdrawTask`
+  // turns this red. Each removal waits a little while it holds the provider, which is the window the other call
+  // would use if nothing held it back.
+  const { p } = sharedBox();
+  const A = p.register(OLD_ID, "GH_A", "taker-a", TAKER());
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent(TENANT, AGENT_B);
+  await store.addMount({
+    tenantId: TENANT, agentId: AGENT_B, alias: "sandbox", plugin: "sandbox", installationId: "i", connectionId: null,
+    toolVersion: sandboxPlugin(null as any, "bucket", null).version,
+    publicConfig: { endpoint: "https://run9.example", project: "p", graceMs: 10_000 }, secretRef: "env:RUN9", policy: null,
+  } as any);
+  const plugin = sandboxPlugin(null as any, "bucket", LEASE);
+  store.pluginDb.put({ tenantId: TENANT, agentId: AGENT_B, alias: "sandbox", plugin: "sandbox" }, BOX_STORE, BOX_KEY,
+    takerRecord([wiring([{ name: "GH_A", id: A }])]) as any, null);
+  const gw = new ToolGateway(store, [plugin], new Set(["sandbox"]), { async resolve() { return JSON.stringify({ ak: "a", sk: "b" }); } } as any);
+  p.o.caller = TAKER();
+  p.o.failRemove = true;
+  const inside = new Set<string>();
+  let most = 0;
+  const settledAt: Record<string, number> = {};
+  const firstRemovalAt: Record<string, number> = {};
+  let tick = 0;
+  p.o.beforeRemoval = async () => {
+    const who = whichCall.getStore() ?? "unknown";
+    firstRemovalAt[who] ??= ++tick;
+    inside.add(who);
+    most = Math.max(most, inside.size);
+    await new Promise((r) => setTimeout(r, 20));
+    inside.delete(who);
+  };
+  const ctx = { tenantId: TENANT, agentId: AGENT_B, taskId: "k" };
+  const run = (who: string, f: () => Promise<unknown>) => whichCall.run(who, () => f().then(() => { settledAt[who] = ++tick; }, () => { settledAt[who] = ++tick; }));
+  await logged(() => Promise.all([
+    run("invoke", () => gw.invoke(ctx, "sandbox.shell", { command: "ls" } as any)),
+    run("release", () => gw.releaseTask(ctx, { alias: "sandbox", reason: "idle" })),
+    run("withdraw", () => gw.withdrawTask(ctx)),
+  ]));
+  p.o.beforeRemoval = null;
+  must(Object.keys(firstRemovalAt).length >= 2, `fewer than two calls reached the provider: ${JSON.stringify(firstRemovalAt)}`);
+  must(most === 1, `calls inside the provider at once: ${most}`);
+  for (const who of Object.keys(firstRemovalAt)) {
+    for (const other of Object.keys(firstRemovalAt)) {
+      if (who !== other && firstRemovalAt[who]! < firstRemovalAt[other]!) {
+        must(settledAt[who]! < firstRemovalAt[other]!, `${other} reached the provider before ${who} had finished: ${JSON.stringify({ firstRemovalAt, settledAt })}`);
+      }
+    }
+  }
+});
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.ok ? "" : `\n    ${r.error}`}`);
 const passed = results.filter((r) => r.ok).length;

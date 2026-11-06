@@ -1522,13 +1522,14 @@ async function stopBox(
   // A box switched off for being idle already recorded its compute session
   // when it was switched off (parkBox), so deleting it adds none: a second
   // one from `createdAt` would count the days it sat stopped as compute.
-  // Read again before overwriting. `releaseTask` does not take the per-mount
-  // lock that `invoke` takes, so an operator release or the idle sweep can
-  // interleave with a command on this mount: the command finds no container,
-  // creates one and records it, and clearing the record on top would leave that
-  // container alive and billed with nothing naming it — the orphan `asBoxState`
-  // refuses to create. A lock in the gateway closes the
-  // window inside one object; this half does not depend on the caller.
+  // Read again before overwriting. `releaseTask` takes the per-mount lock that
+  // `invoke` takes (`#onMount`, src/runtime/gateway.ts), so through the gateway
+  // an operator release or the idle sweep cannot interleave with a command on
+  // this mount. This read does not depend on that: a caller that reached the
+  // plugin past the lock could find a command creating and recording a
+  // container in between, and clearing the record on top would leave that
+  // container alive and billed with nothing naming it — the orphan
+  // `asBoxState` refuses to create.
   //
   // The shared lists are taken from this second read, not the first: another
   // machine of the mount may have added a session or kept an environment since.
