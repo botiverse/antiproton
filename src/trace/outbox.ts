@@ -111,7 +111,7 @@ export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "contain
   "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check", "raft.session_unsealable",
   "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner", "stamp.agent_login", "state.dropped",
   "raft.assistant_decision", "memory.shadow_due", "memory.shadow", "memory.observe", "memory.shadow_redact", "memory.shadow_clear",
-  "raft.assistant_owner_actions"] as const;
+  "raft.assistant_owner_actions", "sandbox.box_owner"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
@@ -190,12 +190,16 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * status `called`, one per call, with the tool, the `result` (`ok`, the SDK's failure code, or `refused:not_chat`),
  * Raft's HTTP `status`, its `error_code` and a confirm's `state` (`runOwnerAction`). Never an argument or Raft's text.
  * Not forwarded.
+ * `sandbox.box_owner` is a box a sandbox mount's record named, read for whose it is before anything was sent to it
+ * (src/plugins/sandbox.ts `ownedProvider`): status `box_not_ours` (verdict `blocked`) when it was made for another
+ * agent and the record let go of it, or `owner_unknown` when the provider lists it with no owner and it was kept; with
+ * `code` (the status again), `tenant`, `agent`, `mount`, `machine` and `box`, the box's id. Not forwarded.
  */
 export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake", "raft.assistant_notify",
   "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check",
   "raft.session_unsealable", "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner",
   "stamp.agent_login", "state.dropped", "raft.assistant_decision", "memory.shadow_due", "memory.shadow_redact",
-  "raft.assistant_owner_actions"] as const satisfies readonly TraceKind[];
+  "raft.assistant_owner_actions", "sandbox.box_owner"] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;

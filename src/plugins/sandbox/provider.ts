@@ -196,6 +196,13 @@ export interface SandboxProvider {
    * is never adopted: the name alone does not say whose it is.
    */
   adopt(spec: BoxSpec): Promise<string | null>;
+  /**
+   * Whose box this is, as the provider says, read without waking it: `ours` when it carries one of these
+   * descriptions (the ones this plugin creates boxes with, `BoxSpec.description`), `other` when it carries another,
+   * `unknown` when it carries none, `gone` when the provider does not have it. Absent where the plugin's own record
+   * is enough because the provider mints the ids (InstaBox). Throws when it cannot read the answer.
+   */
+  ownerOf?(id: string, descriptions: readonly string[]): Promise<"ours" | "other" | "unknown" | "gone">;
   /** Where the box is, read without waking it. */
   status(id: string, within?: Within): Promise<BoxState>;
   /** Starts a command, detached so it can be killed; its execution id. */

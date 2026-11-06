@@ -1093,6 +1093,7 @@
       "lastUsedAt": 1800000013000,
       "execs": 3,
       "saved": [],
+      "ownerChecked": true,
       "deleteAt": 1800086401000,
       "credentialRef": "agent",
       "image": "universal"
@@ -1613,6 +1614,7 @@
       "lastUsedAt": 1800000024000,
       "execs": 2,
       "saved": [],
+      "ownerChecked": true,
       "deleteAt": 1800086416000,
       "credentialRef": "agent",
       "image": "universal",
@@ -2523,6 +2525,7 @@
       "saved": [
        "artifact://sandbox/m_1/data/home/work/out.txt"
       ],
+      "ownerChecked": true,
       "deleteAt": 1800086401000,
       "credentialRef": "agent",
       "image": "universal",
@@ -3231,6 +3234,7 @@
       "lastUsedAt": 1800000003000,
       "execs": 1,
       "saved": [],
+      "ownerChecked": true,
       "deleteAt": 1800086401000,
       "credentialRef": "agent",
       "image": "universal",
@@ -6742,6 +6746,7 @@
       "lastUsedAt": 1800000046000,
       "execs": 1,
       "saved": [],
+      "ownerChecked": true,
       "deleteAt": 1800086442000,
       "credentialRef": "agent",
       "image": "docker.io/library/python:3.12",

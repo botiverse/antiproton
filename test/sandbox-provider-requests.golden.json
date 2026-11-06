@@ -1360,6 +1360,7 @@
       "lastUsedAt": 1800000007000,
       "execs": 0,
       "saved": [],
+      "ownerChecked": true,
       "credentialRef": "operator",
       "image": "public.ecr.aws/docker/library/node:24-bookworm"
      }
@@ -1577,6 +1578,7 @@
       "lastUsedAt": 1800000010000,
       "execs": 3,
       "saved": [],
+      "ownerChecked": true,
       "credentialRef": "operator",
       "image": "public.ecr.aws/docker/library/node:24-bookworm"
      }
@@ -3693,6 +3695,7 @@
       "lastUsedAt": 1800000014000,
       "execs": 6,
       "saved": [],
+      "ownerChecked": true,
       "credentialRef": "operator",
       "image": "public.ecr.aws/docker/library/node:24-bookworm"
      }

@@ -1,11 +1,11 @@
 import type { Json, MountRecord } from "../core/types.ts";
 import type { CredentialRefKind, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm, ToolSchema, Withdrawal } from "./types.ts";
-import { backgrounded, identityNote, LEASE_KEY, markIdentity, markReleased, releaseRetryMs } from "./types.ts";
+import { Backgrounded, backgrounded, identityNote, LEASE_KEY, markIdentity, markReleased, releaseRetryMs } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
 import { spanText } from "../runtime/idle-lease.ts";
 import { ProviderError, TERMINAL_EXEC_STATES } from "./sandbox/provider.ts";
-import type { BoxState as ProviderBoxState, EgressSecret, ExecStatus, SandboxBackend, SandboxProvider } from "./sandbox/provider.ts";
+import type { BoxSpec, BoxState as ProviderBoxState, EgressSecret, ExecStatus, SandboxBackend, SandboxProvider } from "./sandbox/provider.ts";
 import { run9 } from "./sandbox/providers/run9.ts";
 import { instabox, INSTABOX_ENDPOINT, shapeOf } from "./sandbox/providers/instabox.ts";
 
@@ -180,6 +180,11 @@ interface BoxState {
    * this says its error lease has been reported, so later attempts that fail the same way do not report another.
    */
   deleteFailedAt?: number;
+  /**
+   * The provider has shown this box was made for this agent (`ownedProvider`): set when this mount created or
+   * adopted it, or once its owner was read. A box recorded without it is asked about before anything is sent to it.
+   */
+  ownerChecked?: true;
   /** Mounts that declare a container form and hold a credential but were left out, and why. */
   leftOut?: LeftOut[];
   execs?: number;
@@ -626,10 +631,151 @@ function providerName(cfg: { provider?: string }): string {
  * a job outside one. One door, with the same credential resolution, so a call with no account is refused the
  * same way wherever it comes from.
  */
-function openProvider(cfg: ReturnType<typeof cfgOf>, ctx: PluginContext): SandboxProvider {
+function openProvider(cfg: ReturnType<typeof cfgOf>, ctx: PluginContext, opts?: { wake?: boolean; look?: boolean }): OwnedProvider {
   const backend = backendFor(cfg);
   if (!ctx.credential) throw markIdentity(new Error(`the ${backend.name} API needs an account, and this call had none — ${identityNote(ctx)}`), ctx);
-  return backend.open(cfg, ctx.credential);
+  return ownedProvider(backend.open(cfg, ctx.credential, opts?.wake === false ? { wake: false } : undefined), ctx, opts?.look === true);
+}
+
+/** What every box this plugin creates says it is for, at the provider (`BoxSpec.description`). */
+export function boxDescriptionOf(caller: { tenantId: string; agentId: string }): string {
+  return `antiproton ${caller.tenantId}/${caller.agentId}`;
+}
+
+/**
+ * The descriptions a box made for this agent may carry: today's, and the one the very first build sent before the
+ * project was renamed (`agent-harness`, 2026-09-08). A box of that build still recorded is this agent's, and judging
+ * it another's would leave it alive and billed with nothing naming it.
+ */
+function ownDescriptions(caller: { tenantId: string; agentId: string }): string[] {
+  return [boxDescriptionOf(caller), `agent-harness ${caller.tenantId}/${caller.agentId}`];
+}
+
+/** A box the record named turned out to be another agent's: the record no longer names it, and nothing was sent. */
+export class BoxNotOurs extends Error {
+  readonly boxId: string;
+  readonly machine: string | null;
+  constructor(boxId: string, machine: string | null) {
+    super(`box ${boxId} was made for another agent, so this mount no longer uses it; nothing was sent to it`);
+    this.boxId = boxId;
+    this.machine = machine;
+  }
+}
+
+/**
+ * The boxes a call let go of as another agent's, by the call's context, for the sentence its result carries
+ * (`notOursNote` in `sandboxPlugin`). Weak, so a context nobody holds any more takes its entry with it.
+ */
+const lettingGo = new WeakMap<PluginContext, Array<{ boxId: string; machine: string | null }>>();
+
+/** A tool's result with that sentence in front of its `note`, or of a handed-over job's. */
+function withNotOursNote(result: Json, note: string | null): Json {
+  if (!note) return result;
+  if (result instanceof Backgrounded) {
+    return new Backgrounded(result.handle, result.note ? `${note} ${result.note}` : note) as unknown as Json;
+  }
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const r = result as Record<string, Json>;
+  return { ...r, note: typeof r.note === "string" && r.note ? `${note} ${r.note}` : note };
+}
+
+/** The provider's methods whose first argument is a box id: every request that reaches a box. */
+const BOX_ID_METHODS = ["status", "execBackground", "upload", "download", "stop", "pause", "wake", "delete", "snapshot",
+  "usage", "addSecret", "listSecrets", "removeSecret"] as const;
+
+type OwnedProvider = SandboxProvider & {
+  /** Whether the box may be used, asked before any request reaches it: throws `BoxNotOurs` when it is another's. */
+  owns(id: string): Promise<void>;
+};
+
+/**
+ * The provider as every path of this plugin gets it: no request naming a box goes out until the box is shown to be
+ * this agent's. One door, because the paths that reach a box are many (the tools, a release, the idle lease's
+ * switch-off and deletion, a look at its files, a withdrawal) and a check made in each is one a new path forgets.
+ *
+ * Why it is needed at all: run9's ids are the whole project's, which is every tenant's, and ids minted before
+ * `boxIdFor` could be the same for two agents (two agents of one Raft server in one millisecond). Such a pair's
+ * records both name one box, and every request either sends acts on the other's machine: its files and processes,
+ * and a release or an idle deletion destroys it. A record keeps its id for as long as the box lives, so the pairs
+ * made before the fix stay shared until they are found here.
+ *
+ * A box is this agent's when this provider just created or adopted it, when its record already says it was shown to
+ * be (`ownerChecked`), or when the provider says so now (`SandboxProvider.ownerOf`), which is then written to the
+ * record so it is asked once per box. A box the provider lists with no description is kept and said once
+ * (`owner_unknown`): every create has sent one, so none is expected, and dropping the machine of an agent that may
+ * well own it is the worse mistake. One made for another agent is never sent anything, not even a stop or a
+ * delete: the record stops naming it (its sessions and kept environments stay), the fact is written as a
+ * `sandbox.box_owner` trace row and a log line with `code: "box_not_ours"`, and `BoxNotOurs` is thrown for the
+ * caller to carry on without it. An answer that cannot be read is thrown as it came: nothing is sent to a box that
+ * has not been shown to be ours. An id the record does not name at all is refused the same way.
+ *
+ * A `look` (a person viewing the machine's files) writes nothing, as a look never does: it neither records what it
+ * learnt nor lets go of the box, and the agent's next call does both.
+ */
+function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false): OwnedProvider {
+  const shown = new Set<string>();
+  const say = (code: "box_not_ours" | "owner_unknown", boxId: string, machine: string | null) => {
+    const attrs = { code, tenant: ctx.caller.tenantId, agent: ctx.caller.agentId, mount: ctx.alias, machine, box: boxId };
+    console.log(JSON.stringify({ event: "sandbox.box_owner", ...attrs }));
+    ctx.trace?.({ kind: "sandbox.box_owner", status: code, verdict: code === "box_not_ours" ? "blocked" : "ok", attrs });
+  };
+  const owns = async (id: string): Promise<void> => {
+    if (shown.has(id) || !inner.ownerOf) return;
+    const mount = await readMount(ctx);
+    const machine = Object.keys(mount?.machines ?? {}).find((n) => mount!.machines[n]!.boxId === id) ?? null;
+    const stranded = machine === null ? mount?.stranded?.[id] : undefined;
+    if (machine === null && !stranded) throw new BoxNotOurs(id, null);
+    if ((machine !== null ? mount!.machines[machine]! : stranded!).ownerChecked) { shown.add(id); return; }
+    const owner = await inner.ownerOf(id, ownDescriptions(ctx.caller));
+    // Not there: nothing can be sent to another's box under this id, and the request fails as it always has.
+    if (owner === "gone") return;
+    if (owner === "ours" || owner === "unknown") {
+      if (owner === "unknown" && !look) say("owner_unknown", id, machine);
+      shown.add(id);
+      if (machine !== null && !look) {
+        const now = await readView(ctx, machine);
+        if (now.boxId === id) await writeView(ctx, machine, { ...now, ownerChecked: true });
+      }
+      return;
+    }
+    // Another agent's. The record lets go of it and of nothing else: the box is theirs, so it is not stopped or
+    // deleted, and its session is not recorded as one of this mount's.
+    if (look) {
+      // Nothing written: the agent's next call lets go of it, and tells the agent why.
+    } else if (machine !== null) {
+      const now = await readView(ctx, machine);
+      if (now.boxId === id) {
+        await writeView(ctx, machine, {
+          boxId: "", createdAt: 0, lastUsedAt: 0,
+          ...(now.sessions ? { sessions: now.sessions } : {}), ...(now.envs ? { envs: now.envs } : {}),
+          ...(now.startFrom ? { startFrom: now.startFrom } : {}),
+        });
+      }
+    } else {
+      const now = await readMount(ctx);
+      if (now?.stranded?.[id]) {
+        const { [id]: _gone, ...rest } = now.stranded;
+        await writeMount(ctx, { ...now, stranded: rest });
+      }
+    }
+    // Said once per box, where the record lets go of it, so the rows count the pairs as they come apart.
+    if (!look) {
+      say("box_not_ours", id, machine);
+      lettingGo.set(ctx, [...(lettingGo.get(ctx) ?? []), { boxId: id, machine }]);
+    }
+    throw new BoxNotOurs(id, machine);
+  };
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(inner)) if (typeof v === "function") out[k] = v.bind(inner);
+  for (const k of BOX_ID_METHODS) {
+    const f = (inner as unknown as Record<string, unknown>)[k];
+    if (typeof f !== "function") continue;
+    out[k] = async (id: string, ...rest: unknown[]) => { await owns(id); return f.call(inner, id, ...rest); };
+  }
+  out.create = async (spec: BoxSpec) => { const made = await inner.create(spec); shown.add(made.id); return made; };
+  out.adopt = async (spec: BoxSpec) => { const id = await inner.adopt(spec); if (id !== null) shown.add(id); return id; };
+  out.owns = owns;
+  return out as unknown as OwnedProvider;
 }
 
 /**
@@ -986,12 +1132,13 @@ const DEFAULTS = {
  * key could be shown the box at all.
  */
 async function deleteBox(ctx: PluginContext, boxId: string, believeGone: boolean): Promise<{ error?: string; definitive: boolean }> {
-  const cfg = cfgOf(ctx);
-  const provider = backendFor(cfg).open(cfg, ctx.credential!);
+  const provider = openProvider(cfgOf(ctx), ctx);
   try {
     await provider.delete(boxId);
     return { definitive: false };
   } catch (e) {
+    // Another agent's box is not this mount's to delete, and the caller lets go of it without a release.
+    if (e instanceof BoxNotOurs) throw e;
     if (e instanceof ProviderError) {
       if (believeGone && e.code === "not_found") return { definitive: false };
       return { error: e.message, definitive: e.definitive };
@@ -1010,7 +1157,15 @@ async function stopBox(
   // the box, so its "not found" says nothing, and a kind that differs is certainly another key; two keys of one
   // kind may still be two accounts, which the kind cannot tell apart.
   const maker = state.credentialRef === undefined || state.credentialRef === ctx.credentialRefKind;
-  const { error, definitive } = await deleteBox(ctx, state.boxId, maker);
+  let deleted: { error?: string; definitive: boolean };
+  try {
+    deleted = await deleteBox(ctx, state.boxId, maker);
+  } catch (e) {
+    // Another agent's box: the record already let go of it (`ownedProvider`), and nothing was held here to release.
+    if (e instanceof BoxNotOurs) return null;
+    throw e;
+  }
+  const { error, definitive } = deleted;
   const endedAt = Date.now();
   const stoppedAt = parkedAt(state);
   const session = sessionOf(state, stoppedAt ?? endedAt, machine);
@@ -1104,7 +1259,7 @@ async function parkBox(ctx: PluginContext, machine: string, state: BoxState): Pr
   if (!ctx.credential) return false;
   const cfg = cfgOf(ctx);
   const backend = backendFor(cfg);
-  const provider = backend.open(cfg, ctx.credential);
+  const provider = openProvider(cfg, ctx);
   // A provider that keeps memory across a pause (InstaBox) pauses an idle box, and the box stays paused until it
   // is used or deleted. Everything else is switched off.
   const pausing = backend.caps.pause === "memory" && typeof provider.pause === "function";
@@ -1113,6 +1268,8 @@ async function parkBox(ctx: PluginContext, machine: string, state: BoxState): Pr
     if (pausing) await provider.pause!(state.boxId);
     else await provider.stop(state.boxId);
   } catch (e) {
+    // Another agent's box: not switched off, and the record no longer names it, so there is nothing to release.
+    if (e instanceof BoxNotOurs) return false;
     // Deleted by InstaBox already: nothing to pause, and the caller lets it go as gone (`releaseMachine`).
     if (await goneAfter(backend, provider, state, e)) return "gone";
     error = e instanceof ProviderError ? e.message : String((e as Error)?.message ?? e).slice(0, 160);
@@ -1781,7 +1938,12 @@ async function releaseStranded(ctx: PluginContext, id: string, forget: boolean):
     // every settled turn where the deployment has no idle lease — not on every ask. Its error lease is reported.
     throw new Error(`${providerName(cfgOf(ctx))} box ${id} (stranded) not released: not retried before ${new Date(b.nextTryAt!).toISOString()}; last: ${b.lastError ?? "unknown"}`);
   } else {
-    ({ error, definitive } = await deleteBox(ctx, id, false));
+    try {
+      ({ error, definitive } = await deleteBox(ctx, id, false));
+    } catch (e) {
+      if (e instanceof BoxNotOurs) return false;
+      throw e;
+    }
   }
   const endedAt = Date.now();
   const after = (await readMount(ctx)) ?? { machines: {} };
@@ -1887,8 +2049,15 @@ async function awakeBox(ctx: PluginContext, deadline: number): Promise<Box | nul
   if (!box?.boxId || parkedAt(box) !== null || !ctx.credential) return null;
   const cfg = cfgOf(ctx);
   // Never woken from here: a look at a box that is not running answers "not running".
-  const b: Box = { boxId: box.boxId, cfg, provider: backendFor(cfg).open(cfg, ctx.credential, { wake: false }), deadline };
-  const state: ProviderBoxState = await b.provider.status(box.boxId, { deadline });
+  const b: Box = { boxId: box.boxId, cfg, provider: openProvider(cfg, ctx, { wake: false, look: true }), deadline };
+  let state: ProviderBoxState;
+  try {
+    state = await b.provider.status(box.boxId, { deadline });
+  } catch (e) {
+    // Another agent's box: this mount has no machine running, so there is nothing to look at.
+    if (e instanceof BoxNotOurs) return null;
+    throw e;
+  }
   return state === "running" ? b : null;
 }
 
@@ -2359,7 +2528,26 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     },
   ];
   };
-  return {
+
+  /**
+   * What the agent is told in the result of the call that found a machine's recorded box to be another agent's
+   * (`ownedProvider`): it cannot see the trace, and without this the files and installs it expected would be gone
+   * with no reason given. Said once, on that call: by the next one the record no longer names the box.
+   */
+  async function notOursNote(ctx: PluginContext): Promise<string | null> {
+    const found = lettingGo.get(ctx);
+    if (!found?.length) return null;
+    const mount = await readMount(ctx);
+    return found.map((f) => {
+      const which = f.machine === null || f.machine === MAIN_MACHINE ? "The machine" : `Machine "${f.machine}"`;
+      const now = f.machine === null ? undefined : mount?.machines[f.machine]?.boxId;
+      return now && now !== f.boxId
+        ? `${which} you were using belonged to another agent, so it was left to them and a new one was made for you; nothing you had on the old one is here.`
+        : `${which} you were using belonged to another agent, so it was left to them; nothing you had on it is here, and the next call makes a new one.`;
+    }).join(" ");
+  }
+
+  const plugin: Plugin = {
   id: "sandbox",
   /** The box record: that a mount has one is listable; the box id, the kept environments and the sessions are not. */
   database: { version: 1, stores: { [BOX_STORE]: { listed: [BOX_KEY] } } },
@@ -2417,7 +2605,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       const things: Withdrawal["things"] = [];
       // What run9 answered is never repeated, only its status or shape: this text reaches Raft in a DELETE's answer.
       const failure = (e: unknown) => e instanceof ProviderError ? `run9 refused (${e.status ? `HTTP ${e.status}` : e.code})` : String((e as Error)?.message ?? e).slice(0, 200);
-      const provider = ctx.credential && backend.caps.boxSecrets ? backend.open(cfg, ctx.credential) : null;
+      const provider = ctx.credential && backend.caps.boxSecrets ? openProvider(cfg, ctx) : null;
       // Project scope, listed once per withdrawal and never written: one run9 project is shared with production, and
       // a project-scope secret removed here could stop another deployment's boxes from working. What it shows is
       // handed up whole (`project`): the caller keeps residue where it outlives this mount (D1, cf/src/egress-residue.ts)
@@ -2781,7 +2969,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // What it was waiting to start from before, if no environment names it any more (`dropSnapshots`).
       if (after.startFrom && after.startFrom !== env.snapId && ctx.credential) {
         const c = cfgOf(ctx);
-        await dropSnapshots(ctx, backendFor(c).open(c, ctx.credential), [after.startFrom]);
+        await dropSnapshots(ctx, openProvider(c, ctx), [after.startFrom]);
       }
       return {
         startingFrom: env.name, ...named,
@@ -2914,6 +3102,22 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     const history = state.sessions ?? [];
     const kept = state.envs ?? [];
     if (!state.boxId) state = null;
+    // Whose the recorded box is, asked before anything below sends it a request (`ownedProvider`, which every
+    // request passes through anyway: this is where a call learns it has no machine and goes on to make one).
+    if (state && !state.ownerChecked) {
+      try {
+        await provider.owns(state.boxId);
+        const now = await readView(ctx, machine);
+        if (now.boxId === state.boxId && now.ownerChecked) state = { ...state, ownerChecked: true };
+      } catch (e) {
+        if (!(e instanceof BoxNotOurs)) throw e;
+        state = null;
+        // Nothing of this agent's is there to release, keep or save; the call says so rather than making a
+        // machine only to find it empty. The sentence about why comes in front (`notOursNote`).
+        if (tool === "release") return { released: false, note: "nothing was running", ...named };
+        if (tool === "keep" || tool === "save") throw new Error(`nothing was ${tool === "keep" ? "kept" : "saved"}`);
+      }
+    }
     // Past its provider's own deletion time the machine is gone: said before anything is asked of it. A release
     // goes on to let it go as it is.
     if (state && tool !== "release" && backend.id === "instabox" && pastDeleteAt(state)) await expired(state);
@@ -2958,7 +3162,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         image: cfg.image,
         egressSecrets: want.wire.length > 0,
         ...(cfg.shape ? { shape: cfg.shape } : {}),
-        description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
+        description: boxDescriptionOf(ctx.caller),
       };
       // The provider's id for the box, which is what the record names: the minted one where the provider takes
       // ours (run9), its own where it mints them (InstaBox).
@@ -2978,7 +3182,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // a registration that throws must not leave it with no record naming it.
       // The record gains each placeholder only once the provider has accepted it.
       state = {
-        boxId: made.id, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
+        boxId: made.id, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [], ownerChecked: true,
         ...(made.deleteAt !== undefined ? { deleteAt: made.deleteAt } : {}),
         // Whose account this box is on, for as long as it lives (`BoxState.credentialRef`).
         ...(ctx.credentialRefKind ? { credentialRef: ctx.credentialRefKind } : {}),
@@ -3279,4 +3483,17 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
 
 
   };
+  // Every call, whichever tool and however it ends, carries the sentence `notOursNote` says when it let go of a box.
+  const invokeTool = plugin.invoke.bind(plugin);
+  plugin.invoke = async (tool, args, ctx) => {
+    lettingGo.delete(ctx);
+    try {
+      return withNotOursNote(await invokeTool(tool, args, ctx), await notOursNote(ctx));
+    } catch (e) {
+      const note = await notOursNote(ctx);
+      if (note && e instanceof Error) e.message = `${note} ${e.message}`;
+      throw e;
+    }
+  };
+  return plugin;
 }

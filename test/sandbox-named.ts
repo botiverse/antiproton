@@ -32,7 +32,7 @@ const MIN = 60_000;
 const LEASE = { warnMs: 5 * MIN, maxMs: 30 * MIN };
 const T0 = 1_700_000_000_000;
 const box = (id: string, extra: Record<string, unknown> = {}) =>
-  ({ boxId: id, createdAt: T0, lastUsedAt: T0 + MIN, execs: 1, saved: [], ...extra });
+  ({ boxId: id, createdAt: T0, lastUsedAt: T0 + MIN, execs: 1, saved: [], ownerChecked: true, ...extra });
 
 type Call = { method: string; path: string; body?: any };
 
@@ -54,6 +54,11 @@ function fixture(record: unknown, config: Record<string, unknown> = {}, refuse: 
     calls.push(c);
     if (refuse(c, (v) => tables.put(scope, BOX_STORE, BOX_KEY, v as any, null))) return new Response(JSON.stringify({ error: "no" }), { status: 500 });
     if (method === "POST" && /background-execs$/.test(path)) return new Response(JSON.stringify({ exec_id: `e${++n}` }));
+    // The project's list, as run9 gives it: every box the record names, made for this agent.
+    if (method === "GET" && /\/workspace\/boxes$/.test(path)) {
+      const m = asMountState(tables.get(scope, BOX_STORE, BOX_KEY) as any);
+      return new Response(JSON.stringify(Object.values(m?.machines ?? {}).map((b) => ({ box_id: b.boxId, state: "idle", description: "antiproton t/a" }))));
+    }
     if (/\/execs\/e\d+$/.test(path)) {
       return new Response(JSON.stringify({ state: "succeeded", exit_code: 0, output_summary: `ok\n__AP_CWD__${cwd.next}\n` }));
     }

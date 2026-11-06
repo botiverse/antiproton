@@ -27,7 +27,7 @@ const DAY = 24 * 60 * MIN;
 const LEASE = { warnMs: 5 * MIN, maxMs: 30 * MIN };
 const STARTED = 1_700_000_000_000;
 const RUNNING = {
-  boxId: "b1", createdAt: STARTED, lastUsedAt: STARTED + 10 * MIN, execs: 3, saved: ["r2://x"], sessions: [], envs: [],
+  boxId: "b1", createdAt: STARTED, lastUsedAt: STARTED + 10 * MIN, execs: 3, saved: ["r2://x"], sessions: [], envs: [], ownerChecked: true,
 };
 const PARKED = { ...RUNNING, parkedAt: STARTED + 40 * MIN };
 

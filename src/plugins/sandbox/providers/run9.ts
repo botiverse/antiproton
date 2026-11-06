@@ -139,6 +139,9 @@ function open(settings: ProviderSettings, credential: string): SandboxProvider {
   const ws = `/projects/${settings.project}/workspace`;
   const box = (id: string) => `${ws}/boxes/${id}`;
   const exec = (execId: string) => `${ws}/execs/${execId}`;
+  // The listing `ownerOf` just read, for the `status` that follows it on a look (src/plugins/sandbox.ts `awakeBox`):
+  // one read of the list answers both, and is used once, so no later `status` reads an old one.
+  let justListed: { id: string; boxes: unknown[] } | null = null;
   return {
     async create(spec: BoxSpec) {
       await api("POST", `${ws}/boxes`, {
@@ -169,10 +172,23 @@ function open(settings: ProviderSettings, credential: string): SandboxProvider {
      * decide its outbound address (`outbound_ip_label`), in a project shared with production.
      */
     async adopt(spec: BoxSpec) {
+      return (await this.ownerOf!(spec.id, [spec.description])) === "ours" ? spec.id : null;
+    },
+
+    /**
+     * From the project's list, as `status` reads it: the description run9 holds for the box, which the create sent.
+     * Every create has sent one, so a box listed without one was not made by this plugin's create as it stands, and
+     * is `unknown` rather than `other`: the caller decides what that is worth.
+     */
+    async ownerOf(id: string, descriptions: readonly string[]) {
       const boxes = await api("GET", `${ws}/boxes`);
-      const listed = Array.isArray(boxes) ? boxes.find((x: any) => x?.box_id === spec.id) : null;
-      if (!listed) return null;
-      return typeof listed.description === "string" && listed.description === spec.description ? spec.id : null;
+      if (!Array.isArray(boxes)) throw new Error(`run9 GET ${ws}/boxes: not a list of boxes (${shapeOf(boxes)})`);
+      justListed = { id, boxes };
+      const listed = boxes.find((x: any) => x?.box_id === id);
+      if (!listed) return "gone";
+      const said = listed.description;
+      if (typeof said !== "string" || !said) return "unknown";
+      return descriptions.includes(said) ? "ours" : "other";
     },
 
     /**
@@ -180,7 +196,9 @@ function open(settings: ProviderSettings, credential: string): SandboxProvider {
      * under the operator's account is every tenant's; only the one asked about is read from it.
      */
     async status(id: string, within?: Within): Promise<BoxState> {
-      const boxes = await api("GET", `${ws}/boxes`, undefined, within);
+      const reuse = justListed?.id === id ? justListed.boxes : null;
+      justListed = null;
+      const boxes = reuse ?? await api("GET", `${ws}/boxes`, undefined, within);
       const listed = Array.isArray(boxes) ? boxes.find((x: any) => x?.box_id === id) : null;
       if (!listed) return "gone";
       return AWAKE_STATES.includes(String(listed.state)) ? "running" : "stopped";

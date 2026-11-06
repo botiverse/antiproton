@@ -968,7 +968,7 @@ await check("start_from 的每一个结局都直说【释放了没有】,而且�
     db: dbFor(run9, "box", state, (v) => { saved = v; }),
     sibling: async () => null, sandboxForms: async () => [],
   });
-  const live = { boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000, execs: 1,
+  const live = { boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000, execs: 1, ownerChecked: true,
     envs: [{ name: "ready", snapId: "s-1", savedAt: 5 }] };
   try {
     const listed: any = await run9.invoke("start_from", {} as any, ctx(live));
@@ -2503,7 +2503,7 @@ await check("a running container's accounts follow the mounts: removed, replaced
 
     // A container from before `wired`: a GitHub placeholder and no mount named.
     secrets = [{ secret_id: "old1", name: "GH_TOKEN", value: "tok-5" }, { secret_id: "old2", name: "GH_TOKEN_GIT", value: btoa("x-access-token:tok-5") }];
-    box.stored = { boxId: "h-t-a-legacy", createdAt: 1, lastUsedAt: 1, execs: 1, sessions: [], githubPlaceholder: "__AP_GH_TOKEN_legacy__", githubTokenDigest: "x" };
+    box.stored = { boxId: "h-t-a-legacy", createdAt: 1, lastUsedAt: 1, execs: 1, sessions: [], githubPlaceholder: "__AP_GH_TOKEN_legacy__", githubTokenDigest: "x", ownerChecked: true };
     forms = [{ alias: "gh", plugin: "github", form, credential: "tok-5", used: noop }];
     await run();
     if (!registered("GH_TOKEN") || secrets.some((x) => x.secret_id.startsWith("old")) || box.stored.githubPlaceholder
@@ -2535,7 +2535,7 @@ await check("a running container's accounts follow the mounts: removed, replaced
 await check("a release does not clear a record that names a different container, and still records its own session", async () => {
   const original = globalThis.fetch;
   const plugin = sandboxPlugin(null as any, "local");
-  const released = { boxId: "b-old", createdAt: 1_000, lastUsedAt: 2_000, execs: 2, saved: [], sessions: [],
+  const released = { boxId: "b-old", createdAt: 1_000, lastUsedAt: 2_000, execs: 2, saved: [], sessions: [], ownerChecked: true,
     envs: [{ name: "kept", snapId: "s-1", savedAt: 5 }] };
   // What a command racing this release would have written: a different container.
   const raced = { boxId: "b-new", createdAt: 9_000, lastUsedAt: 9_100, execs: 1, saved: [], sessions: [] };
