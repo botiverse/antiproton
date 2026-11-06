@@ -3262,8 +3262,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // One box per machine, remembered, so an install survives to the next call.
     let state: BoxState | null = await readView(ctx, machine);
     // An emptied record keeps the session history and what was kept, but has no box.
-    const history = state.sessions ?? [];
-    const kept = state.envs ?? [];
+    let history = state.sessions ?? [];
+    let kept = state.envs ?? [];
     if (!state.boxId) state = null;
     // Whose the recorded box is, asked before anything below sends it a request (`ownedProvider`, which every
     // request passes through anyway: this is where a call learns it has no machine and goes on to make one).
@@ -3275,6 +3275,10 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       } catch (e) {
         if (!(e instanceof BoxNotOurs)) throw e;
         state = null;
+        // The lists as the split left them, which the new machine's record carries on.
+        const after = await readView(ctx, machine);
+        history = after.sessions ?? [];
+        kept = after.envs ?? [];
         // Nothing of this agent's is there to release, keep or save; the call says so rather than making a
         // machine only to find it empty. The sentence about why comes in front (`notOursNote`).
         if (tool === "release") return { released: false, note: "nothing was running", ...named };
