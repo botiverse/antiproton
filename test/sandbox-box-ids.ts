@@ -964,6 +964,22 @@ await check("two queued notes for one machine are fixed text each: no count, and
   must(!/\d/.test(String(r.note).replace("three times", "")), `a count in a note: ${r.note}`);
 });
 
+await check("a wiring of the interim shape with fewer ids than names proves none of them: never matched up by position", async () => {
+  const { p, ownerSecret } = sharedBox();
+  const a = p.register(OLD_ID, "GH_A", "taker-a", TAKER());
+  const c = p.register(OLD_ID, "GH_C", "taker-c", TAKER());
+  // Three names and two ids: which id goes with which name cannot be told.
+  const interim = { alias: "gh", plugin: "github", placeholder: "__AP_GH_x__", digest: "d", names: ["GH_A", "GH_B", "GH_C"], ids: [a, c] };
+  const b = mountOf(TENANT, AGENT_B, { record: takerRecord([interim]) });
+  p.o.caller = TAKER();
+  await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+  const sp = b.split(OLD_ID);
+  splitShape(sp, null);
+  must(removalsOf(p).length === 0 && sp.remaining.length === 3 && sp.remaining.every((r: any) => r.id === null && r.reason === "wiring_without_ids"),
+    `matched by position: ${JSON.stringify(sp.remaining)} ${JSON.stringify(removalsOf(p))}`);
+  must(ownerSecretIntact(p, ownerSecret), "the owner's registration went");
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.ok ? "" : `\n    ${r.error}`}`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`${passed}/${results.length} passed`);
