@@ -1499,6 +1499,8 @@ const onSplitTx = (before: (n: number, tx: any) => void) => (db: any) => {
 };
 const missingLogged = (lines: string[]) => lines.filter((l) => l.includes('"code":"split_record_missing"') && l.includes(OLD_ID)).length;
 
+// `sent` → stored attempts only: red here (attempts rebuilt to 0 though this call sent a round). `sent` → sentHere:
+// still green here (this test only exercises that arm).
 await check("an unknown box's entry gone after the split's round and before it is told: the note still says the removal was sent", async () => {
   const p = run9Project();
   p.put(OLD_ID, OWNER(), null);
@@ -1516,6 +1518,44 @@ await check("an unknown box's entry gone after the split's round and before it i
   const text = JSON.stringify(call.value);
   must(count(text, UNCONFIRMED_SENT) === 1 && !text.includes(UNCONFIRMED), `the sentence: ${text}`);
   must(p.lifecycle(OLD_ID).length === 0, `requests on the box: ${JSON.stringify(p.lifecycle(OLD_ID))}`);
+});
+
+// `sent` → sentHere: red here (this call sent nothing; the stored entry already counts rounds). `sent` → stored
+// attempts only: still green here.
+await check("an unknown box's split interrupted at the tell, found again with nothing left to remove: the note says the removal was sent", async () => {
+  const p = run9Project();
+  p.put(OLD_ID, OWNER(), null);
+  const sid = p.register(OLD_ID, "GH_TOKEN", "taker-token", TAKER());
+  let interrupt = true;
+  const b = mountOf(TENANT, AGENT_B, {
+    record: takerRecord([wiring([{ name: "GH_TOKEN", id: sid }])]),
+    // Split transactions in call 1: 1 begins (writes the fresh entry), 2 writes the removal round (commits), 3 is the
+    // tell, which dies here. Throwing at 2 does not work: the round's write is not committed yet, the entry is still
+    // attempts 0 and pending, and call 2 sends another round, which tests the sentHere arm, not this one.
+    // The count only places the throw on the tell; if a future change adds a transaction and the count drifts, the
+    // precondition assertions below (removals still 1, told unset, unwire removed, attempts 1) go red first: do not
+    // drop those assertions and keep only the count.
+    db: onSplitTx((n) => { if (interrupt && n === 3) throw new Error("the object was evicted"); }),
+  });
+  p.o.caller = TAKER();
+  const first = await logged(() => b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>);
+  must(first.error !== undefined, "call 1 was not interrupted");
+  must(removalsOf(p).length === 1, `call 1 removals: ${removalsOf(p).length}`);
+  const mid = b.split(OLD_ID);
+  must(mid?.reason === "owner_unknown", `reason: ${JSON.stringify(mid)}`);
+  must(mid.attempts === 1, `attempts: ${JSON.stringify(mid)}`);
+  must(!mid.told, `told: ${JSON.stringify(mid)}`);
+  must(mid.unwire === "removed" && Array.isArray(mid.remaining) && mid.remaining.length === 0, `unwire: ${JSON.stringify(mid)}`);
+  must(b.main()?.boxId === OLD_ID && b.queue().length === 0, `record or queue after call 1: ${JSON.stringify([b.main(), b.queue()])}`);
+  // Call 2 finds the split again with nothing pending, so it sends no round, and tells.
+  interrupt = false;
+  const before = p.on(OLD_ID).length;
+  const second = await logged(() => b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>);
+  must(second.error === undefined, `call 2 failed: ${second.error}`);
+  must(removalsOf(p).length === 1 && p.on(OLD_ID).length === before, `call 2 sent the box something: ${JSON.stringify(p.on(OLD_ID).slice(before))}`);
+  must(b.split(OLD_ID)?.told === true && b.split(OLD_ID)?.attempts === 1 && b.main()?.boxId !== OLD_ID, `after call 2: ${JSON.stringify([b.split(OLD_ID), b.main()])}`);
+  const text = JSON.stringify(second.value);
+  must(count(text, UNCONFIRMED_SENT) === 1 && !text.includes(UNCONFIRMED), `the sentence: ${text}`);
 });
 
 await check("an earlier-shape entry found on the split path gets its items from its own ids, never from the wiring as it is now", async () => {
