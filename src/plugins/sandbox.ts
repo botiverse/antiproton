@@ -1,5 +1,5 @@
 import type { Json, MountRecord } from "../core/types.ts";
-import type { CredentialRefKind, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm, ToolSchema, Withdrawal } from "./types.ts";
+import type { CredentialRefKind, DbOperations, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm, ToolSchema, Withdrawal } from "./types.ts";
 import { Backgrounded, backgrounded, identityNote, KeyRange, LEASE_KEY, markIdentity, markReleased, releaseRetryMs } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
@@ -192,6 +192,8 @@ interface ForeignBox {
   /** Removal rounds made over the pending items, as a set (`UNWIRE_ATTEMPTS`); why the last one failed. */
   attempts: number;
   lastError: string | null;
+  /** The agent's note about this split is queued (`noteLetGo`): set once, so finding the split again says nothing new. */
+  told?: true;
 }
 
 /**
@@ -203,12 +205,13 @@ interface ForeignBox {
 type Remaining = { id: string | null; name: string | null; state: "pending" | "residue"; reason?: string };
 
 /**
- * How many removal rounds a pending removal gets. `attempts` counts the rounds actually made, and is advanced in one
- * place (`removalRound`) around every round, wherever it runs: in the call that splits, on recovering an entry an
- * interruption left, or in a later call's retry (`retryForeign`). A split's first write has 0; a round that leaves
- * nothing clears the entry, and one that fails adds one; at this many it is given up on and kept as residue. So
- * exactly this many rounds in all, and a recovered entry goes on from the count it had. Why a round failed is in
- * `lastError` and `reason`; `attempts` only counts.
+ * How many removal rounds a pending removal gets. `attempts` counts the rounds actually sent, and is advanced in one
+ * place (`applyRound`, run inside the write) for every round, wherever it runs: in the call that splits, on finding an
+ * interrupted split again, or in a later call's retry (`retryForeign`). A split's first write has 0, and every round
+ * adds one whatever came of it; once this many have been made, what is still pending is kept as residue. So at most
+ * this many rounds in all, and a split found again goes on from the count it had. Calls at once each count the round
+ * they really sent, so under concurrency a split can reach the limit sooner, which the count intends. Why a round
+ * failed is in `lastError` and `reason`; `attempts` only counts.
  */
 export const UNWIRE_ATTEMPTS = 3;
 
@@ -747,11 +750,16 @@ type LetGo = {
 // One row per event, never merged by box: the same box can give two events at different times (let go of with a
 // removal pending, then that removal given up on), and the second is the only place the agent hears it could not be
 // removed. The same note is not repeated, but different outcomes for the same box are different notes.
-const noteLetGo = async (ctx: PluginContext, g: LetGo) => {
-  const v = await ctx.db.get(BOX_STORE, NOTICES_KEY);
+// One machine's one outcome appears at most once in the queue; that is the only reason dedupe looks harmless today.
+// Do not add dedupe, and if a path ever re-enqueues, the test with two identical rows is the guard.
+function enqueueIn(tx: DbOperations, g: LetGo): void {
+  const v = tx.get(BOX_STORE, NOTICES_KEY);
   const owed = Array.isArray(v) ? (v as LetGo[]) : [];
   const id = `${Date.now().toString(36)}-${[...crypto.getRandomValues(new Uint8Array(4))].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
-  await ctx.db.put(BOX_STORE, [...owed, { ...g, id }] as unknown as Json, NOTICES_KEY);
+  tx.put(BOX_STORE, [...owed, { ...g, id }] as unknown as Json, NOTICES_KEY);
+}
+const noteLetGo = async (ctx: PluginContext, g: LetGo) => {
+  await ctx.db.transaction([BOX_STORE], "readwrite", (tx) => enqueueIn(tx, g));
 };
 
 /** Every split this mount recorded, by box id. An entry that does not read is left out. */
@@ -766,22 +774,46 @@ async function readForeign(ctx: PluginContext): Promise<Record<string, ForeignBo
   return out;
 }
 
-/** The one writer of a split entry. `unwire` is derived here from `remaining`, never taken from the caller, so the two cannot drift. */
-async function writeSplit(ctx: PluginContext, e: ForeignBox): Promise<void> {
-  await ctx.db.put(BOX_STORE, { ...e, unwire: outcomeOf(e.remaining) } as unknown as Json, splitKey(e.box));
+/**
+ * The one writer of a split entry: `fn` is given the entry as stored and returns what to store, and the note the
+ * change owes the agent, if any. `unwire` is derived here from `remaining`, never taken from the caller, so the two
+ * cannot drift. The note is queued in the same transaction as the entry that records the change: never two writes
+ * with a gap where the entry says the change happened and the note was lost, after which nothing would see a change.
+ *
+ * Inside the callback only the transaction's own synchronous get and put are used; any await there would be refused
+ * and roll the whole transaction back. What is written is computed only from what is read inside it and from values
+ * passed in (`fn`'s inputs, never an entry read earlier): two calls working on one split each apply their change to
+ * what the other left, so neither's is lost.
+ */
+async function updateSplit(
+  ctx: PluginContext, box: string, fn: (stored: ForeignBox | undefined) => { next: ForeignBox; note?: LetGo },
+): Promise<{ next: ForeignBox; note?: LetGo }> {
+  return ctx.db.transaction([BOX_STORE], "readwrite", (tx) => {
+    const raw = tx.get(BOX_STORE, splitKey(box));
+    const stored = raw && typeof raw === "object" ? raw as ForeignBox : undefined;
+    const out = fn(stored);
+    const next = { ...out.next, unwire: outcomeOf(out.next.remaining) };
+    tx.put(BOX_STORE, next as unknown as Json, splitKey(box));
+    if (out.note) enqueueIn(tx, out.note);
+    return { next, ...(out.note ? { note: out.note } : {}) };
+  });
 }
 
-/**
- * Remove these registrations from another agent's box, by id and nothing else: the one write this plugin ever sends a
- * box that is not its own. By id because a name does not say whose a registration is (the owner may have wired the
- * same kind of account under the same name), and one already gone counts as removed. What could not be removed, and
- * the last refusal's code.
- */
+/** A well-formed entry as stored: one with its items. */
+const settledEntry = (e: ForeignBox | undefined): ForeignBox | undefined => (e && Array.isArray(e.remaining) ? e : undefined);
+
+/** The note owed when a round turns a told split's pending items into residue: a new event, told on its own. */
+const gaveUpNote = (stored: ForeignBox | undefined, next: ForeignBox, machine: string | null): LetGo | undefined =>
+  stored?.told && outcomeOf(stored.remaining) === "pending" && outcomeOf(next.remaining) === "residue"
+    ? { boxId: next.box, machine, outcome: "given_up" } : undefined;
+
 /**
  * A wiring's registrations as name and id pairs. One recorded with its pairs reads as them; one recorded before them
  * (names alone, which is every wiring made before ids were kept, or names with an `ids` list from the build between)
  * reads its ids only from a list as long as its names, and otherwise has none: never matched up by position from a
- * shorter one. Null where not even the names are known. Read only: an old wiring is never rewritten to this shape.
+ * shorter one. Null where not even the names are known. Applied where the record is read (`withPairs`), so the next
+ * write of the record stores the wiring as pairs: an old wiring is converted on its next ordinary write, never by a
+ * write made only to convert it.
  */
 function pairsOf(w: Wired): Array<{ name: string; id: string | null }> | null {
   if (Array.isArray(w.pairs)) return w.pairs;
@@ -802,25 +834,29 @@ function withPairs(w: Wired): Wired {
 const outcomeOf = (remaining: readonly Remaining[]): ForeignBox["unwire"] =>
   remaining.some((r) => r.state === "pending") ? "pending" : remaining.length ? "residue" : "removed";
 
+/** One removal round as sent: the ids sent, those still there after it, and why the last refusal was. */
+type Round = { sent: string[]; left: string[]; error: string };
+
+/** Sends one removal round for the pending items of `e`. Only items with an id are ever pending, so only ids are sent. */
+async function sendRound(inner: SandboxProvider, e: ForeignBox): Promise<Round> {
+  const sent = e.remaining.filter((r) => r.state === "pending" && typeof r.id === "string").map((r) => r.id!);
+  return { sent, ...(await unwireForeign(inner, e.box, sent)) };
+}
+
 /**
- * One removal round for a pending entry, and what the entry becomes: removed when nothing is left, otherwise pending
- * with one more attempt, or residue once `UNWIRE_ATTEMPTS` rounds have been made. The ids left and their names are
- * narrowed together, so what is said to remain is what remains.
+ * A round applied to an entry: what it removed is taken out, the round is counted, and once `UNWIRE_ATTEMPTS` rounds
+ * have been made what is still pending becomes residue. Applied to the entry as stored when the round is written
+ * (`updateSplit`), so two rounds made at once both count and what remains is what neither removed.
  */
-async function removalRound(inner: SandboxProvider, e: ForeignBox): Promise<ForeignBox> {
-  // Only items with an id are ever pending, so only ids are ever sent.
-  const pending = e.remaining.filter((r) => r.state === "pending" && typeof r.id === "string");
-  const { left, error } = await unwireForeign(inner, e.box, pending.map((r) => r.id!));
-  const attempts = e.attempts + 1;
-  const exhausted = left.length > 0 && attempts >= UNWIRE_ATTEMPTS;
+function applyRound(base: ForeignBox, r: Round): ForeignBox {
+  const removed = r.sent.filter((sid) => !r.left.includes(sid));
+  const attempts = base.attempts + 1;
+  const kept = base.remaining.filter((x) => !(x.state === "pending" && x.id !== null && removed.includes(x.id)));
+  const exhausted = attempts >= UNWIRE_ATTEMPTS && kept.some((x) => x.state === "pending");
   // Residue is terminal: no path retries or removes it; it goes away only when the owner removes those
   // registrations or the box is released.
-  const remaining = e.remaining.flatMap((r): Remaining[] => {
-    if (r.state !== "pending") return [r];
-    if (!left.includes(r.id!)) return [];
-    return [exhausted ? { ...r, state: "residue", reason: `unwire failed ${UNWIRE_ATTEMPTS} times` } : r];
-  });
-  return { ...e, remaining, unwire: outcomeOf(remaining), attempts: left.length ? attempts : e.attempts + 1, lastError: left.length ? error : e.lastError };
+  const remaining = exhausted ? kept.map((x): Remaining => (x.state === "pending" ? { ...x, state: "residue", reason: `unwire failed ${UNWIRE_ATTEMPTS} times` } : x)) : kept;
+  return { ...base, remaining, unwire: outcomeOf(remaining), attempts, lastError: r.left.length ? r.error : base.lastError };
 }
 
 async function unwireForeign(inner: SandboxProvider, boxId: string, secretIds: string[]): Promise<{ left: string[]; error: string }> {
@@ -926,7 +962,6 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
       // Nothing written and nothing removed: the agent's next call does both, and tells the agent why.
       throw new BoxNotOurs(id, machine);
     }
-    let states = { pending: false, residue: false };
     // A machine's record or a stranded box's: the same split either way, and only if the record still names it.
     const held: (MachineState & { wired?: Wired[] }) | undefined = machine !== null
       ? await readView(ctx, machine).then((v) => (v.boxId === id ? v : undefined))
@@ -942,23 +977,50 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
         : w.pairs.map((x): Remaining => typeof x.id === "string"
           ? { id: x.id, name: x.name, state: "pending" }
           : { id: null, name: x.name, state: "residue", reason: "wiring_without_ids" }));
-      // Found once: a split interrupted before the record let go is found again, and keeps the moment it was first.
-      const before = (await readForeign(ctx))[id];
-      // Written as soon as the split is decided, before anything is sent, with everything that describes it: what is
-      // to be removed is in it, so an interruption from here leaves an entry `retryForeign` finishes. Every later write
-      // updates this entry's outcome (`unwire`, `remaining`, `attempts`, `lastError`) and nothing else.
-      const first: ForeignBox = {
-        box: id, mount: ctx.alias, machine, reason: "foreign_owner", registeredNames,
-        secretIds: items.flatMap((r) => (r.id ? [r.id] : [])), detectedAt: before?.detectedAt ?? Date.now(),
-        unwire: outcomeOf(items), remaining: items, attempts: 0, lastError: null,
-      };
-      await writeSplit(ctx, first);
-      let entry = first;
-      if (first.unwire === "pending") {
-        entry = await removalRound(inner, first);
-        await writeSplit(ctx, entry);
+      // Written as soon as the split is decided, before anything is sent, with everything that describes it: what
+      // is to be removed is in it, so an interruption from here leaves an entry `retryForeign` finishes and this path
+      // goes on from. Every later write updates its outcome (`unwire`, `remaining`, `attempts`, `lastError`) and
+      // nothing else.
+      //
+      // Found again (an earlier call wrote this split and was interrupted before the record let go of the box), the
+      // stored entry is what goes on, never the wiring: its items, its rounds counted and its outcome stand, so the
+      // rounds stay at `UNWIRE_ATTEMPTS` in all and residue never returns to pending. A field an earlier shape lacks
+      // is filled (`registeredNames`), which changes nothing it said; one without items is begun again from the
+      // wiring, keeping the moment it was first found.
+      const { next: begun } = await updateSplit(ctx, id, (stored) => {
+        const had = settledEntry(stored);
+        if (had) return { next: had.registeredNames === undefined ? { ...had, registeredNames } : had };
+        return { next: {
+          box: id, mount: ctx.alias, machine, reason: "foreign_owner", registeredNames,
+          secretIds: items.flatMap((r) => (r.id ? [r.id] : [])), detectedAt: stored?.detectedAt ?? Date.now(),
+          unwire: outcomeOf(items), remaining: items, attempts: typeof stored?.attempts === "number" ? stored.attempts : 0, lastError: null,
+        } };
+      });
+      let entry = begun;
+      if (entry.unwire === "pending") {
+        const round = await sendRound(inner, entry);
+        // A round that gives up on a split already told is a new event, told as one with the entry that records it;
+        // one not told yet is told below with what it now holds.
+        const done = await updateSplit(ctx, id, (stored) => {
+          const base = settledEntry(stored) ?? entry;
+          const next = applyRound(base, round);
+          return { next, note: gaveUpNote(base, next, machine) };
+        });
+        entry = done.next;
+        if (done.note) say("unwire_given_up", id, machine, { accounts: entry.remaining.map((r) => r.name).filter(Boolean).join(","), lastError: entry.lastError ?? "" });
       }
-      states = { pending: entry.remaining.some((r) => r.state === "pending"), residue: entry.remaining.some((r) => r.state === "residue") };
+      // The split is told once, before the record lets go (so an interruption after this does not lose it), and never
+      // again when it is found again: `told` on its entry says it was, written with the note in one transaction.
+      const tell = await updateSplit(ctx, id, (stored) => {
+        const base = settledEntry(stored) ?? entry;
+        if (base.told) return { next: base };
+        const states = { pending: base.remaining.some((r) => r.state === "pending"), residue: base.remaining.some((r) => r.state === "residue") };
+        return { next: { ...base, told: true }, note: { boxId: id, machine, outcome: "split", ...states } };
+      });
+      if (tell.note) {
+        // Said once per box, where the record lets go of it, so the rows count the pairs as they come apart.
+        say("box_not_ours", id, machine, { unwire: tell.note.pending ? "pending" : tell.note.residue ? "residue" : "removed" });
+      }
       if (machine !== null) {
         const now = await readView(ctx, machine);
         await writeView(ctx, machine, {
@@ -974,9 +1036,6 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
         }
       }
     }
-    // Said once per box, where the record lets go of it, so the rows count the pairs as they come apart.
-    say("box_not_ours", id, machine, { unwire: states.pending ? "pending" : states.residue ? "residue" : "removed" });
-    await noteLetGo(ctx, { boxId: id, machine, outcome: "split", ...states });
     throw new BoxNotOurs(id, machine);
   };
   const out: Record<string, unknown> = {};
@@ -1002,27 +1061,32 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
       // nothing to try, and it is residue.
       if (!Array.isArray(e.remaining)) {
         const old = e as unknown as { secretIds?: unknown; names?: unknown; registeredNames?: unknown };
+        // An entry of the earlier shape has its names as `names` and no `registeredNames`: taking them over fills a
+        // field that was missing, it does not change what was registered.
         const names = Array.isArray(old.registeredNames) ? old.registeredNames as string[] : Array.isArray(old.names) ? old.names as string[] : null;
         const ids = Array.isArray(old.secretIds) ? old.secretIds as string[] : null;
         const named = names !== null && ids !== null && names.length === ids.length;
         const remaining: Remaining[] = ids && ids.length
           ? ids.map((sid, i) => ({ id: sid, name: named ? names![i]! : null, state: "pending" as const }))
           : (names ?? [null]).map((n) => ({ id: null, name: n, state: "residue" as const, reason: "pending without details" }));
-        entry = { ...e, registeredNames: names, secretIds: ids ?? [], remaining, unwire: outcomeOf(remaining),
+        const rebuilt: ForeignBox = { ...e, registeredNames: names, secretIds: ids ?? [], remaining, unwire: outcomeOf(remaining),
           attempts: typeof e.attempts === "number" ? e.attempts : 0, lastError: e.lastError ?? null };
-        if (entry.unwire !== "pending") {
-          await writeSplit(ctx, entry);
-          say("unwire_given_up", boxId, e.machine, { lastError: "pending without details" });
-          await noteLetGo(ctx, { boxId, machine: e.machine, outcome: "remains" });
-          continue;
-        }
+        const done = await updateSplit(ctx, boxId, (stored) => {
+          const had = settledEntry(stored);
+          if (had) return { next: had };
+          return { next: rebuilt, note: rebuilt.unwire !== "pending" ? { boxId, machine: e.machine, outcome: "remains" } : undefined };
+        });
+        if (done.note) say("unwire_given_up", boxId, e.machine, { lastError: "pending without details" });
+        entry = done.next;
+        if (entry.unwire !== "pending") continue;
       }
-      const next = await removalRound(inner, entry);
-      await writeSplit(ctx, next);
-      if (next.unwire === "residue" && next.remaining.some((r) => r.reason === `unwire failed ${UNWIRE_ATTEMPTS} times`)) {
-        say("unwire_given_up", boxId, e.machine, { accounts: next.remaining.map((r) => r.name).filter(Boolean).join(","), lastError: next.lastError ?? "" });
-        await noteLetGo(ctx, { boxId, machine: e.machine, outcome: "given_up" });
-      }
+      const round = await sendRound(inner, entry);
+      const done = await updateSplit(ctx, boxId, (stored) => {
+        const base = settledEntry(stored) ?? entry;
+        const next = applyRound(base, round);
+        return { next, note: gaveUpNote(base, next, e.machine) };
+      });
+      if (done.note) say("unwire_given_up", boxId, e.machine, { accounts: done.next.remaining.map((r) => r.name).filter(Boolean).join(","), lastError: done.next.lastError ?? "" });
     }
   };
   return out as unknown as OwnedProvider;

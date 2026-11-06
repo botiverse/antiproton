@@ -100,7 +100,14 @@ function run9Project() {
   const owners = new Map<string, string>();
   const calls: Call[] = [];
   const crossings: Call[] = [];
-  const o = { lose: false, caller: "", failRemove: false, failIds: new Set<string>(), noIdFor: new Set<string>() };
+  const o = {
+    lose: false, caller: "", failRemove: false, failIds: new Set<string>(), noIdFor: new Set<string>(),
+    /** Answers for removals of an id, in order of arrival: true succeeds (the registration stays, so a later one can too), false refuses. */
+    script: new Map<string, boolean[]>(),
+    /** Awaited before a removal is answered, with its arrival number, to hold one at a gate. */
+    beforeRemoval: null as null | ((n: number) => Promise<void>),
+  };
+  let removalN = 0;
   let n = 0, sec = 0;
   /** Each box's registrations, with the value each holds, so a test can tell whose one is. */
   const secrets = new Map<string, Array<{ name: string; secret_id: string; value: string; holder: string }>>();
@@ -153,6 +160,12 @@ function run9Project() {
     }
     if (method === "DELETE" && /\/secrets\//.test(path)) {
       const sid = decodeURIComponent(path.split("/").at(-1)!);
+      const n = ++removalN;
+      const scripted = o.script.get(sid);
+      const answer = scripted?.length ? scripted.shift()! : null;
+      if (o.beforeRemoval) await o.beforeRemoval(n);
+      if (answer === false) return ok({ error: "try later" }, 503);
+      if (answer === true) return ok({});
       if (o.failRemove || o.failIds.has(sid)) return ok({ error: "try later" }, 503);
       const list = secrets.get(id!) ?? [];
       if (!list.some((x) => x.secret_id === sid)) return ok({ error: "secret not found" }, 404);
@@ -805,15 +818,22 @@ await check("a split interrupted after its first write: the record is already wh
   const firstWrites: any[] = [];
   const b = mountOf(TENANT, AGENT_B, {
     record: takerRecord([wiring([{ name: "GH_TOKEN", id: takerSecret }])]),
-    // The process dies on the split's second write, after the first and before the record lets go of the box.
-    db: (db) => ({ ...db, put: async (store: string, v: any, key?: any) => {
-      if (typeof key === "string" && key.startsWith(SPLIT_PREFIX)) {
-        splitPuts++;
-        if (splitPuts === 1) firstWrites.push(JSON.parse(JSON.stringify(v)));
-        if (splitPuts === 2 && dying) throw new Error("the object was evicted");
-      }
-      return db.put(store, v, key);
-    } }),
+    // The process dies on the split's second write, after the first and before the record lets go of the box. Split
+    // entries are written in transactions, so the failure is put inside one, which rolls that write back whole.
+    db: (db) => ({ ...db, transaction: (stores: any, mode: any, fn: any) => db.transaction(stores, mode, (tx: any) => fn({
+      ...tx,
+      get: (st: string, k: any) => tx.get(st, k),
+      getAll: (...a: any[]) => tx.getAll(...a),
+      delete: (...a: any[]) => tx.delete(...a),
+      put: (st: string, v: any, key?: any) => {
+        if (typeof key === "string" && key.startsWith(SPLIT_PREFIX)) {
+          splitPuts++;
+          if (splitPuts === 1) firstWrites.push(JSON.parse(JSON.stringify(v)));
+          if (splitPuts === 2 && dying) throw new Error("the object was evicted");
+        }
+        return tx.put(st, v, key);
+      },
+    })) }),
   });
   p.o.caller = TAKER();
   Date.now = () => AT;
@@ -979,6 +999,183 @@ await check("a wiring of the interim shape with fewer ids than names proves none
     `matched by position: ${JSON.stringify(sp.remaining)} ${JSON.stringify(removalsOf(p))}`);
   must(ownerSecretIntact(p, ownerSecret), "the owner's registration went");
 });
+
+// ---- a split found again goes on from its entry, never from the wiring
+
+/** The taker's record still naming the owner's box (unchecked), as an interrupted split leaves it. */
+const stillNamed = (wired: unknown[]) => takerRecord(wired);
+const entryOf = (o: Record<string, unknown>) => ({ box: OLD_ID, mount: "sandbox", machine: "main", reason: "foreign_owner", detectedAt: AT, lastError: null, ...o });
+
+await check("found again after an interruption before the record let go: rounds go on from the entry's count, three in all", async () => {
+  const { p, takerSecret } = sharedBox();
+  let dying = 2;
+  const b = mountOf(TENANT, AGENT_B, {
+    record: stillNamed([wiring([{ name: "GH_TOKEN", id: takerSecret }])]),
+    // The process dies when the record would let go of the box, on the first two calls.
+    db: (db) => ({ ...db, put: async (store: string, v: any, key?: any) => {
+      if (key === BOX_KEY && dying > 0 && v?.machines && !v.machines.main) { dying--; throw new Error("the object was evicted"); }
+      return db.put(store, v, key);
+    } }),
+  });
+  p.o.caller = TAKER();
+  p.o.failRemove = true;
+  Date.now = () => AT;
+  try {
+    // Everything the agent was handed, results and refusals alike.
+    const seen: string[] = [];
+    const call = async () => { const o = await logged(() => b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>); seen.push(o.error ?? JSON.stringify(o.value)); return o; };
+    must(/evicted/.test(String((await call()).error)), "the first call was not interrupted");
+    must(removalsOf(p).length === 1 && b.split(OLD_ID).attempts === 1 && b.main()?.boxId === OLD_ID, `after one: ${JSON.stringify(b.split(OLD_ID))}`);
+    must(/evicted/.test(String((await call()).error)), "the second call was not interrupted");
+    must(b.split(OLD_ID).attempts === removalsOf(p).length, `attempts ${b.split(OLD_ID).attempts}, rounds sent ${removalsOf(p).length}`);
+    const r: any = (await call()).value;
+    const sp = b.split(OLD_ID);
+    splitShape(sp, AT);
+    must(removalsOf(p).length === 3 && sp.attempts === 3 && sp.unwire === "residue", `rounds ${removalsOf(p).length}: ${JSON.stringify(sp)}`);
+    must(b.main()?.boxId === r.box, "the third call did not end on a new box");
+    await call();
+    // Told once, though found three times.
+    must(count(seen.join(" | "), NOT_OURS) === 1, `the split was not told exactly once: ${seen.join(" | ")}`);
+    must(removalsOf(p).length === 3, "tried again after residue");
+  } finally { Date.now = realNow; }
+});
+
+await check("found again with no round made yet: the count goes on from 0, and three rounds in all", async () => {
+  const { p, takerSecret } = sharedBox();
+  const b = mountOf(TENANT, AGENT_B, { record: stillNamed([wiring([{ name: "GH_TOKEN", id: takerSecret }])]) });
+  b.putRaw(`${SPLIT_PREFIX}${OLD_ID}`, entryOf({ registeredNames: ["GH_TOKEN"], secretIds: [takerSecret], attempts: 0, unwire: "pending",
+    remaining: [{ id: takerSecret, name: "GH_TOKEN", state: "pending" }] }));
+  p.o.caller = TAKER();
+  p.o.failRemove = true;
+  await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+  // The retry at the start of the call and the found-again split's round: two rounds, both counted.
+  must(b.split(OLD_ID).attempts === removalsOf(p).length && removalsOf(p).length === 2, `attempts ${b.split(OLD_ID).attempts}, rounds ${removalsOf(p).length}`);
+  await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+  await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+  must(removalsOf(p).length === 3 && b.split(OLD_ID).unwire === "residue" && b.split(OLD_ID).attempts === 3, `rounds ${removalsOf(p).length}: ${JSON.stringify(b.split(OLD_ID))}`);
+});
+
+await check("found again when it is already residue: the entry is unchanged and nothing is sent", async () => {
+  const { p, takerSecret } = sharedBox();
+  const b = mountOf(TENANT, AGENT_B, { record: stillNamed([wiring([{ name: "GH_TOKEN", id: takerSecret }])]) });
+  const residue = entryOf({ registeredNames: ["GH_TOKEN"], secretIds: [takerSecret], attempts: 3, unwire: "residue", told: true, lastError: "transient 503",
+    remaining: [{ id: takerSecret, name: "GH_TOKEN", state: "residue", reason: "unwire failed 3 times" }] });
+  b.putRaw(`${SPLIT_PREFIX}${OLD_ID}`, residue);
+  p.o.caller = TAKER();
+  const r: any = await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+  must(JSON.stringify(b.split(OLD_ID)) === JSON.stringify(residue), `the residue entry changed: ${JSON.stringify(b.split(OLD_ID))}`);
+  must(removalsOf(p).length === 0 && b.main()?.boxId === r.box && r.box !== OLD_ID, `sent a removal, or kept the box: ${removalsOf(p).length}`);
+  must(!/another agent/.test(JSON.stringify(r)), `told again: ${r.note}`);
+});
+
+await check("found again after this mount wired another account on its new box: that registration is never merged in or sent", async () => {
+  const { p, takerSecret } = sharedBox();
+  const C = "s-new-account";
+  // The record names the old box again, with a wiring that now also holds C (made on another box).
+  const b = mountOf(TENANT, AGENT_B, { record: stillNamed([wiring([{ name: "GH_TOKEN", id: takerSecret }, { name: "GH_OTHER", id: C }])]) });
+  b.putRaw(`${SPLIT_PREFIX}${OLD_ID}`, entryOf({ registeredNames: ["GH_TOKEN"], secretIds: [takerSecret], attempts: 1, unwire: "pending", told: true,
+    remaining: [{ id: takerSecret, name: "GH_TOKEN", state: "pending" }, { id: null, name: "GH_LEGACY", state: "residue", reason: "wiring_without_ids" }] }));
+  p.o.caller = TAKER();
+  p.o.failRemove = true;
+  await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+  const sp = b.split(OLD_ID);
+  const sent = removalsOf(p).map((c) => decodeURIComponent(c.path.split("/").at(-1)!));
+  must(!sent.includes(C) && !sp.remaining.some((r: any) => r.id === C || r.name === "GH_OTHER"), `C merged or sent: ${JSON.stringify(sent)} ${JSON.stringify(sp.remaining)}`);
+  must(sp.attempts === 1 + sent.length && JSON.stringify(sp.registeredNames) === '["GH_TOKEN"]', `count or names changed: ${JSON.stringify(sp)}`);
+  must(sp.remaining.some((r: any) => r.id === null && r.name === "GH_LEGACY" && r.state === "residue" && r.reason === "wiring_without_ids"), `the id-less row: ${JSON.stringify(sp.remaining)}`);
+});
+
+// ---- the notes queue
+
+await check("two queued rows of identical content are both said and both deleted", async () => {
+  // Guards a change that does not exist yet: dedupe (by box, by box and outcome, or by content) would swallow the
+  // later residue note, the only one saying registrations may remain. Today's code cannot queue two identical rows,
+  // which is why this builds that state directly.
+  const { p } = sharedBox();
+  const b = mountOf(TENANT, AGENT_B, { record: { machines: {} } });
+  const row = { boxId: OLD_ID, machine: null, outcome: "remains" };
+  b.putRaw("notices", [{ ...row, id: "one" }, { ...row, id: "two" }]);
+  p.o.caller = TAKER();
+  const r: any = await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+  must(count(JSON.stringify(r), REMAINS) === 2, `not both said: ${r.note}`);
+  const again: any = await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+  must(!JSON.stringify(again).includes(REMAINS), `not both deleted: ${again.note}`);
+});
+
+await check("a round that gives up writes its residue and its note together: an interruption cannot keep one and lose the other", async () => {
+  const { p, takerSecret } = sharedBox();
+  let dying = false;
+  const b = mountOf(TENANT, AGENT_B, {
+    record: takerRecord([wiring([{ name: "GH_TOKEN", id: takerSecret }])]),
+    // Any write of the notes queue on its own fails while dying: one made apart from the entry is lost.
+    db: (db) => ({ ...db, put: async (store: string, v: any, key?: any) => {
+      if (key === "notices" && dying) throw new Error("the object was evicted");
+      return db.put(store, v, key);
+    } }),
+  });
+  p.o.caller = TAKER();
+  p.o.failRemove = true;
+  await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+  await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+  const seen: string[] = [];
+  const call = async () => { const o = await logged(() => b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>); seen.push(o.error ?? JSON.stringify(o.value)); };
+  dying = true;
+  await call();
+  dying = false;
+  await call();
+  await call();
+  must(b.split(OLD_ID).unwire === "residue", `not given up: ${JSON.stringify(b.split(OLD_ID))}`);
+  must(count(seen.join(" | "), GIVEN_UP) === 1, `the given-up note was lost or repeated: ${seen.join(" | ")}`);
+});
+
+// ---- a tool call and a release at once, on one split
+
+/**
+ * Tool calls on one mount are serialised (`exclusive`), so what runs beside one is a release (the idle pass, an
+ * operator's) or a job's poll. This models a real window, not an extreme: when the provider is slow, a tool call waits
+ * on a removal while an idle release comes in. A tool call and an idle release both find the record naming the owner's box, both
+ * split it and both send a round; the first removal is held at a gate until the second call is in its own, so the two
+ * really interleave. Without the gate this test stays green under the sabotages it is for (reading the entry outside
+ * the write, writing back a snapshot): do not remove the gate to make it "stable".
+ */
+for (const order of ["first released first", "second released first"] as const) {
+  await check(`a tool call and an idle release on one split, ${order}: every round counted, nothing either removed comes back`, async () => {
+    const { p } = sharedBox();
+    const A = p.register(OLD_ID, "GH_A", "taker-a", TAKER());
+    const B = p.register(OLD_ID, "GH_B", "taker-b", TAKER());
+    // Whichever round asks first is refused A and has B removed; the second has A removed and is refused B.
+    p.o.script.set(A, [false, true]);
+    p.o.script.set(B, [true, false]);
+    const b = mountOf(TENANT, AGENT_B, {
+      record: takerRecord([wiring([{ name: "GH_A", id: A }, { name: "GH_B", id: B }, { name: "GH_LEGACY", id: null }])]), lease: LEASE,
+    });
+    p.o.caller = TAKER();
+    let releaseFirst: () => void = () => {};
+    let entered = 0;
+    p.o.beforeRemoval = async (n) => {
+      entered++;
+      if (n === 1) await new Promise<void>((r) => { releaseFirst = r; });
+      else if (n === 2) {
+        if (order === "first released first") { releaseFirst(); await new Promise((r) => setTimeout(r, 5)); }
+        else setTimeout(() => releaseFirst(), 5);
+      }
+    };
+    const [tool] = await Promise.all([
+      b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>,
+      logged(() => b.plugin.holds!.release(b.ctx, { reason: "idle" }) as Promise<unknown>),
+    ]);
+    p.o.beforeRemoval = null;
+    must(entered >= 2, `the two calls did not interleave at the removal: ${entered}`);
+    const sp = b.split(OLD_ID);
+    splitShape(sp, null);
+    const rounds = new Set(removalsOf(p).map((c) => c.caller + p.calls.indexOf(c))).size;
+    must(sp.attempts === 2, `attempts ${sp.attempts}, rounds sent 2 (${rounds} removals)`);
+    must(JSON.stringify(sp.remaining) === '[{"id":null,"name":"GH_LEGACY","state":"residue","reason":"wiring_without_ids"}]',
+      `remaining is not what neither round removed: ${JSON.stringify(sp.remaining)}`);
+    const queued = JSON.stringify(tool) + JSON.stringify((await b.plugin.invoke("shell", { command: "ls" }, b.ctx)) as any);
+    must(count(queued, NOT_OURS) === 1, `the split was not told exactly once: ${queued}`);
+  });
+}
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.ok ? "" : `\n    ${r.error}`}`);
 const passed = results.filter((r) => r.ok).length;
