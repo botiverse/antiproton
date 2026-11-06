@@ -44,13 +44,16 @@ export const OTHER_TEXT =
 export const UNCONFIRMED_TEXT =
   "This machine's files cannot be shown, because the machine could not be confirmed as this agent's. " +
   "It is no longer used for this agent. If that is unexpected, contact the operator.\n";
+/** When the agent has nothing here that could ever show files (no mount that does, or no agent): no promise either. */
+export const NO_FILES_TEXT = "This agent has no machine whose files can be shown here.\n";
 /** For an answer with no `why` this code knows (an object not yet updated during a deploy): no claim either way. */
 export const NEUTRAL_TEXT = "This machine's files cannot be shown right now.\n";
 
 /** The one file `sandbox/` holds when no files are shown. `why` is read as unknown: an older object may send none. */
 function notShownFile(why: NotShown | undefined): { name: string; text: string } {
   switch (why) {
-    case "none": case "no_files": case "no_agent": return { name: NOT_RUNNING_FILE, text: NOT_RUNNING_TEXT };
+    case "none": return { name: NOT_RUNNING_FILE, text: NOT_RUNNING_TEXT };
+    case "no_files": case "no_agent": return { name: NOT_RUNNING_FILE, text: NO_FILES_TEXT };
     case "other": return { name: NOT_AVAILABLE_FILE, text: OTHER_TEXT };
     case "unconfirmed": return { name: NOT_AVAILABLE_FILE, text: UNCONFIRMED_TEXT };
     default: {

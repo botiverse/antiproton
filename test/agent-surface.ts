@@ -10,7 +10,7 @@
  * real runtime and the real sandbox plugin in test/agent-surface-runtime.ts.
  */
 import { agentUsage, nonOverlapping, parseUsageQuery, splitModelKey, HOURLY_KEPT_MS, type LedgerRow, type UsageDeps } from "../cf/src/agent-surface/usage.ts";
-import { workspaceList, workspaceRead, NOT_RUNNING_FILE, NOT_RUNNING_TEXT, NOT_AVAILABLE_FILE, OTHER_TEXT, UNCONFIRMED_TEXT, NEUTRAL_TEXT, READ_MAX_BYTES, type SandboxList, type SandboxRead, type WorkspaceDeps } from "../cf/src/agent-surface/workspace.ts";
+import { workspaceList, workspaceRead, NOT_RUNNING_FILE, NOT_RUNNING_TEXT, NOT_AVAILABLE_FILE, OTHER_TEXT, UNCONFIRMED_TEXT, NEUTRAL_TEXT, NO_FILES_TEXT, READ_MAX_BYTES, type SandboxList, type SandboxRead, type WorkspaceDeps } from "../cf/src/agent-surface/workspace.ts";
 import { surface, type SurfaceDeps } from "../cf/src/agent-surface/surface.ts";
 import { handleProvision, type ProvisionDeps } from "../cf/src/provision/handlers.ts";
 import { handleAgentsApi, type AgentsApiDeps } from "../cf/src/agents-api/handlers.ts";
@@ -502,8 +502,8 @@ await check("sandbox/ with no container running holds one text file saying so, a
 // the regex checks below are independent of them, so definitions swapped between the two turn red.
 const NOT_SHOWN_ROWS: Array<{ why: string | undefined; file: string; text: string }> = [
   { why: "none", file: NOT_RUNNING_FILE, text: NOT_RUNNING_TEXT },
-  { why: "no_files", file: NOT_RUNNING_FILE, text: NOT_RUNNING_TEXT },
-  { why: "no_agent", file: NOT_RUNNING_FILE, text: NOT_RUNNING_TEXT },
+  { why: "no_files", file: NOT_RUNNING_FILE, text: NO_FILES_TEXT },
+  { why: "no_agent", file: NOT_RUNNING_FILE, text: NO_FILES_TEXT },
   { why: "other", file: NOT_AVAILABLE_FILE, text: OTHER_TEXT },
   { why: "unconfirmed", file: NOT_AVAILABLE_FILE, text: UNCONFIRMED_TEXT },
   { why: undefined, file: NOT_RUNNING_FILE, text: NEUTRAL_TEXT },
@@ -523,7 +523,8 @@ for (const row of NOT_SHOWN_ROWS) {
     const content = text.file.content!;
     if (row.why === "other") must(/another agent/.test(content), content);
     if (row.why === "unconfirmed") must(/could not be confirmed/.test(content), content);
-    if (row.why === "none" || row.why === "no_files" || row.why === "no_agent") must(content === NOT_RUNNING_TEXT, content);
+    if (row.why === "none") must(content === NOT_RUNNING_TEXT, content);
+    if (row.why === "no_files" || row.why === "no_agent") must(content !== NOT_RUNNING_TEXT, "an agent with nothing to show was promised files later");
     if (row.why === undefined) must(content !== NOT_RUNNING_TEXT, "a missing why promised that files appear later");
   });
 }
@@ -531,6 +532,7 @@ for (const row of NOT_SHOWN_ROWS) {
 await check("the not-shown texts are distinct: other is not unconfirmed, the neutral text is not the not-running one", () => {
   must(OTHER_TEXT !== UNCONFIRMED_TEXT, "other and unconfirmed say the same");
   must(NEUTRAL_TEXT !== NOT_RUNNING_TEXT, "the neutral text promises files later");
+  must(NO_FILES_TEXT !== NOT_RUNNING_TEXT, "the no-files text promises files later");
   must(/another agent/.test(OTHER_TEXT) && !/another agent/.test(UNCONFIRMED_TEXT), "another agent");
   must(/could not be confirmed/.test(UNCONFIRMED_TEXT) && !/could not be confirmed/.test(OTHER_TEXT), "could not be confirmed");
 });
