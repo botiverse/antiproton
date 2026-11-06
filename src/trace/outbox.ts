@@ -110,7 +110,8 @@ export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "contain
   "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "github.refresh", "github.refresh_skipped", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call",
   "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check", "raft.session_unsealable",
   "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner", "stamp.agent_login", "state.dropped",
-  "raft.assistant_decision", "memory.shadow_due", "memory.shadow", "memory.observe", "memory.shadow_redact", "memory.shadow_clear"] as const;
+  "raft.assistant_decision", "memory.shadow_due", "memory.shadow", "memory.observe", "memory.shadow_redact", "memory.shadow_clear",
+  "raft.assistant_owner_actions"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
@@ -182,11 +183,19 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * `memory.shadow_clear` is the operator's clear of an agent's shadow runs (src/store/memory-shadow.ts
  * `clearMemoryShadow`): how many rows were `deleted`, how many were still `queued` (each given a `cleared` heartbeat),
  * and `stillRecording`. None of the five is forwarded.
+ * `raft.assistant_owner_actions` is a personal assistant's owner actions (src/plugins/raft-assistant-owner-actions.ts):
+ * status `listed`, one per listing of an assistant's raft mount, with how many entries Raft's context listed
+ * (`entries`), how many tools were made (`generated`, and by tier `direct`, `confirm`, `read`) and left out (`filtered`:
+ * `unknown_tier`, `sdk_skipped`, `name_taken`, and `left_out` naming each as tool:tier:why) (`traceListing`); or
+ * status `called`, one per call, with the tool, the `result` (`ok`, the SDK's failure code, or `refused:not_chat`),
+ * Raft's HTTP `status`, its `error_code` and a confirm's `state` (`runOwnerAction`). Never an argument or Raft's text.
+ * Not forwarded.
  */
 export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake", "raft.assistant_notify",
   "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check",
   "raft.session_unsealable", "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner",
-  "stamp.agent_login", "state.dropped", "raft.assistant_decision", "memory.shadow_due", "memory.shadow_redact"] as const satisfies readonly TraceKind[];
+  "stamp.agent_login", "state.dropped", "raft.assistant_decision", "memory.shadow_due", "memory.shadow_redact",
+  "raft.assistant_owner_actions"] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;

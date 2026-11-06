@@ -25,7 +25,7 @@ import {
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
 import {
-  ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, CONTACT_KEY, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY, SEND_AS_OWNER_TOOL,
+  ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, CONTACT_KEY, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY, SEND_AS_OWNER_TOOL, SYSTEM_ASSISTANT_APP,
   sendAsOwner, type SendAsOwnerAnswer, assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, mergeSources, noteDoorbell,
   notifyOwner, noteChatNotice, noteOwnerReply, noteToldInChat, pauseOn, replyFallback, preferences, type PersonResolve, type OwnerResolveRead, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
   checkEnded, pushBriefImport, turnDelivered, type AssistantApi, type DeliveredReport, type RaftAnswer,
@@ -34,6 +34,7 @@ import {
 import type { RaftCheck, RefusedCheck } from "./raft-assistant-check.ts";
 import { clearIntegrationSessions, INTEGRATION_SESSIONS_STORE, REMINDER_TOOL, reminderTool } from "./raft-assistant-reminder.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
+import { ownerActionTools, ownerActionsOf, rawOwnerActions, runOwnerAction, traceListing, type OwnerActionListing } from "./raft-assistant-owner-actions.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import { isSubagentSession } from "../runtime/subagent-session.ts";
 import type { TurnEndEvent, TurnOutcome } from "../runtime/activity.ts";
@@ -3078,6 +3079,15 @@ export function createRaftPlugin(deps: {
   const appTools = new Set(generated.filter((op) => appOf(op) !== null).map((op) => op.toolName));
   const allTools: ToolSchema[] = everyTool.filter((t) => t.name !== RAFTBENCH_TOOL && !appTools.has(t.name));
   /**
+   * The names a personal assistant's owner action (src/plugins/raft-assistant-owner-actions.ts) may not take: every tool
+   * name this plugin has or had (any manifest operation, excluded or not, its own tools, the assistant's, the retired
+   * ones) and the managed MCP namespace. Such an entry is left out of the listing (`name_taken`), and a snapshot tool
+   * marked as an owner action under one is not offered, so a call by that name always reaches this plugin's own tool.
+   */
+  const reserved = new Set([...RAFT_OPERATIONS.map((op) => op.toolName), ...OWN_TOOLS.map((t) => t.name), VIEW_SCHEMA.name, UPLOAD_SCHEMA.name,
+    ...ASSISTANT_TOOLS.map((t) => t.name), ...Object.keys(RETIRED), LEGACY_SEND]);
+  const reservedName = (name: string) => reserved.has(name) || name.startsWith(MCP_PREFIX);
+  /**
    * What this call's mount does not offer, for the hints and the attachment suffix: `unoffered`, plus every generated
    * tool the kernel says this mount is not offered right now (`PluginContext.offered`) — one its credential lacks the
    * capability for, or one this build added that the mount's stored snapshot predates. A context without `offered`
@@ -3235,7 +3245,10 @@ export function createRaftPlugin(deps: {
       const view = generatedHere.some((t) => t.name === DOWNLOAD_TOOL) ? viewTools.filter((t) => allowed.has(t.name)) : [];
       // The managed MCP tools are the catalogue's, so they are read whole from the snapshot (src/plugins/raft-mcp.ts).
       const managed = snapshot.tools.filter((t) => t.name.startsWith(MCP_PREFIX));
-      return [...OWN_TOOLS, ...generatedHere, ...view, ...uploadTools.filter((t) => allowed.has(t.name)), ...ASSISTANT_TOOLS.filter((t) => allowed.has(t.name)), ...managed];
+      // A personal assistant's owner actions are Raft's too (`assistantOf.ownerActions`): read whole from the snapshot,
+      // the mark that says which they are taken out (src/plugins/raft-assistant-owner-actions.ts `ownerActionsOf`).
+      const owner = ownerActionsOf(snapshot.tools, reservedName);
+      return [...OWN_TOOLS, ...generatedHere, ...view, ...uploadTools.filter((t) => allowed.has(t.name)), ...ASSISTANT_TOOLS.filter((t) => allowed.has(t.name)), ...owner, ...managed];
     },
 
     /**
@@ -3344,7 +3357,23 @@ export function createRaftPlugin(deps: {
         if (uploadMissing.length) skipped.push({ name: t.name, reason: `the credential lacks the Raft capability ${uploadMissing.join(", ")}` });
         else tools.push(t);
       }
-      if (isAssistantOf(me.data.agent.assistantOf)) tools.push(...ASSISTANT_TOOLS);
+      if (isAssistantOf(me.data.agent.assistantOf)) {
+        tools.push(...ASSISTANT_TOOLS);
+        // The owner actions Raft lists in the same answer, one tool each (src/plugins/raft-assistant-owner-actions.ts).
+        // None listed (a Server without the routes, or an empty list) is no tools and no second request.
+        const raw = rawOwnerActions(me.data.agent.assistantOf);
+        let owner: OwnerActionListing = { tools: [], entries: 0, filtered: [] };
+        if (raw && raw.length) {
+          // Through the SDK, which says which entries it cannot run (`skipped`). It reads the context again, and answers
+          // nothing at all when that read fails: with entries in hand that is a failed listing, which keeps the stored
+          // list, rather than an assistant whose owner actions are gone until the next one.
+          const listed = await raft.assistant.ownerActions.list();
+          if (!listed.actions.length && !listed.skipped.length) throw new Error("could not ask Raft which owner actions this assistant has: its second context read failed");
+          owner = ownerActionTools(raw, listed, reservedName);
+        }
+        tools.push(...owner.tools);
+        traceListing(ctx, owner);
+      }
       // The managed MCP catalogue, last: asked only of a credential that holds `mcp`, and never the reason the listing
       // fails (`listMcp`). After Raft's own tools, so the kernel's bound on a list's length never costs one of those.
       const managed = await listMcp(raft, ctx, CONTEXT_STORE, capabilities.has(MCP_CAPABILITY));
@@ -3474,6 +3503,11 @@ export function createRaftPlugin(deps: {
       // Not the mount's own timeout: Raft gives the remote server its own budget to connect and to answer
       // (`MCP_CALL_TIMEOUT_MS`), and a call cut short here is one Raft may still complete.
       if (isMcpTool(name)) return callMcp(name, args, ctx, () => raftFor(ctx, { state: false, timeoutMs: MCP_CALL_TIMEOUT_MS }), CONTEXT_STORE, mcp);
+      // A personal assistant's owner action: a name the mount's list offers that is none of this plugin's own
+      // (`reservedName`), so it can only have come from Raft's `assistantOf.ownerActions` (`mountTools`).
+      if (!reservedName(name) && ctx.offered?.includes(name)) {
+        return runOwnerAction(name, args, ctx, (tool, a) => raftFor(ctx, { state: false }).assistant.ownerActions.run(tool, a), () => mcp.markStale(ctx));
+      }
       const op = operationOf.get(name);
       if (op?.name === RAFTBENCH_OP) {
         // Offered only where the mount's list names it (`isRaftbenchReader`); the gateway refuses it elsewhere as an
@@ -4136,10 +4170,14 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
   // is asked at all; only the rest of the notice — its owner writing to it — wakes the model, in its chat.
   const owner = await loadOwner(ctx);
   const assistant = owner !== null;
-  const bells = assistant ? payload.targets.filter(isDoorbellTarget) : [];
-  const change = bells.length > 0 ? await doorbellChange(ctx, bells) : null;
-  const bell = change !== null && await noteDoorbell(ctx, Date.now(), change.firstChangeAt, change.sources, change.checks, change.eventIds);
-  if (bell && payload.targets.every(isDoorbellTarget)) {
+  const sent: unknown[] = assistant ? payload.targets.filter(isDoorbellTarget) : [];
+  const change = sent.length > 0 ? await doorbellChange(ctx, sent) : null;
+  // The `system.assistant` app sends the owner's chat more than doorbells: the outcome of an owner action the owner
+  // confirmed (done, failed, declined, expired) is its event too, under the same sender. Such an event, read and found
+  // not to be a doorbell, is the chat's to read: it wakes the chat like any message, and only the rest are the code's.
+  const bells = sent.filter((t) => !change?.notBells.includes((t as { target: string }).target));
+  const bell = bells.length > 0 && change !== null && await noteDoorbell(ctx, Date.now(), change.firstChangeAt, change.sources, change.checks, change.eventIds);
+  if (bell && payload.targets.every((t: unknown) => bells.includes(t))) {
     return { deliver: false, wake: true, reason: "an assistant's doorbell, for its code to check", dedupeKey: payload.noticeId };
   }
   // The owner's chat is woken by this notice: kept so a failed turn's line is sent once for it (`noteChatNotice`).
@@ -4165,18 +4203,26 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
  */
 async function doorbellChange(ctx: PluginContext, targets: readonly unknown[]): Promise<{
   firstChangeAt: string | null; sources: ChangeSources; checks: Array<(RaftCheck & { eventIds?: string[] }) | RefusedCheck>; eventIds: string[];
+  notBells: string[];
 }> {
   let earliest: string | null = null, sources: ChangeSources = {};
   const checks: Array<(RaftCheck & { eventIds?: string[] }) | RefusedCheck> = [];
   // Each doorbell read here by its id, to be reported delivered once handled: with its check when it brought one Raft
   // will have run, else with the doorbell (src/plugins/raft-assistant.ts `reportDelivered`).
   const eventIds: string[] = [];
-  if (!ctx.credential) return { firstChangeAt: earliest, sources, checks, eventIds };
+  // The targets whose read showed an event of the `system.assistant` app that is no doorbell (`doorbellOf` null): an
+  // owner action's outcome, for the chat. A read that failed or showed nothing stays a doorbell, as before.
+  const notBells: string[] = [];
+  if (!ctx.credential) return { firstChangeAt: earliest, sources, checks, eventIds, notBells };
   for (const t of targets) {
     const channel = (t as { target: string }).target;
     try {
       const out = await raftFor(ctx, { state: false }).routes.history.read({ query: { channel, limit: "1", consume: "false" } });
       const bell = out.ok ? doorbellOf(out.data.messages[0]) : null;
+      if (out.ok && !bell && isAssistantAppEvent(out.data.messages[0])) {
+        notBells.push(channel);
+        continue;
+      }
       const at = bell?.firstChangeAt ?? null;
       if (bell) sources = mergeSources(sources, bell.sources);
       // Raft's check for this doorbell or brief, when it ran one (`payload.check`).
@@ -4191,7 +4237,13 @@ async function doorbellChange(ctx: PluginContext, targets: readonly unknown[]): 
       logEvent("raft.doorbell_unread", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, error: String((e as Error)?.message ?? e).slice(0, 120) });
     }
   }
-  return { firstChangeAt: earliest, sources, checks, eventIds };
+  return { firstChangeAt: earliest, sources, checks, eventIds, notBells };
+}
+
+/** Whether a message is an event of Raft's `system.assistant` app (`third_party_event.client_id`), doorbell or not. */
+function isAssistantAppEvent(raw: unknown): boolean {
+  const e = object(object(raw).third_party_event);
+  return e.client_id === SYSTEM_ASSISTANT_APP;
 }
 
 /**

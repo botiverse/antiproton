@@ -59,6 +59,7 @@ import { logicalMain, physicalSession } from "./fresh-context.ts";
 import { assistantSystemPrompt, profilePrompt, systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { returnToolsChange, takeToolsChange, type ToolsChange } from "../../src/runtime/tools-seen.ts";
 import { MEMORY_PLUGIN, assistantMountOf, assistantTools, isOwnerReadAddress, memoryMountOf } from "../../src/plugins/raft-assistant.ts";
+import { ownerActionNames } from "../../src/plugins/raft-assistant-owner-actions.ts";
 import { forgetIsolated, isIsolatedSession, isolatedSession, isolatedSessions, newIsolatedSessionId, recordIsolated } from "../../src/runtime/isolated-session.ts";
 import { profileOf, profileSpec } from "../../src/runtime/agent-profile.ts";
 import {
@@ -3869,7 +3870,9 @@ export class AgentRuntime {
     const tools = narrowed(profileOf(agentConfig) || memoryCall ? []
       : isSubagentSession(session)
       ? (() => { const withheld = this.#childWithheldIn(catalogue); return catalogue.tools.filter((t) => !withheld.has(t.address)); })()
-      : assistant ? assistantTools(catalogue.tools, assistant, isolated ? "check" : "chat", memory)
+      : assistant ? assistantTools(catalogue.tools, assistant, isolated ? "check" : "chat", memory,
+        // The owner actions, in the owner's chat alone: the main session, never a check's or any other.
+        session === MAIN_SESSION ? ownerActionNames(records.find((r) => r.alias === assistant)?.toolSnapshot) : [])
       : catalogue.tools);
     const sandbox = this.#deps.sandbox ?? true;
     const store = this.store;

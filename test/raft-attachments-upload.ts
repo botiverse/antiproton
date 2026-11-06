@@ -289,7 +289,8 @@ await check("Raft refusing the upload, or the target, is said with its reason an
   must((e as any).mayHaveLanded !== true, `marked as may have landed: ${JSON.stringify(e)}`);
   raft({ resolveFails: json({ error: "No such channel: #nowhere", errorCode: "CHANNEL_NOT_FOUND" }, 404) });
   const r = await failure(() => uploadAttachment({ ref: OWN_REF, target: "#nowhere" }, ctx(), fakeArtifacts({ [OWN_KEY]: PNG })));
-  must(/does not exist or is not visible/.test(r.message) && r.message.includes("(HTTP 404, CHANNEL_NOT_FOUND)"), r.message);
+  // Raft's own one-line sentence since SDK 0.33.0.
+  must(r.message.startsWith("No such channel: #nowhere (HTTP 404, CHANNEL_NOT_FOUND)"), r.message);
   // No answer at all: said in Raft's words and marked as one that may clear, not thrown raw.
   globalThis.fetch = (async () => { throw new TypeError("network down"); }) as any;
   const t = await failure(() => uploadAttachment({ ref: OWN_REF, target: "#general" }, ctx(), fakeArtifacts({ [OWN_KEY]: PNG })));
