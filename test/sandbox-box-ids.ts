@@ -1410,11 +1410,14 @@ const missingLogged = (lines: string[]) => lines.filter((l) => l.includes('"code
 await check("an earlier-shape entry found on the split path gets its items from its own ids, never from the wiring as it is now", async () => {
   const { p, takerSecret } = sharedBox();
   const LATER = "s-wired-later";
-  const b = mountOf(TENANT, AGENT_B, { record: takerRecord([wiring([{ name: "GH_TOKEN", id: takerSecret }, { name: "GH_LATER", id: LATER }])]) });
+  const b = mountOf(TENANT, AGENT_B, { record: takerRecord([wiring([{ name: "GH_TOKEN", id: takerSecret }, { name: "GH_LATER", id: LATER }])]), lease: LEASE });
   b.putRaw(`${SPLIT_PREFIX}${OLD_ID}`, { box: OLD_ID, mount: "sandbox", machine: "main", reason: "foreign_owner", names: ["GH_TOKEN"],
     secretIds: [takerSecret], detectedAt: AT, unwire: "pending" });
   p.o.caller = TAKER();
-  await logged(() => b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>);
+  // Through the idle pass, which reaches the split path with no retry before it (a tool call's retry would give the
+  // entry its items first, and the split path would never see the earlier shape).
+  await logged(() => b.plugin.holds!.release(b.ctx, { reason: "idle" }) as Promise<unknown>);
+  must(Array.isArray(b.split(OLD_ID).remaining), `the split path did not see the entry: ${JSON.stringify(b.split(OLD_ID))}`);
   const sent = removalsOf(p).map((c) => decodeURIComponent(c.path.split("/").at(-1)!));
   must(sent.length >= 1 && sent.every((x) => x === takerSecret), `removals: ${JSON.stringify(sent)}`);
   must(!JSON.stringify(b.split(OLD_ID)).includes(LATER) && b.split(OLD_ID).detectedAt === AT, `entry: ${JSON.stringify(b.split(OLD_ID))}`);
