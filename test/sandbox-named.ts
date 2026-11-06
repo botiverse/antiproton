@@ -81,7 +81,7 @@ await check("with no machine named, everything is the one box it always was, sto
   const r: any = await f.plugin.invoke("shell", { command: "ls" }, f.ctx);
   must(f.creates().length === 1, `one box created: ${JSON.stringify(f.creates())}`);
   const id = f.creates()[0]!.body.box_id as string;
-  must(/^h-t-a-[a-z0-9]+$/.test(id), `the default box's id has no machine in it: ${id}`);
+  must(/^h-[0-9a-f]{12}-[a-z0-9]+$/.test(id), `the default box's id has no machine in it: ${id}`);
   must(r.box === id && !("machine" in r), `the result is what it was: ${JSON.stringify(r)}`);
   must(Object.keys(f.raw().machines).join() === "main" && f.raw().machines.main.boxId === id, `stored as main: ${JSON.stringify(f.raw())}`);
   must(f.raw().boxId === undefined, "the old top-level shape is no longer written");

@@ -80,7 +80,7 @@ async function bodyOf(b: unknown): Promise<unknown> {
 
 function fake(): Fake {
   const f: Fake = { log: [], execs: [], overrides: [] };
-  const boxes = new Map<string, { state: string }>();
+  const boxes = new Map<string, { state: string; description?: string }>();
   const started = new Map<string, { command: string[]; answers: ExecAnswer[]; served: number; killed: boolean }>();
   const files = new Map<string, Uint8Array>();
   const secrets = new Map<string, Array<{ name: string; secret_id: string }>>();
@@ -109,12 +109,12 @@ function fake(): Fake {
     if (method === "GET" && path === "/credential") return answer({ json: { ok: true } });
     if (method === "POST" && p === "/boxes") {
       const body = JSON.parse(init.body);
-      boxes.set(body.box_id, { state: "idle" });
+      boxes.set(body.box_id, { state: "idle", description: body.description });
       return answer({ json: { box_id: body.box_id, state: "ready" } });
     }
     if (method === "GET" && p === "/boxes") {
       return answer({ json: [{ box_id: "someone-elses", state: "idle", box_snap_id: "s-other" },
-        ...[...boxes].map(([id, b]) => ({ box_id: id, state: b.state, box_snap_id: `s-${id}` }))] });
+        ...[...boxes].map(([id, b]) => ({ box_id: id, state: b.state, box_snap_id: `s-${id}`, description: b.description }))] });
     }
     if ((m = /^\/boxes\/([^/]+)\/stop$/.exec(p)) && method === "POST") {
       const b = boxes.get(m[1]!);

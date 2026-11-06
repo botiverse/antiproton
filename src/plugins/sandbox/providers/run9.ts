@@ -156,11 +156,23 @@ function open(settings: ProviderSettings, credential: string): SandboxProvider {
 
     /**
      * A create answered "already exists" for an id the plugin had just minted (seen twice in one benchmark run,
-     * once as run9's own database's duplicate-key error): the box is there and only the answer was lost, so it is
-     * this spec's when the project lists it.
+     * once as run9's own database's duplicate-key error): the box is there and only the answer was lost.
+     *
+     * Being listed is not enough to make it this spec's. The project is shared by every tenant, so a box under the
+     * same id may be someone else's, and adopting it hands this agent that box's files, processes and egress
+     * registrations. It is adopted only when it carries the description this spec created it with, which names the
+     * tenant and the agent (the id's digest covers the mount and machine, `boxIdFor` in src/plugins/sandbox.ts). A
+     * box listed without one, or with another, is not adopted, and the create's own refusal stands.
+     *
+     * The description and not run9's labels: the create has never sent labels, so no box has them, and on run9
+     * a label is not inert. It decides which project-scope secrets a managed box is given (`box_label`) and can
+     * decide its outbound address (`outbound_ip_label`), in a project shared with production.
      */
     async adopt(spec: BoxSpec) {
-      return (await this.status(spec.id)) === "gone" ? null : spec.id;
+      const boxes = await api("GET", `${ws}/boxes`);
+      const listed = Array.isArray(boxes) ? boxes.find((x: any) => x?.box_id === spec.id) : null;
+      if (!listed) return null;
+      return typeof listed.description === "string" && listed.description === spec.description ? spec.id : null;
     },
 
     /**

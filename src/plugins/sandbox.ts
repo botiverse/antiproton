@@ -2049,6 +2049,32 @@ export const PUT_PREPARE_SCRIPT = 'mkdir -p -- "$(dirname -- "$1")" 2>/dev/null 
 export const PUT_CHECK_SCRIPT = 'test -f "$1" || exit 3; stat -c %s -- "$1"; sha256sum -- "$1" 2>/dev/null | cut -d " " -f 1';
 
 const hexOf = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
+
+/**
+ * The name a new box is created under: `h-`, twelve hex digits of SHA-256 over who and what it is for (tenant,
+ * agent, mount, machine), a named machine's name, and the creation time in base 36: `h-<12 hex>-mywpiww0` for the
+ * main machine and `h-<12 hex>-build-mywpiww0` for one called `build`, both made at 1_800_000_000_000.
+ *
+ * run9's ids are the whole project's, which under the operator's account is every tenant's, and a create of an id
+ * it already has is answered "already exists" and then adopted (`SandboxProvider.adopt`). So two owners must never
+ * mint the same id. The identity used to be spelled out and cut at 40 characters, and a Raft tenant id is
+ * `raft_<uuid>`, so `h-raft_<uuid>` alone is 43: the cut removed the agent entirely, and two agents of one server
+ * creating their first box in the same millisecond got one id, and so one box. A digest keeps every part of the
+ * identity in a fixed length; JSON keeps a separator inside an id from making two identities spell the same input.
+ *
+ * The longest id is 48 characters (a 24-character machine name, `MACHINE_RE`). run9 states no limit (its swagger,
+ * https://api.run.sys9.ai/swagger.yaml read 2026-11-05, gives `box_id` as a plain string with no length or
+ * pattern), so the bound kept is the one it has accepted: the old ids, 40 characters, a dash and eight of time,
+ * 49. The time stays because each box one machine is given over its life (after a release, say) needs a name of
+ * its own, and the name stays in a named machine's id so a person reading a listing can tell them apart; the
+ * digest's 48 bits stand only against an accident between owners, which `adopt` checks again.
+ */
+export async function boxIdFor(owner: { tenantId: string; agentId: string; mount: string; machine: string }, at: number): Promise<string> {
+  const who = JSON.stringify([owner.tenantId, owner.agentId, owner.mount, owner.machine]);
+  const digest = hexOf(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(who))).slice(0, 12);
+  return `h-${digest}${owner.machine === MAIN_MACHINE ? "" : `-${owner.machine}`}-${at.toString(36)}`;
+}
+
 const mib = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MiB`;
 
 export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lease: BoxLease | null = null): Plugin {
@@ -2907,11 +2933,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         );
       }
       created = true;
-      // Named machines put their name in the id, inside the same length as before: run9's ids are the
-      // project's, and two machines of one agent created in one millisecond must still differ.
-      const owner = `h-${ctx.caller.tenantId}-${ctx.caller.agentId}`.toLowerCase().replace(/[^a-z0-9-]/g, "-");
-      const boxId = (machine === MAIN_MACHINE ? owner.slice(0, 40) : `${owner.slice(0, 39 - machine.length)}-${machine}`)
-        + `-${Date.now().toString(36)}`;
+      // Unique to this tenant, agent, mount and machine, and to the millisecond (`boxIdFor`).
+      const boxId = await boxIdFor({ tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, machine }, Date.now());
       // `state` is null in this branch by construction — the line above nulls an
       // emptied record, and `start_from` writes exactly that — so the value can
       // only come from the record read at the top of this call. `BoxState`
@@ -2945,7 +2968,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       } catch (e) {
         // A create answered "already exists" for a name this call had just minted: the box existed and only the
         // answer was lost. Throwing here failed the agent's first command and leaked the box, since no record of
-        // it was ever written. If the box is there, it is ours (`SandboxProvider.adopt`).
+        // it was ever written. If the box is there and carries this spec's owner, it is ours (`SandboxProvider.adopt`).
         if (!(e instanceof ProviderError && e.code === "conflict")) throw e;
         const adopted = await provider.adopt(spec);
         if (adopted === null) throw e;

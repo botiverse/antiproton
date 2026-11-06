@@ -190,7 +190,11 @@ export interface SandboxProvider {
    * its own, if it will. A box that already exists under this name is a `conflict`.
    */
   create(spec: BoxSpec): Promise<{ id: string; deleteAt?: number }>;
-  /** After a create answered `conflict`: the id of the box this spec made, when one is there, else null. */
+  /**
+   * After a create answered `conflict`: the id of the box this spec made, when one is there and the provider shows
+   * it was made for this spec's owner, else null. A box under the same name that cannot be shown to be this owner's
+   * is never adopted: the name alone does not say whose it is.
+   */
   adopt(spec: BoxSpec): Promise<string | null>;
   /** Where the box is, read without waking it. */
   status(id: string, within?: Within): Promise<BoxState>;
