@@ -754,8 +754,10 @@ type LetGo = {
 // One row per event, never merged by box: the same box can give two events at different times (let go of with a
 // removal pending, then that removal given up on), and the second is the only place the agent hears it could not be
 // removed. The same note is not repeated, but different outcomes for the same box are different notes.
-// One machine's one outcome appears at most once in the queue; that is the only reason dedupe looks harmless today.
-// Do not add dedupe, and if a path ever re-enqueues, the test with two identical rows is the guard.
+// One row is one event: rows are delivered and deleted by their ids, never deduped by content. The same box's same
+// outcome may have two rows; they are two events, both said and both deleted. Today only a lost split entry produces
+// that (a call interrupted before the pointer clear, after which the entry is deleted: the next discovery begins a new
+// entry and tells again).
 function enqueueIn(tx: DbOperations, g: LetGo): void {
   const v = tx.get(BOX_STORE, NOTICES_KEY);
   const owed = Array.isArray(v) ? (v as LetGo[]) : [];
@@ -806,8 +808,9 @@ async function updateSplit(
 
 /**
  * A well-formed entry as stored: one with its items. An entry of an earlier shape (no items) is not one, and is given
- * its items from what it recorded itself (`itemsOfEarlierEntry`), never from the wiring as it is now: the wiring may
- * hold accounts wired after the split, on another box, whose ids were never on this one.
+ * its items from what it recorded itself (`itemsOfEarlierEntry`). Not from the wiring: on the split path that wiring
+ * is this box's own registrations, but rebuilding from it where an entry exists would throw away the removal rounds
+ * already counted and the residue already recorded.
  *
  * Split entries must be kept for good. Deleting one resets its count of removal rounds (so the limit of
  * `UNWIRE_ATTEMPTS` holds only while the entry lives), makes the next discovery tell the agent again (`told` lives in
@@ -1044,10 +1047,13 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
       let entry = begin!.next;
       // The entry gone between this call's own writes (both run before the record lets go of the box below, so
       // `held.wired` is still whole, and after that this pass neither reads nor writes the entry). It is written whole
-      // again from `held.wired`, at the moment this call first wrote it, so the record never lets go of a box with no
-      // entry naming it. Built from `held.wired`, never from the entry as this call last saw it, and only because
-      // nothing is stored to overwrite: where an entry exists, building from an earlier read is the lost update. Items
-      // already removed come back pending, and the next round finds them gone, which counts as removed.
+      // again, at the moment this call first wrote it, so the record never lets go of a box with no entry naming it.
+      // Items already removed come back pending, and the next round finds them gone, which counts as removed. Two
+      // rules, guarding different things, neither covering the other:
+      //  - a rebuild happens only inside the transaction that read "no entry", built from `held.wired` and written in
+      //    that same transaction: never a write-back of a version other than the one read (the lost update);
+      //  - `told` and its split row are always written in one transaction, so `told` never exists without its row
+      //    (which would leave the note never sent).
       let missing = false;
       const rebuilt = () => { missing = true; return fresh(entry.detectedAt); };
       if (entry.unwire === "pending") {

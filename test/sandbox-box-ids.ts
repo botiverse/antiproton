@@ -1102,9 +1102,9 @@ await check("found again after this mount wired another account on its new box: 
 // ---- the notes queue
 
 await check("two queued rows of identical content are both said and both deleted", async () => {
-  // Guards a change that does not exist yet: dedupe (by box, by box and outcome, or by content) would swallow the
-  // later residue note, the only one saying registrations may remain. Today's code cannot queue two identical rows,
-  // which is why this builds that state directly.
+  // Guards delivery against dedupe (by box, by box and outcome, or by content), which would swallow one of two events.
+  // The rows are written directly so delivery is tested on its own; the case after the next queues two such rows by
+  // the real path (a split entry lost in between) and guards enqueue.
   const { p } = sharedBox();
   const b = mountOf(TENANT, AGENT_B, { record: { machines: {} } });
   const row = { boxId: OLD_ID, machine: null, outcome: "remains" };
@@ -1503,24 +1503,35 @@ await check("a split entry read that throws is not a missing entry: the call fai
 });
 
 await check("two events of the same box and outcome, queued by the real path, are two rows: both said, both deleted", async () => {
-  // Through the path splits and retries queue notes by (`updateSplit` with its note), not by writing rows: an
-  // earlier-shape entry with nothing to retry is given up on with a `remains` note. Done twice for one box, as two
-  // events, outside any tool call so both wait in the queue. Dedupe at enqueue (by box and outcome) would keep one.
+  // The same box's same outcome may have two rows; they are two events, both are said and both deleted. Today the only
+  // path that produces this: a call interrupted before the pointer clear, after which the entry is deleted; the next
+  // discovery begins a new entry (no `told`) and queues another split row. Two identical rows for one machine mean a
+  // split entry was lost in between (the evidence that the agent was told went with it), not a duplicate send or a
+  // failed dedupe. This guards against dedupe at enqueue and also pins that a rebuild tells the agent again.
   const { p } = sharedBox();
-  const b = mountOf(TENANT, AGENT_B, { record: { machines: {} } });
-  const earlier = { box: OLD_ID, mount: "sandbox", machine: "main", reason: "foreign_owner", names: ["GH_TOKEN"], detectedAt: AT, unwire: "pending" };
+  let dying = true;
+  const b = mountOf(TENANT, AGENT_B, {
+    record: takerRecord([]), lease: LEASE,
+    // The first pass dies when the record would let go of the box: after the tell, before the pointer clear.
+    db: (db) => ({ ...db, put: async (store: string, v: any, key?: any) => {
+      if (key === BOX_KEY && dying && v?.machines && !v.machines.main) { dying = false; throw new Error("the object was evicted"); }
+      return db.put(store, v, key);
+    } }),
+  });
   p.o.caller = TAKER();
-  for (let i = 0; i < 2; i++) {
-    b.putRaw(`${SPLIT_PREFIX}${OLD_ID}`, earlier);
-    await logged(() => b.plugin.holds!.withdraw!(b.ctx));
-  }
+  // Outside any tool call, so nothing is delivered in between.
+  await logged(() => b.plugin.holds!.release(b.ctx, { reason: "idle" }) as Promise<unknown>);
+  must(b.main()?.boxId === OLD_ID && b.split(OLD_ID)?.told === true && b.queue().length === 1, `first pass: ${JSON.stringify([b.main(), b.split(OLD_ID), b.queue()])}`);
+  b.dropSplit(OLD_ID);
+  await logged(() => b.plugin.holds!.release(b.ctx, { reason: "idle" }) as Promise<unknown>);
   const rows = b.queue();
-  must(rows.length === 2 && rows[0].id !== rows[1].id && rows.every((r: any) => r.boxId === OLD_ID && r.outcome === "remains"),
+  must(rows.length === 2 && rows[0].id !== rows[1].id && rows.every((r: any) => r.boxId === OLD_ID && r.outcome === "split"),
     `queued: ${JSON.stringify(rows)}`);
+  must(b.main() === undefined, "the second pass did not let go of the box");
   const r: any = await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
-  must(count(JSON.stringify(r), REMAINS) === 2 && b.queue().length === 0, `delivered: ${r.note} | left ${b.queue().length}`);
+  must(count(JSON.stringify(r), NOT_OURS) === 2 && b.queue().length === 0, `delivered: ${r.note} | left ${b.queue().length}`);
   const again: any = await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
-  must(!JSON.stringify(again).includes(REMAINS), `said again: ${again.note}`);
+  must(!JSON.stringify(again).includes(NOT_OURS), `said again: ${again.note}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.ok ? "" : `\n    ${r.error}`}`);
