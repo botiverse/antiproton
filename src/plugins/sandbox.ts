@@ -192,7 +192,7 @@ interface ForeignBox {
   /** Removal rounds made over the pending items, as a set (`UNWIRE_ATTEMPTS`); why the last one failed. */
   attempts: number;
   lastError: string | null;
-  /** The agent's note about this split is queued (`noteLetGo`): set once, so finding the split again says nothing new. */
+  /** The agent's note about this split is queued (`updateSplit`): set once, so finding the split again says nothing new. */
   told?: true;
 }
 
@@ -758,9 +758,7 @@ function enqueueIn(tx: DbOperations, g: LetGo): void {
   const id = `${Date.now().toString(36)}-${[...crypto.getRandomValues(new Uint8Array(4))].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
   tx.put(BOX_STORE, [...owed, { ...g, id }] as unknown as Json, NOTICES_KEY);
 }
-const noteLetGo = async (ctx: PluginContext, g: LetGo) => {
-  await ctx.db.transaction([BOX_STORE], "readwrite", (tx) => enqueueIn(tx, g));
-};
+
 
 /** Every split this mount recorded, by box id. An entry that does not read is left out. */
 async function readForeign(ctx: PluginContext): Promise<Record<string, ForeignBox>> {
@@ -2895,10 +2893,13 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
   }
   /** Drops the notices a result has just carried, by their ids and only those: one owed meanwhile stays for the next. */
   async function delivered(ctx: PluginContext, ids: string[]): Promise<void> {
-    const v = await ctx.db.get(BOX_STORE, NOTICES_KEY);
-    const left = (Array.isArray(v) ? (v as LetGo[]) : []).filter((f) => !ids.includes(String(f.id)));
-    if (left.length) await ctx.db.put(BOX_STORE, left as unknown as Json, NOTICES_KEY);
-    else await ctx.db.delete(BOX_STORE, NOTICES_KEY);
+    // Read and written in one transaction, so a row a release queues meanwhile is never written over.
+    await ctx.db.transaction([BOX_STORE], "readwrite", (tx) => {
+      const v = tx.get(BOX_STORE, NOTICES_KEY);
+      const left = (Array.isArray(v) ? (v as LetGo[]) : []).filter((f) => !ids.includes(String(f.id)));
+      if (left.length) tx.put(BOX_STORE, left as unknown as Json, NOTICES_KEY);
+      else tx.delete(BOX_STORE, NOTICES_KEY);
+    });
   }
 
   const plugin: Plugin = {
