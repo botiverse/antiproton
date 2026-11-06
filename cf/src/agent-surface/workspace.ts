@@ -18,7 +18,7 @@
  * No caller's concepts either; the public API and the provider binding both call these.
  */
 
-import type { HeldListing, HeldRead } from "../../../src/plugins/types.ts";
+import type { HeldListing, HeldRead, NotShown } from "../../../src/plugins/types.ts";
 import { sha256Hex } from "../../../src/store/seed-files.ts";
 
 export const ROOTS = ["state", "artifacts", "sandbox"] as const;
@@ -36,6 +36,32 @@ export const NOT_RUNNING_TEXT =
   "The agent's container is not running, so its files cannot be shown.\n\n" +
   "A container is billed while it runs, and this view never starts one. Its files appear here the " +
   "next time the agent is using its container.\n";
+/** What `sandbox/` holds instead when the machine is not this agent's to show: no promise that files appear later. */
+export const NOT_AVAILABLE_FILE = "NOT_AVAILABLE.txt";
+export const OTHER_TEXT =
+  "This machine's files cannot be shown, because the machine belongs to another agent. " +
+  "It is no longer used for this agent. If that is unexpected, contact the operator.\n";
+export const UNCONFIRMED_TEXT =
+  "This machine's files cannot be shown, because the machine could not be confirmed as this agent's. " +
+  "It is no longer used for this agent. If that is unexpected, contact the operator.\n";
+/** When the agent has nothing here that could ever show files (no mount that does, or no agent): no promise either. */
+export const NO_FILES_TEXT = "This agent has no machine whose files can be shown here.\n";
+/** For an answer with no `why` this code knows (an object not yet updated during a deploy): no claim either way. */
+export const NEUTRAL_TEXT = "This machine's files cannot be shown right now.\n";
+
+/** The one file `sandbox/` holds when no files are shown. `why` is read as unknown: an older object may send none. */
+function notShownFile(why: NotShown | undefined): { name: string; text: string } {
+  switch (why) {
+    case "none": return { name: NOT_RUNNING_FILE, text: NOT_RUNNING_TEXT };
+    case "no_files": case "no_agent": return { name: NOT_RUNNING_FILE, text: NO_FILES_TEXT };
+    case "other": return { name: NOT_AVAILABLE_FILE, text: OTHER_TEXT };
+    case "unconfirmed": return { name: NOT_AVAILABLE_FILE, text: UNCONFIRMED_TEXT };
+    default: {
+      const _exhaustive: undefined = why;
+      return { name: NOT_RUNNING_FILE, text: NEUTRAL_TEXT };
+    }
+  }
+}
 
 /** What the agent's sealed secrets are named in the store (src/runtime/secrets.ts KEPT_PREFIX). */
 const SECRET_PREFIX = "kept:";
@@ -178,7 +204,8 @@ export async function workspaceList(
   const box = await deps.sandbox.list(tenantId, agentId, p.segs.join("/"));
   if (!box.running) {
     if (p.segs.length) return notFound(base);
-    return { ok: true, files: [node(`sandbox/${NOT_RUNNING_FILE}`, NOT_RUNNING_FILE, false, new TextEncoder().encode(NOT_RUNNING_TEXT).byteLength, 0)] };
+    const f = notShownFile((box as { why?: NotShown }).why);
+    return { ok: true, files: [node(`sandbox/${f.name}`, f.name, false, new TextEncoder().encode(f.text).byteLength, 0)] };
   }
   if (!box.found) {
     return box.notDirectory ? { ok: false, status: 400, param: "dirPath", message: `${base.slice(0, -1)} is a file, not a directory` } : notFound(base);
@@ -278,7 +305,8 @@ export async function workspaceRead(
 
   const got = await deps.sandbox.read(tenantId, agentId, p.segs.join("/"), READ_MAX_BYTES);
   if (!got.running) {
-    if (p.segs.length === 1 && name === NOT_RUNNING_FILE) return { ok: true, file: asRead(new TextEncoder().encode(NOT_RUNNING_TEXT), name) };
+    const f = notShownFile((got as { why?: NotShown }).why);
+    if (p.segs.length === 1 && name === f.name) return { ok: true, file: asRead(new TextEncoder().encode(f.text), name) };
     return notFound(shownPath);
   }
   if (!got.found) return notFound(shownPath);
