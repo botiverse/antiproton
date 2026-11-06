@@ -360,7 +360,10 @@ await check("a record naming this agent's own box from before the fix keeps it: 
 });
 
 /** What the agent is told when its machine's box is listed with no description (`owner_unknown`): never "another agent's". */
-const UNCONFIRMED = "This machine could not be confirmed as yours, so it is no longer used and nothing was sent to it; there is nothing for you to do.";
+const UNCONFIRMED = "This machine could not be confirmed as yours, so it is no longer used and nothing was sent to it; nothing you had on it is here, and there is nothing for you to do.";
+/** The same, where the split took this mount's own registrations off the box. */
+const UNCONFIRMED_SENT = "This machine could not be confirmed as yours, so it is no longer used and nothing was sent to it but the removal of " +
+  "this mount's own account registrations; nothing you had on it is here, and there is nothing for you to do.";
 
 /** Asserts the split of a box listed with no description: recorded, said once as `owner_unknown`, never recorded as ours. */
 function unknownSplit(m: ReturnType<typeof mountOf>, lines: string[]) {
@@ -403,7 +406,7 @@ await check("a named machine's box listed with no description: its own sentence,
   p.o.caller = a.owner;
   const r: any = await a.plugin.invoke("shell", { command: "ls", machine: "build" }, a.ctx);
   const text = JSON.stringify(r);
-  must(text.includes(`Machine \\"build\\" could not be confirmed as yours, so it is no longer used and nothing was sent to it but the removal of this mount's own account registrations; there is nothing for you to do.`),
+  must(text.includes(`Machine \\"build\\" could not be confirmed as yours, so it is no longer used and nothing was sent to it but the removal of this mount's own account registrations; nothing you had on it is here, and there is nothing for you to do.`),
     `the sentence: ${text}`);
   must(!/another agent/.test(text) && a.split(OLD_ID)?.reason === "owner_unknown", `${text} ${JSON.stringify(a.split(OLD_ID))}`);
   must(p.lifecycle(OLD_ID).length === 0 && p.crossings.length === 0 && !(p.secrets.get(OLD_ID) ?? []).some((x) => x.secret_id === sid),
@@ -1495,6 +1498,25 @@ const onSplitTx = (before: (n: number, tx: any) => void) => (db: any) => {
   }) };
 };
 const missingLogged = (lines: string[]) => lines.filter((l) => l.includes('"code":"split_record_missing"') && l.includes(OLD_ID)).length;
+
+await check("an unknown box's entry gone after the split's round and before it is told: the note still says the removal was sent", async () => {
+  const p = run9Project();
+  p.put(OLD_ID, OWNER(), null);
+  const sid = p.register(OLD_ID, "GH_TOKEN", "taker-token", TAKER());
+  const b = mountOf(TENANT, AGENT_B, {
+    record: takerRecord([wiring([{ name: "GH_TOKEN", id: sid }])]),
+    // The third split transaction is the tell: the entry is gone there, so it is rebuilt with no rounds counted.
+    db: onSplitTx((n, tx) => { if (n === 3) tx.delete(BOX_STORE, `${SPLIT_PREFIX}${OLD_ID}`); }),
+  });
+  p.o.caller = TAKER();
+  const call = await logged(() => b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>);
+  must(call.error === undefined, `the call failed: ${call.error}`);
+  must(removalsOf(p).length === 1 && missingLogged(call.lines) === 1, `round or rebuild: ${removalsOf(p).length} ${JSON.stringify(call.lines)}`);
+  must(b.split(OLD_ID)?.reason === "owner_unknown" && b.split(OLD_ID)?.attempts === 0, `rebuilt: ${JSON.stringify(b.split(OLD_ID))}`);
+  const text = JSON.stringify(call.value);
+  must(count(text, UNCONFIRMED_SENT) === 1 && !text.includes(UNCONFIRMED), `the sentence: ${text}`);
+  must(p.lifecycle(OLD_ID).length === 0, `requests on the box: ${JSON.stringify(p.lifecycle(OLD_ID))}`);
+});
 
 await check("an earlier-shape entry found on the split path gets its items from its own ids, never from the wiring as it is now", async () => {
   const { p, takerSecret } = sharedBox();

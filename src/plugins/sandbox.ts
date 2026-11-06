@@ -725,20 +725,17 @@ function ownDescriptions(caller: { tenantId: string; agentId: string }): string[
 }
 
 /**
- * A box the record named turned out to be another agent's, or could not be shown to be this agent's (`unconfirmed`):
- * the record no longer names it, and nothing was sent to the box itself.
+ * A box the record named turned out to be another agent's, or could not be shown to be this agent's: the record no
+ * longer names it, and nothing was sent to the box itself. Every caller catches it by class; its message is not what
+ * the agent is told (that is the note, `notOursNote`).
  */
 export class BoxNotOurs extends Error {
   readonly boxId: string;
   readonly machine: string | null;
-  readonly unconfirmed: boolean;
-  constructor(boxId: string, machine: string | null, unconfirmed = false) {
-    super(unconfirmed
-      ? `box ${boxId} could not be confirmed as this agent's, so this mount no longer uses it; nothing was sent to it`
-      : `box ${boxId} was made for another agent, so this mount no longer uses it; nothing was sent to it`);
+  constructor(boxId: string, machine: string | null) {
+    super(`box ${boxId} was made for another agent, so this mount no longer uses it; nothing was sent to it`);
     this.boxId = boxId;
     this.machine = machine;
-    this.unconfirmed = unconfirmed;
   }
 }
 
@@ -1021,7 +1018,7 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
     // (`retryForeign`) and otherwise kept as residue for a person, and said in the call's result.
     if (look) {
       // Nothing written and nothing removed: the agent's next call does both, and tells the agent why.
-      throw new BoxNotOurs(id, machine, unconfirmed);
+      throw new BoxNotOurs(id, machine);
     }
     // A machine's record or a stranded box's: the same split either way, and only if the record still names it.
     const held: (MachineState & { wired?: Wired[] }) | undefined = machine !== null
@@ -1076,8 +1073,11 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
       //    (which would leave the note never sent).
       let missing = false;
       const rebuilt = () => { missing = true; return fresh(entry.detectedAt); };
+      // Whether this call sent the box a removal round: an entry rebuilt below starts at no rounds, yet this one was sent.
+      let sentHere = false;
       if (entry.unwire === "pending") {
         const round = await sendRound(inner, entry);
+        sentHere = round.sent.length > 0;
         // A round that gives up on a split already told is a new event, told as one with the entry that records it;
         // one not told yet is told below with what it now holds.
         const done = await updateSplit(ctx, id, (stored) => {
@@ -1094,7 +1094,10 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
         const base = settledEntry(stored) ?? rebuilt();
         if (base.told) return { next: base };
         const states = { pending: base.remaining.some((r) => r.state === "pending"), residue: base.remaining.some((r) => r.state === "residue") };
-        const about = base.reason === "owner_unknown" ? { unconfirmed: true, sent: base.attempts > 0 } : {};
+        // `sent` from what is known to have happened, never from `base` alone, which may be an entry rebuilt with no
+        // rounds counted: this call's own round, or rounds the stored entry counts.
+        const sent = sentHere || (settledEntry(stored)?.attempts ?? 0) > 0;
+        const about = base.reason === "owner_unknown" ? { unconfirmed: true, sent } : {};
         return { next: { ...base, told: true }, note: { boxId: id, machine, outcome: "split", ...states, ...about } };
       });
       if (missing) say("split_record_missing", id, machine);
@@ -1117,7 +1120,7 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
         }
       }
     }
-    throw new BoxNotOurs(id, machine, unconfirmed);
+    throw new BoxNotOurs(id, machine);
   };
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(inner)) if (typeof v === "function") out[k] = v.bind(inner);
@@ -2950,7 +2953,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     const found = Array.isArray(v) ? (v as LetGo[]) : [];
     if (!found.length) return null;
     const text = found.map((f) => {
-      // A box that could not be shown to be the agent's is never said to be another agent's: that is not known.
+      // The wording the agent sees about a box let go of is produced here only: `BoxNotOurs`'s message is not
+      // agent-facing. A box that could not be shown to be the agent's is never said to be another agent's: that is not known.
       const where = f.unconfirmed ? "a machine that could not be confirmed as yours" : "a machine that belonged to another agent";
       if (f.outcome === "given_up") {
         return `Taking this mount's accounts off ${where} failed three times, so some of ` +
@@ -2967,11 +2971,13 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         ].filter(Boolean).join(" ");
       }
       // Each state the set held at the split, said once: a set with items of both kinds says both.
+      // The two sentences differ only in the cause ("could not be confirmed as yours" against "belonged to another
+      // agent"), never in what the agent lost: "nothing you had on it is here" in both.
       const lead = f.unconfirmed
         // "Nothing was sent" only where it is so: a split that took this mount's own registrations off sent those.
         ? `${f.machine === MAIN_MACHINE ? "This machine" : `Machine "${f.machine}"`} could not be confirmed as yours, so it is no longer used and ` +
           (f.sent ? "nothing was sent to it but the removal of this mount's own account registrations" : "nothing was sent to it") +
-          "; there is nothing for you to do."
+          "; nothing you had on it is here, and there is nothing for you to do."
         : `${f.machine === MAIN_MACHINE ? "The machine" : `Machine "${f.machine}"`} you were using belonged to another agent, so it was left to them; nothing you had on it is here.`;
       return lead
         + (f.pending ? " Some of this mount's account registrations on that machine were not removed at the time; there is nothing for you to do." : "")
