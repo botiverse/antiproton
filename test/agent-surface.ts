@@ -108,7 +108,7 @@ function fakeSurface(opts: { now?: number } = {}) {
     sandbox: {
       async list(tenantId, agentId, path): Promise<SandboxList> {
         sandboxCalls.push(`list ${tenantId}/${agentId} ${path}`);
-        if (!sandbox.running) return { running: false };
+        if (!sandbox.running) return { running: false, why: "none" };
         if (sandbox.fail) throw new Error(sandbox.fail);
         if (sandbox.files.has(path)) return { running: true, found: false, notDirectory: true };
         if (!sandbox.dirs.has(path)) return { running: true, found: false };
@@ -120,7 +120,7 @@ function fakeSurface(opts: { now?: number } = {}) {
       },
       async read(tenantId, agentId, path, maxBytes): Promise<SandboxRead> {
         sandboxCalls.push(`read ${tenantId}/${agentId} ${path}`);
-        if (!sandbox.running) return { running: false };
+        if (!sandbox.running) return { running: false, why: "none" };
         if (sandbox.fail) throw new Error(sandbox.fail);
         if (sandbox.dirs.has(path)) return { running: true, found: true, kind: "directory", size: 0, modifiedAt: T0, bytes: null };
         if (sandbox.others?.has(path)) return { running: true, found: true, kind: "other", size: 0, modifiedAt: T0, bytes: null };

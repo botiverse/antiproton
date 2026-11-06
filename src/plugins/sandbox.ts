@@ -1,5 +1,5 @@
 import type { Json, MountRecord } from "../core/types.ts";
-import type { CredentialRefKind, DbOperations, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm, ToolSchema, Withdrawal } from "./types.ts";
+import type { CredentialRefKind, DbOperations, HeldFiles, NotShown, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm, ToolSchema, Withdrawal } from "./types.ts";
 import { Backgrounded, backgrounded, identityNote, KeyRange, LEASE_KEY, markIdentity, markReleased, releaseRetryMs } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
@@ -732,10 +732,21 @@ function ownDescriptions(caller: { tenantId: string; agentId: string }): string[
 export class BoxNotOurs extends Error {
   readonly boxId: string;
   readonly machine: string | null;
-  constructor(boxId: string, machine: string | null) {
-    super(`box ${boxId} was made for another agent, so this mount no longer uses it; nothing was sent to it`);
+  /**
+   * Which of the three it was: made for another agent (`other`), listed with no description so it cannot be shown to
+   * be this agent's (`unconfirmed`), or not named by this mount's record at all (`unnamed`). Read by a look
+   * (`awakeBox`), which says which in its answer (`NotShown`); the agent is told by the note, not by this.
+   */
+  readonly why: "other" | "unconfirmed" | "unnamed";
+  constructor(boxId: string, machine: string | null, why: "other" | "unconfirmed" | "unnamed") {
+    super(why === "unconfirmed"
+      ? `box ${boxId} could not be confirmed as this agent's, so this mount no longer uses it; nothing was sent to it`
+      : why === "unnamed"
+        ? `box ${boxId} is not named by this mount's record; nothing was sent to it`
+        : `box ${boxId} was made for another agent, so this mount no longer uses it; nothing was sent to it`);
     this.boxId = boxId;
     this.machine = machine;
+    this.why = why;
   }
 }
 
@@ -989,7 +1000,7 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
     const mount = await readMount(ctx);
     const machine = Object.keys(mount?.machines ?? {}).find((n) => mount!.machines[n]!.boxId === id) ?? null;
     const stranded = machine === null ? mount?.stranded?.[id] : undefined;
-    if (machine === null && !stranded) throw new BoxNotOurs(id, null);
+    if (machine === null && !stranded) throw new BoxNotOurs(id, null, "unnamed");
     if ((machine !== null ? mount!.machines[machine]! : stranded!).ownerChecked) { shown.add(id); return; }
     const owner = await inner.ownerOf(id, ownDescriptions(ctx.caller));
     // Not there: nothing can be sent to another's box under this id, and the request fails as it always has.
@@ -1018,7 +1029,7 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
     // (`retryForeign`) and otherwise kept as residue for a person, and said in the call's result.
     if (look) {
       // Nothing written and nothing removed: the agent's next call does both, and tells the agent why.
-      throw new BoxNotOurs(id, machine);
+      throw new BoxNotOurs(id, machine, unconfirmed ? "unconfirmed" : "other");
     }
     // A machine's record or a stranded box's: the same split either way, and only if the record still names it.
     const held: (MachineState & { wired?: Wired[] }) | undefined = machine !== null
@@ -1120,7 +1131,7 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
         }
       }
     }
-    throw new BoxNotOurs(id, machine);
+    throw new BoxNotOurs(id, machine, unconfirmed ? "unconfirmed" : "other");
   };
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(inner)) if (typeof v === "function") out[k] = v.bind(inner);
@@ -2449,12 +2460,12 @@ type Box = { boxId: string; cfg: ReturnType<typeof cfgOf>; provider: SandboxProv
 
 /**
  * The main machine's box, only if it is running by both records: this mount's own (a box, not
- * switched off by the idle lease) and the provider's, read without starting anything. Null for
- * anything less, without a call to the provider when our own record already says no.
+ * switched off by the idle lease) and the provider's, read without starting anything. For anything
+ * less, why not (`NotShown`), without a call to the provider when our own record already says no.
  */
-async function awakeBox(ctx: PluginContext, deadline: number): Promise<Box | null> {
+async function awakeBox(ctx: PluginContext, deadline: number): Promise<Box | { why: NotShown }> {
   const box = (await readMount(ctx))?.machines[MAIN_MACHINE];
-  if (!box?.boxId || parkedAt(box) !== null || !ctx.credential) return null;
+  if (!box?.boxId || parkedAt(box) !== null || !ctx.credential) return { why: "none" };
   const cfg = cfgOf(ctx);
   // Never woken from here: a look at a box that is not running answers "not running".
   const b: Box = { boxId: box.boxId, cfg, provider: openProvider(cfg, ctx, { wake: false, look: true }), deadline };
@@ -2462,11 +2473,12 @@ async function awakeBox(ctx: PluginContext, deadline: number): Promise<Box | nul
   try {
     state = await b.provider.status(box.boxId, { deadline });
   } catch (e) {
-    // Another agent's box: this mount has no machine running, so there is nothing to look at.
-    if (e instanceof BoxNotOurs) return null;
+    // Not this agent's box, or not shown to be: its files are not this agent's to show, and the answer says which.
+    // One the record no longer names (it changed in between) is simply no machine.
+    if (e instanceof BoxNotOurs) return { why: e.why === "unnamed" ? "none" : e.why };
     throw e;
   }
-  return state === "running" ? b : null;
+  return state === "running" ? b : { why: "none" };
 }
 
 /**
@@ -2550,9 +2562,9 @@ const sandboxFiles: HeldFiles = {
     // Behind the lock: deciding the box is awake, and starting the command on it. The wait is not.
     const started = await locked(async () => {
       const box = await awakeBox(ctx, deadline);
-      return box ? { box, execId: await startLook(box, LIST_SCRIPT, boxPathOf(box.cfg, path)) } : null;
+      return "boxId" in box ? { box, execId: await startLook(box, LIST_SCRIPT, boxPathOf(box.cfg, path)) } : box;
     });
-    if (!started) return { running: false };
+    if (!("box" in started)) return { running: false, why: started.why };
     const got = await finishLook(started.box, started.execId);
     if (got.exit === 3 || got.exit === 4) return { running: true, found: false };
     if (got.exit === 5) return { running: true, found: false, notDirectory: true };
@@ -2562,9 +2574,9 @@ const sandboxFiles: HeldFiles = {
     const deadline = Date.now() + LOOK_READ_MS;
     const started = await locked(async () => {
       const box = await awakeBox(ctx, deadline);
-      return box ? { box, execId: await startLook(box, STAT_SCRIPT, boxPathOf(box.cfg, path)) } : null;
+      return "boxId" in box ? { box, execId: await startLook(box, STAT_SCRIPT, boxPathOf(box.cfg, path)) } : box;
     });
-    if (!started) return { running: false };
+    if (!("box" in started)) return { running: false, why: started.why };
     const got = await finishLook(started.box, started.execId);
     if (got.exit !== 0) return { running: true, found: false };
     const m = FIND_LINE.exec(got.out.split("\n")[0] ?? "");
@@ -2578,11 +2590,11 @@ const sandboxFiles: HeldFiles = {
     // that went to sleep in between may wake it, and the body is read no further than the cap.
     const body = await locked(async () => {
       const box = await awakeBox(ctx, deadline);
-      if (!box) return null;
+      if (!("boxId" in box)) return box;
       const res = await box.provider.download(box.boxId, real, { timeoutMs: Math.max(1, deadline - Date.now()) });
       return readCapped(res, maxBytes);
     });
-    if (!body) return { running: false };
+    if ("why" in body) return { running: false, why: body.why };
     return { running: true, found: true, kind, size: body.bytes ? body.seen : Math.max(size, body.seen), modifiedAt, bytes: body.bytes };
   },
 };
@@ -3656,6 +3668,11 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // Recorded before anything else can fail: the box exists and is billed, so
       // a registration that throws must not leave it with no record naming it.
       // The record gains each placeholder only once the provider has accepted it.
+      // `ownerChecked: true` means the box's owner need not be asked again: here because this mount just made it, or
+      // where `owns()` judged a box `ours`. It is not evidence that an ownership check was made: `owns()` uses it to
+      // skip the check, and a call uses its absence to decide to ask. To count old records that were checked, count
+      // `ownerChecked=true` among boxes whose `createdAt` is before the build that writes it; give the field a third
+      // reason to be written and it must be split first.
       state = {
         boxId: made.id, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [], ownerChecked: true,
         ...(made.deleteAt !== undefined ? { deleteAt: made.deleteAt } : {}),

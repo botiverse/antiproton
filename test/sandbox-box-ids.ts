@@ -26,7 +26,7 @@ import { ToolGateway } from "../src/runtime/gateway.ts";
 /** Which of two concurrent calls a request was made by, for the gated cases. */
 const whichCall = new AsyncLocalStorage<string>();
 import type { BoxLease } from "../src/plugins/sandbox.ts";
-import type { PluginTraceRow } from "../src/plugins/types.ts";
+import type { NotShown, PluginTraceRow } from "../src/plugins/types.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
@@ -524,6 +524,55 @@ await check("the same entry points, from the box's own agent: each does reach it
     if (p.crossings.length) missed.push(`${name} crossed: ${JSON.stringify(p.crossings)}`);
   }
   must(missed.length === 0, `never reached its own box: ${missed.join(", ")}`);
+});
+
+// ---- what a look answers when it shows nothing (#1175)
+
+/**
+ * Every `NotShown` value and who answers it, so a sixth value fails to compile here until someone says where it comes
+ * from. The sandbox's look answers three; the gateway (`no_files`) and the agent object (`no_agent`) answer the others.
+ */
+/**
+ * The negative answer exactly: `running: false` with this `why` and no other key (a key present with no value counts),
+ * in any key order. Exact on purpose: the answer's shape is the contract's, and a key added to it should make this fail.
+ */
+const isNo = (r: unknown, why: NotShown) => {
+  const o = r as Record<string, unknown> | null;
+  return !!o && JSON.stringify(Object.keys(o).sort()) === '["running","why"]' && o.running === false && o.why === why;
+};
+
+const NOT_SHOWN_FROM: Record<NotShown, "sandbox look" | "gateway" | "agent object"> = {
+  none: "sandbox look", other: "sandbox look", unconfirmed: "sandbox look", no_files: "gateway", no_agent: "agent object",
+};
+
+await check("a look that shows no files says which kind of no: another agent's box, one not confirmed as this agent's, or no machine", async () => {
+  // The contract's one negative answer used to be `{ running: false }` for all three, so a person looking at the files
+  // of a machine that was running, but not this agent's, was told it was not running.
+  const got: string[] = [];
+  for (const [label, put, why] of [
+    ["another agent's box", (p: ReturnType<typeof run9Project>) => p.put(OLD_ID, `${TENANT}/${AGENT_B}`), "other"],
+    ["a box listed with no description", (p: ReturnType<typeof run9Project>) => p.put(OLD_ID, `${TENANT}/${AGENT_B}`, null), "unconfirmed"],
+  ] as const) {
+    const p = run9Project();
+    put(p);
+    const a = mountOf(TENANT, AGENT_A, { record: recordFor(OLD_ID) });
+    p.o.caller = a.owner;
+    const list = (await logged(() => a.plugin.holds!.files!.list(a.ctx, "", (fn) => fn()))).value;
+    const read = (await logged(() => a.plugin.holds!.files!.read(a.ctx, "out.txt", 1024, (fn) => fn()))).value;
+    for (const r of [list, read]) if (!isNo(r, why)) got.push(`${label}: ${JSON.stringify(r)}`);
+    if (p.crossings.length) got.push(`${label}: crossed ${JSON.stringify(p.crossings.map((c) => c.path))}`);
+  }
+  // No machine at all: nothing to ask the provider, and the plain "none".
+  const p = run9Project();
+  const none = mountOf(TENANT, AGENT_A);
+  p.o.caller = none.owner;
+  const list = await none.plugin.holds!.files!.list(none.ctx, "", (fn) => fn());
+  if (!isNo(list, "none")) got.push(`no machine: ${JSON.stringify(list)}`);
+  // Each value the sandbox answers was reached above, by a case that asserts it in full (`why` included, so a path never
+  // taken cannot pass as a right answer).
+  const answered = new Set(["other", "unconfirmed", "none"]);
+  for (const [v, from] of Object.entries(NOT_SHOWN_FROM)) if (from === "sandbox look" && !answered.has(v)) got.push(`${v}: no case`);
+  must(got.length === 0, got.join("\n    "));
 });
 
 // ---- the call site, and both halves of the owner

@@ -434,8 +434,8 @@ await check("a context that serves no operation has no operationId: prompt, hold
       async usage(c) { note("usage", c); return []; },
       async release(c) { note("release", c); },
       files: {
-        async list(c) { note("files.list", c); return { running: false }; },
-        async read(c) { note("files.read", c); return { running: false }; },
+        async list(c) { note("files.list", c); return { running: false, why: "none" }; },
+        async read(c) { note("files.read", c); return { running: false, why: "none" }; },
       },
     },
     background: {

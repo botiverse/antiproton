@@ -137,7 +137,7 @@ await check("state rows come back without the agent's sealed secrets, and a secr
   const deps: WorkspaceDeps = {
     state: { list: (t, a, p, l) => stateList(rt, t, a, p, l), get: (t, a, k) => stateGet(rt, t, a, k) },
     artifacts: { list: async () => ({ objects: [], prefixes: [] }), head: async () => null, get: async () => null },
-    sandbox: { list: async () => ({ running: false }), read: async () => ({ running: false }) },
+    sandbox: { list: async () => ({ running: false, why: "none" }), read: async () => ({ running: false, why: "none" }) },
   };
   const listed = await workspaceList(deps, T, A, "state/", true);
   must(listed.ok && !JSON.stringify(listed).includes("kept"), JSON.stringify(listed));

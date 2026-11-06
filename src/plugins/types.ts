@@ -1967,7 +1967,7 @@ export interface Holding {
   /**
    * The files of the thing held, for a person looking at the agent's workspace (cf/src/agent-surface/
    * workspace.ts). Only while it is already running: **neither method may start it**, since starting is
-   * what is billed. Not running answers `{ running: false }` and touches nothing at the far end.
+   * what is billed. Not running answers `{ running: false, why }` (`NotShown`) and touches nothing at the far end.
    *
    * The gateway hands them the mount's own lock (`ToolGateway.heldFiles`), so a release cannot switch
    * the thing off between the plugin's "it is running" and the step that reads it. They must not write
@@ -1979,8 +1979,22 @@ export interface Holding {
   files?: HeldFiles;
 }
 
+/**
+ * Why a look shows no files, for the one answer the contract has for "nothing to show". Required, so no answer can
+ * leave a person to guess between a machine that is merely not running and one that is not this agent's to show:
+ * - `none`: this mount's own record has no running machine (none made, switched off, or the provider says it is
+ *   not running).
+ * - `no_files`: no mount of the agent can show files (`ToolGateway.heldFiles`).
+ * - `no_agent`: there is no such agent here.
+ * - `other`: the machine the record named was made for another agent, so it is not this agent's to show.
+ * - `unconfirmed`: the machine the record named could not be shown to be this agent's (listed with no description).
+ * Only the last two call for words of their own (why no files are shown, and that an operator can look into it);
+ * neither names the other owner. Readers still decide on `running` first: `why` only says which kind of no.
+ */
+export type NotShown = "none" | "no_files" | "no_agent" | "other" | "unconfirmed";
+
 export type HeldListing =
-  | { running: false }
+  | { running: false; why: NotShown }
   | { running: true; found: false; notDirectory?: true }
   | {
     running: true; found: true;
@@ -1995,7 +2009,7 @@ export type HeldListing =
  * than the `maxBytes` asked for; `size` is still reported.
  */
 export type HeldRead =
-  | { running: false }
+  | { running: false; why: NotShown }
   | { running: true; found: false }
   | { running: true; found: true; kind: "file" | "directory" | "other"; size: number; modifiedAt: number; bytes: Uint8Array | null };
 

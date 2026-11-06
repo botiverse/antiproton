@@ -1047,7 +1047,7 @@ export class ToolGateway {
 
   /**
    * The files of what the agent's first file-showing mount holds (`Holding.files`), for a person
-   * looking at its workspace. `{ running: false }` when no mount can show any.
+   * looking at its workspace. `{ running: false, why: "no_files" }` when no mount can show any.
    *
    * The plugin is handed the mount's own lock, the one a call and a release take, for the steps where
    * its "it is running" and the read it starts must not be split by a release — which would leave the
@@ -1070,7 +1070,7 @@ export class ToolGateway {
       const locked = <T>(fn: () => Promise<T>): Promise<T> => (isExclusive(plugin) ? this.#onMount(key, fn) : fn());
       return op.op === "list" ? files.list(pctx, op.path, locked) : files.read(pctx, op.path, op.maxBytes, locked);
     }
-    return { running: false };
+    return { running: false, why: "no_files" };
   }
 
   /** The context `activity` and `usage` are asked in: the mount's own database, and no credential. */

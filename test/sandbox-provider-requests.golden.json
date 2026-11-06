@@ -1860,7 +1860,8 @@
   {
    "step": "list with no box",
    "result": {
-    "running": false
+    "running": false,
+    "why": "none"
    }
   },
   {
@@ -2155,7 +2156,8 @@
   {
    "step": "list when run9 does not list it",
    "result": {
-    "running": false
+    "running": false,
+    "why": "none"
    }
   }
  ],

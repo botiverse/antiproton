@@ -1171,7 +1171,8 @@
   {
    "step": "the workspace view does not wake it",
    "result": {
-    "running": false
+    "running": false,
+    "why": "none"
    }
   },
   {

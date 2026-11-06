@@ -2448,7 +2448,7 @@ export class AgentDO extends DurableObject<Env> {
 
   /** The files the agent's container holds, only while it is already running; never starts it. */
   async surfaceHeldFiles(tenantId: string, agentId: string, op: { op: "list"; path: string } | { op: "read"; path: string; maxBytes: number }) {
-    if (!this.#isAgent(tenantId, agentId)) return { running: false as const };
+    if (!this.#isAgent(tenantId, agentId)) return { running: false as const, why: "no_agent" as const };
     return surfaceHeldFiles(this.runtime(), tenantId, agentId, op);
   }
 
