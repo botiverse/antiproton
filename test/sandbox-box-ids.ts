@@ -1148,6 +1148,13 @@ for (const order of ["first released first", "second released first"] as const) 
     p.o.script.set(B, [true, false]);
     const b = mountOf(TENANT, AGENT_B, {
       record: takerRecord([wiring([{ name: "GH_A", id: A }, { name: "GH_B", id: B }, { name: "GH_LEGACY", id: null }])]), lease: LEASE,
+      // Storage that answers a read a little later, as a durable object's may: a read awaited apart from the write it
+      // decides leaves room for the other call's write in between.
+      db: (db) => ({ ...db, get: async (st: string, k: any) => {
+        const v = await db.get(st, k);
+        if (typeof k === "string" && k.startsWith(SPLIT_PREFIX)) await new Promise((r) => setTimeout(r, 3));
+        return v;
+      } }),
     });
     p.o.caller = TAKER();
     let releaseFirst: () => void = () => {};
