@@ -176,8 +176,11 @@ interface ForeignBox {
   /** The mount and machine whose record named it. */
   mount: string;
   machine: string | null;
-  /** Why it is not this mount's: made for another agent. */
-  reason: "foreign_owner";
+  /**
+   * Why it is not this mount's: made for another agent (`foreign_owner`), or listed with no description, so it cannot
+   * be shown to be this agent's (`owner_unknown`).
+   */
+  reason: "foreign_owner" | "owner_unknown";
   /**
    * Every account registration this mount had made there, by name, as found at the split and never changed: the most
    * that can have been exposed, for reports. Null where the record could not say (`Wired.names` null).
@@ -721,14 +724,21 @@ function ownDescriptions(caller: { tenantId: string; agentId: string }): string[
   return [boxDescriptionOf(caller), `agent-harness ${caller.tenantId}/${caller.agentId}`];
 }
 
-/** A box the record named turned out to be another agent's: the record no longer names it, and nothing was sent. */
+/**
+ * A box the record named turned out to be another agent's, or could not be shown to be this agent's (`unconfirmed`):
+ * the record no longer names it, and nothing was sent to the box itself.
+ */
 export class BoxNotOurs extends Error {
   readonly boxId: string;
   readonly machine: string | null;
-  constructor(boxId: string, machine: string | null) {
-    super(`box ${boxId} was made for another agent, so this mount no longer uses it; nothing was sent to it`);
+  readonly unconfirmed: boolean;
+  constructor(boxId: string, machine: string | null, unconfirmed = false) {
+    super(unconfirmed
+      ? `box ${boxId} could not be confirmed as this agent's, so this mount no longer uses it; nothing was sent to it`
+      : `box ${boxId} was made for another agent, so this mount no longer uses it; nothing was sent to it`);
     this.boxId = boxId;
     this.machine = machine;
+    this.unconfirmed = unconfirmed;
   }
 }
 
@@ -745,6 +755,10 @@ type LetGo = {
   /** `split` when the record let go of it, with which item states its set holds; or a later turn of its removal. */
   outcome: "split" | "given_up" | "remains";
   pending?: boolean; residue?: boolean;
+  /** The box could not be shown to be this agent's (`ForeignBox.reason` `owner_unknown`), so no note says whose it was. */
+  unconfirmed?: boolean;
+  /** At a split: a removal of this mount's own registrations was sent to the box, so "nothing was sent" is not said. */
+  sent?: boolean;
 };
 /**
  * Kept in the mount's own storage until a tool's result has carried it: a split is often found outside any tool call
@@ -845,7 +859,7 @@ const gaveUpNote = (stored: ForeignBox | undefined, next: ForeignBox, machine: s
   if (!stored?.told) return undefined;
   const wasPending = new Set(stored.remaining.filter((r) => r.state === "pending").map((r) => r.id));
   const givenUp = next.remaining.some((r) => r.state === "residue" && wasPending.has(r.id));
-  return givenUp ? { boxId: next.box, machine, outcome: "given_up" } : undefined;
+  return givenUp ? { boxId: next.box, machine, outcome: "given_up", ...(next.reason === "owner_unknown" ? { unconfirmed: true } : {}) } : undefined;
 };
 
 /**
@@ -956,12 +970,11 @@ type OwnedProvider = SandboxProvider & {
  *
  * A box is this agent's when this provider just created or adopted it, when its record already says it was shown to
  * be (`ownerChecked`), or when the provider says so now (`SandboxProvider.ownerOf`), which is then written to the
- * record so it is asked once per box. A box the provider lists with no description is kept and said once
- * (`owner_unknown`): every create has sent one, so none is expected, and dropping the machine of an agent that may
- * well own it is the worse mistake. One made for another agent is never sent anything, not even a stop or a
+ * record so it is asked once per box. One made for another agent is never sent anything, not even a stop or a
  * delete: the record stops naming it (its sessions and kept environments stay), the fact is written as a
  * `sandbox.box_owner` trace row and a log line with `code: "box_not_ours"`, and `BoxNotOurs` is thrown for the
- * caller to carry on without it. An answer that cannot be read is thrown as it came: nothing is sent to a box that
+ * caller to carry on without it. A box the provider lists with no description (`unknown`) goes the same way, said
+ * as `owner_unknown`: see the comment in `owns`. An answer that cannot be read is thrown as it came: nothing is sent to a box that
  * has not been shown to be ours. An id the record does not name at all is refused the same way.
  *
  * A `look` (a person viewing the machine's files) writes nothing, as a look never does: it neither records what it
@@ -972,7 +985,7 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
   const say = (code: "box_not_ours" | "owner_unknown" | "unwire_given_up" | "split_record_missing", boxId: string, machine: string | null, more: Record<string, string> = {}) => {
     const attrs = { code, tenant: ctx.caller.tenantId, agent: ctx.caller.agentId, mount: ctx.alias, machine, box: boxId, ...more };
     console.log(JSON.stringify({ event: "sandbox.box_owner", ...attrs }));
-    ctx.trace?.({ kind: "sandbox.box_owner", status: code, verdict: code === "owner_unknown" ? "ok" : code === "split_record_missing" ? "failed" : "blocked", attrs });
+    ctx.trace?.({ kind: "sandbox.box_owner", status: code, verdict: code === "split_record_missing" ? "failed" : "blocked", attrs });
   };
   const owns = async (id: string): Promise<void> => {
     if (shown.has(id) || !inner.ownerOf) return;
@@ -984,8 +997,15 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
     const owner = await inner.ownerOf(id, ownDescriptions(ctx.caller));
     // Not there: nothing can be sent to another's box under this id, and the request fails as it always has.
     if (owner === "gone") return;
-    if (owner === "ours" || owner === "unknown") {
-      if (owner === "unknown" && !look) say("owner_unknown", id, machine);
+    // A box listed with no description is not shown to be ours, so it is let go of exactly as another's is, and
+    // never recorded as ours (`ownerChecked`). Every create of every build has sent a description in the create
+    // request itself (`agent-harness …` from the first sandbox commit, 6d4f2a85, `antiproton …` now, both in
+    // `ownDescriptions`), so a box without one was not made by this plugin, and `adopt` refuses it for the same
+    // reason. Treating it as ours sent another tenant's box our stop and delete (#1173). The cost: a box of ours
+    // that somehow lost its description is no longer stopped or deleted by a release; it is left in the project for
+    // an operator, found by the `owner_unknown` log line and trace row and the split record's reason.
+    const unconfirmed = owner === "unknown";
+    if (owner === "ours") {
       shown.add(id);
       if (machine !== null && !look) {
         const now = await readView(ctx, machine);
@@ -1001,7 +1021,7 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
     // (`retryForeign`) and otherwise kept as residue for a person, and said in the call's result.
     if (look) {
       // Nothing written and nothing removed: the agent's next call does both, and tells the agent why.
-      throw new BoxNotOurs(id, machine);
+      throw new BoxNotOurs(id, machine, unconfirmed);
     }
     // A machine's record or a stranded box's: the same split either way, and only if the record still names it.
     const held: (MachineState & { wired?: Wired[] }) | undefined = machine !== null
@@ -1021,7 +1041,7 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
           : { id: null, name: x.name, state: "residue", reason: "wiring_without_ids" }));
       /** A whole entry from the record's own wiring (`held.wired`), found at `detectedAt`, no round made yet. */
       const fresh = (detectedAt: number): ForeignBox => ({
-        box: id, mount: ctx.alias, machine, reason: "foreign_owner", registeredNames,
+        box: id, mount: ctx.alias, machine, reason: unconfirmed ? "owner_unknown" : "foreign_owner", registeredNames,
         secretIds: items.flatMap((r) => (r.id ? [r.id] : [])), detectedAt, unwire: outcomeOf(items), remaining: items, attempts: 0, lastError: null,
       });
       // Written as soon as the split is decided, before anything is sent, with everything that describes it: what
@@ -1074,12 +1094,13 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
         const base = settledEntry(stored) ?? rebuilt();
         if (base.told) return { next: base };
         const states = { pending: base.remaining.some((r) => r.state === "pending"), residue: base.remaining.some((r) => r.state === "residue") };
-        return { next: { ...base, told: true }, note: { boxId: id, machine, outcome: "split", ...states } };
+        const about = base.reason === "owner_unknown" ? { unconfirmed: true, sent: base.attempts > 0 } : {};
+        return { next: { ...base, told: true }, note: { boxId: id, machine, outcome: "split", ...states, ...about } };
       });
       if (missing) say("split_record_missing", id, machine);
       if (tell!.note) {
         // Said once per box, where the record lets go of it, so the rows count the pairs as they come apart.
-        say("box_not_ours", id, machine, { unwire: tell!.note.pending ? "pending" : tell!.note.residue ? "residue" : "removed" });
+        say(tell!.note.unconfirmed ? "owner_unknown" : "box_not_ours", id, machine, { unwire: tell!.note.pending ? "pending" : tell!.note.residue ? "residue" : "removed" });
       }
       if (machine !== null) {
         const now = await readView(ctx, machine);
@@ -1096,7 +1117,7 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
         }
       }
     }
-    throw new BoxNotOurs(id, machine);
+    throw new BoxNotOurs(id, machine, unconfirmed);
   };
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(inner)) if (typeof v === "function") out[k] = v.bind(inner);
@@ -1126,7 +1147,7 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
           const { remaining, names, ids } = itemsOfEarlierEntry(stored);
           const next: ForeignBox = { ...stored, registeredNames: names, secretIds: ids, remaining, unwire: outcomeOf(remaining),
             attempts: typeof stored.attempts === "number" ? stored.attempts : 0, lastError: stored.lastError ?? null };
-          return { next, note: next.unwire !== "pending" ? { boxId, machine: e.machine, outcome: "remains" } : undefined };
+          return { next, note: next.unwire !== "pending" ? { boxId, machine: e.machine, outcome: "remains", ...(next.reason === "owner_unknown" ? { unconfirmed: true } : {}) } : undefined };
         });
         if (!done) { say("split_record_missing", boxId, e.machine); continue; }
         if (done.note) say("unwire_given_up", boxId, e.machine, { lastError: "pending without details" });
@@ -2929,23 +2950,30 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     const found = Array.isArray(v) ? (v as LetGo[]) : [];
     if (!found.length) return null;
     const text = found.map((f) => {
+      // A box that could not be shown to be the agent's is never said to be another agent's: that is not known.
+      const where = f.unconfirmed ? "a machine that could not be confirmed as yours" : "a machine that belonged to another agent";
       if (f.outcome === "given_up") {
-        return "Taking this mount's accounts off a machine that belonged to another agent failed three times, so some of " +
+        return `Taking this mount's accounts off ${where} failed three times, so some of ` +
           "its account registrations may remain there; there is nothing for you to do about them.";
       }
       if (f.outcome === "remains") {
-        return "Some of this mount's account registrations may remain on a machine that belonged to another agent; there is nothing for you to do about them.";
+        return `Some of this mount's account registrations may remain on ${where}; there is nothing for you to do about them.`;
       }
       // A box set aside earlier (`stranded`), not the agent's machine: only what of its accounts was left is said.
       if (f.machine === null) {
         return [
-          f.pending ? "Some of this mount's account registrations on a machine that belonged to another agent were not removed at the time; there is nothing for you to do." : "",
-          f.residue ? "Some of this mount's account registrations may remain on a machine that belonged to another agent; there is nothing for you to do about them." : "",
+          f.pending ? `Some of this mount's account registrations on ${where} were not removed at the time; there is nothing for you to do.` : "",
+          f.residue ? `Some of this mount's account registrations may remain on ${where}; there is nothing for you to do about them.` : "",
         ].filter(Boolean).join(" ");
       }
-      const which = f.machine === MAIN_MACHINE ? "The machine" : `Machine "${f.machine}"`;
       // Each state the set held at the split, said once: a set with items of both kinds says both.
-      return `${which} you were using belonged to another agent, so it was left to them; nothing you had on it is here.`
+      const lead = f.unconfirmed
+        // "Nothing was sent" only where it is so: a split that took this mount's own registrations off sent those.
+        ? `${f.machine === MAIN_MACHINE ? "This machine" : `Machine "${f.machine}"`} could not be confirmed as yours, so it is no longer used and ` +
+          (f.sent ? "nothing was sent to it but the removal of this mount's own account registrations" : "nothing was sent to it") +
+          "; there is nothing for you to do."
+        : `${f.machine === MAIN_MACHINE ? "The machine" : `Machine "${f.machine}"`} you were using belonged to another agent, so it was left to them; nothing you had on it is here.`;
+      return lead
         + (f.pending ? " Some of this mount's account registrations on that machine were not removed at the time; there is nothing for you to do." : "")
         + (f.residue ? " Some of this mount's account registrations may remain on that machine; there is nothing for you to do about them." : "");
     }).filter(Boolean).join(" ");
@@ -3079,15 +3107,16 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // Boxes of other agents this mount's registrations may still be on: pending ones a later delete tries again,
       // given-up ones a person has to look at. Removed ones are not this mount's to report.
       for (const e of Object.values(await readForeign(ctx))) {
+        const whose = e.reason === "owner_unknown" ? "a box not confirmed as this agent's (owner_unknown)" : "another agent's box";
         // One line per item, each by its own state: a set with items of both kinds lists both.
         for (const r of Array.isArray(e.remaining) ? e.remaining : []) {
           const name = r.name ?? "unnamed";
           if (r.state === "pending") {
             things.push({ id: e.box, clean: false, ownKey: false, code: "listing_failed",
-              why: `another agent's box: this mount's registration ${name} is not removed yet (${e.lastError ?? "not tried yet"})` });
+              why: `${whose}: this mount's registration ${name} is not removed yet (${e.lastError ?? "not tried yet"})` });
           } else {
             things.push({ id: e.box, clean: false, ownKey: false, code: "foreign_residue",
-              why: `another agent's box: this mount's registration ${name} may remain on it (${r.reason ?? "unknown"})` });
+              why: `${whose}: this mount's registration ${name} may remain on it (${r.reason ?? "unknown"})` });
           }
         }
       }

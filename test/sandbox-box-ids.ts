@@ -359,20 +359,109 @@ await check("a record naming this agent's own box from before the fix keeps it: 
   must(p.lists().length === 1 && p.execsOn(OLD_ID).length === 2, `asked again: ${p.lists().length} lists`);
 });
 
-await check("a box run9 lists with no description is kept and said once (owner_unknown), never let go of", async () => {
+/** What the agent is told when its machine's box is listed with no description (`owner_unknown`): never "another agent's". */
+const UNCONFIRMED = "This machine could not be confirmed as yours, so it is no longer used and nothing was sent to it; there is nothing for you to do.";
+
+/** Asserts the split of a box listed with no description: recorded, said once as `owner_unknown`, never recorded as ours. */
+function unknownSplit(m: ReturnType<typeof mountOf>, lines: string[]) {
+  const sp = m.split(OLD_ID);
+  must(sp && sp.box === OLD_ID && sp.reason === "owner_unknown" && sp.machine === "main" && sp.told === true, `split: ${JSON.stringify(sp)}`);
+  must(m.main()?.boxId !== OLD_ID && !JSON.stringify(m.raw()).includes(OLD_ID), `the record still names it: ${JSON.stringify(m.raw())}`);
+  const rows = m.traces.filter((t) => t.kind === "sandbox.box_owner");
+  must(rows.length === 1 && rows[0]!.status === "owner_unknown" && rows[0]!.verdict === "blocked" && rows[0]!.attrs.box === OLD_ID,
+    `trace: ${JSON.stringify(rows)}`);
+  must(lines.filter((l) => l.includes('"code":"owner_unknown"') && l.includes(OLD_ID)).length === 1, `log: ${JSON.stringify(lines)}`);
+  must(!lines.some((l) => l.includes('"code":"box_not_ours"')), `said as another's: ${JSON.stringify(lines)}`);
+}
+
+await check("a box run9 lists with no description is let go of as another's is (owner_unknown): a new box made, nothing sent to it", async () => {
   const p = run9Project();
-  p.put(OLD_ID, `${TENANT}/${AGENT_A}`, null);
+  p.put(OLD_ID, `${TENANT}/${AGENT_B}`, null);
+  const before = JSON.stringify(p.boxes.get(OLD_ID));
   const a = mountOf(TENANT, AGENT_A, { record: legacyRecord(OLD_ID) });
   p.o.caller = a.owner;
   const first = await logged(() => a.plugin.invoke("shell", { command: "ls" }, a.ctx) as Promise<any>);
-  must(first.error === undefined && (first.value as any).box === OLD_ID, `the box was not kept: ${first.error ?? JSON.stringify(first.value)}`);
-  must(p.creates().length === 0 && p.execsOn(OLD_ID).length === 1 && a.main()?.boxId === OLD_ID, `record ${JSON.stringify(a.main())}`);
-  const rows = a.traces.filter((t) => t.kind === "sandbox.box_owner");
-  must(rows.length === 1 && rows[0]!.status === "owner_unknown" && rows[0]!.verdict === "ok" && rows[0]!.attrs.box === OLD_ID, `trace: ${JSON.stringify(rows)}`);
-  must(first.lines.filter((l) => l.includes('"code":"owner_unknown"')).length === 1, `log: ${JSON.stringify(first.lines)}`);
-  must(!/another agent/.test(JSON.stringify(first.value)), "the agent was told its own box was another's");
-  await a.plugin.invoke("shell", { command: "ls" }, a.ctx);
-  must(a.traces.length === 1 && p.lists().length === 1, `said or asked again: ${a.traces.length} rows, ${p.lists().length} lists`);
+  must(first.error === undefined, `the call failed: ${first.error}`);
+  const r = first.value as any;
+  const made = p.creates().map((c) => c.body.box_id as string);
+  must(made.length === 1 && made[0] !== OLD_ID && r.box === made[0] && a.main()?.boxId === made[0], `a new box: ${JSON.stringify(made)} ${r.box}`);
+  must(p.on(OLD_ID).length === 0 && p.crossings.length === 0, `requests on the box: ${JSON.stringify(p.on(OLD_ID))}`);
+  must(JSON.stringify(p.boxes.get(OLD_ID)) === before, "the box changed");
+  unknownSplit(a, first.lines);
+  must(count(JSON.stringify(r), UNCONFIRMED) === 1 && !/another agent/.test(JSON.stringify(r)), `the sentence: ${JSON.stringify(r)}`);
+  const next: any = await a.plugin.invoke("shell", { command: "ls" }, a.ctx);
+  must(!JSON.stringify(next).includes(UNCONFIRMED) && a.traces.length === 1 && p.on(OLD_ID).length === 0, `said or sent again: ${JSON.stringify(next)}`);
+});
+
+await check("a named machine's box listed with no description: its own sentence, and one that took this mount's registrations off does not say nothing was sent", async () => {
+  const p = run9Project();
+  p.put(OLD_ID, `${TENANT}/${AGENT_B}`, null);
+  const sid = p.register(OLD_ID, "GH_TOKEN", "mine", `${TENANT}/${AGENT_A}`);
+  const a = mountOf(TENANT, AGENT_A, { record: { machines: {
+    build: { boxId: OLD_ID, createdAt: AT, lastUsedAt: AT, execs: 1, saved: [], wired: [{ alias: "gh", plugin: "github", placeholder: "__AP_GH_x__", digest: "d", names: ["GH_TOKEN"], pairs: [{ name: "GH_TOKEN", id: sid }] }] },
+  } } });
+  p.o.caller = a.owner;
+  const r: any = await a.plugin.invoke("shell", { command: "ls", machine: "build" }, a.ctx);
+  const text = JSON.stringify(r);
+  must(text.includes(`Machine \\"build\\" could not be confirmed as yours, so it is no longer used and nothing was sent to it but the removal of this mount's own account registrations; there is nothing for you to do.`),
+    `the sentence: ${text}`);
+  must(!/another agent/.test(text) && a.split(OLD_ID)?.reason === "owner_unknown", `${text} ${JSON.stringify(a.split(OLD_ID))}`);
+  must(p.lifecycle(OLD_ID).length === 0 && p.crossings.length === 0 && !(p.secrets.get(OLD_ID) ?? []).some((x) => x.secret_id === sid),
+    `only this mount's own registration was removed: ${JSON.stringify(p.on(OLD_ID))}`);
+});
+
+await check("#1173: another agent's box listed with no description, named by this agent's record: holds.release sends it no delete or stop", async () => {
+  const p = run9Project();
+  // Agent A's box, as run9 lists it with no description; agent B's record names the same id.
+  p.put(OLD_ID, `${TENANT}/${AGENT_A}`, null);
+  const before = JSON.stringify(p.boxes.get(OLD_ID));
+  const b = mountOf(TENANT, AGENT_B, { record: legacyRecord(OLD_ID) });
+  p.o.caller = b.owner;
+  const out = await logged(() => b.plugin.holds!.release(b.ctx) as Promise<unknown>);
+  must(out.error === undefined, `the release threw: ${out.error}`);
+  must(p.lifecycle(OLD_ID).length === 0 && p.crossings.length === 0, `requests on the box: ${JSON.stringify(p.on(OLD_ID))}`);
+  must(p.boxes.has(OLD_ID) && JSON.stringify(p.boxes.get(OLD_ID)) === before, "the box was deleted or changed");
+  must(out.value === false, `the release reported something released: ${JSON.stringify(out.value)}`);
+  must(!b.main()?.ownerChecked && p.creates().length === 0, `recorded as ours: ${JSON.stringify(b.main())}`);
+  unknownSplit(b, out.lines);
+  // The agent hears it on its next call, from the queue the release left.
+  must(b.queue().length === 1 && b.queue()[0].unconfirmed === true, `queued: ${JSON.stringify(b.queue())}`);
+  const r: any = await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+  must(count(JSON.stringify(r), UNCONFIRMED) === 1 && p.on(OLD_ID).length === 0, `told: ${JSON.stringify(r)}`);
+});
+
+await check("#1173: the same box on an agent's delete (withdraw, then release): no delete or stop, nothing reported freed", async () => {
+  const p = run9Project();
+  p.put(OLD_ID, `${TENANT}/${AGENT_A}`, null);
+  const before = JSON.stringify(p.boxes.get(OLD_ID));
+  const b = mountOf(TENANT, AGENT_B, { record: legacyRecord(OLD_ID) });
+  p.o.caller = b.owner;
+  // cf/src/runtime.ts `releaseForDelete`: the withdrawal, then the release.
+  const out = await logged(async () => {
+    const w: any = await b.plugin.holds!.withdraw!(b.ctx);
+    const r = await b.plugin.holds!.release(b.ctx);
+    return { w, r };
+  });
+  must(out.error === undefined, `the delete threw: ${out.error}`);
+  const { w, r } = out.value!;
+  must(p.lifecycle(OLD_ID).length === 0 && p.crossings.length === 0, `requests on the box: ${JSON.stringify(p.on(OLD_ID))}`);
+  must(p.boxes.has(OLD_ID) && JSON.stringify(p.boxes.get(OLD_ID)) === before, "the box was deleted or changed");
+  must(r === false, `the release reported something released: ${JSON.stringify(r)}`);
+  must(!w.things.some((t: any) => t.id === OLD_ID && t.clean), `withdrawn as clean: ${JSON.stringify(w.things)}`);
+  must(!b.main()?.ownerChecked, `recorded as ours: ${JSON.stringify(b.main())}`);
+  unknownSplit(b, out.lines);
+});
+
+await check("control: this agent's own box, listed with its description, is still released by holds.release", async () => {
+  const p = run9Project();
+  p.put(OLD_ID, `${TENANT}/${AGENT_B}`);
+  const b = mountOf(TENANT, AGENT_B, { record: legacyRecord(OLD_ID) });
+  p.o.caller = b.owner;
+  const out = await logged(() => b.plugin.holds!.release(b.ctx) as Promise<any>);
+  must(out.error === undefined, `the release threw: ${out.error}`);
+  must(!p.boxes.has(OLD_ID) && p.calls.some((c) => c.method === "DELETE" && c.path.endsWith(`/boxes/${OLD_ID}`)), "the own box was not deleted");
+  must(out.value?.id === OLD_ID && out.value?.status === "freed", `released: ${JSON.stringify(out.value)}`);
+  must(b.traces.filter((t) => t.kind === "sandbox.box_owner").length === 0 && !b.split(OLD_ID), "an owned box was split");
 });
 
 // ---- every way in, against the fake's own record of who owns each box
