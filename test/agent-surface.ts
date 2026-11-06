@@ -10,7 +10,7 @@
  * real runtime and the real sandbox plugin in test/agent-surface-runtime.ts.
  */
 import { agentUsage, nonOverlapping, parseUsageQuery, splitModelKey, HOURLY_KEPT_MS, type LedgerRow, type UsageDeps } from "../cf/src/agent-surface/usage.ts";
-import { workspaceList, workspaceRead, NOT_RUNNING_FILE, READ_MAX_BYTES, type SandboxList, type SandboxRead, type WorkspaceDeps } from "../cf/src/agent-surface/workspace.ts";
+import { workspaceList, workspaceRead, NOT_RUNNING_FILE, NOT_RUNNING_TEXT, NOT_AVAILABLE_FILE, OTHER_TEXT, UNCONFIRMED_TEXT, NEUTRAL_TEXT, READ_MAX_BYTES, type SandboxList, type SandboxRead, type WorkspaceDeps } from "../cf/src/agent-surface/workspace.ts";
 import { surface, type SurfaceDeps } from "../cf/src/agent-surface/surface.ts";
 import { handleProvision, type ProvisionDeps } from "../cf/src/provision/handlers.ts";
 import { handleAgentsApi, type AgentsApiDeps } from "../cf/src/agents-api/handlers.ts";
@@ -495,6 +495,44 @@ await check("sandbox/ with no container running holds one text file saying so, a
   must(!sub.ok && sub.status === 404, JSON.stringify(sub));
   const file = await workspaceRead(f.deps.workspace, "t", "a", "sandbox/index.js");
   must(!file.ok && file.status === 404, JSON.stringify(file));
+});
+
+// Every `why` a not-running answer can carry, plus none at all (an object not yet updated during a deploy).
+// `other` and `unconfirmed` share one file name and differ only by content, which the two constants define;
+// the regex checks below are independent of them, so definitions swapped between the two turn red.
+const NOT_SHOWN_ROWS: Array<{ why: string | undefined; file: string; text: string }> = [
+  { why: "none", file: NOT_RUNNING_FILE, text: NOT_RUNNING_TEXT },
+  { why: "no_files", file: NOT_RUNNING_FILE, text: NOT_RUNNING_TEXT },
+  { why: "no_agent", file: NOT_RUNNING_FILE, text: NOT_RUNNING_TEXT },
+  { why: "other", file: NOT_AVAILABLE_FILE, text: OTHER_TEXT },
+  { why: "unconfirmed", file: NOT_AVAILABLE_FILE, text: UNCONFIRMED_TEXT },
+  { why: undefined, file: NOT_RUNNING_FILE, text: NEUTRAL_TEXT },
+];
+for (const row of NOT_SHOWN_ROWS) {
+  await check(`sandbox/ not running, why ${row.why ?? "(missing)"}: list and read both show ${row.file} with its own text, and only that name`, async () => {
+    const answer = (row.why === undefined ? { running: false } : { running: false, why: row.why }) as SandboxList & SandboxRead;
+    const ws: WorkspaceDeps = { ...workspaceFixture().deps.workspace, sandbox: { list: async () => answer, read: async () => answer } };
+    const r = await workspaceList(ws, "t", "a", "sandbox/", true);
+    must(JSON.stringify(names(r)) === JSON.stringify([`sandbox/${row.file}`]), JSON.stringify(names(r)));
+    const text = await workspaceRead(ws, "t", "a", `sandbox/${row.file}`);
+    must(text.ok && text.file.content === row.text, JSON.stringify(text));
+    must(r.ok && r.files[0]!.size === text.file.size, "the listed size is the file's");
+    const otherName = row.file === NOT_RUNNING_FILE ? NOT_AVAILABLE_FILE : NOT_RUNNING_FILE;
+    const wrong = await workspaceRead(ws, "t", "a", `sandbox/${otherName}`);
+    must(!wrong.ok && wrong.status === 404, `${otherName}: ${JSON.stringify(wrong)}`);
+    const content = text.file.content!;
+    if (row.why === "other") must(/another agent/.test(content), content);
+    if (row.why === "unconfirmed") must(/could not be confirmed/.test(content), content);
+    if (row.why === "none" || row.why === "no_files" || row.why === "no_agent") must(content === NOT_RUNNING_TEXT, content);
+    if (row.why === undefined) must(content !== NOT_RUNNING_TEXT, "a missing why promised that files appear later");
+  });
+}
+
+await check("the not-shown texts are distinct: other is not unconfirmed, the neutral text is not the not-running one", () => {
+  must(OTHER_TEXT !== UNCONFIRMED_TEXT, "other and unconfirmed say the same");
+  must(NEUTRAL_TEXT !== NOT_RUNNING_TEXT, "the neutral text promises files later");
+  must(/another agent/.test(OTHER_TEXT) && !/another agent/.test(UNCONFIRMED_TEXT), "another agent");
+  must(/could not be confirmed/.test(UNCONFIRMED_TEXT) && !/could not be confirmed/.test(OTHER_TEXT), "could not be confirmed");
 });
 
 await check("sandbox/ with the container running shows its working directory, one level at a time, under the same cap", async () => {
