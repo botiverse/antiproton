@@ -788,12 +788,15 @@ async function readForeign(ctx: PluginContext): Promise<Record<string, ForeignBo
  * what the other left, so neither's is lost.
  */
 async function updateSplit(
-  ctx: PluginContext, box: string, fn: (stored: ForeignBox | undefined) => { next: ForeignBox; note?: LetGo },
-): Promise<{ next: ForeignBox; note?: LetGo }> {
+  ctx: PluginContext, box: string, fn: (stored: ForeignBox | undefined) => { next: ForeignBox; note?: LetGo } | null,
+): Promise<{ next: ForeignBox; note?: LetGo } | null> {
   return ctx.db.transaction([BOX_STORE], "readwrite", (tx) => {
+    // A read that throws is not a missing entry: it rolls the transaction back and the call fails as it came.
     const raw = tx.get(BOX_STORE, splitKey(box));
     const stored = raw && typeof raw === "object" ? raw as ForeignBox : undefined;
     const out = fn(stored);
+    // Nothing to write (`retryForeign` finding its entry gone).
+    if (out === null) return null;
     const next = { ...out.next, unwire: outcomeOf(out.next.remaining) };
     tx.put(BOX_STORE, next as unknown as Json, splitKey(box));
     if (out.note) enqueueIn(tx, out.note);
@@ -801,8 +804,34 @@ async function updateSplit(
   });
 }
 
-/** A well-formed entry as stored: one with its items. */
+/**
+ * A well-formed entry as stored: one with its items. An entry of an earlier shape (no items) is not one, and is given
+ * its items from what it recorded itself (`itemsOfEarlierEntry`), never from the wiring as it is now: the wiring may
+ * hold accounts wired after the split, on another box, whose ids were never on this one.
+ *
+ * Split entries must be kept for good. Deleting one resets its count of removal rounds (so the limit of
+ * `UNWIRE_ATTEMPTS` holds only while the entry lives), makes the next discovery tell the agent again (`told` lives in
+ * it), erases the evidence that the split happened, and gives a later discovery a new `detectedAt` (that moment),
+ * which reads the same as a first split. Any future limit on how long or how many are kept changes these meanings.
+ */
 const settledEntry = (e: ForeignBox | undefined): ForeignBox | undefined => (e && Array.isArray(e.remaining) ? e : undefined);
+
+/**
+ * The items of an entry of an earlier shape, from its own fields: pending ones from the ids it recorded (named when
+ * its names match them one for one), or, with no ids, residue `pending without details` for each name it had.
+ */
+function itemsOfEarlierEntry(e: ForeignBox): { remaining: Remaining[]; names: string[] | null; ids: string[] } {
+  const old = e as unknown as { secretIds?: unknown; names?: unknown; registeredNames?: unknown };
+  // An entry of the earlier shape has its names as `names` and no `registeredNames`: taking them over fills a
+  // field that was missing, it does not change what was registered.
+  const names = Array.isArray(old.registeredNames) ? old.registeredNames as string[] : Array.isArray(old.names) ? old.names as string[] : null;
+  const ids = Array.isArray(old.secretIds) ? old.secretIds as string[] : [];
+  const named = names !== null && names.length === ids.length;
+  const remaining: Remaining[] = ids.length
+    ? ids.map((sid, i) => ({ id: sid, name: named ? names![i]! : null, state: "pending" as const }))
+    : (names ?? [null]).map((n) => ({ id: null, name: n, state: "residue" as const, reason: "pending without details" }));
+  return { remaining, names, ids };
+}
 
 /**
  * The note owed when a round gives up on a told split's pending items: a new event, told on its own. Only when the
@@ -937,10 +966,10 @@ type OwnedProvider = SandboxProvider & {
  */
 function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false): OwnedProvider {
   const shown = new Set<string>();
-  const say = (code: "box_not_ours" | "owner_unknown" | "unwire_given_up", boxId: string, machine: string | null, more: Record<string, string> = {}) => {
+  const say = (code: "box_not_ours" | "owner_unknown" | "unwire_given_up" | "split_record_missing", boxId: string, machine: string | null, more: Record<string, string> = {}) => {
     const attrs = { code, tenant: ctx.caller.tenantId, agent: ctx.caller.agentId, mount: ctx.alias, machine, box: boxId, ...more };
     console.log(JSON.stringify({ event: "sandbox.box_owner", ...attrs }));
-    ctx.trace?.({ kind: "sandbox.box_owner", status: code, verdict: code === "owner_unknown" ? "ok" : "blocked", attrs });
+    ctx.trace?.({ kind: "sandbox.box_owner", status: code, verdict: code === "owner_unknown" ? "ok" : code === "split_record_missing" ? "failed" : "blocked", attrs });
   };
   const owns = async (id: string): Promise<void> => {
     if (shown.has(id) || !inner.ownerOf) return;
@@ -980,12 +1009,18 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
       // older wiring, or a registration the provider answered no id for) cannot be told from the owner's own, so it
       // is residue and never tried. A wiring whose names are not known at all is one residue item with neither.
       const wired = held.wired ?? [];
+      // Every name from the record's own wiring; null only where a wiring's names were not known.
       const registeredNames = wired.some((w) => !w.pairs) ? null : wired.flatMap((w) => w.pairs!.map((x) => x.name));
       const items: Remaining[] = wired.flatMap((w): Remaining[] => !w.pairs
         ? [{ id: null, name: null, state: "residue", reason: "names_unknown" }]
         : w.pairs.map((x): Remaining => typeof x.id === "string"
           ? { id: x.id, name: x.name, state: "pending" }
           : { id: null, name: x.name, state: "residue", reason: "wiring_without_ids" }));
+      /** A whole entry from the record's own wiring (`held.wired`), found at `detectedAt`, no round made yet. */
+      const fresh = (detectedAt: number): ForeignBox => ({
+        box: id, mount: ctx.alias, machine, reason: "foreign_owner", registeredNames,
+        secretIds: items.flatMap((r) => (r.id ? [r.id] : [])), detectedAt, unwire: outcomeOf(items), remaining: items, attempts: 0, lastError: null,
+      });
       // Written as soon as the split is decided, before anything is sent, with everything that describes it: what
       // is to be removed is in it, so an interruption from here leaves an entry `retryForeign` finishes and this path
       // goes on from. Every later write updates its outcome (`unwire`, `remaining`, `attempts`, `lastError`) and
@@ -994,41 +1029,51 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
       // Found again (an earlier call wrote this split and was interrupted before the record let go of the box), the
       // stored entry is what goes on, never the wiring: its items, its rounds counted and its outcome stand, so the
       // rounds stay at `UNWIRE_ATTEMPTS` in all and residue never returns to pending. A field an earlier shape lacks
-      // is filled (`registeredNames`), which changes nothing it said; one without items is begun again from the
-      // wiring, keeping the moment it was first found.
-      const { next: begun } = await updateSplit(ctx, id, (stored) => {
+      // is filled (`registeredNames`), which changes nothing it said; one without items gets them from its own ids
+      // (`itemsOfEarlierEntry`), never from the wiring, keeping the moment it was first found and its count.
+      const begin = await updateSplit(ctx, id, (stored) => {
         const had = settledEntry(stored);
         if (had) return { next: had.registeredNames === undefined ? { ...had, registeredNames } : had };
-        return { next: {
-          box: id, mount: ctx.alias, machine, reason: "foreign_owner", registeredNames,
-          secretIds: items.flatMap((r) => (r.id ? [r.id] : [])), detectedAt: stored?.detectedAt ?? Date.now(),
-          unwire: outcomeOf(items), remaining: items, attempts: typeof stored?.attempts === "number" ? stored.attempts : 0, lastError: null,
-        } };
+        if (stored) {
+          const { remaining, names, ids } = itemsOfEarlierEntry(stored);
+          return { next: { ...stored, registeredNames: names, secretIds: ids, remaining, unwire: outcomeOf(remaining),
+            attempts: typeof stored.attempts === "number" ? stored.attempts : 0, lastError: stored.lastError ?? null } };
+        }
+        return { next: fresh(Date.now()) };
       });
-      let entry = begun;
+      let entry = begin!.next;
+      // The entry gone between this call's own writes (both run before the record lets go of the box below, so
+      // `held.wired` is still whole, and after that this pass neither reads nor writes the entry). It is written whole
+      // again from `held.wired`, at the moment this call first wrote it, so the record never lets go of a box with no
+      // entry naming it. Built from `held.wired`, never from the entry as this call last saw it, and only because
+      // nothing is stored to overwrite: where an entry exists, building from an earlier read is the lost update. Items
+      // already removed come back pending, and the next round finds them gone, which counts as removed.
+      let missing = false;
+      const rebuilt = () => { missing = true; return fresh(entry.detectedAt); };
       if (entry.unwire === "pending") {
         const round = await sendRound(inner, entry);
         // A round that gives up on a split already told is a new event, told as one with the entry that records it;
         // one not told yet is told below with what it now holds.
         const done = await updateSplit(ctx, id, (stored) => {
-          const base = settledEntry(stored) ?? entry;
+          const base = settledEntry(stored) ?? rebuilt();
           const next = applyRound(base, round);
           return { next, note: gaveUpNote(base, next, machine) };
         });
-        entry = done.next;
-        if (done.note) say("unwire_given_up", id, machine, { accounts: entry.remaining.map((r) => r.name).filter(Boolean).join(","), lastError: entry.lastError ?? "" });
+        entry = done!.next;
+        if (done!.note) say("unwire_given_up", id, machine, { accounts: entry.remaining.map((r) => r.name).filter(Boolean).join(","), lastError: entry.lastError ?? "" });
       }
       // The split is told once, before the record lets go (so an interruption after this does not lose it), and never
       // again when it is found again: `told` on its entry says it was, written with the note in one transaction.
       const tell = await updateSplit(ctx, id, (stored) => {
-        const base = settledEntry(stored) ?? entry;
+        const base = settledEntry(stored) ?? rebuilt();
         if (base.told) return { next: base };
         const states = { pending: base.remaining.some((r) => r.state === "pending"), residue: base.remaining.some((r) => r.state === "residue") };
         return { next: { ...base, told: true }, note: { boxId: id, machine, outcome: "split", ...states } };
       });
-      if (tell.note) {
+      if (missing) say("split_record_missing", id, machine);
+      if (tell!.note) {
         // Said once per box, where the record lets go of it, so the rows count the pairs as they come apart.
-        say("box_not_ours", id, machine, { unwire: tell.note.pending ? "pending" : tell.note.residue ? "residue" : "removed" });
+        say("box_not_ours", id, machine, { unwire: tell!.note.pending ? "pending" : tell!.note.residue ? "residue" : "removed" });
       }
       if (machine !== null) {
         const now = await readView(ctx, machine);
@@ -1065,36 +1110,33 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
     for (const [boxId, e] of Object.entries(await readForeign(ctx))) {
       if (e.unwire !== "pending") continue;
       let entry = e;
-      // Marked pending with no items written (an interrupted write of an earlier build). With the ids the split
-      // recorded, the items are rebuilt from them and go on from the rounds already counted; without them there is
-      // nothing to try, and it is residue.
+      // Marked pending with no items written (an interrupted write of an earlier build): given its items from its own
+      // ids, going on from the rounds already counted; without ids there is nothing to try, and it is residue.
       if (!Array.isArray(e.remaining)) {
-        const old = e as unknown as { secretIds?: unknown; names?: unknown; registeredNames?: unknown };
-        // An entry of the earlier shape has its names as `names` and no `registeredNames`: taking them over fills a
-        // field that was missing, it does not change what was registered.
-        const names = Array.isArray(old.registeredNames) ? old.registeredNames as string[] : Array.isArray(old.names) ? old.names as string[] : null;
-        const ids = Array.isArray(old.secretIds) ? old.secretIds as string[] : null;
-        const named = names !== null && ids !== null && names.length === ids.length;
-        const remaining: Remaining[] = ids && ids.length
-          ? ids.map((sid, i) => ({ id: sid, name: named ? names![i]! : null, state: "pending" as const }))
-          : (names ?? [null]).map((n) => ({ id: null, name: n, state: "residue" as const, reason: "pending without details" }));
-        const rebuilt: ForeignBox = { ...e, registeredNames: names, secretIds: ids ?? [], remaining, unwire: outcomeOf(remaining),
-          attempts: typeof e.attempts === "number" ? e.attempts : 0, lastError: e.lastError ?? null };
         const done = await updateSplit(ctx, boxId, (stored) => {
+          if (!stored) return null;
           const had = settledEntry(stored);
           if (had) return { next: had };
-          return { next: rebuilt, note: rebuilt.unwire !== "pending" ? { boxId, machine: e.machine, outcome: "remains" } : undefined };
+          const { remaining, names, ids } = itemsOfEarlierEntry(stored);
+          const next: ForeignBox = { ...stored, registeredNames: names, secretIds: ids, remaining, unwire: outcomeOf(remaining),
+            attempts: typeof stored.attempts === "number" ? stored.attempts : 0, lastError: stored.lastError ?? null };
+          return { next, note: next.unwire !== "pending" ? { boxId, machine: e.machine, outcome: "remains" } : undefined };
         });
+        if (!done) { say("split_record_missing", boxId, e.machine); continue; }
         if (done.note) say("unwire_given_up", boxId, e.machine, { lastError: "pending without details" });
         entry = done.next;
         if (entry.unwire !== "pending") continue;
       }
       const round = await sendRound(inner, entry);
+      // The entry as stored is the only base: if it is gone (deleted by hand), nothing is written back from what this
+      // call read before the round, and the round is not counted anywhere.
       const done = await updateSplit(ctx, boxId, (stored) => {
-        const base = settledEntry(stored) ?? entry;
+        const base = settledEntry(stored);
+        if (!base) return null;
         const next = applyRound(base, round);
         return { next, note: gaveUpNote(base, next, e.machine) };
       });
+      if (!done) { say("split_record_missing", boxId, e.machine); continue; }
       if (done.note) say("unwire_given_up", boxId, e.machine, { accounts: done.next.remaining.map((r) => r.name).filter(Boolean).join(","), lastError: done.next.lastError ?? "" });
     }
   };

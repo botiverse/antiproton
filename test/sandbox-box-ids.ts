@@ -235,7 +235,9 @@ function mountOf(tenantId: string, agentId: string, o: { lease?: BoxLease | null
   const putRaw = (key: string, v: unknown) => tables.put(scope, BOX_STORE, key, v as any, null);
   /** This mount's notes queue as stored. */
   const queue = () => { const v = tables.get(scope, BOX_STORE, "notices"); return Array.isArray(v) ? v as any[] : []; };
-  return { plugin, ctx, main, raw, split, putRaw, queue, traces, owner: `${tenantId}/${agentId}` };
+  /** Deletes this mount's split entry for a box, as by hand. */
+  const dropSplit = (boxId: string) => tables.delete(scope, BOX_STORE, `${SPLIT_PREFIX}${boxId}`);
+  return { plugin, ctx, main, raw, split, putRaw, queue, dropSplit, traces, owner: `${tenantId}/${agentId}` };
 }
 
 const realNow = Date.now;
@@ -1385,6 +1387,116 @@ await check("one agent's two mounts split from the same box: each keeps its own 
   must(one.queue().length === 0 && two.queue().length === 1 && two.queue()[0].id === idTwo, `delivery reached the other queue: ${JSON.stringify([one.queue(), two.queue()])}`);
   const d2: any = await two.plugin.invoke("shell", { command: "ls" }, two.ctx);
   must(count(JSON.stringify(d2), NOT_OURS) === 1 && two.queue().length === 0, `the second mount's note: ${d2.note}`);
+});
+
+// ---- a split entry gone, or of an earlier shape, never written back from an earlier read
+
+/** A transaction wrapper calling `before(n, tx)` at the start of each transaction that touches a split entry. */
+const onSplitTx = (before: (n: number, tx: any) => void) => (db: any) => {
+  let n = 0;
+  return { ...db, transaction: (stores: any, mode: any, fn: any) => db.transaction(stores, mode, (tx: any) => {
+    const wrapped = {
+      ...tx, getAll: (...a: any[]) => tx.getAll(...a), delete: (...a: any[]) => tx.delete(...a), put: (...a: any[]) => tx.put(...a),
+      get: (st: string, k: any) => {
+        if (typeof k === "string" && k.startsWith(SPLIT_PREFIX)) before(++n, tx);
+        return tx.get(st, k);
+      },
+    };
+    return fn(wrapped);
+  }) };
+};
+const missingLogged = (lines: string[]) => lines.filter((l) => l.includes('"code":"split_record_missing"') && l.includes(OLD_ID)).length;
+
+await check("an earlier-shape entry found on the split path gets its items from its own ids, never from the wiring as it is now", async () => {
+  const { p, takerSecret } = sharedBox();
+  const LATER = "s-wired-later";
+  const b = mountOf(TENANT, AGENT_B, { record: takerRecord([wiring([{ name: "GH_TOKEN", id: takerSecret }, { name: "GH_LATER", id: LATER }])]) });
+  b.putRaw(`${SPLIT_PREFIX}${OLD_ID}`, { box: OLD_ID, mount: "sandbox", machine: "main", reason: "foreign_owner", names: ["GH_TOKEN"],
+    secretIds: [takerSecret], detectedAt: AT, unwire: "pending" });
+  p.o.caller = TAKER();
+  await logged(() => b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>);
+  const sent = removalsOf(p).map((c) => decodeURIComponent(c.path.split("/").at(-1)!));
+  must(sent.length >= 1 && sent.every((x) => x === takerSecret), `removals: ${JSON.stringify(sent)}`);
+  must(!JSON.stringify(b.split(OLD_ID)).includes(LATER) && b.split(OLD_ID).detectedAt === AT, `entry: ${JSON.stringify(b.split(OLD_ID))}`);
+});
+
+await check("the split's entry gone between this call's own writes: written whole again from the record's wiring, at its first moment", async () => {
+  const { p } = sharedBox();
+  const ids = ["GH_A", "GH_B"].map((n) => p.register(OLD_ID, n, `taker-${n}`, TAKER()));
+  let pointerAtRebuild: string | undefined;
+  let firstAt: number | undefined;
+  const b: ReturnType<typeof mountOf> = mountOf(TENANT, AGENT_B, {
+    record: takerRecord([wiring([{ name: "GH_A", id: ids[0]! }, { name: "GH_B", id: ids[1]! }, { name: "GH_C", id: null }])]),
+    // The entry disappears just before the split's removal round is written (the second split transaction).
+    db: onSplitTx((n, tx) => {
+      if (n === 1) return;
+      if (n === 2) {
+        firstAt = (tx.get(BOX_STORE, `${SPLIT_PREFIX}${OLD_ID}`) as any)?.detectedAt;
+        pointerAtRebuild = asMountState(tx.get(BOX_STORE, BOX_KEY) as any)?.machines.main?.boxId;
+        tx.delete(BOX_STORE, `${SPLIT_PREFIX}${OLD_ID}`);
+      }
+    }),
+  });
+  p.o.caller = TAKER();
+  const call = await logged(() => b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>);
+  must(call.error === undefined, `the call failed: ${call.error}`);
+  must(pointerAtRebuild === OLD_ID, `the record had let go before the rebuild: ${pointerAtRebuild}`);
+  const sp = b.split(OLD_ID);
+  splitShape(sp, firstAt ?? null);
+  must(sp.detectedAt === firstAt && JSON.stringify(sp.registeredNames) === '["GH_A","GH_B","GH_C"]', `rebuilt: ${JSON.stringify(sp)}`);
+  must(b.main()?.boxId === call.value.box && call.value.box !== OLD_ID && missingLogged(call.lines) === 1, `pointer, new box or log: ${JSON.stringify(b.main())} ${call.lines.length}`);
+  const next: any = await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+  must(next.box === call.value.box && p.execsOn(next.box).length === 2, `the next call did not run on the machine: ${JSON.stringify(next)}`);
+});
+
+await check("the entry gone after the split's round and before it is told: rebuilt pending, and the next round finds them gone, which counts as removed", async () => {
+  // Proves both that the rebuild is safe (rows already removed come back pending, and nothing is lost by it) and that
+  // a removal answered not found counts as removed (`unwireForeign`'s catch, and run9 answering 404 for a
+  // registration that is gone; a 400 would count as a failure).
+  const { p } = sharedBox();
+  const ids = ["GH_A", "GH_B"].map((n) => p.register(OLD_ID, n, `taker-${n}`, TAKER()));
+  const b = mountOf(TENANT, AGENT_B, {
+    record: takerRecord([wiring([{ name: "GH_A", id: ids[0]! }, { name: "GH_B", id: ids[1]! }])]),
+    db: onSplitTx((n, tx) => { if (n === 3) tx.delete(BOX_STORE, `${SPLIT_PREFIX}${OLD_ID}`); }),
+  });
+  p.o.caller = TAKER();
+  await logged(() => b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>);
+  must(b.split(OLD_ID).unwire === "pending" && b.split(OLD_ID).told === true, `not rebuilt pending: ${JSON.stringify(b.split(OLD_ID))}`);
+  await logged(() => b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>);
+  must(b.split(OLD_ID).unwire === "removed" && b.split(OLD_ID).remaining.length === 0, `not removed: ${JSON.stringify(b.split(OLD_ID))}`);
+});
+
+await check("a pending entry deleted by hand: the retry writes nothing back, sends nothing, and says so", async () => {
+  const { p, takerSecret } = sharedBox();
+  const b = mountOf(TENANT, AGENT_B, { record: takerRecord([wiring([{ name: "GH_TOKEN", id: takerSecret }])]) });
+  p.o.caller = TAKER();
+  p.o.failRemove = true;
+  await logged(() => b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>);
+  must(b.split(OLD_ID).unwire === "pending", "no pending split to delete");
+  // The retry reads the entry before its round; it is deleted after that read and before the round's write.
+  p.o.beforeRemoval = async () => { b.dropSplit(OLD_ID); };
+  const call = await logged(() => b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>);
+  p.o.beforeRemoval = null;
+  must(call.error === undefined, `the call failed: ${call.error}`);
+  must(b.split(OLD_ID) === undefined, `an entry was written back: ${JSON.stringify(b.split(OLD_ID))}`);
+  must(missingLogged(call.lines) === 1, `not said: ${JSON.stringify(call.lines)}`);
+  // And with it already gone when a call starts: no round at all, nothing written.
+  const after = removalsOf(p).length;
+  const again = await logged(() => b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>);
+  must(removalsOf(p).length === after && b.split(OLD_ID) === undefined && again.error === undefined, `sent or written with the entry gone: ${removalsOf(p).length - after}`);
+});
+
+await check("a split entry read that throws is not a missing entry: the call fails, nothing is written, the record still names the box", async () => {
+  const { p, takerSecret } = sharedBox();
+  let threw = false;
+  const b = mountOf(TENANT, AGENT_B, {
+    record: takerRecord([wiring([{ name: "GH_TOKEN", id: takerSecret }])]),
+    db: onSplitTx((n) => { if (n === 1 && !threw) { threw = true; throw new Error("storage read failed"); } }),
+  });
+  p.o.caller = TAKER();
+  const call = await logged(() => b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>);
+  must(call.error !== undefined && /storage read failed/.test(call.error), `the call did not fail with the read: ${call.error ?? JSON.stringify(call.value)}`);
+  must(b.split(OLD_ID) === undefined && b.main()?.boxId === OLD_ID && removalsOf(p).length === 0, `written, let go or sent: ${JSON.stringify([b.split(OLD_ID), b.main()])}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.ok ? "" : `\n    ${r.error}`}`);
