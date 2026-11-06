@@ -636,7 +636,7 @@ function open(settings: ProviderSettings, credential: string, o: { wake?: boolea
 
     // InstaBox's credential injection is by org-wide secret (`PUT /v1/orgs/{id}/secrets/{name}`), not per box.
     // The plugin does not wire accounts on this provider (`caps.boxSecrets`), so these are never called.
-    async addSecret(_id: string, _s: EgressSecret) { throw noBoxSecrets(); },
+    async addSecret(_id: string, _s: EgressSecret): Promise<string | null> { throw noBoxSecrets(); },
     async listSecrets(_id: string) { return []; },
     async removeSecret(_id: string, _secretId: unknown) { throw noBoxSecrets(); },
   };

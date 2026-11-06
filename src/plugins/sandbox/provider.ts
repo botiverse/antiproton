@@ -230,7 +230,11 @@ export interface SandboxProvider {
   /** What the provider metered for this box, where it meters one. */
   usage?(id: string): Promise<{ runningSeconds: number; vcpuSeconds: number; memGiBSeconds: number; diskGiBSeconds: number }>;
   /** Registered for this box alone (box scope), never for the project: see `listProjectSecrets`. */
-  addSecret(id: string, secret: EgressSecret): Promise<void>;
+  /**
+   * The provider's id for the registration, when it answers one: what proves later that a registration on the box is
+   * this mount's, where the name cannot (another owner of the box may register the same name).
+   */
+  addSecret(id: string, secret: EgressSecret): Promise<string | null>;
   /** This box's registrations, as the provider lists them. Throws on any answer it cannot read as that list. */
   listSecrets(id: string): Promise<Array<{ name: unknown; id: unknown; placeholder?: unknown }>>;
   /**

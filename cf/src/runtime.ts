@@ -792,7 +792,7 @@ function boxEnds(things: Array<{ alias: string } & Withdrawal["things"][number]>
     const common = { alias: t.alias, id: t.id, ...(t.review ? { review: t.review } : {}), ...(t.why ? { why: t.why } : {}) };
     if (via) return { alias: t.alias, id: t.id, ...(t.review ? { review: t.review } : {}), clean: true, via };
     const code: UncleanCode = listingFailed ? "project_listing_failed"
-      : t.code === "stranded" || t.code === "no_credential" ? t.code
+      : t.code === "stranded" || t.code === "no_credential" || t.code === "foreign_residue" ? t.code
       : releaseFailed !== null && !releaseFailed.has(t.alias) ? "deletion_unconfirmed"
       : t.code === "listing_failed" ? "listing_failed" : "not_withdrawn";
     return unclean({ ...common, clean: false }, code);

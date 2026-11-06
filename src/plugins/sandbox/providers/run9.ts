@@ -319,11 +319,15 @@ function open(settings: ProviderSettings, credential: string): SandboxProvider {
       return snapId as string;
     },
 
+    // run9 answers the created registration's metadata (swagger `createBoxSecret`, 201 `api.ProjectSecretView`, read
+    // 2026-11-06), whose `secret_id` is the one `removeSecret` takes.
     async addSecret(id: string, s: EgressSecret) {
-      await api("POST", `${box(id)}/secrets`, {
+      const made = await api("POST", `${box(id)}/secrets`, {
         name: s.name, value: s.value, placeholder: s.placeholder,
         inject_header_name: s.header, allowed_hosts: s.hosts,
       });
+      const secretId = (made as { secret_id?: unknown } | null)?.secret_id;
+      return typeof secretId === "string" && secretId ? secretId : null;
     },
 
     // listBoxSecrets and listProjectSecrets (https://api.run.sys9.ai/swagger.yaml, read 2026-10-29, sha256

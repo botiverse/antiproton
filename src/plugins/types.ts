@@ -1868,7 +1868,7 @@ export interface PromptPart {
  */
 export interface Withdrawal {
   things: Array<{ id: string; clean: boolean; ownKey: boolean; why?: string; review?: string;
-    code?: "no_credential" | "stranded" | "listing_failed" | "not_withdrawn" | "project_listing_failed" }>;
+    code?: "no_credential" | "stranded" | "listing_failed" | "not_withdrawn" | "project_listing_failed" | "foreign_residue" }>;
   project: { state: "complete" | "failed" | "no_credential" | "none"; ids: string[]; findings: Array<{ boxId: string; secretId: string; name: string }>; error?: string };
 }
 

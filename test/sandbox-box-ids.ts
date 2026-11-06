@@ -16,7 +16,9 @@
  * trusting a list of paths: the fake run9 below remembers who each box was made for, and counts every request that
  * names a box (in its path, or a snapshot of it) sent while another agent is the caller.
  */
-import { BOX_KEY, BOX_STORE, MAIN_MACHINE, asMountState, boxIdFor, sandboxPlugin } from "../src/plugins/sandbox.ts";
+import { BOX_KEY, BOX_STORE, MAIN_MACHINE, SPLIT_PREFIX, asMountState, boxIdFor, sandboxPlugin } from "../src/plugins/sandbox.ts";
+import { countHeldTime } from "../src/usage/container.ts";
+import { pendingUsage } from "../src/usage/outbox.ts";
 import type { BoxLease } from "../src/plugins/sandbox.ts";
 import type { PluginTraceRow } from "../src/plugins/types.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
@@ -75,6 +77,10 @@ await check("no id is longer than run9 has accepted, and every one is lowercase 
     must(id.length <= RUN9_LONGEST_SEEN, `${id} is ${id.length} characters`);
     must(/^[a-z0-9-]+$/.test(id), `${id} has a character outside [a-z0-9-]`);
   }
+  // 48 today, one more per base-36 digit the time gains: the ninth arrives at 36^8 ms (2059).
+  const longest = (at: number) => boxIdFor({ tenantId: TENANT, agentId: AGENT_A, mount: "sandbox", machine: LONGEST_MACHINE }, at);
+  must((await longest(AT)).length === 48, `today's longest: ${(await longest(AT)).length}`);
+  must((await longest(36 ** 8 - 1)).length === 48 && (await longest(36 ** 8)).length === 49, "the ninth time digit does not add exactly one");
 });
 
 // ---- through the plugin, against a run9 that answers here
@@ -94,9 +100,10 @@ function run9Project() {
   const owners = new Map<string, string>();
   const calls: Call[] = [];
   const crossings: Call[] = [];
-  const o = { lose: false, caller: "" };
+  const o = { lose: false, caller: "", failRemove: false };
   let n = 0, sec = 0;
-  const secrets = new Map<string, Array<{ name: string; secret_id: string }>>();
+  /** Each box's registrations, with the value each holds, so a test can tell whose one is. */
+  const secrets = new Map<string, Array<{ name: string; secret_id: string; value: string; holder: string }>>();
   /** The box a request names: in its path, or as the snapshot `keep` forks. */
   const named = (path: string): string | null => {
     const m = /\/workspace\/boxes\/([^/?]+)/.exec(path);
@@ -112,7 +119,10 @@ function run9Project() {
     const c: Call = { method, path, ...(body ? { body } : {}), caller: o.caller };
     calls.push(c);
     const id = named(path);
-    if (id !== null && owners.has(id) && owners.get(id) !== o.caller) crossings.push(c);
+    // The one request another agent may send a box: removing a registration it made itself there, by its id.
+    const ownRemoval = method === "DELETE" && /\/secrets\/[^/]+$/.test(path)
+      && (secrets.get(id ?? "") ?? []).some((x) => x.secret_id === decodeURIComponent(path.split("/").at(-1)!) && x.holder === o.caller);
+    if (id !== null && owners.has(id) && owners.get(id) !== o.caller && !ownRemoval) crossings.push(c);
     const ok = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status });
     if (method === "POST" && /\/workspace\/boxes$/.test(path)) {
       if (boxes.has(body.box_id)) return ok({ error: "box already exists" }, 400);
@@ -133,10 +143,21 @@ function run9Project() {
     if (/\/secrets$/.test(path)) {
       const list = secrets.get(id!) ?? [];
       secrets.set(id!, list);
-      if (method === "POST") { list.push({ name: body.name, secret_id: `s${++sec}` }); return ok({}); }
-      return ok(list);
+      if (method === "POST") {
+        const made = { name: body.name, secret_id: `s${++sec}`, value: body.value, holder: o.caller };
+        list.push(made);
+        return ok({ secret_id: made.secret_id, name: made.name }, 201);
+      }
+      return ok(list.map(({ value: _v, holder: _h, ...meta }) => meta));
     }
-    if (method === "DELETE" && /\/secrets\//.test(path)) return ok({});
+    if (method === "DELETE" && /\/secrets\//.test(path)) {
+      if (o.failRemove) return ok({ error: "try later" }, 503);
+      const sid = decodeURIComponent(path.split("/").at(-1)!);
+      const list = secrets.get(id!) ?? [];
+      if (!list.some((x) => x.secret_id === sid)) return ok({ error: "secret not found" }, 404);
+      secrets.set(id!, list.filter((x) => x.secret_id !== sid));
+      return ok({});
+    }
     if (/\/snaps\/[^/]+\/fork$/.test(path)) return ok({ snap_id: `kept-${++n}` });
     return ok({});
   }) as any;
@@ -149,14 +170,24 @@ function run9Project() {
     boxes.set(id, { box_id: id, state: "idle", ...(description !== null ? { description } : {}), box_snap_id: `snap-of-${id}` });
     owners.set(id, owner);
   };
-  return { boxes, owners, calls, crossings, creates, on, execsOn, lists, put, o };
+  /** A registration on a box, as its owner made it. */
+  const register = (boxId: string, name: string, value: string, holder: string) => {
+    const made = { name, secret_id: `s${++sec}`, value, holder };
+    secrets.set(boxId, [...(secrets.get(boxId) ?? []), made]);
+    return made.secret_id;
+  };
+  /** Requests that end, stop or change a box itself, as opposed to a registration on it. */
+  const lifecycle = (boxId: string) => on(boxId).filter((c) => c.method === "DELETE" && !/\/secrets\//.test(c.path) || /\/stop$/.test(c.path)
+    || /background-execs$/.test(c.path) || /\/files\//.test(c.path) || /\/snaps\//.test(c.path));
+  return { boxes, owners, calls, crossings, creates, on, execsOn, lists, put, o, secrets, register, lifecycle };
 }
 
 const LEASE: BoxLease = { warnMs: 5 * 60_000, maxMs: 30 * 60_000 };
 
-function mountOf(tenantId: string, agentId: string, o: { lease?: BoxLease | null; record?: unknown } = {}) {
-  const tables = new PluginDbTables(sqliteHost()).ensure();
-  const scope = { tenantId, agentId, alias: "sandbox", plugin: "sandbox" };
+function mountOf(tenantId: string, agentId: string, o: { lease?: BoxLease | null; record?: unknown; alias?: string; tables?: PluginDbTables } = {}) {
+  const alias = o.alias ?? "sandbox";
+  const tables = o.tables ?? new PluginDbTables(sqliteHost()).ensure();
+  const scope = { tenantId, agentId, alias, plugin: "sandbox" };
   if (o.record) tables.put(scope, BOX_STORE, BOX_KEY, o.record as any, null);
   const artifacts = {
     async put(key: string, body: Uint8Array) { return { ref: `r2://bucket/${key}`, bytes: body.byteLength }; },
@@ -166,7 +197,7 @@ function mountOf(tenantId: string, agentId: string, o: { lease?: BoxLease | null
   const plugin = sandboxPlugin(artifacts as any, "bucket", o.lease ?? null);
   const traces: PluginTraceRow[] = [];
   const ctx: any = {
-    caller: { tenantId, agentId, taskId: "k" }, alias: "sandbox",
+    caller: { tenantId, agentId, taskId: "k" }, alias,
     credential: JSON.stringify({ ak: "a", sk: "b" }),
     publicConfig: { endpoint: "https://run9.example", project: "p", graceMs: 10_000 },
     db: openPluginDatabase(tables, scope, plugin.database),
@@ -175,7 +206,9 @@ function mountOf(tenantId: string, agentId: string, o: { lease?: BoxLease | null
   };
   const raw = () => tables.get(scope, BOX_STORE, BOX_KEY) as any;
   const main = () => asMountState(raw())?.machines.main;
-  return { plugin, ctx, main, raw, traces, owner: `${tenantId}/${agentId}` };
+  /** The split this mount recorded for a box, read the direct way an audit would. */
+  const split = (boxId: string) => tables.get(scope, BOX_STORE, `${SPLIT_PREFIX}${boxId}`) as any;
+  return { plugin, ctx, main, raw, split, traces, owner: `${tenantId}/${agentId}` };
 }
 
 const realNow = Date.now;
@@ -370,6 +403,235 @@ await check("the same entry points, from the box's own agent: each does reach it
     if (p.crossings.length) missed.push(`${name} crossed: ${JSON.stringify(p.crossings)}`);
   }
   must(missed.length === 0, `never reached its own box: ${missed.join(", ")}`);
+});
+
+// ---- the call site, and both halves of the owner
+
+await check("one agent's two mounts, first command in the same millisecond, through the plugin: two boxes", async () => {
+  const p = run9Project();
+  const tables = new PluginDbTables(sqliteHost()).ensure();
+  const one = mountOf(TENANT, AGENT_A, { alias: "sandbox", tables }), two = mountOf(TENANT, AGENT_A, { alias: "sandbox2", tables });
+  p.o.caller = one.owner;
+  await frozen(() => one.plugin.invoke("shell", { command: "ls" }, one.ctx));
+  await frozen(() => two.plugin.invoke("shell", { command: "ls" }, two.ctx));
+  const ids = p.creates().map((c) => c.body.box_id as string);
+  must(ids.length === 2 && ids[0] !== ids[1], `one id for two mounts: ${JSON.stringify(ids)}`);
+  must(one.main()?.boxId === ids[0] && two.main()?.boxId === ids[1], `records: ${one.main()?.boxId} ${two.main()?.boxId}`);
+});
+
+await check("another tenant's agent of the same id: its box is neither adopted nor kept, at create or when a record names it", async () => {
+  const OTHER_TENANT = TENANT.slice(0, 38) + "fff";
+  // At create: the minted id is listed, made for the same agent id in another tenant.
+  const p = run9Project();
+  const a = mountOf(TENANT, AGENT_A);
+  const id = await boxIdFor({ tenantId: TENANT, agentId: AGENT_A, mount: "sandbox", machine: MAIN_MACHINE }, AT);
+  p.put(id, `${OTHER_TENANT}/${AGENT_A}`);
+  p.o.caller = a.owner;
+  const err = await thrown(() => frozen(() => a.plugin.invoke("shell", { command: "ls" }, a.ctx)));
+  must(err !== null && /already exists/.test(err) && !a.main()?.boxId, `adopted: ${err} ${JSON.stringify(a.main())}`);
+  // At read: a record from before the fix names it.
+  const q = run9Project();
+  q.put(OLD_ID, `${OTHER_TENANT}/${AGENT_A}`);
+  const b = mountOf(TENANT, AGENT_A, { record: legacyRecord(OLD_ID) });
+  q.o.caller = b.owner;
+  await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+  must(b.main()?.boxId !== OLD_ID && q.creates().length === 1 && q.on(OLD_ID).length === 0 && q.crossings.length === 0,
+    `kept: ${JSON.stringify(b.main())} ${JSON.stringify(q.on(OLD_ID))}`);
+});
+
+// ---- the release and the delete, from the agent whose record names the other's box
+
+await check("the taker's release and delete never stop or delete the owner's machine; the taker's own other box still goes", async () => {
+  const p = run9Project();
+  // The owner's box, as the owner's record names it, and the taker's record naming the same id beside a box of its own.
+  p.put(OLD_ID, `${TENANT}/${AGENT_A}`);
+  const OWN = "h-taker-build-box";
+  p.put(OWN, `${TENANT}/${AGENT_B}`);
+  const before = JSON.stringify(p.boxes.get(OLD_ID));
+  const record = { machines: {
+    main: { boxId: OLD_ID, createdAt: AT, lastUsedAt: AT, execs: 1, saved: [] },
+    build: { boxId: OWN, createdAt: AT, lastUsedAt: AT, execs: 1, saved: [] },
+  } };
+  // The construction measured on d740381: holds.release from the taker deleted the owner's box and answered freed.
+  const b = mountOf(TENANT, AGENT_B, { record });
+  p.o.caller = b.owner;
+  const released: any = await b.plugin.holds!.release(b.ctx);
+  must(p.boxes.has(OLD_ID) && JSON.stringify(p.boxes.get(OLD_ID)) === before, "the owner's box was changed or deleted");
+  must(p.lifecycle(OLD_ID).length === 0 && p.crossings.length === 0, `requests on the owner's box: ${JSON.stringify(p.on(OLD_ID))}`);
+  must(!p.boxes.has(OWN) && p.calls.some((c) => c.method === "DELETE" && c.path.endsWith(`/boxes/${OWN}`)), "the taker's own box was not released");
+  const facts = Array.isArray(released) ? released : [released];
+  must(facts.length === 1 && facts[0].id === OWN, `released: ${JSON.stringify(released)}`);
+  // An agent's delete runs the withdrawal and then the release (cf/src/runtime.ts `releaseForDelete`).
+  const q = run9Project();
+  q.put(OLD_ID, `${TENANT}/${AGENT_A}`);
+  q.put(OWN, `${TENANT}/${AGENT_B}`);
+  const c = mountOf(TENANT, AGENT_B, { record });
+  q.o.caller = c.owner;
+  await c.plugin.holds!.withdraw!(c.ctx);
+  await c.plugin.holds!.release(c.ctx);
+  must(q.boxes.has(OLD_ID) && q.lifecycle(OLD_ID).length === 0 && q.crossings.length === 0, `the delete reached the owner's box: ${JSON.stringify(q.on(OLD_ID))}`);
+  must(!q.boxes.has(OWN), "the deleted agent's own box was not released");
+});
+
+// ---- what a split leaves behind, and what it takes off the owner's box
+
+const TAKER = () => `${TENANT}/${AGENT_B}`;
+const OWNER = () => `${TENANT}/${AGENT_A}`;
+/** The taker's record naming the owner's box, with what the taker wired there. */
+const takerRecord = (wired: unknown[]) => ({ machines: { main: { boxId: OLD_ID, createdAt: AT - 3_600_000, lastUsedAt: AT, execs: 1, saved: [], wired } } });
+const ghWiring = (extra: Record<string, unknown>) => ({ alias: "gh", plugin: "github", placeholder: "__AP_GH_x__", digest: "d", names: ["GH_TOKEN"], ...extra });
+/** The owner's box with the owner's registration and the taker's, both under one name. */
+function sharedBox() {
+  const p = run9Project();
+  p.put(OLD_ID, OWNER());
+  const ownerSecret = p.register(OLD_ID, "GH_TOKEN", "owner-token", OWNER());
+  const takerSecret = p.register(OLD_ID, "GH_TOKEN", "taker-token", TAKER());
+  return { p, ownerSecret, takerSecret };
+}
+const ownerSecretIntact = (p: ReturnType<typeof run9Project>, sid: string) => {
+  const mine = (p.secrets.get(OLD_ID) ?? []).filter((x) => x.secret_id === sid);
+  return mine.length === 1 && mine[0]!.value === "owner-token" && mine[0]!.holder === OWNER();
+};
+const RESIDUE = "Some of this mount's account registrations may remain on that machine; there is nothing for you to do about them.";
+const PENDING = "Taking this mount's accounts off that machine did not finish and will be retried; there is nothing for you to do.";
+const GIVEN_UP = "failed three times, so some of its account registrations may remain there; there is nothing for you to do about them.";
+
+await check("a split is recorded by box id, beside the record: never in machines or sessions, and never billed to the taker", async () => {
+  const { p } = sharedBox();
+  const b = mountOf(TENANT, AGENT_B, { record: takerRecord([]) });
+  p.o.caller = TAKER();
+  await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+  const raw = JSON.stringify(b.raw());
+  must(!(b.raw().sessions ?? []).some((x: any) => x.boxId === OLD_ID), `a session for the owner's box: ${raw}`);
+  const sp = b.split(OLD_ID);
+  must(sp?.box === OLD_ID && sp.reason === "foreign_owner" && sp.unwire === "removed" && sp.mount === "sandbox" && typeof sp.detectedAt === "number",
+    `the split record: ${JSON.stringify(sp)}`);
+  must(!Object.values(b.raw().machines ?? {}).some((m: any) => m.boxId === OLD_ID) && !raw.includes(OLD_ID), `the record still names it: ${raw}`);
+});
+
+await check("a split adds no billed time for the owner's box to the taker, even with the usage watermark before the split", async () => {
+  // Guards the first reason splits are not written into sessions (`SPLIT_PREFIX`): they would be billed. The
+  // watermark is put before the split, as for an agent that was dormant a long time and is split on its first call
+  // after waking; written into sessions as a spanning interval, the tail [watermark, split] would be billed to the
+  // taker one pass late. Without the watermark before the split, even that wrong version would pass.
+  const { p } = sharedBox();
+  const b = mountOf(TENANT, AGENT_B, { record: takerRecord([]) });
+  p.o.caller = TAKER();
+  const host = sqliteHost();
+  const base = { tenantId: TENANT, agentId: AGENT_B };
+  const pass = async (now: number) => {
+    const report = { activity: await b.plugin.holds!.activity!(b.ctx), usage: await b.plugin.holds!.usage!(b.ctx) };
+    return countHeldTime(host.sql, { sandbox: { plugin: "sandbox", report } }, base, now);
+  };
+  const T1 = AT, T2 = AT + 3_600_000, T3 = AT + 7_200_000;
+  Date.now = () => T1;
+  try {
+    await pass(T1);
+    const marked = () => Object.fromEntries(host.sql.exec("SELECT box_id, through FROM usage_held").toArray().map((r: any) => [r.box_id, Number(r.through)]));
+    must(marked()[OLD_ID] === T1, `the watermark is not before the split: ${JSON.stringify(marked())}`);
+    const seen = pendingUsage(host.sql, 0).length;
+    Date.now = () => T2;
+    await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+    const fresh = b.main()!.boxId;
+    Date.now = () => T3;
+    await pass(T3);
+    const rows = pendingUsage(host.sql, 0).slice(seen).filter((r) => r.unit === "seconds");
+    const seconds = rows.reduce((n, r) => n + r.quantity, 0);
+    // Only the new box, from its creation; the hour of the owner's box between the watermark and the split is not the taker's.
+    must(seconds === (T3 - T2) / 1000, `seconds after the split: ${seconds}, expected ${(T3 - T2) / 1000} (the new box only)`);
+    must(marked()[fresh] === T3, `the pass did not process this mount: ${JSON.stringify(marked())}`);
+    must(marked()[OLD_ID] === T1, `the owner's box was counted on: ${JSON.stringify(marked())}`);
+  } finally { Date.now = realNow; }
+});
+
+await check("registrations proven the taker's by id are removed; the owner's of the same name stays, with its own value", async () => {
+  const { p, ownerSecret, takerSecret } = sharedBox();
+  const b = mountOf(TENANT, AGENT_B, { record: takerRecord([ghWiring({ ids: [] })]) });
+  // The taker's wiring recorded the id its registration was made under.
+  const rec = takerRecord([ghWiring({ ids: [takerSecret] })]);
+  const c = mountOf(TENANT, AGENT_B, { record: rec });
+  void b;
+  p.o.caller = TAKER();
+  const r: any = await c.plugin.invoke("shell", { command: "ls" }, c.ctx);
+  must(!(p.secrets.get(OLD_ID) ?? []).some((x) => x.secret_id === takerSecret), "the taker's registration is still on the owner's box");
+  must(ownerSecretIntact(p, ownerSecret), `the owner's registration changed: ${JSON.stringify(p.secrets.get(OLD_ID))}`);
+  must(p.lifecycle(OLD_ID).length === 0 && p.crossings.length === 0 && p.boxes.has(OLD_ID), `the owner's box was touched: ${JSON.stringify(p.on(OLD_ID))}`);
+  must(c.split(OLD_ID)?.unwire === "removed" && r.box === c.main()?.boxId && p.execsOn(r.box).length === 1, `split ${JSON.stringify(c.split(OLD_ID))}, result ${JSON.stringify(r)}`);
+  must(!JSON.stringify(r).includes("may remain") && !JSON.stringify(r).includes("retried"), `said more than the split: ${r.note}`);
+});
+
+for (const [name, wired, reason, names] of [
+  ["wirings from before ids were recorded", ghWiring({}), "wiring_without_ids", '["GH_TOKEN"]'],
+  ["a wiring whose names are unknown", ghWiring({ names: null }), "names_unknown", "[]"],
+] as const) {
+  await check(`${name}: nothing is removed, a residue is kept and said, and the taker works on a new box`, async () => {
+    const { p, ownerSecret, takerSecret } = sharedBox();
+    const b = mountOf(TENANT, AGENT_B, { record: takerRecord([wired]) });
+    p.o.caller = TAKER();
+    const r: any = await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+    // The same outcomes as a split that could remove: a working new box, the owner's box and registration as they were.
+    must(r.box === b.main()?.boxId && r.box !== OLD_ID && p.execsOn(r.box).length === 1, `the taker has no working box: ${JSON.stringify(r)}`);
+    must(p.boxes.has(OLD_ID) && p.lifecycle(OLD_ID).length === 0 && p.crossings.length === 0, `the owner's box was touched: ${JSON.stringify(p.on(OLD_ID))}`);
+    must(ownerSecretIntact(p, ownerSecret), `the owner's registration changed: ${JSON.stringify(p.secrets.get(OLD_ID))}`);
+    // Differing only in this: nothing removed, a residue kept beside the record, and said.
+    must((p.secrets.get(OLD_ID) ?? []).some((x) => x.secret_id === takerSecret), "a registration not proven the taker's was removed");
+    const sp = b.split(OLD_ID);
+    must(sp?.unwire === "residue" && sp.residue?.reason === reason && JSON.stringify(sp.names) === names && sp.mount === "sandbox",
+      `the residue: ${JSON.stringify(sp)}`);
+    must(count(JSON.stringify(r), RESIDUE) === 1, `the residue is not said: ${r.note}`);
+    const act: any = await b.plugin.holds!.activity!(b.ctx);
+    must(act.live?.id === r.box && !(act.aside ?? []).some((x: any) => x.id === OLD_ID), `held: ${JSON.stringify(act)}`);
+    must(!Object.values(b.raw().machines ?? {}).some((m: any) => m.boxId === OLD_ID), "machines still names the owner's box");
+  });
+}
+
+await check("a removal the provider refuses is pending: the taker works now, the next call retries it, and the split keeps its time", async () => {
+  const { p, ownerSecret, takerSecret } = sharedBox();
+  const b = mountOf(TENANT, AGENT_B, { record: takerRecord([ghWiring({ ids: [takerSecret] })]) });
+  p.o.caller = TAKER();
+  p.o.failRemove = true;
+  Date.now = () => AT;
+  try {
+    const r: any = await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+    must(r.box === b.main()?.boxId && p.execsOn(r.box).length === 1, `the taker was held up: ${JSON.stringify(r)}`);
+    must(count(JSON.stringify(r), PENDING) === 1, `pending not said: ${r.note}`);
+    must(b.split(OLD_ID)?.unwire === "pending" && b.split(OLD_ID).pending.attempts === 1, `split: ${JSON.stringify(b.split(OLD_ID))}`);
+    const act: any = await b.plugin.holds!.activity!(b.ctx);
+    must(!(act.aside ?? []).some((x: any) => x.id === OLD_ID), `the owner's box is held by the taker: ${JSON.stringify(act)}`);
+    p.o.failRemove = false;
+    Date.now = () => AT + 60_000;
+    const next: any = await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+    must(b.split(OLD_ID)?.unwire === "removed" && b.split(OLD_ID).pending === undefined, `not retried: ${JSON.stringify(b.split(OLD_ID))}`);
+    must(b.split(OLD_ID).detectedAt === AT, `the split's time moved: ${b.split(OLD_ID).detectedAt}`);
+    must(!(p.secrets.get(OLD_ID) ?? []).some((x) => x.secret_id === takerSecret) && ownerSecretIntact(p, ownerSecret), "the retry removed the wrong one");
+    must(p.lifecycle(OLD_ID).length === 0 && p.crossings.length === 0 && next.box === r.box, `the owner's box was touched: ${JSON.stringify(p.lifecycle(OLD_ID))}`);
+  } finally { Date.now = realNow; }
+});
+
+await check("a removal refused three times in a row is given up on: kept as residue, said once, and not tried again", async () => {
+  const { p, ownerSecret, takerSecret } = sharedBox();
+  const b = mountOf(TENANT, AGENT_B, { record: takerRecord([ghWiring({ ids: [takerSecret] })]) });
+  p.o.caller = TAKER();
+  p.o.failRemove = true;
+  Date.now = () => AT;
+  try {
+    await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+    Date.now = () => AT + 1;
+    const second: any = await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+    must(b.split(OLD_ID)?.unwire === "pending" && b.split(OLD_ID).pending.attempts === 2 && !JSON.stringify(second).includes(GIVEN_UP), `after two: ${JSON.stringify(b.split(OLD_ID))}`);
+    const third: any = await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+    const sp = b.split(OLD_ID);
+    must(sp?.unwire === "residue" && sp.residue?.reason === "unwire failed 3 times" && /unavailable|transient|503/.test(sp.residue.lastError ?? ""), `after three: ${JSON.stringify(sp)}`);
+    must(sp.detectedAt === AT, `the split's time moved: ${sp.detectedAt}`);
+    must(count(JSON.stringify(third), GIVEN_UP) === 1 && p.execsOn(third.box).length >= 1, `the conversion is not said: ${JSON.stringify(third)}`);
+    const removals = () => p.calls.filter((c) => c.method === "DELETE" && /\/secrets\//.test(c.path)).length;
+    const tried = removals();
+    const fourth: any = await b.plugin.invoke("shell", { command: "ls" }, b.ctx);
+    must(removals() === tried && !JSON.stringify(fourth).includes(GIVEN_UP), "tried or said again after giving up");
+    must(ownerSecretIntact(p, ownerSecret) && p.boxes.has(OLD_ID) && p.lifecycle(OLD_ID).length === 0 && p.crossings.length === 0, "the owner's box or registration was touched");
+    const act: any = await b.plugin.holds!.activity!(b.ctx);
+    must(!(act.aside ?? []).some((x: any) => x.id === OLD_ID), `the owner's box is held by the taker: ${JSON.stringify(act)}`);
+  } finally { Date.now = realNow; }
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.ok ? "" : `\n    ${r.error}`}`);
