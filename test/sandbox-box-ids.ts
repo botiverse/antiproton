@@ -233,7 +233,9 @@ function mountOf(tenantId: string, agentId: string, o: { lease?: BoxLease | null
   /** The split this mount recorded for a box, read the direct way an audit would. */
   const split = (boxId: string) => tables.get(scope, BOX_STORE, `${SPLIT_PREFIX}${boxId}`) as any;
   const putRaw = (key: string, v: unknown) => tables.put(scope, BOX_STORE, key, v as any, null);
-  return { plugin, ctx, main, raw, split, putRaw, traces, owner: `${tenantId}/${agentId}` };
+  /** This mount's notes queue as stored. */
+  const queue = () => { const v = tables.get(scope, BOX_STORE, "notices"); return Array.isArray(v) ? v as any[] : []; };
+  return { plugin, ctx, main, raw, split, putRaw, queue, traces, owner: `${tenantId}/${agentId}` };
 }
 
 const realNow = Date.now;
@@ -1355,19 +1357,34 @@ await check("through the gateway, a tool call, a release and a withdrawal on one
 
 await check("one agent's two mounts split from the same box: each keeps its own split record and its own note", async () => {
   // Split records and notes live in the mount's own database, the one the per-mount lock covers; in a store shared by
-  // the agent's mounts one mount would read, overwrite or deliver the other's. The two records differ in `mount`, and
-  // each is read from its own mount and checked by that field: one row shared by both could not pass as both.
+  // the agent's mounts one mount would read, overwrite or deliver the other's. The box is another agent's (the
+  // owner's), foreign to both mounts.
   const { p } = sharedBox();
   const tables = new PluginDbTables(sqliteHost()).ensure();
-  const one = mountOf(TENANT, AGENT_B, { alias: "sandbox", tables, record: takerRecord([]) });
-  const two = mountOf(TENANT, AGENT_B, { alias: "sandbox2", tables, record: takerRecord([]) });
+  const one = mountOf(TENANT, AGENT_B, { alias: "sandbox", tables, record: takerRecord([]), lease: LEASE });
+  const two = mountOf(TENANT, AGENT_B, { alias: "sandbox2", tables, record: takerRecord([]), lease: LEASE });
   p.o.caller = TAKER();
-  const r1: any = await one.plugin.invoke("shell", { command: "ls" }, one.ctx);
-  const r2: any = await two.plugin.invoke("shell", { command: "ls" }, two.ctx);
-  must(one.split(OLD_ID)?.mount === "sandbox" && two.split(OLD_ID)?.mount === "sandbox2", `split records: ${JSON.stringify([one.split(OLD_ID), two.split(OLD_ID)])}`);
-  must(count(JSON.stringify(r1), NOT_OURS) === 1 && count(JSON.stringify(r2), NOT_OURS) === 1, `each mount's note once: ${r1.note} | ${r2.note}`);
-  const again = JSON.stringify(await one.plugin.invoke("shell", { command: "ls" }, one.ctx)) + JSON.stringify(await two.plugin.invoke("shell", { command: "ls" }, two.ctx));
-  must(!again.includes(NOT_OURS), `a note seen twice: ${again}`);
+  must(p.owners.get(OLD_ID) === OWNER() && OWNER() !== one.owner, "the box is not foreign to both mounts");
+  // Both split it, outside a tool call, so each note waits in its queue.
+  await logged(() => one.plugin.holds!.release(one.ctx, { reason: "idle" }) as Promise<unknown>);
+  await logged(() => two.plugin.holds!.release(two.ctx, { reason: "idle" }) as Promise<unknown>);
+  // Record half: both really wrote one, naming the same box from different aliases; the two are distinguishable, and
+  // each mount reads only its own (one row shared by both could not pass as both).
+  const r1 = one.split(OLD_ID), r2 = two.split(OLD_ID);
+  must(r1 && r2, `a mount did not split: ${JSON.stringify([r1, r2])}`);
+  must(r1.box === OLD_ID && r2.box === OLD_ID && r1.mount !== r2.mount, `not one box from two aliases: ${JSON.stringify([r1, r2])}`);
+  must(r1.mount === "sandbox" && r2.mount === "sandbox2", `each mount does not read its own: ${r1.mount} ${r2.mount}`);
+  // Queue half, by row id and count, never by content (the two notes say the same words by design): one row each,
+  // each the row its own mount queued.
+  const q1 = one.queue(), q2 = two.queue();
+  must(q1.length === 1 && q2.length === 1, `rows queued: ${q1.length} and ${q2.length}`);
+  must(q1[0].id !== q2[0].id, `one row id in both queues: ${q1[0].id}`);
+  const idTwo = q2[0].id;
+  const d1: any = await one.plugin.invoke("shell", { command: "ls" }, one.ctx);
+  must(count(JSON.stringify(d1), NOT_OURS) === 1, `the first mount's note: ${d1.note}`);
+  must(one.queue().length === 0 && two.queue().length === 1 && two.queue()[0].id === idTwo, `delivery reached the other queue: ${JSON.stringify([one.queue(), two.queue()])}`);
+  const d2: any = await two.plugin.invoke("shell", { command: "ls" }, two.ctx);
+  must(count(JSON.stringify(d2), NOT_OURS) === 1 && two.queue().length === 0, `the second mount's note: ${d2.note}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.ok ? "" : `\n    ${r.error}`}`);
