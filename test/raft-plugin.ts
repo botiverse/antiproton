@@ -214,8 +214,12 @@ const EXPECTED_GENERATED = [
   "channels.mute", "channels.unmute", "channels.members", "channels.info", "threads.list", "threads.unfollow", "server.info", "server.update", "labs.list", "labs.setAccess", "labs.setEnrollment", "users.info",
   "profile.show", "profile.update",
   // SDK 0.31.0: the Artifacts app's operations, listed only where the Server has the app on (`appOf`).
-  "artifacts.list", "artifacts.read", "artifacts.comments", "artifacts.fileContent", "artifacts.publish", "artifacts.comment",
-  "artifacts.follow", "artifacts.unfollow", "artifacts.move", "artifacts.delete", "artifacts.import", "artifacts.saveAttachment",
+  "artifacts.list", "artifacts.read", "artifacts.comments", "artifacts.fileContent", "artifacts.push", "artifacts.comment",
+  "artifacts.follow", "artifacts.unfollow", "artifacts.move", "artifacts.delete", "artifacts.saveAttachment",
+  // SDK 0.33.0: `artifacts.publish` is `artifacts.push` and `artifacts.import` is gone; new are a card message's update
+  // (`messages.updateCard`, refused where the Server's message_cards flag is off), a question card's withdrawal
+  // (`actions.withdraw`, beside `actions.prepare`), and the Artifacts app's review and publish check.
+  "messages.updateCard", "actions.withdraw", "artifacts.review", "artifacts.check",
 ];
 
 await check("every manifest operation is a generated tool or in the exclusion table, never both, and every exclusion names a real operation", async () => {
@@ -376,7 +380,7 @@ await check("the manifest's declarations map onto the tool: side effect, model-o
   // Keyed since 0.9.0 like a send: "key", never "native". When the model gives no key the key is the operation id, which
   // a re-run after a crash does not keep, so declaring "native" (replayed on its own) would land the write twice.
   const keyed = GENERATED.filter((op) => op.idempotency.kind === "key").map((op) => op.toolName);
-  if (JSON.stringify(keyed) !== JSON.stringify(["messages_send", "messages_reply", "actions_prepare", "tasks_create"])) throw new Error(`keyed operations: ${keyed.join(", ")}`);
+  if (JSON.stringify(keyed) !== JSON.stringify(["messages_send", "messages_reply", "messages_update_card", "artifacts_review", "actions_prepare", "tasks_create"])) throw new Error(`keyed operations: ${keyed.join(", ")}`);
   for (const name of keyed) {
     const t = toolNamed(name)!;
     if (t.idempotency !== "key" || t.sideEffects !== "write") throw new Error(`${name} lost its key idempotency: ${t.idempotency}`);
@@ -691,8 +695,9 @@ await check("a held task claim asks proceed or drop, and proceed makes the ident
   if ("idempotencyKey" in ((held.state as any).args ?? {}) || "seen" in (held.state as any)) throw new Error(`a claim carries a send's continuation: ${JSON.stringify(held.state)}`);
   const out = await raftPlugin.interrupts!.resume("tasks_claim", held.state, "proceed", inTurn(m.ctx)) as any;
   // The identical claim, now attesting the message the question showed (task writes attest since SDK 0.20.0).
-  const { seenUpToSeq, ...again } = JSON.parse(String(calls[1]?.init.body));
-  if (calls.length !== 2 || JSON.stringify(again) !== calls[0]!.init.body || seenUpToSeq !== 20 || out.state !== "claimed") throw new Error(`resume: ${JSON.stringify({ out, bodies: calls.map((c) => c.init.body) })}`);
+  // Since SDK 0.33.0 the attestation names what it is for: the task's own conversation (`seenFor`).
+  const { seenUpToSeq, seenFor, ...again } = JSON.parse(String(calls[1]?.init.body));
+  if (calls.length !== 2 || JSON.stringify(again) !== calls[0]!.init.body || seenUpToSeq !== 20 || seenFor !== "task_conversation" || out.state !== "claimed") throw new Error(`resume: ${JSON.stringify({ out, bodies: calls.map((c) => c.init.body) })}`);
   const dropped = await raftPlugin.interrupts!.resume("tasks_claim", held.state, "drop", inTurn(m.ctx)) as any;
   if (dropped.state !== "dropped" || !/Nothing was done/.test(dropped.note)) throw new Error(JSON.stringify(dropped));
 });
@@ -732,8 +737,9 @@ await check("a held task write (unread_messages) is a question, never a success:
     const server = boardServer(path, ok);
     const held = await raftPlugin.invoke(tool, args, m.ctx) as any;
     if (!(held instanceof Interrupt)) throw new Error(`${tool}: a held write came back as a result: ${JSON.stringify(held)}`);
+    // The hold is about the task's own conversation since SDK 0.33.0.
     if (held.question !== sdk.context || JSON.stringify(held.answer) !== '{"choices":["proceed","drop"]}' ||
-        JSON.stringify(held.context) !== JSON.stringify({ reason: "unread_messages", target: "#general" })) {
+        JSON.stringify(held.context) !== JSON.stringify({ reason: "unread_messages", target: "#general:#7" })) {
       throw new Error(`${tool}: the question: ${JSON.stringify({ question: held.question, answer: held.answer, context: held.context })}`);
     }
     if (server.applied() !== 0 || server.sent() !== 1) throw new Error(`${tool}: applied at the hold: ${JSON.stringify({ applied: server.applied(), bodies: server.bodies })}`);
@@ -747,9 +753,9 @@ await check("a held task write (unread_messages) is a question, never a success:
       throw new Error(`${tool}: resume: ${JSON.stringify({ out, applied: server.applied(), bodies: server.bodies })}`);
     }
     // The identical call, now attesting the held message it showed.
-    const { seenUpToSeq, seenExactSeqs: _x, ...second } = server.bodies[1];
-    const { seenUpToSeq: _s, seenExactSeqs: _y, ...first } = server.bodies[0];
-    if (seenUpToSeq !== 20 || JSON.stringify(second) !== JSON.stringify(first)) throw new Error(`${tool}: the resumed write: ${JSON.stringify(server.bodies)}`);
+    const { seenUpToSeq, seenExactSeqs: _x, seenFor, ...second } = server.bodies[1];
+    const { seenUpToSeq: _s, seenExactSeqs: _y, seenFor: _f, ...first } = server.bodies[0];
+    if (seenUpToSeq !== 20 || seenFor !== "task_conversation" || JSON.stringify(second) !== JSON.stringify(first)) throw new Error(`${tool}: the resumed write: ${JSON.stringify(server.bodies)}`);
     const answer = m.rows.find((r) => r.kind === "raft.held_answer");
     if (answer?.status !== "proceed" || answer.attrs?.reason !== "unread_messages" || answer.attrs?.outcome !== state) throw new Error(`${tool}: raft.held_answer: ${JSON.stringify(answer)}`);
     // The model calling again instead of answering: the identical call, attesting what it was shown, applied once.
@@ -893,11 +899,16 @@ await check("a Server conflict on a send is an ordinary refusal: not retryable, 
 
 await check("a Server rejection shows the model its HTTP status and error code beside the SDK's sentence and the Server's next action", async () => {
   const next = "Creating channels needs the admin role on this Server; your role is member. Ask a Server admin to create it or to change your role.";
-  one(json(403, { errorCode: "server_role_required", suggestedNextAction: next, error: "raw body text that stays out" }));
+  // A body `error` that is not one short line stays out: the SDK's own sentence stands.
+  one(json(403, { errorCode: "server_role_required", suggestedNextAction: next, error: "raw body text\nthat stays out" }));
   const why = await failure(() => raftPlugin.invoke("messages_send", { target: "#general", content: "x", idempotencyKey: "k-role" }, inTurn(ctx())));
   const want = `The Raft Server rejected the request (HTTP 403, server_role_required). — ${next}`;
   if (why.message !== want) throw new Error(`said: ${why.message}`);
   if (/raw body/.test(why.message) || why.retryable !== false || why.mayHaveLanded === true) throw new Error(`marks or body: ${JSON.stringify({ message: why.message, retryable: why.retryable })}`);
+  // Since SDK 0.33.0 a 4xx refusal's own one-line sentence is the message, as Raft wrote it for the agent.
+  one(json(403, { errorCode: "server_role_required", suggestedNextAction: next, error: "Only an admin can send here." }));
+  const said = await failure(() => raftPlugin.invoke("messages_send", { target: "#general", content: "x", idempotencyKey: "k-role2" }, inTurn(ctx())));
+  if (said.message !== `Only an admin can send here (HTTP 403, server_role_required). — ${next}`) throw new Error(`the Server's sentence: ${said.message}`);
   // A rejection with no code still says its status.
   one(json(403, {}));
   const bare = await failure(() => raftPlugin.invoke("messages_read", { target: "#general" }, inTurn(ctx())));
@@ -949,31 +960,33 @@ function attestingServer() {
   }) as any;
   return bodies;
 }
-/** What the mount's saved Raft state says was seen in #general, by context. */
-const bookedIn = (fresh: ReturnType<typeof freshDb>) => (fresh.tables.get(fresh.scope, INBOX_STORE, "state") as any)?.frontier?.targets?.["#general"] ?? null;
+/** What the mount's saved Raft state says was seen in `target` (#general unless named), by context. */
+const bookedIn = (fresh: ReturnType<typeof freshDb>, target = "#general") => (fresh.tables.get(fresh.scope, INBOX_STORE, "state") as any)?.frontier?.targets?.[target] ?? null;
 
 await check("a question raised inside a program records nothing as seen; the model's answer records it, in the context answering", async () => {
-  for (const [tool, args, go] of [
-    ["messages_send", { target: "#general", content: "done", idempotencyKey: "k-prog" }, "send"],
-    ["tasks_claim", { target: "#general", taskNumbers: [7] }, "proceed"],
+  // A task write's hold is about the task's own conversation since SDK 0.33.0 (`seenFor: "task_conversation"`), so
+  // that is where what it showed is seen, and where a later send attests it.
+  for (const [tool, args, go, where] of [
+    ["messages_send", { target: "#general", content: "done", idempotencyKey: "k-prog" }, "send", "#general"],
+    ["tasks_claim", { target: "#general", taskNumbers: [7] }, "proceed", "#general:#7"],
   ] as const) {
     const fresh = freshDb();
     const model = { ...inTurn(ctx(), "ctx_turn"), db: fresh.db };
     const fromProgram = { ...model, caller: { ...model.caller, fromProgram: true } };
     const bodies = attestingServer();
     const held = await raftPlugin.invoke(tool, args, fromProgram) as any;
-    if (!(held instanceof Interrupt) || !held.question.startsWith("Held — 1 unread message in #general.")) throw new Error(`${tool}: not held: ${JSON.stringify(held)}`);
+    if (!(held instanceof Interrupt) || !held.question.startsWith(`Held — 1 unread message in ${where}.`)) throw new Error(`${tool}: not held: ${JSON.stringify(held)}`);
     // The program's run may close before anyone is asked: nothing is booked. (That the model's own send there is then
     // held is the run_js case below; asked here, that send's own hold would book and hide the answer's booking.)
-    if (bookedIn(fresh) !== null) throw new Error(`${tool}: booked at the program's hold: ${JSON.stringify(bookedIn(fresh))}`);
+    if (bookedIn(fresh, where) !== null) throw new Error(`${tool}: booked at the program's hold: ${JSON.stringify(bookedIn(fresh, where))}`);
     // The model answers the question: the messages it showed are seen now, in the context answering.
     const out = await raftPlugin.interrupts!.resume(tool, held.state, go, model) as any;
-    const booked = bookedIn(fresh);
+    const booked = bookedIn(fresh, where);
     if (out instanceof Interrupt || booked?.upTo !== 20 || booked?.upToContextId !== "ctx_turn") {
       throw new Error(`${tool}: answered: ${JSON.stringify({ out, body: bodies.at(-1), booked })}`);
     }
     // So a later send of the model's there attests them and goes through.
-    const after = await raftPlugin.invoke("messages_send", { target: "#general", content: "after", idempotencyKey: "k-after" }, model) as any;
+    const after = await raftPlugin.invoke("messages_send", { target: where, content: "after", idempotencyKey: "k-after" }, model) as any;
     if (after instanceof Interrupt || bodies.at(-1)?.seenUpToSeq !== 20) throw new Error(`${tool}: after the answer: ${JSON.stringify(bodies.at(-1))}`);
   }
 });
@@ -2240,7 +2253,7 @@ await check("raftbench_findings is listed only for an agent whose context says r
 
 await check("the Artifacts app's tools are listed only where the context's features.enabledApps names artifacts; elsewhere, or on an older Server, quietly none", async () => {
   const appTools = GENERATED.filter((op) => appOf(op) === "artifacts").map((op) => op.toolName);
-  must(appTools.length === 12 && GENERATED.every((op) => appOf(op) === (op.name.startsWith("artifacts.") ? "artifacts" : null)), `control: ${appTools.join(", ")}`);
+  must(appTools.length === 13 && GENERATED.every((op) => appOf(op) === (op.name.startsWith("artifacts.") ? "artifacts" : null)), `control: ${appTools.join(", ")}`);
   const listedUnder = async (features: unknown, capabilities = ["read", "send"]) => {
     one(json(200, {
       agent: { id: "agent-1", name: "raft-bot", displayName: null, description: null, runtime: "external", external: true },
@@ -2261,8 +2274,8 @@ await check("the Artifacts app's tools are listed only where the context's featu
   }
   // The capability filter still applies with the app on: without send, the app's writes are skipped as any write is.
   const readOnly = await listedUnder({ reminderApp: false, vaultApp: false, enabledApps: ["artifacts"] }, ["read"]);
-  must(readOnly.names.includes("artifacts_list") && !readOnly.names.includes("artifacts_publish") &&
-    readOnly.skipped.some((x) => x.name === "artifacts_publish"), `read only: ${readOnly.names.join(", ")}`);
+  must(readOnly.names.includes("artifacts_list") && !readOnly.names.includes("artifacts_push") &&
+    readOnly.skipped.some((x) => x.name === "artifacts_push"), `read only: ${readOnly.names.join(", ")}`);
   must(enabledApps({ enabledApps: ["artifacts", 7] }).has("artifacts") && enabledApps(null).size === 0 && enabledApps({ enabledApps: "artifacts" }).size === 0, "enabledApps");
   // A mount with no snapshot never read the features, so it is not offered them (the fallback).
   const base: any = { tenantId: "t", agentId: "a", alias: "raft", plugin: "raft" };
@@ -4249,7 +4262,8 @@ await check("a Server that cannot mint a URL (CONFLICT) is answered by the binar
   // Control: any other refusal is the SDK's failure, not the fallback.
   attachmentServer({ mint: "notfound" });
   const nf = await failure(() => downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), fakeArtifacts()));
-  if (!/does not exist or is not visible/.test(nf.message)) throw new Error(`not found: ${nf.message}`);
+  // The Server's own one-line sentence since SDK 0.33.0.
+  if (!/^not found \(HTTP 404\)/.test(nf.message)) throw new Error(`not found: ${nf.message}`);
 });
 
 await check("an attachment Raft refuses (404 ATTACHMENT_UNAVAILABLE) is told as a neutral step, never the Server's Feedback Admin CLI command (SDK 0.12.1)", async () => {
@@ -4549,7 +4563,7 @@ await check("the administration operations (SDK 0.14.0) are offered and pass thr
   if (!created.startsWith("Created #launch-room (private).")) throw new Error(`created: ${created}`);
   // The Server refuses: its code and its next action reach the model.
   const next = "Creating channels needs the admin role; ask a server owner or admin.";
-  answer = () => json(403, { errorCode: "server_role_required", suggestedNextAction: next, error: "raw body text that stays out" });
+  answer = () => json(403, { errorCode: "server_role_required", suggestedNextAction: next, error: "raw body text\nthat stays out" });
   const refused = await failure(() => raftPlugin.invoke("channels_create", { name: "launch-room" }, inTurn(ctx())));
   if (refused.message !== `The Raft Server rejected the request (HTTP 403, server_role_required). — ${next}`) throw new Error(`refused: ${refused.message}`);
   // A 403 with neither: the SDK's permission sentence, not "read the error code".

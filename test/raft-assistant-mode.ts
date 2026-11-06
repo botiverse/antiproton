@@ -731,6 +731,53 @@ await check("a push that is only the doorbell asks the plugin's wake and gives t
   must(plain.deliver && !("wake" in plain) && plain.text.startsWith(wakeInstruction("raft")), show(plain));
 });
 
+await check("an owner action's outcome from the system.assistant app wakes the chat, which reads it whole; it is no doorbell, and a doorbell beside it still is", async () => {
+  const secret = "push-secret-0123456789";
+  let n = 0;
+  const delivered = async (ctx: unknown, targets: unknown[]) => {
+    const payload = { schema: "raft-agent-inbox-notice.v1", noticeId: `ntc_0123456789abcde${n++}`, recipientAgentId: "agent-1", text: "Inbox update: 1 event", targets };
+    const body = new TextEncoder().encode(JSON.stringify(payload));
+    const headers = { "x-raft-signature-256": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`, "x-raft-delivery-id": payload.noticeId };
+    return raftPlugin.receive!({ headers, body, hookId: "hk_0123456789abcdef" } as never, secret, ctx as never) as Promise<any>;
+  };
+  const target = (id8: string) => ({ target: `agent-event:${id8}`, pendingCount: 1, latestSenderName: "system.assistant", latestSenderType: "third_party_app", flags: [] });
+  const OUTCOME = { type: "owner_action_result", tool: "move_agent", outcome: "done", text: "Moved @bot to box-2 for Ada." };
+  const a = await assistant();
+  a.r.bellEvents["agent-event:aaaa0001"] = OUTCOME;
+  const outcome = await delivered(a.ctx, [target("aaaa0001")]);
+  must(outcome.deliver === true && !("wake" in outcome) && outcome.text.startsWith(assistantWakeInstruction("raft")), `the outcome: ${show(outcome)}`);
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).doorbellAt === null, `the outcome was kept as a doorbell: ${show(a.read(ASSISTANT_STORE, OWNER_KEY))}`);
+  // Beside a doorbell: the doorbell is the code's, and the outcome still wakes the chat.
+  a.r.bellEvents["agent-event:aaaa0002"] = { type: "owner_inbox_updated", owner_user_id: OWNER };
+  const both = await delivered(a.ctx, [target("aaaa0002"), target("aaaa0001")]);
+  must(both.deliver === true && both.wake === true && typeof a.read(ASSISTANT_STORE, OWNER_KEY).doorbellAt === "number", `both: ${show(both)}`);
+  // Control: a doorbell alone is still the code's alone, and one whose event cannot be read still counts as one.
+  const b = await assistant();
+  b.r.bellEvents["agent-event:aaaa0003"] = { type: "owner_inbox_updated", owner_user_id: OWNER };
+  const bell = await delivered(b.ctx, [target("aaaa0003")]);
+  must(!bell.deliver && bell.wake === true, `doorbell: ${show(bell)}`);
+  const unread = await delivered(b.ctx, [target("aaaa0004")]);
+  must(!unread.deliver && unread.wake === true, `an unreadable doorbell: ${show(unread)}`);
+});
+
+await check("receive_events shows an owner action's outcome event whole: Raft's text and payload, every line, nothing cut", async () => {
+  const long = "Moved @bot to box-2 for Ada.\nIt was on box-1 since Monday.\n" + "detail ".repeat(400) + "END-OF-TEXT";
+  const id = "33333333-0000-4000-8000-0000000000aa";
+  const a = await assistant();
+  a.r.events.push({
+    message_id: id, timestamp: "2026-10-20T09:05:00Z", channel_type: "dm", channel_name: "third-party-agent-events:agent-1", sender_type: "third_party_app",
+    sender_name: "system.assistant", content: long,
+    third_party_event: { id, kind: "event", client_id: "system.assistant", client_name: "system.assistant", system_app: "assistant",
+      payload: { type: "owner_action_result", outcome: "done", text: long }, payload_hash: "h" },
+  });
+  const out = await raftPlugin.invoke("receive_events", {}, a.ctx) as any;
+  must(out.messages.length === 1, show(out).slice(0, 300));
+  const line = out.messages[0] as string;
+  // The SDK quotes continuation lines with its prefix; with that taken out, the text is all there.
+  const unquoted = line.replaceAll("\n  │ ", "\n");
+  must(unquoted.includes(long) && line.includes("END-OF-TEXT") && line.includes("owner_action_result"), `cut or folded: ${line.slice(0, 200)} … ${line.slice(-200)}`);
+});
+
 await check("a doorbell whose activity is all told, muted or already looked at ends in code: no turn, counted skipped_filtered", async () => {
   const a = await assistant();
   a.write(REMINDED_STORE, "msg:aaaaaaa1", { at: 1 });

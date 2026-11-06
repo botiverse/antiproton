@@ -1200,10 +1200,33 @@ and the log never carry the params, the app's answer, the session or the login c
 `tool.call` row for a failed call carries the error message's first 200 characters, as for every tool
 (`TOOL_ERROR_MAX`, `src/trace/seams.ts`), so an `APP_ERROR` there quotes the app's words.
 
+An assistant acts as its owner through the owner actions Raft lists in its credential context
+(`assistantOf.ownerActions`, production Raft v1.21.54 and later; `src/plugins/raft-assistant-owner-actions.ts`), one
+tool each, offered in the chat only and run through the Raft SDK's `raft.assistant.ownerActions` (SDK 0.33). The
+listing makes each tool from the entry as Raft wrote it: its name, its description, and its parameters with their
+descriptions, required unless an entry marks one `optional`; nothing in this repository describes an action. Only the
+tiers `direct`, `confirm` and `read` make a tool; an entry of any other tier, one the SDK leaves out (`skipped`, a tier
+it does not know), and one named like a tool the plugin has or had (or in the `mcp_` namespace) make none. A context
+with no `ownerActions`, or an empty list, makes no tools and costs no second request. The tools are offered in the
+owner's chat (the main session) alone: never in a check's short session, which reads what other people wrote with no
+owner there, so a tool acting as the owner there would act for whoever wrote it. The runtime leaves them out of every
+other session's list, and a call from any other session or from a program is refused before anything is sent; they
+are model-only, so none is held for an approval. What the model reads is Raft's: a success is the response's
+`assistant` block whole (a direct action's `done` and `undo`, a confirm action's `pending_owner_confirm` state and
+text, a read's text), with `omitted` and `omittedReason` beside it when Raft sends them; a refusal is Raft's `error`
+text as the SDK passes it (a confirm request the owner declined is its `409 owner_declined`), with the SDK's code, the
+HTTP status and Raft's code. A tool Raft no longer lists is the SDK's answer, and the mount is listed again at the next
+turn. A confirm action's outcome arrives later as an event of Raft's `system.assistant` app: a push naming such an event
+that is no doorbell wakes the chat, which reads it with `receive_events` like any message, whole. Each listing writes a
+`raft.assistant_owner_actions` row with status `listed` (`entries`, `generated`, `filtered` with `unknown_tier`,
+`sdk_skipped` and `name_taken`, the tools by tier, and `left_out` naming each as tool:tier:why), and each call one with
+status `called` (the tool, `result`, Raft's status, its code and a confirm's state); never an argument or Raft's text.
+Not forwarded.
+
 A `403 assistant_not_enabled` from any call
 pauses the checks, the brief and the notify tool until Raft's context names the
 owner again. The chat is offered the owner DM, attachments, the reads, the
-preferences, send-as-owner and the Reminder app (plus `resume` and the parked-result reader), with no run_js, jobs
+preferences, send-as-owner, the Reminder app and the owner actions Raft lists (plus `resume` and the parked-result reader), with no run_js, jobs
 or subagents, under a prompt of its own (`assistantSystemPrompt`,
 `src/runtime/pi-prompt.ts`, the one entry point for it).
 

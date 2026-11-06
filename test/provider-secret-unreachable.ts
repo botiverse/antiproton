@@ -127,6 +127,8 @@ function dump(exec: (q: string) => any[]): string {
 // ---- Raft, as a recording fetch ------------------------------------------------------------------------------------
 
 type Out = { method: string; url: string; headers: Record<string, string>; body: string };
+/** The owner actions Raft's context lists (`assistantOf.ownerActions`); none, as a Server without the routes, while null. */
+let ownerActions: unknown[] | null = null;
 let outbound: Out[] = [];
 /** What Raft's provider endpoint (the hint route) answered each request: `ok` (signature verified) or `401 <code>`. */
 let hintAnswers: string[] = [];
@@ -156,7 +158,7 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   if (path === "/context") {
     return json(200, {
       agent: { id: "ag-1", name: "ottie", displayName: "Ottie", description: null, runtime: "external", external: true,
-        assistantOf: { userId: "u-owner", timezone: "UTC", dmTarget: "dm:@owner" } },
+        assistantOf: { userId: "u-owner", timezone: "UTC", dmTarget: "dm:@owner", ...(ownerActions ? { ownerActions } : {}) } },
       server: { id: "srv-1", slug: "s", name: "S" }, credential: { capabilities: ["read", "send", "reactions"] }, prompt: null,
     });
   }
@@ -350,6 +352,46 @@ await check("the allowlists that bound every assistant session (chat and check) 
   const catalogue = ["raft.receive_events", "raft.assistant_notify_owner", "raft.enable_push", "web.send", "sandbox.run", "state.get", "state.secret_get", "x.run_js"]
     .map((address) => ({ address }));
   must(show(m.assistantTools(catalogue, "raft", "check", "state").map((t) => t.address)) === show(["raft.assistant_notify_owner", "state.get"]), "check session widened");
+});
+
+/**
+ * The same two lists where Raft's context lists owner actions (src/plugins/raft-assistant-owner-actions.ts): the chat
+ * gains exactly one tool per action of a known tier, and a check's session gains none. Written out per state, beside
+ * the two above, which hold the lists with none.
+ */
+await check("setup, with owner actions in Raft's context: the chat is offered the listed tools plus one per known-tier action; a check's session exactly the check tools", async () => {
+  const action = (tool: string, tier: string, method = "POST") => ({
+    tool, tier, description: `${tool} as Raft describes it`, method, path: `/api/servers/:id/${tool}`,
+    params: [{ name: "note", kind: "text", description: "what", optional: true }], mapping: [{ param: "note", into: "body", field: "note" }],
+  });
+  ownerActions = [action("save_message", "direct"), action("move_agent", "confirm"), action("list_owner_channels", "read", "GET"), action("delete_owner_account", "irreversible", "DELETE")];
+  try {
+    const wo = await world();
+    const offered: string[] = (await wo.rt.offeredTools(T, A))!.tools.map((t: { name: string }) => t.name);
+    const CHAT = ["raft__receive_events", "raft__identity_whoami", "raft__messages_send", "raft__messages_read", "raft__messages_react",
+      "raft__messages_unreact", "raft__attachments_download_url", "raft__attachments_view", "raft__attachments_upload", "raft__assistant_owner_inbox",
+      "raft__assistant_owner_messages", "raft__assistant_preferences", "raft__assistant_send_as_owner", "raft__assistant_reminder",
+      "raft__save_message", "raft__move_agent", "raft__list_owner_channels",
+      "state__remember", "state__put", "state__get", "state__list", "state__forget", "state__revise", "state__insert", "artifacts__read", "resume"];
+    must(show([...offered].sort()) === show([...CHAT].sort()),
+      `the chat's tools: added ${offered.filter((n) => !CHAT.includes(n))}, removed ${CHAT.filter((n) => !offered.includes(n))}`);
+    const session = sessionOf(wo, "check");
+    const from = wo.sent.length;
+    await wo.turn("a check", [{ text: "nothing" }], session);
+    const check_ = namesOf(wo.sent[from]);
+    const CHECK = ["raft__assistant_owner_inbox", "raft__assistant_owner_messages", "raft__assistant_notify_owner", "raft__note_decision",
+      "state__remember", "state__put", "state__get", "state__list", "state__forget", "state__revise", "state__insert", "artifacts__read"];
+    must(show([...check_].sort()) === show([...CHECK].sort()),
+      `a check's tools: added ${check_.filter((n) => !CHECK.includes(n))}, removed ${CHECK.filter((n) => !check_.includes(n))}`);
+    // Control: the chat's own request carries them, as the model is sent them.
+    const chatFrom = wo.sent.length;
+    await wo.turn("hi", [{ text: "hello" }]);
+    const sentChat = namesOf(wo.sent[chatFrom]);
+    must(["raft__save_message", "raft__move_agent", "raft__list_owner_channels"].every((n) => sentChat.includes(n)) && !sentChat.includes("raft__delete_owner_account"),
+      `the chat's request: ${sentChat}`);
+  } finally {
+    ownerActions = null;
+  }
 });
 
 await check("push registration: PUT …/push-webhook went out on the agent's own sk_agent, with an https URL at the configured HOOK_ORIGIN", () => {

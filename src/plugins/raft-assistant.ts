@@ -151,12 +151,17 @@ export function isOwnerReadAddress(address: string): boolean {
 /**
  * The tools an assistant's model is offered out of the mounts' (`address` is `alias.tool`): `CHAT_TOOLS` or
  * `CHECK_TOOLS` on its raft mount, and `MEMORY_TOOLS` on its memory mount (`memoryMountOf`) when it has one.
+ *
+ * `ownerActions` are the owner action tools the raft mount lists (src/plugins/raft-assistant-owner-actions.ts
+ * `ownerActionNames`): added to the chat's list, and never to a check's, whatever the caller passes. A check reads what
+ * other people wrote with no owner there, so a tool that acts as the owner in it would act for whoever wrote it.
  */
 export function assistantTools<T extends { address: string; reads?: string }>(
-  tools: readonly T[], alias: string, session: "chat" | "check", memory: string | null = null,
+  tools: readonly T[], alias: string, session: "chat" | "check", memory: string | null = null, ownerActions: readonly string[] = [],
 ): T[] {
   const allowed = new Set([
     ...(session === "check" ? CHECK_TOOLS : CHAT_TOOLS).map((n) => `${alias}.${n}`),
+    ...(session === "chat" ? ownerActions.map((n) => `${alias}.${n}`) : []),
     ...(memory ? MEMORY_TOOLS.map((n) => `${memory}.${n}`) : []),
   ]);
   return tools.filter((t) => allowed.has(t.address) || t.reads === "parked-result");
