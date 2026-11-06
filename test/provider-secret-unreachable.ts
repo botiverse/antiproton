@@ -383,6 +383,15 @@ await check("setup, with owner actions in Raft's context: the chat is offered th
       "state__remember", "state__put", "state__get", "state__list", "state__forget", "state__revise", "state__insert", "artifacts__read"];
     must(show([...check_].sort()) === show([...CHECK].sort()),
       `a check's tools: added ${check_.filter((n) => !CHECK.includes(n))}, removed ${CHECK.filter((n) => !check_.includes(n))}`);
+    // A short session whose ask names no tools is not narrowed by it (#1020): what keeps the owner actions out of it is
+    // the runtime's own list alone, and the result must be the same.
+    const open = newIsolatedSessionId();
+    recordIsolated(wo.raw.sql, open, "raft", Date.now(), { turnKey: checkTurnKey({ id: CHECK_ID, trigger: "doorbell" }) });
+    const openFrom = wo.sent.length;
+    await wo.turn("a check", [{ text: "nothing" }], open);
+    const unnarrowed = namesOf(wo.sent[openFrom]);
+    must(unnarrowed.length > 0 && !unnarrowed.some((n) => ["raft__save_message", "raft__move_agent", "raft__list_owner_channels"].includes(n)),
+      `an unnarrowed short session was offered owner actions: ${unnarrowed}`);
     // Control: the chat's own request carries them, as the model is sent them.
     const chatFrom = wo.sent.length;
     await wo.turn("hi", [{ text: "hello" }]);
