@@ -19,6 +19,10 @@
 import { BOX_KEY, BOX_STORE, MAIN_MACHINE, SPLIT_PREFIX, asMountState, boxIdFor, sandboxPlugin, unreadableEntries } from "../src/plugins/sandbox.ts";
 import { countHeldTime } from "../src/usage/container.ts";
 import { pendingUsage } from "../src/usage/outbox.ts";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+/** Which of two concurrent calls a request was made by, for the gated cases. */
+const whichCall = new AsyncLocalStorage<string>();
 import type { BoxLease } from "../src/plugins/sandbox.ts";
 import type { PluginTraceRow } from "../src/plugins/types.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
@@ -85,7 +89,7 @@ await check("no id is longer than run9 has accepted, and every one is lowercase 
 
 // ---- through the plugin, against a run9 that answers here
 
-type Call = { method: string; path: string; body?: any; caller: string };
+type Call = { method: string; path: string; body?: any; caller: string; by?: string };
 type Box = { box_id: string; state: string; description?: string; box_snap_id: string };
 
 /**
@@ -123,7 +127,8 @@ function run9Project() {
     const path = String(url).replace("https://run9.example", "");
     let body: any;
     try { body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined; } catch { body = undefined; }
-    const c: Call = { method, path, ...(body ? { body } : {}), caller: o.caller };
+    const by = whichCall.getStore();
+    const c: Call = { method, path, ...(body ? { body } : {}), caller: o.caller, ...(by ? { by } : {}) };
     calls.push(c);
     const id = named(path);
     // The one request another agent may send a box: removing a registration it made itself there, by its id.
@@ -1130,57 +1135,158 @@ await check("a round that gives up writes its residue and its note together: an 
 
 // ---- a tool call and a release at once, on one split
 
+/** Waits for a gate to open, and fails with its name rather than hanging the suite when it never does. */
+const gated = (name: string, open: (go: () => void) => void, ms = 3_000) => new Promise<void>((resolve, reject) => {
+  const t = setTimeout(() => reject(new Error(`gate never reached: ${name}`)), ms);
+  open(() => { clearTimeout(t); resolve(); });
+});
+
 /**
  * Tool calls on one mount are serialised (`exclusive`), so what runs beside one is a release (the idle pass, an
  * operator's) or a job's poll. This models a real window, not an extreme: when the provider is slow, a tool call waits
  * on a removal while an idle release comes in. A tool call and an idle release both find the record naming the owner's box, both
  * split it and both send a round; the first removal is held at a gate until the second call is in its own, so the two
- * really interleave. Without the gate this test stays green under the sabotages it is for (reading the entry outside
- * the write, writing back a snapshot): do not remove the gate to make it "stable".
+ * really interleave. The correct implementation passes regardless of timing; what these gates control is whether a
+ * wrong one (reading the entry outside the transaction, writing back a snapshot) is caught. Without them this test
+ * stays green under those sabotages: do not remove them to make it "stable". Each order is its own check, with its own
+ * mount and storage, and both expect the same record.
  */
-for (const order of ["first released first", "second released first"] as const) {
-  await check(`a tool call and an idle release on one split, ${order}: every round counted, nothing either removed comes back`, async () => {
-    const { p } = sharedBox();
-    const A = p.register(OLD_ID, "GH_A", "taker-a", TAKER());
-    const B = p.register(OLD_ID, "GH_B", "taker-b", TAKER());
-    // Whichever round asks first is refused A and has B removed; the second has A removed and is refused B.
-    p.o.script.set(A, [false, true]);
-    p.o.script.set(B, [true, false]);
-    const b = mountOf(TENANT, AGENT_B, {
-      record: takerRecord([wiring([{ name: "GH_A", id: A }, { name: "GH_B", id: B }, { name: "GH_LEGACY", id: null }])]), lease: LEASE,
-      // Storage that answers a read a little later, as a durable object's may: a read awaited apart from the write it
-      // decides leaves room for the other call's write in between.
-      db: (db) => ({ ...db, get: async (st: string, k: any) => {
-        const v = await db.get(st, k);
-        if (typeof k === "string" && k.startsWith(SPLIT_PREFIX)) await new Promise((r) => setTimeout(r, 3));
-        return v;
-      } }),
-    });
-    p.o.caller = TAKER();
-    let releaseFirst: () => void = () => {};
-    let entered = 0;
-    p.o.beforeRemoval = async (n) => {
-      entered++;
-      if (n === 1) await new Promise<void>((r) => { releaseFirst = r; });
-      else if (n === 2) {
+/**
+ * A case can catch a sabotage only if a timeline exists where the two calls really overlap on the same provider and
+ * the same record, and its failure does not depend on a timeout; the gate is necessary, not sufficient. So the overlap
+ * is asserted, not assumed: two removals inside the provider at once, and a removal round sent by each call.
+ *
+ * The removal gate is in the fake run9 itself (`globalThis.fetch`), shared by every provider the plugin opens: a tool
+ * call opens its own (`openProvider`), and a gate kept on one provider instance would never hold the other call.
+ *
+ * Two calls on one split, interleaved at two gates: the provider's removal (the first round's first removal is held
+ * until the second round's has arrived, then released in the given order) and the storage read (one read of a split
+ * entry made outside a transaction is held until the other call has written it). `record` and `split` set the
+ * stored state; `first` and `second` are the two calls.
+ */
+async function gatedPair(
+  order: "first released first" | "second released first",
+  o: { record: unknown; split?: unknown; first: (m: ReturnType<typeof mountOf>) => Promise<unknown>; second: (m: ReturnType<typeof mountOf>) => Promise<unknown> },
+) {
+  const { p } = sharedBox();
+  const A = p.register(OLD_ID, "GH_A", "taker-a", TAKER());
+  const B = p.register(OLD_ID, "GH_B", "taker-b", TAKER());
+  // Whichever round asks first is refused A and has B removed; the second has A removed and is refused B.
+  p.o.script.set(A, [false, true]);
+  p.o.script.set(B, [true, false]);
+  let entered = 0;
+  const b = mountOf(TENANT, AGENT_B, {
+    record: typeof o.record === "function" ? (o.record as (a: string, b: string) => unknown)(A, B) : o.record, lease: LEASE,
+    // A storage gate, as the removal gate is a provider one: it models a durable object's storage read not
+    // answering at once. The first read of a split entry made outside a transaction once both rounds are under way
+    // is answered, and then held until the other call has written that entry, so a read awaited apart from the
+    // write it decides sees the other call's write land in between, deterministically. Removing this gate makes the
+    // "read outside, write inside" sabotage green again. Correct code reads split entries only inside the
+    // transaction that writes them, so it never reaches this gate.
+    db: (db) => {
+      let waiting: (() => void) | null = null;
+      let held = false;
+      return {
+        ...db,
+        get: async (st: string, k: any) => {
+          const v = await db.get(st, k);
+          if (!held && entered >= 2 && typeof k === "string" && k.startsWith(SPLIT_PREFIX)) {
+            held = true;
+            await gated("the other call's write of the split entry (storage read)", (go) => { waiting = go; });
+          }
+          return v;
+        },
+        transaction: async (stores: any, mode: any, fn: any) => {
+          let wrote = false;
+          const out = await db.transaction(stores, mode, (tx: any) => fn({
+            ...tx, get: (st2: string, k2: any) => tx.get(st2, k2), getAll: (...x: any[]) => tx.getAll(...x),
+            delete: (...x: any[]) => tx.delete(...x),
+            put: (st2: string, v2: any, k2?: any) => { if (typeof k2 === "string" && k2.startsWith(SPLIT_PREFIX)) wrote = true; return tx.put(st2, v2, k2); },
+          }));
+          if (wrote && waiting) { const go = waiting; waiting = null; go(); }
+          return out;
+        },
+      };
+    },
+  });
+  if (o.split) b.putRaw(`${SPLIT_PREFIX}${OLD_ID}`, typeof o.split === "function" ? (o.split as (a: string, b: string) => unknown)(A, B) : o.split);
+  p.o.caller = TAKER();
+  let releaseFirst: () => void = () => {};
+  let firstReleased = false;
+  let firstHeldWhenSecondCame = false;
+  // Which calls are inside the provider's removal now, by the call each removal came from: counted by call, not by
+  // request, so one call sending several removals at once could not pass for two calls overlapping. The bookkeeping
+  // is synchronous at entry and exit, with no await between adding a call and reading how many are in.
+  const inside = new Map<string, number>();
+  let mostCallsInside = 0;
+  p.o.beforeRemoval = async (n) => {
+    entered++;
+    const who = whichCall.getStore() ?? "unknown";
+    inside.set(who, (inside.get(who) ?? 0) + 1);
+    mostCallsInside = Math.max(mostCallsInside, inside.size);
+    try {
+      if (n === 1) {
+        await gated("a second removal while the first is held (provider removal)", (go) => { releaseFirst = () => { firstReleased = true; go(); }; });
+      } else if (n === 2) {
+        firstHeldWhenSecondCame = !firstReleased;
         if (order === "first released first") { releaseFirst(); await new Promise((r) => setTimeout(r, 5)); }
         else setTimeout(() => releaseFirst(), 5);
       }
-    };
-    const [tool] = await Promise.all([
-      b.plugin.invoke("shell", { command: "ls" }, b.ctx) as Promise<any>,
-      logged(() => b.plugin.holds!.release(b.ctx, { reason: "idle" }) as Promise<unknown>),
-    ]);
-    p.o.beforeRemoval = null;
-    must(entered >= 2, `the two calls did not interleave at the removal: ${entered}`);
+    } finally {
+      const left = (inside.get(who) ?? 1) - 1;
+      if (left) inside.set(who, left); else inside.delete(who);
+    }
+  };
+  // One capture of the console around both: two nested ones restored out of order would leave it captured.
+  const settle = (f: () => Promise<unknown>) => f().then((value) => ({ value: value as any, error: undefined as string | undefined }),
+    (e) => ({ value: undefined as any, error: String((e as Error)?.message ?? e) }));
+  const both = await logged(() => Promise.all([
+    whichCall.run("first", () => settle(() => o.first(b))),
+    whichCall.run("second", () => settle(() => o.second(b))),
+  ]));
+  const [first, second] = both.value!;
+  p.o.beforeRemoval = null;
+  // The overlap, asserted: a setup where the second call never reaches the gate is red, not a single-threaded pass.
+  must(entered >= 2 && mostCallsInside === 2 && firstHeldWhenSecondCame,
+    `the two calls did not overlap inside the provider: arrivals ${entered}, calls inside at once ${mostCallsInside}, first held when second came ${firstHeldWhenSecondCame}`);
+  const byCall = (who: string) => removalsOf(p).filter((c) => c.by === who).length;
+  must(byCall("first") >= 1 && byCall("second") >= 1, `a call sent no removal round: first ${byCall("first")}, second ${byCall("second")}`);
+  return { p, b, A, B, first, second };
+}
+
+const ONLY_LEGACY = '[{"id":null,"name":"GH_LEGACY","state":"residue","reason":"wiring_without_ids"}]';
+
+for (const order of ["first released first", "second released first"] as const) {
+  await check(`a tool call and an idle release on one split, ${order}: every round counted, nothing either removed comes back`, async () => {
+    const { p, b, first } = await gatedPair(order, {
+      record: (A: string, B: string) => takerRecord([wiring([{ name: "GH_A", id: A }, { name: "GH_B", id: B }, { name: "GH_LEGACY", id: null }])]),
+      first: (m) => m.plugin.invoke("shell", { command: "ls" }, m.ctx),
+      second: (m) => m.plugin.holds!.release(m.ctx, { reason: "idle" }),
+    });
     const sp = b.split(OLD_ID);
     splitShape(sp, null);
-    const rounds = new Set(removalsOf(p).map((c) => c.caller + p.calls.indexOf(c))).size;
-    must(sp.attempts === 2, `attempts ${sp.attempts}, rounds sent 2 (${rounds} removals)`);
-    must(JSON.stringify(sp.remaining) === '[{"id":null,"name":"GH_LEGACY","state":"residue","reason":"wiring_without_ids"}]',
-      `remaining is not what neither round removed: ${JSON.stringify(sp.remaining)}`);
-    const queued = JSON.stringify(tool) + JSON.stringify((await b.plugin.invoke("shell", { command: "ls" }, b.ctx)) as any);
-    must(count(queued, NOT_OURS) === 1, `the split was not told exactly once: ${queued}`);
+    must(sp.attempts === 2, `attempts ${sp.attempts}, rounds sent 2 (${removalsOf(p).length} removals)`);
+    must(JSON.stringify(sp.remaining) === ONLY_LEGACY, `remaining is not what neither round removed: ${JSON.stringify(sp.remaining)}`);
+    const queued = JSON.stringify(first.value) + JSON.stringify((await b.plugin.invoke("shell", { command: "ls" }, b.ctx)) as any);
+    must(count(queued, NOT_OURS) === 1 && !queued.includes(GIVEN_UP), `the split was not told exactly once, or told as given up: ${queued}`);
+  });
+
+  await check(`a tool call's retry and a withdrawal's retry on one pending split, ${order}: every round counted, nothing either removed comes back`, async () => {
+    // The split was made and told earlier; the record let go of the box. Both calls retry it (`retryForeign`).
+    const { p, b, first } = await gatedPair(order, {
+      record: { machines: {} },
+      split: (A: string, B: string) => entryOf({ registeredNames: ["GH_A", "GH_B", "GH_LEGACY"], secretIds: [A, B], attempts: 0, unwire: "pending", told: true,
+        remaining: [{ id: A, name: "GH_A", state: "pending" }, { id: B, name: "GH_B", state: "pending" }, { id: null, name: "GH_LEGACY", state: "residue", reason: "wiring_without_ids" }] }),
+      first: (m) => m.plugin.invoke("shell", { command: "ls" }, m.ctx),
+      second: (m) => m.plugin.holds!.withdraw!(m.ctx),
+    });
+    const sp = b.split(OLD_ID);
+    splitShape(sp, AT);
+    must(sp.attempts === 2, `attempts ${sp.attempts}, rounds sent 2 (${removalsOf(p).length} removals)`);
+    must(JSON.stringify(sp.remaining) === ONLY_LEGACY, `remaining is not what neither round removed: ${JSON.stringify(sp.remaining)}`);
+    // Told before; nothing removed was given up on, so no note is owed by either round.
+    const queued = JSON.stringify(first.value) + JSON.stringify((await b.plugin.invoke("shell", { command: "ls" }, b.ctx)) as any);
+    must(!/another agent|may remain|three times/.test(queued), `a note was queued: ${queued}`);
   });
 }
 
