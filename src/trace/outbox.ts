@@ -192,7 +192,8 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * Not forwarded.
  * `sandbox.box_owner` is a box a sandbox mount's record named, read for whose it is before anything was sent to it
  * (src/plugins/sandbox.ts `ownedProvider`): status `box_not_ours` (verdict `blocked`) when it was made for another
- * agent and the record let go of it, or `owner_unknown` when the provider lists it with no owner and it was kept; with
+ * agent and the record let go of it, or `owner_unknown` (verdict `blocked`) when the provider lists it with no owner,
+ * so it cannot be shown to be this agent's, and the record let go of it the same way; with
  * `code` (the status again), `tenant`, `agent`, `mount`, `machine` and `box`, the box's id. Not forwarded.
  */
 export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake", "raft.assistant_notify",
