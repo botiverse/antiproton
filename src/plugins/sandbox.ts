@@ -161,6 +161,10 @@ export const BOX_KEY = "state";
  * holds (src/usage/container.ts), which would bill the owner's machine to this mount.
  */
 export const SPLIT_PREFIX = "split:";
+// Split records and the notes queue (`NOTICES_KEY`) must live in the mount's own database (`ctx.db`), and their keys
+// must hold nothing shared across mounts but the box id: no agent-level store (`agentDb`), prefix, or name derived from
+// agent-level config. The mount's own database is exactly what the gateway's per-mount lock covers (`#onMount`,
+// src/runtime/gateway.ts); anything shared across mounts would be outside it.
 const splitKey = (boxId: string) => `${SPLIT_PREFIX}${boxId}`;
 
 /**

@@ -30,6 +30,7 @@ import type { PluginTraceRow } from "../src/plugins/types.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
+import { AGENT_SCOPE_ALIAS } from "../src/store/plugin-db.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -222,6 +223,8 @@ function mountOf(tenantId: string, agentId: string, o: { lease?: BoxLease | null
     credential: JSON.stringify({ ak: "a", sk: "b" }),
     publicConfig: { endpoint: "https://run9.example", project: "p", graceMs: 10_000 },
     db: (o.db ?? ((d: any) => d))(openPluginDatabase(tables, scope, plugin.database)),
+    // The agent-level database, as the gateway hands one: shared by every mount of the agent.
+    agentDb: openPluginDatabase(tables, { ...scope, alias: AGENT_SCOPE_ALIAS }, plugin.database),
     sibling: async () => null, sandboxForms: async () => [],
     trace: (row: PluginTraceRow) => { traces.push(row); },
   };
@@ -1348,6 +1351,23 @@ await check("through the gateway, a tool call, a release and a withdrawal on one
       }
     }
   }
+});
+
+await check("one agent's two mounts split from the same box: each keeps its own split record and its own note", async () => {
+  // Split records and notes live in the mount's own database, the one the per-mount lock covers; in a store shared by
+  // the agent's mounts one mount would read, overwrite or deliver the other's. The two records differ in `mount`, and
+  // each is read from its own mount and checked by that field: one row shared by both could not pass as both.
+  const { p } = sharedBox();
+  const tables = new PluginDbTables(sqliteHost()).ensure();
+  const one = mountOf(TENANT, AGENT_B, { alias: "sandbox", tables, record: takerRecord([]) });
+  const two = mountOf(TENANT, AGENT_B, { alias: "sandbox2", tables, record: takerRecord([]) });
+  p.o.caller = TAKER();
+  const r1: any = await one.plugin.invoke("shell", { command: "ls" }, one.ctx);
+  const r2: any = await two.plugin.invoke("shell", { command: "ls" }, two.ctx);
+  must(one.split(OLD_ID)?.mount === "sandbox" && two.split(OLD_ID)?.mount === "sandbox2", `split records: ${JSON.stringify([one.split(OLD_ID), two.split(OLD_ID)])}`);
+  must(count(JSON.stringify(r1), NOT_OURS) === 1 && count(JSON.stringify(r2), NOT_OURS) === 1, `each mount's note once: ${r1.note} | ${r2.note}`);
+  const again = JSON.stringify(await one.plugin.invoke("shell", { command: "ls" }, one.ctx)) + JSON.stringify(await two.plugin.invoke("shell", { command: "ls" }, two.ctx));
+  must(!again.includes(NOT_OURS), `a note seen twice: ${again}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.ok ? "" : `\n    ${r.error}`}`);
