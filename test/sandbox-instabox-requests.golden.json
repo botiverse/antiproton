@@ -253,11 +253,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0",
+   "idem": "create-h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -611,11 +611,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpjk1c",
+   "idem": "create-h-93c18dbf3b20-mywpjk1c",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpjk1c",
+    "name": "h-93c18dbf3b20-mywpjk1c",
     "snapshotId": "sn_2",
     "metadata": {
      "tenant": "t",
@@ -842,11 +842,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0",
+   "idem": "create-h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -1093,6 +1093,7 @@
       "lastUsedAt": 1800000013000,
       "execs": 3,
       "saved": [],
+      "ownerChecked": true,
       "deleteAt": 1800086401000,
       "credentialRef": "agent",
       "image": "universal"
@@ -1283,11 +1284,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0",
+   "idem": "create-h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -1458,11 +1459,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpj8go",
+   "idem": "create-h-93c18dbf3b20-mywpj8go",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpj8go",
+    "name": "h-93c18dbf3b20-mywpj8go",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -1613,6 +1614,7 @@
       "lastUsedAt": 1800000024000,
       "execs": 2,
       "saved": [],
+      "ownerChecked": true,
       "deleteAt": 1800086416000,
       "credentialRef": "agent",
       "image": "universal",
@@ -1738,11 +1740,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0",
+   "idem": "create-h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -1764,11 +1766,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0-1",
+   "idem": "create-h-93c18dbf3b20-mywpiww0-1",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -1850,11 +1852,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpkcl4",
+   "idem": "create-h-93c18dbf3b20-mywpkcl4",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpkcl4",
+    "name": "h-93c18dbf3b20-mywpkcl4",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -1876,11 +1878,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpkcl4",
+   "idem": "create-h-93c18dbf3b20-mywpkcl4",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpkcl4",
+    "name": "h-93c18dbf3b20-mywpkcl4",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -1962,11 +1964,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpkjj4",
+   "idem": "create-h-93c18dbf3b20-mywpkjj4",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpkjj4",
+    "name": "h-93c18dbf3b20-mywpkjj4",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -1995,11 +1997,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpkjj4-1",
+   "idem": "create-h-93c18dbf3b20-mywpkjj4-1",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpkjj4",
+    "name": "h-93c18dbf3b20-mywpkjj4",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -2081,11 +2083,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywplcuo",
+   "idem": "create-h-93c18dbf3b20-mywplcuo",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywplcuo",
+    "name": "h-93c18dbf3b20-mywplcuo",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -2107,11 +2109,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywplcuo-1",
+   "idem": "create-h-93c18dbf3b20-mywplcuo-1",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywplcuo",
+    "name": "h-93c18dbf3b20-mywplcuo",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -2133,11 +2135,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywplcuo-2",
+   "idem": "create-h-93c18dbf3b20-mywplcuo-2",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywplcuo",
+    "name": "h-93c18dbf3b20-mywplcuo",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -2159,11 +2161,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpnzrc",
+   "idem": "create-h-93c18dbf3b20-mywpnzrc",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpnzrc",
+    "name": "h-93c18dbf3b20-mywpnzrc",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -2185,11 +2187,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpnzrc-1",
+   "idem": "create-h-93c18dbf3b20-mywpnzrc-1",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpnzrc",
+    "name": "h-93c18dbf3b20-mywpnzrc",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -2211,11 +2213,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpnzrc-2",
+   "idem": "create-h-93c18dbf3b20-mywpnzrc-2",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpnzrc",
+    "name": "h-93c18dbf3b20-mywpnzrc",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -2310,11 +2312,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0",
+   "idem": "create-h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -2523,6 +2525,7 @@
       "saved": [
        "artifact://sandbox/m_1/data/home/work/out.txt"
       ],
+      "ownerChecked": true,
       "deleteAt": 1800086401000,
       "credentialRef": "agent",
       "image": "universal",
@@ -2606,11 +2609,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0",
+   "idem": "create-h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -2710,11 +2713,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpj328",
+   "idem": "create-h-93c18dbf3b20-mywpj328",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpj328",
+    "name": "h-93c18dbf3b20-mywpj328",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -2848,11 +2851,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0",
+   "idem": "create-h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -2961,11 +2964,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpj328",
+   "idem": "create-h-93c18dbf3b20-mywpj328",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpj328",
+    "name": "h-93c18dbf3b20-mywpj328",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -3141,11 +3144,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0",
+   "idem": "create-h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -3231,6 +3234,7 @@
       "lastUsedAt": 1800000003000,
       "execs": 1,
       "saved": [],
+      "ownerChecked": true,
       "deleteAt": 1800086401000,
       "credentialRef": "agent",
       "image": "universal",
@@ -3273,11 +3277,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0",
+   "idem": "create-h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -3405,11 +3409,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0",
+   "idem": "create-h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -3651,11 +3655,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0",
+   "idem": "create-h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -3730,11 +3734,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-myy4ytvc",
+   "idem": "create-h-93c18dbf3b20-myy4ytvc",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-myy4ytvc",
+    "name": "h-93c18dbf3b20-myy4ytvc",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -3836,11 +3840,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-myy4yz9s",
+   "idem": "create-h-93c18dbf3b20-myy4yz9s",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-myy4yz9s",
+    "name": "h-93c18dbf3b20-myy4yz9s",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -3944,11 +3948,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-myy4z67s",
+   "idem": "create-h-93c18dbf3b20-myy4z67s",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-myy4z67s",
+    "name": "h-93c18dbf3b20-myy4z67s",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -4112,11 +4116,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-myzkf374",
+   "idem": "create-h-93c18dbf3b20-myzkf374",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-myzkf374",
+    "name": "h-93c18dbf3b20-myzkf374",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -4390,11 +4394,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0",
+   "idem": "create-h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -4512,11 +4516,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-b-mywpj7ow",
+   "idem": "create-h-eb865110ac4f-b-mywpj7ow",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-b-mywpj7ow",
+    "name": "h-eb865110ac4f-b-mywpj7ow",
     "snapshotId": "sn_1",
     "metadata": {
      "tenant": "t",
@@ -4904,11 +4908,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0",
+   "idem": "create-h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -5479,11 +5483,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpjnw8",
+   "idem": "create-h-93c18dbf3b20-mywpjnw8",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpjnw8",
+    "name": "h-93c18dbf3b20-mywpjnw8",
     "snapshotId": "sn_1",
     "metadata": {
      "tenant": "t",
@@ -5946,11 +5950,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpiww0",
+   "idem": "create-h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpiww0",
+    "name": "h-93c18dbf3b20-mywpiww0",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -6081,11 +6085,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpj328",
+   "idem": "create-h-93c18dbf3b20-mywpj328",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpj328",
+    "name": "h-93c18dbf3b20-mywpj328",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -6216,11 +6220,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpj98g",
+   "idem": "create-h-93c18dbf3b20-mywpj98g",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpj98g",
+    "name": "h-93c18dbf3b20-mywpj98g",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -6351,11 +6355,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpjfeo",
+   "idem": "create-h-93c18dbf3b20-mywpjfeo",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpjfeo",
+    "name": "h-93c18dbf3b20-mywpjfeo",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -6486,11 +6490,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpjlkw",
+   "idem": "create-h-93c18dbf3b20-mywpjlkw",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpjlkw",
+    "name": "h-93c18dbf3b20-mywpjlkw",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -6593,11 +6597,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpjsiw",
+   "idem": "create-h-93c18dbf3b20-mywpjsiw",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpjsiw",
+    "name": "h-93c18dbf3b20-mywpjsiw",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -6742,6 +6746,7 @@
       "lastUsedAt": 1800000046000,
       "execs": 1,
       "saved": [],
+      "ownerChecked": true,
       "deleteAt": 1800086442000,
       "credentialRef": "agent",
       "image": "docker.io/library/python:3.12",

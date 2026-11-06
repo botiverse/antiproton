@@ -25,7 +25,7 @@ async function check(name: string, fn: () => Promise<void>) {
 }
 
 const plugin = sandboxPlugin(null as any, "local");
-const BOX = { boxId: "b1", createdAt: 1, lastUsedAt: 1, execs: 0, sessions: [], envs: [] };
+const BOX = { boxId: "b1", createdAt: 1, lastUsedAt: 1, execs: 0, sessions: [], envs: [], ownerChecked: true };
 /** A real database holding one box record, with every write also handed to `onPut`. */
 function boxDb(box: unknown, onPut: (v: unknown) => void) {
   const tables = new PluginDbTables(sqliteHost()).ensure();

@@ -190,8 +190,19 @@ export interface SandboxProvider {
    * its own, if it will. A box that already exists under this name is a `conflict`.
    */
   create(spec: BoxSpec): Promise<{ id: string; deleteAt?: number }>;
-  /** After a create answered `conflict`: the id of the box this spec made, when one is there, else null. */
+  /**
+   * After a create answered `conflict`: the id of the box this spec made, when one is there and the provider shows
+   * it was made for this spec's owner, else null. A box under the same name that cannot be shown to be this owner's
+   * is never adopted: the name alone does not say whose it is.
+   */
   adopt(spec: BoxSpec): Promise<string | null>;
+  /**
+   * Whose box this is, as the provider says, read without waking it: `ours` when it carries one of these
+   * descriptions (the ones this plugin creates boxes with, `BoxSpec.description`), `other` when it carries another,
+   * `unknown` when it carries none, `gone` when the provider does not have it. Absent where the plugin's own record
+   * is enough because the provider mints the ids (InstaBox). Throws when it cannot read the answer.
+   */
+  ownerOf?(id: string, descriptions: readonly string[]): Promise<"ours" | "other" | "unknown" | "gone">;
   /** Where the box is, read without waking it. */
   status(id: string, within?: Within): Promise<BoxState>;
   /** Starts a command, detached so it can be killed; its execution id. */
@@ -219,7 +230,11 @@ export interface SandboxProvider {
   /** What the provider metered for this box, where it meters one. */
   usage?(id: string): Promise<{ runningSeconds: number; vcpuSeconds: number; memGiBSeconds: number; diskGiBSeconds: number }>;
   /** Registered for this box alone (box scope), never for the project: see `listProjectSecrets`. */
-  addSecret(id: string, secret: EgressSecret): Promise<void>;
+  /**
+   * The provider's id for the registration, when it answers one: what proves later that a registration on the box is
+   * this mount's, where the name cannot (another owner of the box may register the same name).
+   */
+  addSecret(id: string, secret: EgressSecret): Promise<string | null>;
   /** This box's registrations, as the provider lists them. Throws on any answer it cannot read as that list. */
   listSecrets(id: string): Promise<Array<{ name: unknown; id: unknown; placeholder?: unknown }>>;
   /**

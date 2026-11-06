@@ -1762,11 +1762,11 @@ export function backgrounded(handle: Json, note?: string): Backgrounded {
  * The framework records finished spans (`trace_outbox`), and it cannot derive
  * this one for itself: a container's start and end are known only inside the
  * release, and re-reading the mount afterwards can land on a DIFFERENT
- * container. Releases are not serialised against calls — `releaseTask` does not
- * take the per-mount lock `invoke` takes — so a command that finds no container
- * may create and record one in between, and a span built from a later read
- * would report that box's id against this box's lifetime — the same
- * interleaving `stopBox` already guards its own session against.
+ * container. `releaseTask` takes the per-mount lock `invoke` takes (`#onMount`,
+ * src/runtime/gateway.ts), but this does not depend on it: a caller past the lock
+ * could find a command creating and recording a container in between, and a span
+ * built from a later read would report that box's id against this box's lifetime
+ * — the same interleaving `stopBox` guards its own session against.
  *
  * **So every field here comes from the one read the release itself made.** A
  * plugin that fills these in from a fresh read of its own state has reproduced
@@ -1868,7 +1868,7 @@ export interface PromptPart {
  */
 export interface Withdrawal {
   things: Array<{ id: string; clean: boolean; ownKey: boolean; why?: string; review?: string;
-    code?: "no_credential" | "stranded" | "listing_failed" | "not_withdrawn" | "project_listing_failed" }>;
+    code?: "no_credential" | "stranded" | "listing_failed" | "not_withdrawn" | "project_listing_failed" | "foreign_residue" }>;
   project: { state: "complete" | "failed" | "no_credential" | "none"; ids: string[]; findings: Array<{ boxId: string; secretId: string; name: string }>; error?: string };
 }
 

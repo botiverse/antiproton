@@ -17,9 +17,10 @@ import type { Withdrawal } from "../../src/plugins/types.ts";
  * are what the next delete retries. The rest no retry fixes: `project_residue`
  * (a project-scope registration still acts for the box), `stranded` (made under a key since replaced),
  * `no_credential` (no key to reach it), `deletion_unconfirmed` (let go, but not made under this kind of key, so a
- * "deleted" cannot be believed).
+ * "deleted" cannot be believed), `foreign_residue` (another agent's box the mount's record named, from which its
+ * registrations could not be proven its own or could not be removed; src/plugins/sandbox.ts `ForeignBox`).
  */
-export type UncleanCode = "not_withdrawn" | "listing_failed" | "project_listing_failed" | "residue_store_failed" | "project_residue" | "stranded" | "no_credential" | "deletion_unconfirmed";
+export type UncleanCode = "not_withdrawn" | "listing_failed" | "project_listing_failed" | "residue_store_failed" | "project_residue" | "stranded" | "no_credential" | "deletion_unconfirmed" | "foreign_residue";
 /**
  * What to do about each: `retry_delete` (the next delete can finish it); `needs_operator_cleanup` (a known object an
  * operator can reach, #1128: project-scope residue, or a box whose deletion cannot be believed); `await_provider_reclaim`
@@ -29,7 +30,7 @@ export type UncleanCode = "not_withdrawn" | "listing_failed" | "project_listing_
 export type UncleanAction = "retry_delete" | "needs_operator_cleanup" | "await_provider_reclaim";
 export const ACTION_OF: Record<UncleanCode, UncleanAction> = {
   not_withdrawn: "retry_delete", listing_failed: "retry_delete", project_listing_failed: "retry_delete", residue_store_failed: "retry_delete",
-  project_residue: "needs_operator_cleanup", deletion_unconfirmed: "needs_operator_cleanup",
+  project_residue: "needs_operator_cleanup", deletion_unconfirmed: "needs_operator_cleanup", foreign_residue: "needs_operator_cleanup",
   stranded: "await_provider_reclaim", no_credential: "await_provider_reclaim",
 };
 export const MESSAGE_OF: Partial<Record<UncleanAction, string>> = {

@@ -32,7 +32,7 @@ const MIN = 60_000;
 const LEASE = { warnMs: 5 * MIN, maxMs: 30 * MIN };
 const T0 = 1_700_000_000_000;
 const box = (id: string, extra: Record<string, unknown> = {}) =>
-  ({ boxId: id, createdAt: T0, lastUsedAt: T0 + MIN, execs: 1, saved: [], ...extra });
+  ({ boxId: id, createdAt: T0, lastUsedAt: T0 + MIN, execs: 1, saved: [], ownerChecked: true, ...extra });
 
 type Call = { method: string; path: string; body?: any };
 
@@ -54,6 +54,11 @@ function fixture(record: unknown, config: Record<string, unknown> = {}, refuse: 
     calls.push(c);
     if (refuse(c, (v) => tables.put(scope, BOX_STORE, BOX_KEY, v as any, null))) return new Response(JSON.stringify({ error: "no" }), { status: 500 });
     if (method === "POST" && /background-execs$/.test(path)) return new Response(JSON.stringify({ exec_id: `e${++n}` }));
+    // The project's list, as run9 gives it: every box the record names, made for this agent.
+    if (method === "GET" && /\/workspace\/boxes$/.test(path)) {
+      const m = asMountState(tables.get(scope, BOX_STORE, BOX_KEY) as any);
+      return new Response(JSON.stringify(Object.values(m?.machines ?? {}).map((b) => ({ box_id: b.boxId, state: "idle", description: "antiproton t/a" }))));
+    }
     if (/\/execs\/e\d+$/.test(path)) {
       return new Response(JSON.stringify({ state: "succeeded", exit_code: 0, output_summary: `ok\n__AP_CWD__${cwd.next}\n` }));
     }
@@ -81,7 +86,7 @@ await check("with no machine named, everything is the one box it always was, sto
   const r: any = await f.plugin.invoke("shell", { command: "ls" }, f.ctx);
   must(f.creates().length === 1, `one box created: ${JSON.stringify(f.creates())}`);
   const id = f.creates()[0]!.body.box_id as string;
-  must(/^h-t-a-[a-z0-9]+$/.test(id), `the default box's id has no machine in it: ${id}`);
+  must(/^h-[0-9a-f]{12}-[a-z0-9]+$/.test(id), `the default box's id has no machine in it: ${id}`);
   must(r.box === id && !("machine" in r), `the result is what it was: ${JSON.stringify(r)}`);
   must(Object.keys(f.raw().machines).join() === "main" && f.raw().machines.main.boxId === id, `stored as main: ${JSON.stringify(f.raw())}`);
   must(f.raw().boxId === undefined, "the old top-level shape is no longer written");

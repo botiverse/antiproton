@@ -799,7 +799,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpiww0",
+     "box_id": "h-93c18dbf3b20-mywpiww0",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "network_mode": "managed",
      "description": "antiproton t/a"
@@ -809,7 +809,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/secrets",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/secrets",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -827,7 +827,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/secrets",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/secrets",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -845,7 +845,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -875,7 +875,7 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm",
     "accounts": {
      "github": "gh and git act as the agent's GitHub account. The credential here is a placeholder swapped in on the way out, so nothing in this container, you included, can read it."
@@ -884,7 +884,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -915,7 +915,7 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm",
     "accounts": {
      "github": "gh and git act as the agent's GitHub account. The credential here is a placeholder swapped in on the way out, so nothing in this container, you included, can read it."
@@ -924,7 +924,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -954,7 +954,7 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm",
     "accounts": {
      "github": "gh and git act as the agent's GitHub account. The credential here is a placeholder swapped in on the way out, so nothing in this container, you included, can read it."
@@ -963,7 +963,7 @@
   },
   {
    "method": "GET",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 120000
@@ -972,14 +972,14 @@
    "step": "save a file",
    "result": {
     "path": "/work/out.txt",
-    "ref": "artifact://sandbox/h-t-a-mywpiww0/work/out.txt",
+    "ref": "artifact://sandbox/h-93c18dbf3b20-mywpiww0/work/out.txt",
     "bytes": 22,
     "note": "kept outside the box, for later. A copy outliving the container is not a reason to release it early: it is handed back when the turn ends anyway, and until then it is still the machine you are working on."
    }
   },
   {
    "method": "GET",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/files/download?box_abs_path=%2Fwork%2Fdist&archive=tar",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/files/download?box_abs_path=%2Fwork%2Fdist&archive=tar",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 120000
@@ -988,7 +988,7 @@
    "step": "save a directory as tar",
    "result": {
     "path": "/work/dist",
-    "ref": "artifact://sandbox/h-t-a-mywpiww0/work/dist.tar",
+    "ref": "artifact://sandbox/h-93c18dbf3b20-mywpiww0/work/dist.tar",
     "bytes": 26,
     "note": "kept outside the box, for later. A copy outliving the container is not a reason to release it early: it is handed back when the turn ends anyway, and until then it is still the machine you are working on."
    }
@@ -999,7 +999,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": null,
@@ -1015,7 +1015,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/snaps/s-h-t-a-mywpiww0/fork",
+   "path": "/projects/p/workspace/snaps/s-h-93c18dbf3b20-mywpiww0/fork",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -1035,7 +1035,7 @@
   },
   {
    "method": "GET",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/secrets",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/secrets",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": null,
@@ -1043,7 +1043,7 @@
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/secrets/sec1",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/secrets/sec1",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": null,
@@ -1051,7 +1051,7 @@
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/secrets/sec2",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/secrets/sec2",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": null,
@@ -1059,7 +1059,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/secrets",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/secrets",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -1077,7 +1077,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/secrets",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/secrets",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -1095,7 +1095,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -1126,7 +1126,7 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm",
     "kept": [
      "py-env"
@@ -1143,7 +1143,7 @@
      {
       "machine": "main",
       "state": "running",
-      "box": "h-t-a-mywpiww0",
+      "box": "h-93c18dbf3b20-mywpiww0",
       "image": "public.ecr.aws/docker/library/node:24-bookworm",
       "created": "2027-01-15T08:00:01.000Z",
       "lastUsed": "2027-01-15T08:00:20.000Z",
@@ -1156,21 +1156,21 @@
   },
   {
    "method": "GET",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 120000
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 20000
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
@@ -1179,17 +1179,17 @@
    "step": "release, saving first",
    "result": {
     "released": true,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "liveMs": 23000,
     "saved": [
      {
       "path": "/work/out.txt",
-      "ref": "artifact://sandbox/h-t-a-mywpiww0/work/out.txt",
+      "ref": "artifact://sandbox/h-93c18dbf3b20-mywpiww0/work/out.txt",
       "bytes": 22
      }
     ],
     "__ap_lease__": {
-     "id": "h-t-a-mywpiww0",
+     "id": "h-93c18dbf3b20-mywpiww0",
      "startedAt": 1800000001000,
      "endedAt": 1800000024000,
      "status": "freed"
@@ -1206,9 +1206,9 @@
   },
   {
    "stored": [
-    "t/t/a/sandbox/h-t-a-mywpiww0/work/out.txt application/octet-stream 22",
-    "t/t/a/sandbox/h-t-a-mywpiww0/work/dist.tar application/x-tar 26",
-    "t/t/a/sandbox/h-t-a-mywpiww0/work/out.txt application/octet-stream 22"
+    "t/t/a/sandbox/h-93c18dbf3b20-mywpiww0/work/out.txt application/octet-stream 22",
+    "t/t/a/sandbox/h-93c18dbf3b20-mywpiww0/work/dist.tar application/x-tar 26",
+    "t/t/a/sandbox/h-93c18dbf3b20-mywpiww0/work/out.txt application/octet-stream 22"
    ],
    "used": [
     "github",
@@ -1220,15 +1220,15 @@
     "machines": {},
     "sessions": [
      {
-      "boxId": "h-t-a-mywpiww0",
+      "boxId": "h-93c18dbf3b20-mywpiww0",
       "startedAt": 1800000001000,
       "endedAt": 1800000024000,
       "lastUsedAt": 1800000022000,
       "execs": 4,
       "saved": [
-       "artifact://sandbox/h-t-a-mywpiww0/work/out.txt",
-       "artifact://sandbox/h-t-a-mywpiww0/work/dist.tar",
-       "artifact://sandbox/h-t-a-mywpiww0/work/out.txt"
+       "artifact://sandbox/h-93c18dbf3b20-mywpiww0/work/out.txt",
+       "artifact://sandbox/h-93c18dbf3b20-mywpiww0/work/dist.tar",
+       "artifact://sandbox/h-93c18dbf3b20-mywpiww0/work/out.txt"
       ],
       "credentialRef": "operator"
      }
@@ -1253,7 +1253,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpiww0",
+     "box_id": "h-93c18dbf3b20-mywpiww0",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "description": "antiproton t/a"
     }
@@ -1262,7 +1262,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -1288,7 +1288,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/files/upload?box_abs_path=%2Fwork%2Fin%2Fphoto.jpg",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/files/upload?box_abs_path=%2Fwork%2Fin%2Fphoto.jpg",
    "authorization": "Basic QUs6U0s=",
    "body": {
     "form": [
@@ -1304,7 +1304,7 @@
   },
   {
    "method": "GET",
-   "path": "/projects/p/workspace/data-transfers/active?box_id=h-t-a-mywpiww0",
+   "path": "/projects/p/workspace/data-transfers/active?box_id=h-93c18dbf3b20-mywpiww0",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": null,
@@ -1312,7 +1312,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -1355,11 +1355,12 @@
    "record": {
     "machines": {
      "main": {
-      "boxId": "h-t-a-mywpiww0",
+      "boxId": "h-93c18dbf3b20-mywpiww0",
       "createdAt": 1800000001000,
       "lastUsedAt": 1800000007000,
       "execs": 0,
       "saved": [],
+      "ownerChecked": true,
       "credentialRef": "operator",
       "image": "public.ecr.aws/docker/library/node:24-bookworm"
      }
@@ -1376,7 +1377,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpiww0",
+     "box_id": "h-93c18dbf3b20-mywpiww0",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "description": "antiproton t/a"
     }
@@ -1385,7 +1386,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -1412,7 +1413,7 @@
    "result": {
     "backgrounded": {
      "handle": {
-      "boxId": "h-t-a-mywpiww0",
+      "boxId": "h-93c18dbf3b20-mywpiww0",
       "execId": "e1"
      },
      "note": "running in the container; its result arrives on its own, and `jobs` lists what is running"
@@ -1472,14 +1473,14 @@
      "exitCode": null,
      "output": "",
      "truncated": false,
-     "box": "h-t-a-mywpiww0",
+     "box": "h-93c18dbf3b20-mywpiww0",
      "image": "public.ecr.aws/docker/library/node:24-bookworm"
     }
    }
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -1508,13 +1509,13 @@
     "exitCode": 0,
     "output": "done\n",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm"
    }
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -1541,7 +1542,7 @@
    "result": {
     "backgrounded": {
      "handle": {
-      "boxId": "h-t-a-mywpiww0",
+      "boxId": "h-93c18dbf3b20-mywpiww0",
       "execId": "e3"
      },
      "note": "running in the container; its result arrives on its own, and `jobs` lists what is running"
@@ -1572,11 +1573,12 @@
    "record": {
     "machines": {
      "main": {
-      "boxId": "h-t-a-mywpiww0",
+      "boxId": "h-93c18dbf3b20-mywpiww0",
       "createdAt": 1800000001000,
       "lastUsedAt": 1800000010000,
       "execs": 3,
       "saved": [],
+      "ownerChecked": true,
       "credentialRef": "operator",
       "image": "public.ecr.aws/docker/library/node:24-bookworm"
      }
@@ -1593,7 +1595,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpiww0",
+     "box_id": "h-93c18dbf3b20-mywpiww0",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "description": "antiproton t/a"
     }
@@ -1602,7 +1604,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -1632,7 +1634,7 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm"
    }
   },
@@ -1641,7 +1643,7 @@
    "result": [
     {
      "live": {
-      "id": "h-t-a-mywpiww0",
+      "id": "h-93c18dbf3b20-mywpiww0",
       "startedAt": 1800000001000,
       "lastUsedAt": 1800000002000,
       "credentialRef": "operator",
@@ -1656,7 +1658,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
@@ -1664,7 +1666,7 @@
   {
    "step": "idle release switches it off",
    "result": {
-    "id": "h-t-a-mywpiww0",
+    "id": "h-93c18dbf3b20-mywpiww0",
     "startedAt": 1800000001000,
     "endedAt": 1800000004000,
     "status": "freed"
@@ -1675,7 +1677,7 @@
    "result": [
     {
      "live": {
-      "id": "h-t-a-mywpiww0",
+      "id": "h-93c18dbf3b20-mywpiww0",
       "startedAt": 1800000001000,
       "lastUsedAt": 1800000004000,
       "credentialRef": "operator",
@@ -1696,7 +1698,7 @@
    "step": "quiet while off",
    "result": {
     "quiet": true,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "minutes": 600,
     "until": "2027-01-15T18:00:04.000Z",
     "note": "it stays switched off; this postpones its deletion"
@@ -1704,7 +1706,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -1735,7 +1737,7 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm"
    }
   },
@@ -1743,23 +1745,23 @@
    "step": "quiet while running",
    "result": {
     "quiet": true,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "minutes": 30,
     "until": "2027-01-15T08:30:06.000Z"
    }
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
   },
   {
    "step": "a stop run9 refuses",
-   "threw": "run9 box h-t-a-mywpiww0 not switched off: stop returned 503: busy",
+   "threw": "run9 box h-93c18dbf3b20-mywpiww0 not switched off: stop returned 503: busy",
    "released": {
-    "id": "h-t-a-mywpiww0",
+    "id": "h-93c18dbf3b20-mywpiww0",
     "startedAt": 1800000004000,
     "endedAt": 1800000007000,
     "status": "error",
@@ -1768,7 +1770,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
@@ -1776,7 +1778,7 @@
   {
    "step": "idle release switches it off again",
    "result": {
-    "id": "h-t-a-mywpiww0",
+    "id": "h-93c18dbf3b20-mywpiww0",
     "startedAt": 1800000004000,
     "endedAt": 1800000008000,
     "status": "freed"
@@ -1784,14 +1786,14 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 20000
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
@@ -1799,7 +1801,7 @@
   {
    "step": "idle release of a switched-off box deletes it",
    "result": {
-    "id": "h-t-a-mywpiww0",
+    "id": "h-93c18dbf3b20-mywpiww0",
     "startedAt": 1800000008000,
     "endedAt": 1800000010000,
     "status": "freed"
@@ -1809,7 +1811,7 @@
    "step": "usage",
    "result": [
     {
-     "id": "h-t-a-mywpiww0",
+     "id": "h-93c18dbf3b20-mywpiww0",
      "startedAt": 1800000004000,
      "endedAt": 1800000008000,
      "lastUsedAt": 1800000005000,
@@ -1818,7 +1820,7 @@
      "credentialRef": "operator"
     },
     {
-     "id": "h-t-a-mywpiww0",
+     "id": "h-93c18dbf3b20-mywpiww0",
      "startedAt": 1800000001000,
      "endedAt": 1800000004000,
      "lastUsedAt": 1800000002000,
@@ -1833,7 +1835,7 @@
     "machines": {},
     "sessions": [
      {
-      "boxId": "h-t-a-mywpiww0",
+      "boxId": "h-93c18dbf3b20-mywpiww0",
       "startedAt": 1800000004000,
       "endedAt": 1800000008000,
       "lastUsedAt": 1800000005000,
@@ -1842,7 +1844,7 @@
       "credentialRef": "operator"
      },
      {
-      "boxId": "h-t-a-mywpiww0",
+      "boxId": "h-93c18dbf3b20-mywpiww0",
       "startedAt": 1800000001000,
       "endedAt": 1800000004000,
       "lastUsedAt": 1800000002000,
@@ -1868,7 +1870,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpiww0",
+     "box_id": "h-93c18dbf3b20-mywpiww0",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "description": "antiproton t/a"
     }
@@ -1877,7 +1879,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -1907,7 +1909,7 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm"
    }
   },
@@ -1921,7 +1923,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -1978,7 +1980,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -2013,7 +2015,7 @@
   },
   {
    "method": "GET",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 16000
@@ -2041,7 +2043,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -2087,7 +2089,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -2122,7 +2124,7 @@
   },
   {
    "method": "GET",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 16000
@@ -2133,7 +2135,7 @@
   },
   {
    "method": "GET",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 120000
@@ -2434,7 +2436,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpiww0",
+     "box_id": "h-93c18dbf3b20-mywpiww0",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "description": "antiproton t/a"
     }
@@ -2451,7 +2453,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -2481,20 +2483,20 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm"
    }
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 20000
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
@@ -2503,11 +2505,11 @@
    "step": "release",
    "result": {
     "released": true,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "liveMs": 4000,
     "saved": [],
     "__ap_lease__": {
-     "id": "h-t-a-mywpiww0",
+     "id": "h-93c18dbf3b20-mywpiww0",
      "startedAt": 1800000002000,
      "endedAt": 1800000006000,
      "status": "freed"
@@ -2522,7 +2524,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpj1io",
+     "box_id": "h-93c18dbf3b20-mywpj1io",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "description": "antiproton t/a"
     }
@@ -2548,7 +2550,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpj328",
+     "box_id": "h-93c18dbf3b20-mywpj328",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "description": "antiproton t/a"
     }
@@ -2564,7 +2566,7 @@
     "machines": {},
     "sessions": [
      {
-      "boxId": "h-t-a-mywpiww0",
+      "boxId": "h-93c18dbf3b20-mywpiww0",
       "startedAt": 1800000002000,
       "endedAt": 1800000006000,
       "lastUsedAt": 1800000003000,
@@ -2584,7 +2586,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpiww0",
+     "box_id": "h-93c18dbf3b20-mywpiww0",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "description": "antiproton t/a"
     }
@@ -2593,7 +2595,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -2623,29 +2625,29 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm"
    }
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 20000
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
   },
   {
    "step": "release refused by an outage",
-   "threw": "run9 box h-t-a-mywpiww0 not released: delete returned 503: {\"error\":\"try later\"}",
+   "threw": "run9 box h-93c18dbf3b20-mywpiww0 not released: delete returned 503: {\"error\":\"try later\"}",
    "released": {
-    "id": "h-t-a-mywpiww0",
+    "id": "h-93c18dbf3b20-mywpiww0",
     "startedAt": 1800000001000,
     "endedAt": 1800000005000,
     "status": "error",
@@ -2654,33 +2656,33 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 20000
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
   },
   {
    "step": "forget after an outage does not forget",
-   "threw": "run9 box h-t-a-mywpiww0 not released: delete returned 503: {\"error\":\"try later\"}",
+   "threw": "run9 box h-93c18dbf3b20-mywpiww0 not released: delete returned 503: {\"error\":\"try later\"}",
    "released": []
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 20000
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
@@ -2689,21 +2691,21 @@
    "step": "the agent's release refused outright",
    "result": {
     "released": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "error": "delete returned 403: {\"error\":\"forbidden\"}",
     "saved": []
    }
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 20000
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
@@ -2711,7 +2713,7 @@
   {
    "step": "forget after a definitive refusal",
    "result": {
-    "id": "h-t-a-mywpiww0",
+    "id": "h-93c18dbf3b20-mywpiww0",
     "startedAt": 1800000001000,
     "endedAt": 1800000011000,
     "status": "error",
@@ -2725,7 +2727,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpj5dk",
+     "box_id": "h-93c18dbf3b20-mywpj5dk",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "description": "antiproton t/a"
     }
@@ -2734,7 +2736,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpj5dk/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpj5dk/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -2764,20 +2766,20 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpj5dk",
+    "box": "h-93c18dbf3b20-mywpj5dk",
     "image": "public.ecr.aws/docker/library/node:24-bookworm"
    }
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpj5dk/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpj5dk/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 20000
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpj5dk",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpj5dk",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
@@ -2785,7 +2787,7 @@
   {
    "step": "already gone is believed for the key that made it",
    "result": {
-    "id": "h-t-a-mywpj5dk",
+    "id": "h-93c18dbf3b20-mywpj5dk",
     "startedAt": 1800000012000,
     "endedAt": 1800000016000,
     "status": "freed"
@@ -2798,7 +2800,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpj98g",
+     "box_id": "h-93c18dbf3b20-mywpj98g",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "description": "antiproton t/a"
     }
@@ -2807,7 +2809,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpj98g/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpj98g/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -2837,20 +2839,20 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpj98g",
+    "box": "h-93c18dbf3b20-mywpj98g",
     "image": "public.ecr.aws/docker/library/node:24-bookworm"
    }
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpj98g/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpj98g/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 20000
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpj98g",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpj98g",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
@@ -2858,7 +2860,7 @@
   {
    "step": "a stop that fails before the delete does not stop the delete",
    "result": {
-    "id": "h-t-a-mywpj98g",
+    "id": "h-93c18dbf3b20-mywpj98g",
     "startedAt": 1800000017000,
     "endedAt": 1800000021000,
     "status": "freed"
@@ -2869,7 +2871,7 @@
     "machines": {},
     "sessions": [
      {
-      "boxId": "h-t-a-mywpj98g",
+      "boxId": "h-93c18dbf3b20-mywpj98g",
       "startedAt": 1800000017000,
       "endedAt": 1800000021000,
       "lastUsedAt": 1800000018000,
@@ -2878,7 +2880,7 @@
       "credentialRef": "operator"
      },
      {
-      "boxId": "h-t-a-mywpj5dk",
+      "boxId": "h-93c18dbf3b20-mywpj5dk",
       "startedAt": 1800000012000,
       "endedAt": 1800000016000,
       "lastUsedAt": 1800000013000,
@@ -2887,7 +2889,7 @@
       "credentialRef": "operator"
      },
      {
-      "boxId": "h-t-a-mywpiww0",
+      "boxId": "h-93c18dbf3b20-mywpiww0",
       "startedAt": 1800000001000,
       "endedAt": 1800000011000,
       "lastUsedAt": 1800000002000,
@@ -2915,7 +2917,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpiww0",
+     "box_id": "h-93c18dbf3b20-mywpiww0",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "description": "antiproton t/a"
     }
@@ -2924,7 +2926,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -2954,13 +2956,13 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm"
    }
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": null,
@@ -2976,7 +2978,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/snaps/s-h-t-a-mywpiww0/fork",
+   "path": "/projects/p/workspace/snaps/s-h-93c18dbf3b20-mywpiww0/fork",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -2996,14 +2998,14 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 20000
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
@@ -3015,12 +3017,12 @@
     "note": "the next run or shell starts from this environment",
     "released": true,
     "__ap_lease__": {
-     "id": "h-t-a-mywpiww0",
+     "id": "h-93c18dbf3b20-mywpiww0",
      "startedAt": 1800000001000,
      "endedAt": 1800000008000,
      "status": "freed"
     },
-    "releasedPrevious": "h-t-a-mywpiww0"
+    "releasedPrevious": "h-93c18dbf3b20-mywpiww0"
    }
   },
   {
@@ -3030,7 +3032,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpj328",
+     "box_id": "h-93c18dbf3b20-mywpj328",
      "source_snap_id": "kept-1",
      "description": "antiproton t/a"
     }
@@ -3039,7 +3041,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpj328/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpj328/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -3069,7 +3071,7 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpj328",
+    "box": "h-93c18dbf3b20-mywpj328",
     "image": "public.ecr.aws/docker/library/node:24-bookworm",
     "kept": [
      "base"
@@ -3083,7 +3085,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-two-mywpj5dk",
+     "box_id": "h-aece2c964813-two-mywpj5dk",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "description": "antiproton t/a"
     }
@@ -3092,7 +3094,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-two-mywpj5dk/background-execs",
+   "path": "/projects/p/workspace/boxes/h-aece2c964813-two-mywpj5dk/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -3122,7 +3124,7 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-two-mywpj5dk",
+    "box": "h-aece2c964813-two-mywpj5dk",
     "machine": "two",
     "image": "public.ecr.aws/docker/library/node:24-bookworm",
     "kept": [
@@ -3136,7 +3138,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpj328/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpj328/stop",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": null,
@@ -3156,7 +3158,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpj328/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpj328/stop",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": null,
@@ -3172,7 +3174,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/snaps/s-h-t-a-mywpj328/fork",
+   "path": "/projects/p/workspace/snaps/s-h-93c18dbf3b20-mywpj328/fork",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -3190,7 +3192,7 @@
    "step": "activity",
    "result": {
     "live": {
-     "id": "h-t-a-two-mywpj5dk",
+     "id": "h-aece2c964813-two-mywpj5dk",
      "startedAt": 1800000012000,
      "lastUsedAt": 1800000013000,
      "credentialRef": "operator",
@@ -3208,28 +3210,28 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpj328/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpj328/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 20000
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpj328",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpj328",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-two-mywpj5dk/stop",
+   "path": "/projects/p/workspace/boxes/h-aece2c964813-two-mywpj5dk/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 20000
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-two-mywpj5dk",
+   "path": "/projects/p/workspace/boxes/h-aece2c964813-two-mywpj5dk",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
@@ -3238,13 +3240,13 @@
    "step": "release all",
    "result": [
     {
-     "id": "h-t-a-mywpj328",
+     "id": "h-93c18dbf3b20-mywpj328",
      "startedAt": 1800000009000,
      "endedAt": 1800000021000,
      "status": "freed"
     },
     {
-     "id": "h-t-a-two-mywpj5dk",
+     "id": "h-aece2c964813-two-mywpj5dk",
      "startedAt": 1800000012000,
      "endedAt": 1800000023000,
      "status": "freed"
@@ -3257,7 +3259,7 @@
     "sessions": [
      {
       "machine": "two",
-      "boxId": "h-t-a-two-mywpj5dk",
+      "boxId": "h-aece2c964813-two-mywpj5dk",
       "startedAt": 1800000012000,
       "endedAt": 1800000023000,
       "lastUsedAt": 1800000013000,
@@ -3266,7 +3268,7 @@
       "credentialRef": "operator"
      },
      {
-      "boxId": "h-t-a-mywpj328",
+      "boxId": "h-93c18dbf3b20-mywpj328",
       "startedAt": 1800000009000,
       "endedAt": 1800000021000,
       "lastUsedAt": 1800000010000,
@@ -3275,7 +3277,7 @@
       "credentialRef": "operator"
      },
      {
-      "boxId": "h-t-a-mywpiww0",
+      "boxId": "h-93c18dbf3b20-mywpiww0",
       "startedAt": 1800000001000,
       "endedAt": 1800000008000,
       "lastUsedAt": 1800000006000,
@@ -3303,7 +3305,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpiww0",
+     "box_id": "h-93c18dbf3b20-mywpiww0",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "description": "antiproton t/a"
     }
@@ -3312,7 +3314,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -3342,7 +3344,7 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm"
    }
   },
@@ -3352,23 +3354,23 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 20000
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
   },
   {
    "step": "release: not found is not believed",
-   "threw": "run9 box h-t-a-mywpiww0 (stranded) not released: delete returned 400: {\"error\":\"box not found\"}",
+   "threw": "run9 box h-93c18dbf3b20-mywpiww0 (stranded) not released: delete returned 400: {\"error\":\"box not found\"}",
    "released": {
-    "id": "h-t-a-mywpiww0",
+    "id": "h-93c18dbf3b20-mywpiww0",
     "startedAt": 1800000001000,
     "endedAt": 1800000005000,
     "status": "error",
@@ -3377,19 +3379,19 @@
   },
   {
    "step": "release again before the retry is due",
-   "threw": "run9 box h-t-a-mywpiww0 (stranded) not released: not retried before 2027-01-15T08:05:05.000Z; last: delete returned 400: {\"error\":\"box not found\"}",
+   "threw": "run9 box h-93c18dbf3b20-mywpiww0 (stranded) not released: not retried before 2027-01-15T08:05:05.000Z; last: delete returned 400: {\"error\":\"box not found\"}",
    "released": []
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/stop",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 20000
   },
   {
    "method": "DELETE",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0",
    "authorization": "Basic QUs6U0s=",
    "body": null,
    "timeoutMs": 30000
@@ -3397,7 +3399,7 @@
   {
    "step": "forget after a definitive refusal",
    "result": {
-    "id": "h-t-a-mywpiww0",
+    "id": "h-93c18dbf3b20-mywpiww0",
     "startedAt": 1800000001000,
     "endedAt": 1800000007000,
     "status": "error",
@@ -3410,7 +3412,7 @@
     "sessions": [
      {
       "machine": "stranded",
-      "boxId": "h-t-a-mywpiww0",
+      "boxId": "h-93c18dbf3b20-mywpiww0",
       "startedAt": 1800000001000,
       "endedAt": 1800000007000,
       "lastUsedAt": 1800000002000,
@@ -3430,7 +3432,7 @@
    "authorization": "Basic QUs6U0s=",
    "body": {
     "json": {
-     "box_id": "h-t-a-mywpiww0",
+     "box_id": "h-93c18dbf3b20-mywpiww0",
      "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
      "description": "antiproton t/a"
     }
@@ -3439,7 +3441,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -3469,13 +3471,13 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm"
    }
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -3507,13 +3509,13 @@
     "cwdNote": "files under /tmp do not survive while the container sits idle; keep work in the working directory",
     "output": "",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm"
    }
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -3538,7 +3540,7 @@
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -3568,14 +3570,14 @@
     "cwd": "/work",
     "output": "hello",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm",
     "note": "/tmp/x no longer exists, so this command started in /work"
    }
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -3606,14 +3608,14 @@
     "error": "failed to start: chdir /nope: no such file or directory",
     "output": "",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm",
     "note": "/nope does not exist in the container; create it first, or leave workdir out"
    }
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -3644,13 +3646,13 @@
     "error": "platform trouble",
     "output": "",
     "truncated": false,
-    "box": "h-t-a-mywpiww0",
+    "box": "h-93c18dbf3b20-mywpiww0",
     "image": "public.ecr.aws/docker/library/node:24-bookworm"
    }
   },
   {
    "method": "POST",
-   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "path": "/projects/p/workspace/boxes/h-93c18dbf3b20-mywpiww0/background-execs",
    "contentType": "application/json",
    "authorization": "Basic QUs6U0s=",
    "body": {
@@ -3688,11 +3690,12 @@
    "record": {
     "machines": {
      "main": {
-      "boxId": "h-t-a-mywpiww0",
+      "boxId": "h-93c18dbf3b20-mywpiww0",
       "createdAt": 1800000001000,
       "lastUsedAt": 1800000014000,
       "execs": 6,
       "saved": [],
+      "ownerChecked": true,
       "credentialRef": "operator",
       "image": "public.ecr.aws/docker/library/node:24-bookworm"
      }

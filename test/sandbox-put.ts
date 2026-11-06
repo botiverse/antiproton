@@ -281,7 +281,7 @@ await check("a transfer still running after the wait is an error that says it ma
 
 await check("put on a switched-off box records it as running again before the upload", async () => {
   const T0 = Date.now() - 3_600_000;
-  const f = fixture({ [`${OWN}x`]: PHOTO }, {}, { machines: { main: { boxId: "b1", createdAt: T0, lastUsedAt: T0, parkedAt: T0 + 1, execs: 2, saved: [] } } });
+  const f = fixture({ [`${OWN}x`]: PHOTO }, {}, { machines: { main: { boxId: "b1", createdAt: T0, lastUsedAt: T0, parkedAt: T0 + 1, execs: 2, saved: [], ownerChecked: true } } });
   await f.put({ ref: "artifact://x", path: "x" });
   const m = f.mount()!.machines.main!;
   must(m.boxId === "b1" && (m as any).parkedAt === undefined, `still parked: ${JSON.stringify(m)}`);

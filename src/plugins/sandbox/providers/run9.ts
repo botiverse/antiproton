@@ -139,6 +139,9 @@ function open(settings: ProviderSettings, credential: string): SandboxProvider {
   const ws = `/projects/${settings.project}/workspace`;
   const box = (id: string) => `${ws}/boxes/${id}`;
   const exec = (execId: string) => `${ws}/execs/${execId}`;
+  // The listing `ownerOf` just read, for the `status` that follows it on a look (src/plugins/sandbox.ts `awakeBox`):
+  // one read of the list answers both, and is used once, so no later `status` reads an old one.
+  let justListed: { id: string; boxes: unknown[] } | null = null;
   return {
     async create(spec: BoxSpec) {
       await api("POST", `${ws}/boxes`, {
@@ -156,11 +159,36 @@ function open(settings: ProviderSettings, credential: string): SandboxProvider {
 
     /**
      * A create answered "already exists" for an id the plugin had just minted (seen twice in one benchmark run,
-     * once as run9's own database's duplicate-key error): the box is there and only the answer was lost, so it is
-     * this spec's when the project lists it.
+     * once as run9's own database's duplicate-key error): the box is there and only the answer was lost.
+     *
+     * Being listed is not enough to make it this spec's. The project is shared by every tenant, so a box under the
+     * same id may be someone else's, and adopting it hands this agent that box's files, processes and egress
+     * registrations. It is adopted only when it carries the description this spec created it with, which names the
+     * tenant and the agent (the id's digest covers the mount and machine, `boxIdFor` in src/plugins/sandbox.ts). A
+     * box listed without one, or with another, is not adopted, and the create's own refusal stands.
+     *
+     * The description and not run9's labels: the create has never sent labels, so no box has them, and on run9
+     * a label is not inert. It decides which project-scope secrets a managed box is given (`box_label`) and can
+     * decide its outbound address (`outbound_ip_label`), in a project shared with production.
      */
     async adopt(spec: BoxSpec) {
-      return (await this.status(spec.id)) === "gone" ? null : spec.id;
+      return (await this.ownerOf!(spec.id, [spec.description])) === "ours" ? spec.id : null;
+    },
+
+    /**
+     * From the project's list, as `status` reads it: the description run9 holds for the box, which the create sent.
+     * Every create has sent one, so a box listed without one was not made by this plugin's create as it stands, and
+     * is `unknown` rather than `other`: the caller decides what that is worth.
+     */
+    async ownerOf(id: string, descriptions: readonly string[]) {
+      const boxes = await api("GET", `${ws}/boxes`);
+      if (!Array.isArray(boxes)) throw new Error(`run9 GET ${ws}/boxes: not a list of boxes (${shapeOf(boxes)})`);
+      justListed = { id, boxes };
+      const listed = boxes.find((x: any) => x?.box_id === id);
+      if (!listed) return "gone";
+      const said = listed.description;
+      if (typeof said !== "string" || !said) return "unknown";
+      return descriptions.includes(said) ? "ours" : "other";
     },
 
     /**
@@ -168,7 +196,9 @@ function open(settings: ProviderSettings, credential: string): SandboxProvider {
      * under the operator's account is every tenant's; only the one asked about is read from it.
      */
     async status(id: string, within?: Within): Promise<BoxState> {
-      const boxes = await api("GET", `${ws}/boxes`, undefined, within);
+      const reuse = justListed?.id === id ? justListed.boxes : null;
+      justListed = null;
+      const boxes = reuse ?? await api("GET", `${ws}/boxes`, undefined, within);
       const listed = Array.isArray(boxes) ? boxes.find((x: any) => x?.box_id === id) : null;
       if (!listed) return "gone";
       return AWAKE_STATES.includes(String(listed.state)) ? "running" : "stopped";
@@ -289,11 +319,15 @@ function open(settings: ProviderSettings, credential: string): SandboxProvider {
       return snapId as string;
     },
 
+    // run9 answers the created registration's metadata (swagger `createBoxSecret`, 201 `api.ProjectSecretView`, read
+    // 2026-11-06), whose `secret_id` is the one `removeSecret` takes.
     async addSecret(id: string, s: EgressSecret) {
-      await api("POST", `${box(id)}/secrets`, {
+      const made = await api("POST", `${box(id)}/secrets`, {
         name: s.name, value: s.value, placeholder: s.placeholder,
         inject_header_name: s.header, allowed_hosts: s.hosts,
       });
+      const secretId = (made as { secret_id?: unknown } | null)?.secret_id;
+      return typeof secretId === "string" && secretId ? secretId : null;
     },
 
     // listBoxSecrets and listProjectSecrets (https://api.run.sys9.ai/swagger.yaml, read 2026-10-29, sha256

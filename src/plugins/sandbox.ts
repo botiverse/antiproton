@@ -1,11 +1,11 @@
 import type { Json, MountRecord } from "../core/types.ts";
-import type { CredentialRefKind, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm, ToolSchema, Withdrawal } from "./types.ts";
-import { backgrounded, identityNote, LEASE_KEY, markIdentity, markReleased, releaseRetryMs } from "./types.ts";
+import type { CredentialRefKind, DbOperations, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm, ToolSchema, Withdrawal } from "./types.ts";
+import { Backgrounded, backgrounded, identityNote, KeyRange, LEASE_KEY, markIdentity, markReleased, releaseRetryMs } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
 import { spanText } from "../runtime/idle-lease.ts";
 import { ProviderError, TERMINAL_EXEC_STATES } from "./sandbox/provider.ts";
-import type { BoxState as ProviderBoxState, EgressSecret, ExecStatus, SandboxBackend, SandboxProvider } from "./sandbox/provider.ts";
+import type { BoxSpec, BoxState as ProviderBoxState, EgressSecret, ExecStatus, SandboxBackend, SandboxProvider } from "./sandbox/provider.ts";
 import { run9 } from "./sandbox/providers/run9.ts";
 import { instabox, INSTABOX_ENDPOINT, shapeOf } from "./sandbox/providers/instabox.ts";
 
@@ -148,6 +148,76 @@ interface Session {
  */
 export const BOX_STORE = "box";
 export const BOX_KEY = "state";
+/**
+ * Beside the record, one key per box (`split:<box id>`, so "did this mount ever name box X" is one read): every box
+ * this mount's record named that turned out to be another's, kept for good. Each is small, and without it a split
+ * would leave no trace at all.
+ *
+ * Not in `sessions`, though that is where a box this mount used is remembered. If a split were written there: it
+ * would be billed, since usage passes run after each step and bill every session up to its end (src/usage/container.ts
+ * `heldRows`), so every split would bill this mount the tail since that box's last pass, days for an agent dormant
+ * before its split; the window keeps only the newest `SESSIONS_KEPT`, so the evidence would be evicted; and a session
+ * means "this box ended", where a split leaves the box alive. Not in machines or `stranded` either: those are what this mount holds, and usage bills what it
+ * holds (src/usage/container.ts), which would bill the owner's machine to this mount.
+ */
+export const SPLIT_PREFIX = "split:";
+// Split records and the notes queue (`NOTICES_KEY`) must live in the mount's own database (`ctx.db`), and their keys
+// must hold nothing shared across mounts but the box id: no agent-level store (`agentDb`), prefix, or name derived from
+// agent-level config. The mount's own database is exactly what the gateway's per-mount lock covers (`#onMount`,
+// src/runtime/gateway.ts); anything shared across mounts would be outside it.
+const splitKey = (boxId: string) => `${SPLIT_PREFIX}${boxId}`;
+
+/**
+ * A box another agent owns that this mount's record named, after the record let go of it (`ownedProvider`): when,
+ * why, and what became of this mount's account registrations on it. Names only, never a value.
+ */
+interface ForeignBox {
+  box: string;
+  /** The mount and machine whose record named it. */
+  mount: string;
+  machine: string | null;
+  /** Why it is not this mount's: made for another agent. */
+  reason: "foreign_owner";
+  /**
+   * Every account registration this mount had made there, by name, as found at the split and never changed: the most
+   * that can have been exposed, for reports. Null where the record could not say (`Wired.names` null).
+   */
+  registeredNames: string[] | null;
+  /** The ids of those it can prove its own (`Wired.pairs`), as found at the split and never changed. */
+  secretIds: string[];
+  detectedAt: number;
+  /**
+   * This mount's registrations on it, as a set: `pending` while any item is still to be removed, `residue` when what
+   * is left is only given up on, `removed` when nothing is left (`outcomeOf`).
+   */
+  unwire: "removed" | "pending" | "residue";
+  /** What of this mount is still on it, one item per registration (`Remaining`). */
+  remaining: Remaining[];
+  /** Removal rounds made over the pending items, as a set (`UNWIRE_ATTEMPTS`); why the last one failed. */
+  attempts: number;
+  lastError: string | null;
+  /** The agent's note about this split is queued (`updateSplit`): set once, so finding the split again says nothing new. */
+  told?: true;
+}
+
+/**
+ * One registration of this mount's on another agent's box: its id where the provider answered one, its name where
+ * known. `pending` items have an id and are removed by it; `residue` items are given up on, with why:
+ * `wiring_without_ids` (never had a provable id, so never tried), `names_unknown` (the wiring's names were not
+ * known either), `unwire failed 3 times`, or `pending without details` (an older entry with nothing to retry).
+ */
+type Remaining = { id: string | null; name: string | null; state: "pending" | "residue"; reason?: string };
+
+/**
+ * How many removal rounds a pending removal gets. `attempts` counts the rounds actually sent, and is advanced in one
+ * place (`applyRound`, run inside the write) for every round, wherever it runs: in the call that splits, on finding an
+ * interrupted split again, or in a later call's retry (`retryForeign`). A split's first write has 0, and every round
+ * adds one whatever came of it; once this many have been made, what is still pending is kept as residue. So at most
+ * this many rounds in all, and a split found again goes on from the count it had. Calls at once each count the round
+ * they really sent, so under concurrency a split can reach the limit sooner, which the count intends. Why a round
+ * failed is in `lastError` and `reason`; `attempts` only counts.
+ */
+export const UNWIRE_ATTEMPTS = 3;
 
 /**
  * The mount's box record. `sessions` is what makes the meter readable:
@@ -180,6 +250,11 @@ interface BoxState {
    * this says its error lease has been reported, so later attempts that fail the same way do not report another.
    */
   deleteFailedAt?: number;
+  /**
+   * The provider has shown this box was made for this agent (`ownedProvider`): set when this mount created or
+   * adopted it, or once its owner was read. A box recorded without it is asked about before anything is sent to it.
+   */
+  ownerChecked?: true;
   /** Mounts that declare a container form and hold a credential but were left out, and why. */
   leftOut?: LeftOut[];
   execs?: number;
@@ -626,10 +701,452 @@ function providerName(cfg: { provider?: string }): string {
  * a job outside one. One door, with the same credential resolution, so a call with no account is refused the
  * same way wherever it comes from.
  */
-function openProvider(cfg: ReturnType<typeof cfgOf>, ctx: PluginContext): SandboxProvider {
+function openProvider(cfg: ReturnType<typeof cfgOf>, ctx: PluginContext, opts?: { wake?: boolean; look?: boolean }): OwnedProvider {
   const backend = backendFor(cfg);
   if (!ctx.credential) throw markIdentity(new Error(`the ${backend.name} API needs an account, and this call had none — ${identityNote(ctx)}`), ctx);
-  return backend.open(cfg, ctx.credential);
+  return ownedProvider(backend.open(cfg, ctx.credential, opts?.wake === false ? { wake: false } : undefined), ctx, opts?.look === true);
+}
+
+/** What every box this plugin creates says it is for, at the provider (`BoxSpec.description`). */
+export function boxDescriptionOf(caller: { tenantId: string; agentId: string }): string {
+  return `antiproton ${caller.tenantId}/${caller.agentId}`;
+}
+
+/**
+ * The descriptions a box made for this agent may carry: today's, and the one the very first build sent before the
+ * project was renamed (`agent-harness`, 2026-09-08). A box of that build still recorded is this agent's, and judging
+ * it another's would leave it alive and billed with nothing naming it.
+ */
+function ownDescriptions(caller: { tenantId: string; agentId: string }): string[] {
+  return [boxDescriptionOf(caller), `agent-harness ${caller.tenantId}/${caller.agentId}`];
+}
+
+/** A box the record named turned out to be another agent's: the record no longer names it, and nothing was sent. */
+export class BoxNotOurs extends Error {
+  readonly boxId: string;
+  readonly machine: string | null;
+  constructor(boxId: string, machine: string | null) {
+    super(`box ${boxId} was made for another agent, so this mount no longer uses it; nothing was sent to it`);
+    this.boxId = boxId;
+    this.machine = machine;
+  }
+}
+
+/**
+ * The boxes this mount let go of as another agent's that its agent has not been told about yet, for the sentence the
+ * next tool result carries (`notOursNote` in `sandboxPlugin`).
+ */
+export const NOTICES_KEY = "notices";
+/** What was done about a foreign box: let go of it, with how its account registrations ended, or gave up on them. */
+type LetGo = {
+  /** The row's own id: rows are delivered and cleared by it, never by box. */
+  id?: string;
+  boxId: string; machine: string | null;
+  /** `split` when the record let go of it, with which item states its set holds; or a later turn of its removal. */
+  outcome: "split" | "given_up" | "remains";
+  pending?: boolean; residue?: boolean;
+};
+/**
+ * Kept in the mount's own storage until a tool's result has carried it: a split is often found outside any tool call
+ * (the idle lease's switch-off, an operator's release, a withdrawal), and the agent's next call is then the first
+ * place it can be told why its machine is gone.
+ */
+// One row per event, never merged by box: the same box can give two events at different times (let go of with a
+// removal pending, then that removal given up on), and the second is the only place the agent hears it could not be
+// removed. The same note is not repeated, but different outcomes for the same box are different notes.
+// One row is one event: rows are delivered and deleted by their ids, never deduped by content. The same box's same
+// outcome may have two rows; they are two events, both said and both deleted. Today only a lost split entry produces
+// that (a call interrupted before the pointer clear, after which the entry is deleted: the next discovery begins a new
+// entry and tells again).
+function enqueueIn(tx: DbOperations, g: LetGo): void {
+  const v = tx.get(BOX_STORE, NOTICES_KEY);
+  const owed = Array.isArray(v) ? (v as LetGo[]) : [];
+  const id = `${Date.now().toString(36)}-${[...crypto.getRandomValues(new Uint8Array(4))].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+  tx.put(BOX_STORE, [...owed, { ...g, id }] as unknown as Json, NOTICES_KEY);
+}
+
+
+/** Every split this mount recorded, by box id. An entry that does not read is left out. */
+async function readForeign(ctx: PluginContext): Promise<Record<string, ForeignBox>> {
+  const rows = await ctx.db.getAll(BOX_STORE, KeyRange.bound(SPLIT_PREFIX, `${SPLIT_PREFIX}\uffff`));
+  const out: Record<string, ForeignBox> = {};
+  for (const e of rows) {
+    if (e && typeof e === "object" && typeof (e as ForeignBox).box === "string" && typeof (e as ForeignBox).detectedAt === "number") {
+      out[(e as ForeignBox).box] = e as ForeignBox;
+    }
+  }
+  return out;
+}
+
+/**
+ * The one writer of a split entry: `fn` is given the entry as stored and returns what to store, and the note the
+ * change owes the agent, if any. `unwire` is derived here from `remaining`, never taken from the caller, so the two
+ * cannot drift. The note is queued in the same transaction as the entry that records the change: never two writes
+ * with a gap where the entry says the change happened and the note was lost, after which nothing would see a change.
+ *
+ * Inside the callback only the transaction's own synchronous get and put are used; any await there would be refused
+ * and roll the whole transaction back. What is written is computed only from what is read inside it and from values
+ * passed in (`fn`'s inputs, never an entry read earlier): two calls working on one split each apply their change to
+ * what the other left, so neither's is lost.
+ */
+async function updateSplit(
+  ctx: PluginContext, box: string, fn: (stored: ForeignBox | undefined) => { next: ForeignBox; note?: LetGo } | null,
+): Promise<{ next: ForeignBox; note?: LetGo } | null> {
+  return ctx.db.transaction([BOX_STORE], "readwrite", (tx) => {
+    // A read that throws is not a missing entry: it rolls the transaction back and the call fails as it came.
+    const raw = tx.get(BOX_STORE, splitKey(box));
+    const stored = raw && typeof raw === "object" ? raw as ForeignBox : undefined;
+    const out = fn(stored);
+    // Nothing to write (`retryForeign` finding its entry gone).
+    if (out === null) return null;
+    const next = { ...out.next, unwire: outcomeOf(out.next.remaining) };
+    tx.put(BOX_STORE, next as unknown as Json, splitKey(box));
+    if (out.note) enqueueIn(tx, out.note);
+    return { next, ...(out.note ? { note: out.note } : {}) };
+  });
+}
+
+/**
+ * A well-formed entry as stored: one with its items. An entry of an earlier shape (no items) is not one, and is given
+ * its items from what it recorded itself (`itemsOfEarlierEntry`). Not from the wiring: on the split path that wiring
+ * is this box's own registrations, but rebuilding from it where an entry exists would throw away the removal rounds
+ * already counted and the residue already recorded.
+ *
+ * Split entries must be kept for good. Deleting one resets its count of removal rounds (so the limit of
+ * `UNWIRE_ATTEMPTS` holds only while the entry lives), makes the next discovery tell the agent again (`told` lives in
+ * it), erases the evidence that the split happened, and gives a later discovery a new `detectedAt` (that moment),
+ * which reads the same as a first split. Any future limit on how long or how many are kept changes these meanings.
+ */
+const settledEntry = (e: ForeignBox | undefined): ForeignBox | undefined => (e && Array.isArray(e.remaining) ? e : undefined);
+
+/**
+ * The items of an entry of an earlier shape, from its own fields: pending ones from the ids it recorded (named when
+ * its names match them one for one), or, with no ids, residue `pending without details` for each name it had.
+ */
+function itemsOfEarlierEntry(e: ForeignBox): { remaining: Remaining[]; names: string[] | null; ids: string[] } {
+  const old = e as unknown as { secretIds?: unknown; names?: unknown; registeredNames?: unknown };
+  // An entry of the earlier shape has its names as `names` and no `registeredNames`: taking them over fills a
+  // field that was missing, it does not change what was registered.
+  const names = Array.isArray(old.registeredNames) ? old.registeredNames as string[] : Array.isArray(old.names) ? old.names as string[] : null;
+  const ids = Array.isArray(old.secretIds) ? old.secretIds as string[] : [];
+  const named = names !== null && names.length === ids.length;
+  const remaining: Remaining[] = ids.length
+    ? ids.map((sid, i) => ({ id: sid, name: named ? names![i]! : null, state: "pending" as const }))
+    : (names ?? [null]).map((n) => ({ id: null, name: n, state: "residue" as const, reason: "pending without details" }));
+  return { remaining, names, ids };
+}
+
+/**
+ * The note owed when a round gives up on a told split's pending items: a new event, told on its own. Only when the
+ * round made items residue for failing (`unwire failed …`): a split whose pending items were all removed, leaving only
+ * residue it had from the start (`wiring_without_ids`), gave up on nothing, and that residue was told at the split.
+ */
+const gaveUpNote = (stored: ForeignBox | undefined, next: ForeignBox, machine: string | null): LetGo | undefined => {
+  if (!stored?.told) return undefined;
+  const wasPending = new Set(stored.remaining.filter((r) => r.state === "pending").map((r) => r.id));
+  const givenUp = next.remaining.some((r) => r.state === "residue" && wasPending.has(r.id));
+  return givenUp ? { boxId: next.box, machine, outcome: "given_up" } : undefined;
+};
+
+/**
+ * A wiring's registrations as name and id pairs. One recorded with its pairs reads as them; one recorded before them
+ * (names alone, which is every wiring made before ids were kept, or names with an `ids` list from the build between)
+ * reads its ids only from a list as long as its names, and otherwise has none: never matched up by position from a
+ * shorter one. Null where not even the names are known. Applied where the record is read (`withPairs`), so the next
+ * write of the record stores the wiring as pairs: an old wiring is converted on its next ordinary write, never by a
+ * write made only to convert it.
+ */
+function pairsOf(w: Wired): Array<{ name: string; id: string | null }> | null {
+  if (Array.isArray(w.pairs)) return w.pairs;
+  if (w.names === null) return null;
+  const ids = (w as { ids?: unknown }).ids;
+  const full = Array.isArray(ids) && ids.length === w.names.length && ids.every((x) => typeof x === "string");
+  return w.names.map((name, i) => ({ name, id: full ? (ids as string[])[i]! : null }));
+}
+
+/** A wiring as read: with its pairs (`pairsOf`), the one place an older shape is converted. */
+function withPairs(w: Wired): Wired {
+  const pairs = pairsOf(w);
+  const { ids: _ids, ...rest } = w as Wired & { ids?: unknown };
+  return pairs ? { ...rest, pairs } : rest;
+}
+
+/** The set's state: pending while any item is, residue when only given-up items are left, removed when none is. */
+const outcomeOf = (remaining: readonly Remaining[]): ForeignBox["unwire"] =>
+  remaining.some((r) => r.state === "pending") ? "pending" : remaining.length ? "residue" : "removed";
+
+/** One removal round as sent: the ids sent, those still there after it, and why the last refusal was. */
+type Round = { sent: string[]; left: string[]; error: string };
+
+/** Sends one removal round for the pending items of `e`. Only items with an id are ever pending, so only ids are sent. */
+async function sendRound(inner: SandboxProvider, e: ForeignBox): Promise<Round> {
+  const sent = e.remaining.filter((r) => r.state === "pending" && typeof r.id === "string").map((r) => r.id!);
+  return { sent, ...(await unwireForeign(inner, e.box, sent)) };
+}
+
+/**
+ * A round applied to an entry: what it removed is taken out, the round is counted, and once `UNWIRE_ATTEMPTS` rounds
+ * have been made what is still pending becomes residue. Applied to the entry as stored when the round is written
+ * (`updateSplit`), so two rounds made at once both count and what remains is what neither removed.
+ */
+function applyRound(base: ForeignBox, r: Round): ForeignBox {
+  const removed = r.sent.filter((sid) => !r.left.includes(sid));
+  const attempts = base.attempts + 1;
+  const kept = base.remaining.filter((x) => !(x.state === "pending" && x.id !== null && removed.includes(x.id)));
+  const exhausted = attempts >= UNWIRE_ATTEMPTS && kept.some((x) => x.state === "pending");
+  // Residue is terminal: no path retries or removes it; it goes away only when the owner removes those
+  // registrations or the box is released.
+  const remaining = exhausted ? kept.map((x): Remaining => (x.state === "pending" ? { ...x, state: "residue", reason: `unwire failed ${UNWIRE_ATTEMPTS} times` } : x)) : kept;
+  return { ...base, remaining, unwire: outcomeOf(remaining), attempts, lastError: r.left.length ? r.error : base.lastError };
+}
+
+async function unwireForeign(inner: SandboxProvider, boxId: string, secretIds: string[]): Promise<{ left: string[]; error: string }> {
+  const left: string[] = [];
+  let error = "";
+  for (const sid of secretIds) {
+    try {
+      await inner.removeSecret(boxId, sid);
+    } catch (e) {
+      if (e instanceof ProviderError && e.code === "not_found") continue;
+      left.push(sid);
+      error = e instanceof ProviderError ? `${e.code}${e.status ? ` ${e.status}` : ""}` : "unreachable";
+    }
+  }
+  return { left, error };
+}
+
+/** Two texts as sentences: the second's first letter raised, so "…a new one." and "nothing was running" read as two. */
+export function joinSentences(first: string, second: string): string {
+  if (!second) return first;
+  return `${first} ${second.charAt(0).toUpperCase()}${second.slice(1)}`;
+}
+
+/** A tool's result with that sentence in front of its `note`, or of a handed-over job's. */
+function withNotOursNote(result: Json, note: string | null): Json {
+  if (!note) return result;
+  if (result instanceof Backgrounded) {
+    return new Backgrounded(result.handle, result.note ? joinSentences(note, result.note) : note) as unknown as Json;
+  }
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const r = result as Record<string, Json>;
+  return { ...r, note: typeof r.note === "string" && r.note ? joinSentences(note, r.note) : note };
+}
+
+/** The provider's methods whose first argument is a box id: every request that reaches a box. */
+const BOX_ID_METHODS = ["status", "execBackground", "upload", "download", "stop", "pause", "wake", "delete", "snapshot",
+  "usage", "addSecret", "listSecrets", "removeSecret"] as const;
+
+type OwnedProvider = SandboxProvider & {
+  /** Whether the box may be used, asked before any request reaches it: throws `BoxNotOurs` when it is another's. */
+  owns(id: string): Promise<void>;
+  /** Retries the removals still pending from boxes let go of as another's (`ForeignBox.pending`). */
+  retryForeign(): Promise<void>;
+};
+
+/**
+ * The provider as every path of this plugin gets it: no request naming a box goes out until the box is shown to be
+ * this agent's. One door, because the paths that reach a box are many (the tools, a release, the idle lease's
+ * switch-off and deletion, a look at its files, a withdrawal) and a check made in each is one a new path forgets.
+ *
+ * Why it is needed at all: run9's ids are the whole project's, which is every tenant's, and ids minted before
+ * `boxIdFor` could be the same for two agents (two agents of one Raft server in one millisecond). Such a pair's
+ * records both name one box, and every request either sends acts on the other's machine: its files and processes,
+ * and a release or an idle deletion destroys it. A record keeps its id for as long as the box lives, so the pairs
+ * made before the fix stay shared until they are found here.
+ *
+ * A box is this agent's when this provider just created or adopted it, when its record already says it was shown to
+ * be (`ownerChecked`), or when the provider says so now (`SandboxProvider.ownerOf`), which is then written to the
+ * record so it is asked once per box. A box the provider lists with no description is kept and said once
+ * (`owner_unknown`): every create has sent one, so none is expected, and dropping the machine of an agent that may
+ * well own it is the worse mistake. One made for another agent is never sent anything, not even a stop or a
+ * delete: the record stops naming it (its sessions and kept environments stay), the fact is written as a
+ * `sandbox.box_owner` trace row and a log line with `code: "box_not_ours"`, and `BoxNotOurs` is thrown for the
+ * caller to carry on without it. An answer that cannot be read is thrown as it came: nothing is sent to a box that
+ * has not been shown to be ours. An id the record does not name at all is refused the same way.
+ *
+ * A `look` (a person viewing the machine's files) writes nothing, as a look never does: it neither records what it
+ * learnt nor lets go of the box, and the agent's next call does both.
+ */
+function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false): OwnedProvider {
+  const shown = new Set<string>();
+  const say = (code: "box_not_ours" | "owner_unknown" | "unwire_given_up" | "split_record_missing", boxId: string, machine: string | null, more: Record<string, string> = {}) => {
+    const attrs = { code, tenant: ctx.caller.tenantId, agent: ctx.caller.agentId, mount: ctx.alias, machine, box: boxId, ...more };
+    console.log(JSON.stringify({ event: "sandbox.box_owner", ...attrs }));
+    ctx.trace?.({ kind: "sandbox.box_owner", status: code, verdict: code === "owner_unknown" ? "ok" : code === "split_record_missing" ? "failed" : "blocked", attrs });
+  };
+  const owns = async (id: string): Promise<void> => {
+    if (shown.has(id) || !inner.ownerOf) return;
+    const mount = await readMount(ctx);
+    const machine = Object.keys(mount?.machines ?? {}).find((n) => mount!.machines[n]!.boxId === id) ?? null;
+    const stranded = machine === null ? mount?.stranded?.[id] : undefined;
+    if (machine === null && !stranded) throw new BoxNotOurs(id, null);
+    if ((machine !== null ? mount!.machines[machine]! : stranded!).ownerChecked) { shown.add(id); return; }
+    const owner = await inner.ownerOf(id, ownDescriptions(ctx.caller));
+    // Not there: nothing can be sent to another's box under this id, and the request fails as it always has.
+    if (owner === "gone") return;
+    if (owner === "ours" || owner === "unknown") {
+      if (owner === "unknown" && !look) say("owner_unknown", id, machine);
+      shown.add(id);
+      if (machine !== null && !look) {
+        const now = await readView(ctx, machine);
+        if (now.boxId === id) await writeView(ctx, machine, { ...now, ownerChecked: true });
+      }
+      return;
+    }
+    // Another agent's. The box is theirs: it is never stopped, deleted or changed, and its session is not recorded as
+    // one of this mount's. The one thing taken off it is this mount's own account registrations, by the ids they were
+    // made under (`unwireForeign`), since the owner's commands would otherwise go on acting as this mount's accounts
+    // and nothing else would ever remove them. The mount is never held up by that: the record lets go of the box
+    // whatever came of it, and what may remain is kept beside the record (`ForeignBox`), retried while it can be
+    // (`retryForeign`) and otherwise kept as residue for a person, and said in the call's result.
+    if (look) {
+      // Nothing written and nothing removed: the agent's next call does both, and tells the agent why.
+      throw new BoxNotOurs(id, machine);
+    }
+    // A machine's record or a stranded box's: the same split either way, and only if the record still names it.
+    const held: (MachineState & { wired?: Wired[] }) | undefined = machine !== null
+      ? await readView(ctx, machine).then((v) => (v.boxId === id ? v : undefined))
+      : (await readMount(ctx))?.stranded?.[id];
+    if (held) {
+      // Proven item by item (`Wired.pairs`, converted on read): one with an id is removed by that id; one without (an
+      // older wiring, or a registration the provider answered no id for) cannot be told from the owner's own, so it
+      // is residue and never tried. A wiring whose names are not known at all is one residue item with neither.
+      const wired = held.wired ?? [];
+      // Every name from the record's own wiring; null only where a wiring's names were not known.
+      const registeredNames = wired.some((w) => !w.pairs) ? null : wired.flatMap((w) => w.pairs!.map((x) => x.name));
+      const items: Remaining[] = wired.flatMap((w): Remaining[] => !w.pairs
+        ? [{ id: null, name: null, state: "residue", reason: "names_unknown" }]
+        : w.pairs.map((x): Remaining => typeof x.id === "string"
+          ? { id: x.id, name: x.name, state: "pending" }
+          : { id: null, name: x.name, state: "residue", reason: "wiring_without_ids" }));
+      /** A whole entry from the record's own wiring (`held.wired`), found at `detectedAt`, no round made yet. */
+      const fresh = (detectedAt: number): ForeignBox => ({
+        box: id, mount: ctx.alias, machine, reason: "foreign_owner", registeredNames,
+        secretIds: items.flatMap((r) => (r.id ? [r.id] : [])), detectedAt, unwire: outcomeOf(items), remaining: items, attempts: 0, lastError: null,
+      });
+      // Written as soon as the split is decided, before anything is sent, with everything that describes it: what
+      // is to be removed is in it, so an interruption from here leaves an entry `retryForeign` finishes and this path
+      // goes on from. Every later write updates its outcome (`unwire`, `remaining`, `attempts`, `lastError`) and
+      // nothing else.
+      //
+      // Found again (an earlier call wrote this split and was interrupted before the record let go of the box), the
+      // stored entry is what goes on, never the wiring: its items, its rounds counted and its outcome stand, so the
+      // rounds stay at `UNWIRE_ATTEMPTS` in all and residue never returns to pending. A field an earlier shape lacks
+      // is filled (`registeredNames`), which changes nothing it said; one without items gets them from its own ids
+      // (`itemsOfEarlierEntry`), never from the wiring, keeping the moment it was first found and its count.
+      const begin = await updateSplit(ctx, id, (stored) => {
+        const had = settledEntry(stored);
+        if (had) return { next: had.registeredNames === undefined ? { ...had, registeredNames } : had };
+        if (stored) {
+          const { remaining, names, ids } = itemsOfEarlierEntry(stored);
+          return { next: { ...stored, registeredNames: names, secretIds: ids, remaining, unwire: outcomeOf(remaining),
+            attempts: typeof stored.attempts === "number" ? stored.attempts : 0, lastError: stored.lastError ?? null } };
+        }
+        return { next: fresh(Date.now()) };
+      });
+      let entry = begin!.next;
+      // The entry gone between this call's own writes (both run before the record lets go of the box below, so
+      // `held.wired` is still whole, and after that this pass neither reads nor writes the entry). It is written whole
+      // again, at the moment this call first wrote it, so the record never lets go of a box with no entry naming it.
+      // Items already removed come back pending, and the next round finds them gone, which counts as removed. Two
+      // rules, guarding different things, neither covering the other:
+      //  - a rebuild happens only inside the transaction that read "no entry", built from `held.wired` and written in
+      //    that same transaction: never a write-back of a version other than the one read (the lost update);
+      //  - `told` and its split row are always written in one transaction, so `told` never exists without its row
+      //    (which would leave the note never sent).
+      let missing = false;
+      const rebuilt = () => { missing = true; return fresh(entry.detectedAt); };
+      if (entry.unwire === "pending") {
+        const round = await sendRound(inner, entry);
+        // A round that gives up on a split already told is a new event, told as one with the entry that records it;
+        // one not told yet is told below with what it now holds.
+        const done = await updateSplit(ctx, id, (stored) => {
+          const base = settledEntry(stored) ?? rebuilt();
+          const next = applyRound(base, round);
+          return { next, note: gaveUpNote(base, next, machine) };
+        });
+        entry = done!.next;
+        if (done!.note) say("unwire_given_up", id, machine, { accounts: entry.remaining.map((r) => r.name).filter(Boolean).join(","), lastError: entry.lastError ?? "" });
+      }
+      // The split is told once, before the record lets go (so an interruption after this does not lose it), and never
+      // again when it is found again: `told` on its entry says it was, written with the note in one transaction.
+      const tell = await updateSplit(ctx, id, (stored) => {
+        const base = settledEntry(stored) ?? rebuilt();
+        if (base.told) return { next: base };
+        const states = { pending: base.remaining.some((r) => r.state === "pending"), residue: base.remaining.some((r) => r.state === "residue") };
+        return { next: { ...base, told: true }, note: { boxId: id, machine, outcome: "split", ...states } };
+      });
+      if (missing) say("split_record_missing", id, machine);
+      if (tell!.note) {
+        // Said once per box, where the record lets go of it, so the rows count the pairs as they come apart.
+        say("box_not_ours", id, machine, { unwire: tell!.note.pending ? "pending" : tell!.note.residue ? "residue" : "removed" });
+      }
+      if (machine !== null) {
+        const now = await readView(ctx, machine);
+        await writeView(ctx, machine, {
+          boxId: "", createdAt: 0, lastUsedAt: 0,
+          ...(now.sessions ? { sessions: now.sessions } : {}), ...(now.envs ? { envs: now.envs } : {}),
+          ...(now.startFrom ? { startFrom: now.startFrom } : {}),
+        });
+      } else {
+        const now = await readMount(ctx);
+        if (now?.stranded?.[id]) {
+          const { [id]: _gone, ...rest } = now.stranded;
+          await writeMount(ctx, { ...now, stranded: rest });
+        }
+      }
+    }
+    throw new BoxNotOurs(id, machine);
+  };
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(inner)) if (typeof v === "function") out[k] = v.bind(inner);
+  for (const k of BOX_ID_METHODS) {
+    const f = (inner as unknown as Record<string, unknown>)[k];
+    if (typeof f !== "function") continue;
+    out[k] = async (id: string, ...rest: unknown[]) => { await owns(id); return f.call(inner, id, ...rest); };
+  }
+  out.create = async (spec: BoxSpec) => { const made = await inner.create(spec); shown.add(made.id); return made; };
+  out.adopt = async (spec: BoxSpec) => { const id = await inner.adopt(spec); if (id !== null) shown.add(id); return id; };
+  out.owns = owns;
+  /**
+   * Another try at removing this mount's registrations from the foreign boxes still pending (`ForeignBox.pending`):
+   * cleared when they are gone, given up on and kept as residue after `UNWIRE_ATTEMPTS` failures in a row.
+   */
+  out.retryForeign = async (): Promise<void> => {
+    for (const [boxId, e] of Object.entries(await readForeign(ctx))) {
+      if (e.unwire !== "pending") continue;
+      let entry = e;
+      // Marked pending with no items written (an interrupted write of an earlier build): given its items from its own
+      // ids, going on from the rounds already counted; without ids there is nothing to try, and it is residue.
+      if (!Array.isArray(e.remaining)) {
+        const done = await updateSplit(ctx, boxId, (stored) => {
+          if (!stored) return null;
+          const had = settledEntry(stored);
+          if (had) return { next: had };
+          const { remaining, names, ids } = itemsOfEarlierEntry(stored);
+          const next: ForeignBox = { ...stored, registeredNames: names, secretIds: ids, remaining, unwire: outcomeOf(remaining),
+            attempts: typeof stored.attempts === "number" ? stored.attempts : 0, lastError: stored.lastError ?? null };
+          return { next, note: next.unwire !== "pending" ? { boxId, machine: e.machine, outcome: "remains" } : undefined };
+        });
+        if (!done) { say("split_record_missing", boxId, e.machine); continue; }
+        if (done.note) say("unwire_given_up", boxId, e.machine, { lastError: "pending without details" });
+        entry = done.next;
+        if (entry.unwire !== "pending") continue;
+      }
+      const round = await sendRound(inner, entry);
+      // The entry as stored is the only base: if it is gone (deleted by hand), nothing is written back from what this
+      // call read before the round, and the round is not counted anywhere.
+      const done = await updateSplit(ctx, boxId, (stored) => {
+        const base = settledEntry(stored);
+        if (!base) return null;
+        const next = applyRound(base, round);
+        return { next, note: gaveUpNote(base, next, e.machine) };
+      });
+      if (!done) { say("split_record_missing", boxId, e.machine); continue; }
+      if (done.note) say("unwire_given_up", boxId, e.machine, { accounts: done.next.remaining.map((r) => r.name).filter(Boolean).join(","), lastError: done.next.lastError ?? "" });
+    }
+  };
+  return out as unknown as OwnedProvider;
 }
 
 /**
@@ -785,7 +1302,7 @@ function readBox(v: Json): BoxState | null {
   // it matches none and is redone the same way.
   const { sessions, envs, wired, leftOut, githubPlaceholder, githubTokenDigest: _d, githubWithheld: _w, ...rest } = o;
   const wiring = Array.isArray(wired)
-    ? (wired.every(isWired) ? wired : [UNKNOWN_WIRING])
+    ? (wired.every(isWired) ? (wired as Wired[]).map(withPairs) : [UNKNOWN_WIRING])
     : wired !== undefined ? [UNKNOWN_WIRING]
     : typeof githubPlaceholder === "string"
       ? [{ alias: "", plugin: "github", placeholder: githubPlaceholder, digest: "", names: ["GH_TOKEN", "GH_TOKEN_GIT"] }]
@@ -805,6 +1322,8 @@ function isWired(v: unknown): v is Wired {
   return typeof w.alias === "string" && typeof w.plugin === "string" && typeof w.placeholder === "string"
     && typeof w.digest === "string"
     && (w.names === null || (Array.isArray(w.names) && w.names.every((x) => typeof x === "string")))
+    && (w.pairs === undefined || (Array.isArray(w.pairs) && w.pairs.every((x) => !!x && typeof x === "object"
+      && typeof (x as { name?: unknown }).name === "string" && ((x as { id?: unknown }).id === null || typeof (x as { id?: unknown }).id === "string"))))
     && (w.summary === undefined || typeof w.summary === "string")
     && (w.env === undefined || (typeof w.env === "object" && w.env !== null && !Array.isArray(w.env)
       && Object.values(w.env).every((x) => typeof x === "string")));
@@ -986,12 +1505,13 @@ const DEFAULTS = {
  * key could be shown the box at all.
  */
 async function deleteBox(ctx: PluginContext, boxId: string, believeGone: boolean): Promise<{ error?: string; definitive: boolean }> {
-  const cfg = cfgOf(ctx);
-  const provider = backendFor(cfg).open(cfg, ctx.credential!);
+  const provider = openProvider(cfgOf(ctx), ctx);
   try {
     await provider.delete(boxId);
     return { definitive: false };
   } catch (e) {
+    // Another agent's box is not this mount's to delete, and the caller lets go of it without a release.
+    if (e instanceof BoxNotOurs) throw e;
     if (e instanceof ProviderError) {
       if (believeGone && e.code === "not_found") return { definitive: false };
       return { error: e.message, definitive: e.definitive };
@@ -1010,7 +1530,15 @@ async function stopBox(
   // the box, so its "not found" says nothing, and a kind that differs is certainly another key; two keys of one
   // kind may still be two accounts, which the kind cannot tell apart.
   const maker = state.credentialRef === undefined || state.credentialRef === ctx.credentialRefKind;
-  const { error, definitive } = await deleteBox(ctx, state.boxId, maker);
+  let deleted: { error?: string; definitive: boolean };
+  try {
+    deleted = await deleteBox(ctx, state.boxId, maker);
+  } catch (e) {
+    // Another agent's box: the record already let go of it (`ownedProvider`), and nothing was held here to release.
+    if (e instanceof BoxNotOurs) return null;
+    throw e;
+  }
+  const { error, definitive } = deleted;
   const endedAt = Date.now();
   const stoppedAt = parkedAt(state);
   const session = sessionOf(state, stoppedAt ?? endedAt, machine);
@@ -1046,13 +1574,14 @@ async function stopBox(
   // A box switched off for being idle already recorded its compute session
   // when it was switched off (parkBox), so deleting it adds none: a second
   // one from `createdAt` would count the days it sat stopped as compute.
-  // Read again before overwriting. `releaseTask` does not take the per-mount
-  // lock that `invoke` takes, so an operator release or the idle sweep can
-  // interleave with a command on this mount: the command finds no container,
-  // creates one and records it, and clearing the record on top would leave that
-  // container alive and billed with nothing naming it — the orphan `asBoxState`
-  // refuses to create. A lock in the gateway closes the
-  // window inside one object; this half does not depend on the caller.
+  // Read again before overwriting. `releaseTask` takes the per-mount lock that
+  // `invoke` takes (`#onMount`, src/runtime/gateway.ts), so through the gateway
+  // an operator release or the idle sweep cannot interleave with a command on
+  // this mount. This read does not depend on that: a caller that reached the
+  // plugin past the lock could find a command creating and recording a
+  // container in between, and clearing the record on top would leave that
+  // container alive and billed with nothing naming it — the orphan
+  // `asBoxState` refuses to create.
   //
   // The shared lists are taken from this second read, not the first: another
   // machine of the mount may have added a session or kept an environment since.
@@ -1104,7 +1633,7 @@ async function parkBox(ctx: PluginContext, machine: string, state: BoxState): Pr
   if (!ctx.credential) return false;
   const cfg = cfgOf(ctx);
   const backend = backendFor(cfg);
-  const provider = backend.open(cfg, ctx.credential);
+  const provider = openProvider(cfg, ctx);
   // A provider that keeps memory across a pause (InstaBox) pauses an idle box, and the box stays paused until it
   // is used or deleted. Everything else is switched off.
   const pausing = backend.caps.pause === "memory" && typeof provider.pause === "function";
@@ -1113,6 +1642,8 @@ async function parkBox(ctx: PluginContext, machine: string, state: BoxState): Pr
     if (pausing) await provider.pause!(state.boxId);
     else await provider.stop(state.boxId);
   } catch (e) {
+    // Another agent's box: not switched off, and the record no longer names it, so there is nothing to release.
+    if (e instanceof BoxNotOurs) return false;
     // Deleted by InstaBox already: nothing to pause, and the caller lets it go as gone (`releaseMachine`).
     if (await goneAfter(backend, provider, state, e)) return "gone";
     error = e instanceof ProviderError ? e.message : String((e as Error)?.message ?? e).slice(0, 160);
@@ -1506,6 +2037,12 @@ interface Wired {
   digest: string;
   /** The registrations made for it on the box, by name; `null` means unknown, so every one on the box. */
   names: string[] | null;
+  /**
+   * Each registration made for it, its name with the id the provider answered for it (null where it answered none),
+   * from the same call. Only an id proves a registration on a box is this mount's: a box another agent also used may
+   * hold its own under the same names (`unwireForeign`). Absent on wirings recorded before it (`pairsOf`).
+   */
+  pairs?: Array<{ name: string; id: string | null }>;
   /** The environment its commands run with; holds the placeholder, never the credential. */
   env?: Record<string, string>;
   /** The plugin's own sentence for the model (`SandboxForm.summary`). */
@@ -1514,7 +2051,10 @@ interface Wired {
 
 interface LeftOut { alias: string; why: string }
 
-/** A wiring this record cannot account for; the next command clears the box and wires again. */
+/**
+ * Placeholder put in on read when a wired entry cannot be read; no code path writes it deliberately. The record read
+ * is written back as-is, so a failed read leaves it stored — conversions must happen before this layer (`pairsOf`).
+ */
 const UNKNOWN_WIRING: Wired = { alias: "", plugin: "", placeholder: "", digest: "", names: null };
 
 /**
@@ -1673,10 +2213,11 @@ async function accountsWanted(ctx: PluginContext, cfg: ReturnType<typeof cfgOf>)
 async function register(provider: SandboxProvider, boxId: string, c: Candidate & { credential: string; digest: string }): Promise<Wired> {
   const placeholder = placeholderFor(c.alias, boxId);
   const regs = registrationsFor(c.form, c.credential, placeholder);
-  for (const g of regs) await provider.addSecret(boxId, g);
+  const pairs: Array<{ name: string; id: string | null }> = [];
+  for (const g of regs) pairs.push({ name: g.name, id: await provider.addSecret(boxId, g) });
   await c.used();
   return {
-    alias: c.alias, plugin: c.plugin, placeholder, digest: c.digest, names: regs.map((g) => g.name),
+    alias: c.alias, plugin: c.plugin, placeholder, digest: c.digest, names: regs.map((g) => g.name), pairs,
     env: c.form.env(placeholder), summary: c.form.summary,
   };
 }
@@ -1781,7 +2322,12 @@ async function releaseStranded(ctx: PluginContext, id: string, forget: boolean):
     // every settled turn where the deployment has no idle lease — not on every ask. Its error lease is reported.
     throw new Error(`${providerName(cfgOf(ctx))} box ${id} (stranded) not released: not retried before ${new Date(b.nextTryAt!).toISOString()}; last: ${b.lastError ?? "unknown"}`);
   } else {
-    ({ error, definitive } = await deleteBox(ctx, id, false));
+    try {
+      ({ error, definitive } = await deleteBox(ctx, id, false));
+    } catch (e) {
+      if (e instanceof BoxNotOurs) return false;
+      throw e;
+    }
   }
   const endedAt = Date.now();
   const after = (await readMount(ctx)) ?? { machines: {} };
@@ -1887,8 +2433,15 @@ async function awakeBox(ctx: PluginContext, deadline: number): Promise<Box | nul
   if (!box?.boxId || parkedAt(box) !== null || !ctx.credential) return null;
   const cfg = cfgOf(ctx);
   // Never woken from here: a look at a box that is not running answers "not running".
-  const b: Box = { boxId: box.boxId, cfg, provider: backendFor(cfg).open(cfg, ctx.credential, { wake: false }), deadline };
-  const state: ProviderBoxState = await b.provider.status(box.boxId, { deadline });
+  const b: Box = { boxId: box.boxId, cfg, provider: openProvider(cfg, ctx, { wake: false, look: true }), deadline };
+  let state: ProviderBoxState;
+  try {
+    state = await b.provider.status(box.boxId, { deadline });
+  } catch (e) {
+    // Another agent's box: this mount has no machine running, so there is nothing to look at.
+    if (e instanceof BoxNotOurs) return null;
+    throw e;
+  }
   return state === "running" ? b : null;
 }
 
@@ -2049,6 +2602,33 @@ export const PUT_PREPARE_SCRIPT = 'mkdir -p -- "$(dirname -- "$1")" 2>/dev/null 
 export const PUT_CHECK_SCRIPT = 'test -f "$1" || exit 3; stat -c %s -- "$1"; sha256sum -- "$1" 2>/dev/null | cut -d " " -f 1';
 
 const hexOf = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
+
+/**
+ * The name a new box is created under: `h-`, twelve hex digits of SHA-256 over who and what it is for (tenant,
+ * agent, mount, machine), a named machine's name, and the creation time in base 36: `h-<12 hex>-mywpiww0` for the
+ * main machine and `h-<12 hex>-build-mywpiww0` for one called `build`, both made at 1_800_000_000_000.
+ *
+ * run9's ids are the whole project's, which under the operator's account is every tenant's, and a create of an id
+ * it already has is answered "already exists" and then adopted (`SandboxProvider.adopt`). So two owners must never
+ * mint the same id. The identity used to be spelled out and cut at 40 characters, and a Raft tenant id is
+ * `raft_<uuid>`, so `h-raft_<uuid>` alone is 43: the cut removed the agent entirely, and two agents of one server
+ * creating their first box in the same millisecond got one id, and so one box. A digest keeps every part of the
+ * identity in a fixed length; JSON keeps a separator inside an id from making two identities spell the same input.
+ *
+ * The longest id is 48 characters today (a 24-character machine name, `MACHINE_RE`, and eight base-36 digits of
+ * time), and one more for each digit the time gains: nine from 36^8 ms (2_821_109_907_456, in 2059). run9 states no
+ * limit (its swagger, https://api.run.sys9.ai/swagger.yaml read 2026-11-05, gives `box_id` as a plain string with no
+ * length or pattern), so the bound kept is the one it has accepted: the old ids, 40 characters, a dash and eight of
+ * time, 49. The time stays because each box one machine is given over its life (after a release, say) needs a name of
+ * its own, and the name stays in a named machine's id so a person reading a listing can tell them apart; the
+ * digest's 48 bits stand only against an accident between owners, which `adopt` checks again.
+ */
+export async function boxIdFor(owner: { tenantId: string; agentId: string; mount: string; machine: string }, at: number): Promise<string> {
+  const who = JSON.stringify([owner.tenantId, owner.agentId, owner.mount, owner.machine]);
+  const digest = hexOf(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(who))).slice(0, 12);
+  return `h-${digest}${owner.machine === MAIN_MACHINE ? "" : `-${owner.machine}`}-${at.toString(36)}`;
+}
+
 const mib = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MiB`;
 
 export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lease: BoxLease | null = null): Plugin {
@@ -2333,7 +2913,56 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     },
   ];
   };
-  return {
+
+  /**
+   * What the agent is told in the result of the call that found a machine's recorded box to be another agent's
+   * (`ownedProvider`): it cannot see the trace, and without this the files and installs it expected would be gone
+   * with no reason given. Said once, on that call: by the next one the record no longer names the box.
+   */
+  // Notes describe an event and are said once. A queued note may contain only facts already true when it was queued,
+  // and the one fixed instruction "there is nothing for you to do": nothing about what will happen next (a retry, a
+  // new machine, a release) and no count that changes (how many were removed or remain), which belong to the holds
+  // list (`withdraw`) and result fields. So a row reads the same whenever it is delivered, whatever came after it. A later change for the same box (a removal pending, then given up on) is a new event
+  // with a note of its own; the sequence only goes one way (residue never returns to pending). Not one note per box.
+  async function notOursNote(ctx: PluginContext): Promise<{ text: string; ids: string[] } | null> {
+    const v = await ctx.db.get(BOX_STORE, NOTICES_KEY);
+    const found = Array.isArray(v) ? (v as LetGo[]) : [];
+    if (!found.length) return null;
+    const text = found.map((f) => {
+      if (f.outcome === "given_up") {
+        return "Taking this mount's accounts off a machine that belonged to another agent failed three times, so some of " +
+          "its account registrations may remain there; there is nothing for you to do about them.";
+      }
+      if (f.outcome === "remains") {
+        return "Some of this mount's account registrations may remain on a machine that belonged to another agent; there is nothing for you to do about them.";
+      }
+      // A box set aside earlier (`stranded`), not the agent's machine: only what of its accounts was left is said.
+      if (f.machine === null) {
+        return [
+          f.pending ? "Some of this mount's account registrations on a machine that belonged to another agent were not removed at the time; there is nothing for you to do." : "",
+          f.residue ? "Some of this mount's account registrations may remain on a machine that belonged to another agent; there is nothing for you to do about them." : "",
+        ].filter(Boolean).join(" ");
+      }
+      const which = f.machine === MAIN_MACHINE ? "The machine" : `Machine "${f.machine}"`;
+      // Each state the set held at the split, said once: a set with items of both kinds says both.
+      return `${which} you were using belonged to another agent, so it was left to them; nothing you had on it is here.`
+        + (f.pending ? " Some of this mount's account registrations on that machine were not removed at the time; there is nothing for you to do." : "")
+        + (f.residue ? " Some of this mount's account registrations may remain on that machine; there is nothing for you to do about them." : "");
+    }).filter(Boolean).join(" ");
+    return { text, ids: found.map((f) => String(f.id)) };
+  }
+  /** Drops the notices a result has just carried, by their ids and only those: one owed meanwhile stays for the next. */
+  async function delivered(ctx: PluginContext, ids: string[]): Promise<void> {
+    // Read and written in one transaction, so a row a release queues meanwhile is never written over.
+    await ctx.db.transaction([BOX_STORE], "readwrite", (tx) => {
+      const v = tx.get(BOX_STORE, NOTICES_KEY);
+      const left = (Array.isArray(v) ? (v as LetGo[]) : []).filter((f) => !ids.includes(String(f.id)));
+      if (left.length) tx.put(BOX_STORE, left as unknown as Json, NOTICES_KEY);
+      else tx.delete(BOX_STORE, NOTICES_KEY);
+    });
+  }
+
+  const plugin: Plugin = {
   id: "sandbox",
   /** The box record: that a mount has one is listable; the box id, the kept environments and the sessions are not. */
   database: { version: 1, stores: { [BOX_STORE]: { listed: [BOX_KEY] } } },
@@ -2391,7 +3020,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       const things: Withdrawal["things"] = [];
       // What run9 answered is never repeated, only its status or shape: this text reaches Raft in a DELETE's answer.
       const failure = (e: unknown) => e instanceof ProviderError ? `run9 refused (${e.status ? `HTTP ${e.status}` : e.code})` : String((e as Error)?.message ?? e).slice(0, 200);
-      const provider = ctx.credential && backend.caps.boxSecrets ? backend.open(cfg, ctx.credential) : null;
+      const provider = ctx.credential && backend.caps.boxSecrets ? openProvider(cfg, ctx) : null;
       // Project scope, listed once per withdrawal and never written: one run9 project is shared with production, and
       // a project-scope secret removed here could stop another deployment's boxes from working. What it shows is
       // handed up whole (`project`): the caller keeps residue where it outlives this mount (D1, cf/src/egress-residue.ts)
@@ -2403,6 +3032,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         try { listed = await provider.listProjectSecrets(); project.state = "complete"; project.ids = listed.map((p) => String(p.id)); }
         catch (e) { project.state = "failed"; project.error = `the project-scope listing failed: ${failure(e)}`; }
       } else if (provider) project.state = "none";
+      // Removals still pending from boxes let go of as another agent's get their try here too: a deleted agent makes
+      // no later call to retry them on.
+      if (provider) await provider.retryForeign().catch(() => {});
       for (const machine of boxedMachines(mount)) {
         const state = await readView(ctx, machine);
         if (!state.boxId) continue;
@@ -2438,7 +3070,25 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
           things.push({ id: state.boxId, clean: !left.length && !failed, ownKey, ...(code ? { code } : {}), ...(why ? { why } : {}),
             ...(named ? { review: `${named} project-scope registration(s) share a name with this box's accounts; a person should look` } : {}) });
         } catch (e) {
+          // Another agent's box: the record let go of it, taking this mount's registrations off it by id where it could
+          // (`ownedProvider`). What it could not is reported below with the other splits.
+          if (e instanceof BoxNotOurs) continue;
           things.push({ id: state.boxId, clean: false, ownKey, code: "listing_failed", why: failure(e) });
+        }
+      }
+      // Boxes of other agents this mount's registrations may still be on: pending ones a later delete tries again,
+      // given-up ones a person has to look at. Removed ones are not this mount's to report.
+      for (const e of Object.values(await readForeign(ctx))) {
+        // One line per item, each by its own state: a set with items of both kinds lists both.
+        for (const r of Array.isArray(e.remaining) ? e.remaining : []) {
+          const name = r.name ?? "unnamed";
+          if (r.state === "pending") {
+            things.push({ id: e.box, clean: false, ownKey: false, code: "listing_failed",
+              why: `another agent's box: this mount's registration ${name} is not removed yet (${e.lastError ?? "not tried yet"})` });
+          } else {
+            things.push({ id: e.box, clean: false, ownKey: false, code: "foreign_residue",
+              why: `another agent's box: this mount's registration ${name} may remain on it (${r.reason ?? "unknown"})` });
+          }
         }
       }
       for (const id of Object.keys(mount?.stranded ?? {})) {
@@ -2755,7 +3405,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // What it was waiting to start from before, if no environment names it any more (`dropSnapshots`).
       if (after.startFrom && after.startFrom !== env.snapId && ctx.credential) {
         const c = cfgOf(ctx);
-        await dropSnapshots(ctx, backendFor(c).open(c, ctx.credential), [after.startFrom]);
+        await dropSnapshots(ctx, openProvider(c, ctx), [after.startFrom]);
       }
       return {
         startingFrom: env.name, ...named,
@@ -2885,9 +3535,29 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // One box per machine, remembered, so an install survives to the next call.
     let state: BoxState | null = await readView(ctx, machine);
     // An emptied record keeps the session history and what was kept, but has no box.
-    const history = state.sessions ?? [];
-    const kept = state.envs ?? [];
+    let history = state.sessions ?? [];
+    let kept = state.envs ?? [];
     if (!state.boxId) state = null;
+    // Whose the recorded box is, asked before anything below sends it a request (`ownedProvider`, which every
+    // request passes through anyway: this is where a call learns it has no machine and goes on to make one).
+    if (state && !state.ownerChecked) {
+      try {
+        await provider.owns(state.boxId);
+        const now = await readView(ctx, machine);
+        if (now.boxId === state.boxId && now.ownerChecked) state = { ...state, ownerChecked: true };
+      } catch (e) {
+        if (!(e instanceof BoxNotOurs)) throw e;
+        state = null;
+        // The lists as the split left them, which the new machine's record carries on.
+        const after = await readView(ctx, machine);
+        history = after.sessions ?? [];
+        kept = after.envs ?? [];
+        // Nothing of this agent's is there to release, keep or save; the call says so rather than making a
+        // machine only to find it empty. The sentence about why comes in front (`notOursNote`).
+        if (tool === "release") return { released: false, note: "nothing was running", ...named };
+        if (tool === "keep" || tool === "save") throw new Error(`nothing was ${tool === "keep" ? "kept" : "saved"}`);
+      }
+    }
     // Past its provider's own deletion time the machine is gone: said before anything is asked of it. A release
     // goes on to let it go as it is.
     if (state && tool !== "release" && backend.id === "instabox" && pastDeleteAt(state)) await expired(state);
@@ -2907,11 +3577,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         );
       }
       created = true;
-      // Named machines put their name in the id, inside the same length as before: run9's ids are the
-      // project's, and two machines of one agent created in one millisecond must still differ.
-      const owner = `h-${ctx.caller.tenantId}-${ctx.caller.agentId}`.toLowerCase().replace(/[^a-z0-9-]/g, "-");
-      const boxId = (machine === MAIN_MACHINE ? owner.slice(0, 40) : `${owner.slice(0, 39 - machine.length)}-${machine}`)
-        + `-${Date.now().toString(36)}`;
+      // Unique to this tenant, agent, mount and machine, and to the millisecond (`boxIdFor`).
+      const boxId = await boxIdFor({ tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, machine }, Date.now());
       // `state` is null in this branch by construction — the line above nulls an
       // emptied record, and `start_from` writes exactly that — so the value can
       // only come from the record read at the top of this call. `BoxState`
@@ -2935,7 +3602,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         image: cfg.image,
         egressSecrets: want.wire.length > 0,
         ...(cfg.shape ? { shape: cfg.shape } : {}),
-        description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
+        description: boxDescriptionOf(ctx.caller),
       };
       // The provider's id for the box, which is what the record names: the minted one where the provider takes
       // ours (run9), its own where it mints them (InstaBox).
@@ -2945,7 +3612,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       } catch (e) {
         // A create answered "already exists" for a name this call had just minted: the box existed and only the
         // answer was lost. Throwing here failed the agent's first command and leaked the box, since no record of
-        // it was ever written. If the box is there, it is ours (`SandboxProvider.adopt`).
+        // it was ever written. If the box is there and carries this spec's owner, it is ours (`SandboxProvider.adopt`).
         if (!(e instanceof ProviderError && e.code === "conflict")) throw e;
         const adopted = await provider.adopt(spec);
         if (adopted === null) throw e;
@@ -2955,7 +3622,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // a registration that throws must not leave it with no record naming it.
       // The record gains each placeholder only once the provider has accepted it.
       state = {
-        boxId: made.id, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
+        boxId: made.id, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [], ownerChecked: true,
         ...(made.deleteAt !== undefined ? { deleteAt: made.deleteAt } : {}),
         // Whose account this box is on, for as long as it lives (`BoxState.credentialRef`).
         ...(ctx.credentialRefKind ? { credentialRef: ctx.credentialRefKind } : {}),
@@ -3256,4 +3923,28 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
 
 
   };
+  // Every call, whichever tool and however it ends, carries the sentence `notOursNote` says when it let go of a box.
+  const invokeTool = plugin.invoke.bind(plugin);
+  plugin.invoke = async (tool, args, ctx) => {
+    // Removals left pending on another agent's box get another try on each call, whichever tool it is; one that
+    // cannot be made now is no reason to fail the call (`retryForeign`).
+    if (ctx.credential && tool !== "machines") {
+      try { await openProvider(cfgOf(ctx), ctx).retryForeign(); } catch { /* counted on its own entry, or tried again next call */ }
+    }
+    let result: Json;
+    try {
+      result = await invokeTool(tool, args, ctx);
+    } catch (e) {
+      const note = await notOursNote(ctx);
+      if (note?.text && e instanceof Error) { e.message = joinSentences(note.text, e.message); await delivered(ctx, note.ids); }
+      throw e;
+    }
+    const note = await notOursNote(ctx);
+    if (!note) return result;
+    const told = withNotOursNote(result, note.text || null);
+    // Cleared once a result carries it, and kept while none could (a result with no `note` to put it in).
+    if (!note.text || told !== result) await delivered(ctx, note.ids);
+    return told;
+  };
+  return plugin;
 }

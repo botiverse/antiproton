@@ -26,7 +26,7 @@ function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new E
 
 const T = "t", A = "a";
 const SCOPE = { tenantId: T, agentId: A, alias: "sandbox", plugin: "sandbox" };
-const RUNNING = { boxId: "h-t-a-box1", createdAt: 1_700_000_000_000, lastUsedAt: 1_700_000_100_000, execs: 2, saved: [] };
+const RUNNING = { boxId: "h-t-a-box1", createdAt: 1_700_000_000_000, lastUsedAt: 1_700_000_100_000, execs: 2, saved: [], ownerChecked: true };
 const originalFetch = globalThis.fetch;
 
 /**

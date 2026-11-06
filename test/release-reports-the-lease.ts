@@ -34,7 +34,7 @@ function fixture(run9: (path: string, method: string) => { status: number; body:
   const tables = new PluginDbTables(sqliteHost()).ensure();
   const scope = { tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" };
   tables.put(scope, BOX_STORE, BOX_KEY, {
-    boxId: BOX, createdAt: STARTED, lastUsedAt: STARTED + 60_000, execs: 2, saved: [], sessions: [],
+    boxId: BOX, createdAt: STARTED, lastUsedAt: STARTED + 60_000, execs: 2, saved: [], sessions: [], ownerChecked: true,
   }, null);
   const record = () => tables.get(scope, BOX_STORE, BOX_KEY) as Json;
   const ctx: any = {
@@ -121,7 +121,7 @@ await check("start_from reports the lease of the container it displaced", async 
   // one. An unrecorded span is exactly as expensive as any other.
   const f = fixture(gone);
   f.tables.put(f.scope, BOX_STORE, BOX_KEY, {
-    boxId: BOX, createdAt: STARTED, lastUsedAt: STARTED + 60_000, execs: 2, saved: [], sessions: [],
+    boxId: BOX, createdAt: STARTED, lastUsedAt: STARTED + 60_000, execs: 2, saved: [], sessions: [], ownerChecked: true,
     envs: [{ name: "py", snapId: "snap-1", savedAt: STARTED + 10 }],
   }, null);
   try {

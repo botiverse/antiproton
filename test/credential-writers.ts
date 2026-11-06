@@ -166,7 +166,7 @@ async function heldSandbox(deleteStatus: number | ((who: string) => number) = 20
   const OPS = { ak: "ops-ak", sk: "ops-sk" };
   const w = await runtime(OPERATOR_RUN9_REF, SANDBOX, { operatorRun9: OPS, ...opts.deps });
   w.store.pluginDb.put({ tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" }, "box", "state",
-    { machines: { main: { boxId: "b-ops", createdAt: 1, lastUsedAt: 1, credentialRef: "operator" } } }, null);
+    { machines: { main: { boxId: "b-ops", createdAt: 1, lastUsedAt: 1, credentialRef: "operator", ownerChecked: true } } }, null);
   const calls: Array<{ method: string; path: string; who: string; refAtCall: string | null }> = [];
   const accountOf = (auth: string) => atob(auth.replace(/^Basic /, "")).split(":")[0]!;
   const real = globalThis.fetch;
@@ -202,7 +202,7 @@ async function heldSandbox(deleteStatus: number | ((who: string) => number) = 20
   const aside = () => Object.keys((w.store.pluginDb.get({ tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" }, "box", "state") as any)?.stranded ?? {});
   /** The mount holding one box, made under `kind`. */
   const holds = (id: string, kind: string) => w.store.pluginDb.put({ tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" }, "box", "state",
-    { machines: { main: { boxId: id, createdAt: 1, lastUsedAt: 1, credentialRef: kind } } }, null);
+    { machines: { main: { boxId: id, createdAt: 1, lastUsedAt: 1, credentialRef: kind, ownerChecked: true } } }, null);
   /** The tenant's key on the mount with nothing held, then a box made with it. */
   const ownKeyHolding = async (id: string) => {
     w.store.pluginDb.put({ tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" }, "box", "state", { machines: {} }, null);
@@ -250,7 +250,7 @@ await check("removing the tenant's key deletes the box it made first, with that 
       w.store.pluginDb.put({ tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" }, "box", "state", { machines: {} }, null);
       must((await w.rt.attachCredential("t", "a", "sandbox", { ak: "own-ak", sk: "own-sk" })).ok, "attach");
       w.store.pluginDb.put({ tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" }, "box", "state",
-        { machines: { main: { boxId: "b-own", createdAt: 1, lastUsedAt: 1, credentialRef: "agent" } } }, null);
+        { machines: { main: { boxId: "b-own", createdAt: 1, lastUsedAt: 1, credentialRef: "agent", ownerChecked: true } } }, null);
       w.calls.length = 0;
       const removed = await w.rt.removeCredential("t", "a", "sandbox");
       const del = w.calls.filter((c) => c.method === "DELETE" && c.path.endsWith("/boxes/b-own"));
@@ -451,7 +451,7 @@ const SCOPE = { tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox"
 /** A live main machine made under `kind`, beside whatever the record holds (a set-aside box stays). */
 function addMain(w: { store: any }, id: string, kind: string) {
   const cur = w.store.pluginDb.get(SCOPE, "box", "state") as any;
-  w.store.pluginDb.put(SCOPE, "box", "state", { ...cur, machines: { main: { boxId: id, createdAt: Date.now(), lastUsedAt: Date.now(), credentialRef: kind } } }, null);
+  w.store.pluginDb.put(SCOPE, "box", "state", { ...cur, machines: { main: { boxId: id, createdAt: Date.now(), lastUsedAt: Date.now(), credentialRef: kind, ownerChecked: true } } }, null);
 }
 
 await check("the console's forget by id drops only the set-aside box; the agent's live machine is untouched (F1)", async () => {

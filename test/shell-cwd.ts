@@ -98,7 +98,7 @@ function boxDb(box: unknown, onPut: (v: unknown) => void) {
   return { ...db, put: async (store: string, value: unknown, key?: any) => { onPut(asBoxState(value as any)); return db.put(store, value as any, key); } };
 }
 
-const BOX = { boxId: "b1", createdAt: 1, lastUsedAt: 1, execs: 0, sessions: [], envs: [] };
+const BOX = { boxId: "b1", createdAt: 1, lastUsedAt: 1, execs: 0, sessions: [], envs: [], ownerChecked: true };
 const plugin = sandboxPlugin(null as any, "local");
 
 await check("a new box's first command enters the working directory; the next starts where it ended, with no cd", async () => {
