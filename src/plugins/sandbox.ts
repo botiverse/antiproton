@@ -174,18 +174,42 @@ interface ForeignBox {
   machine: string | null;
   /** Why it is not this mount's: made for another agent. */
   reason: "foreign_owner";
-  /** The account registrations this mount had made there, by name. */
-  names: string[];
+  /**
+   * Every account registration this mount had made there, by name, as found at the split and never changed: the most
+   * that can have been exposed, for reports. Null where the record could not say (`Wired.names` null).
+   */
+  registeredNames: string[] | null;
+  /** The ids of those it can prove its own (`Wired.pairs`), as found at the split and never changed. */
+  secretIds: string[];
   detectedAt: number;
-  /** This mount's registrations on it: removed, removal still pending, or given up on (`residue`). */
+  /**
+   * This mount's registrations on it, as a set: `pending` while any item is still to be removed, `residue` when what
+   * is left is only given up on, `removed` when nothing is left (`outcomeOf`).
+   */
   unwire: "removed" | "pending" | "residue";
-  /** Registrations proven this mount's by their ids, whose removal failed: retried on later calls. */
-  pending?: { secretIds: string[]; attempts: number; lastError: string };
-  /** Given up on: some of this mount's registrations may remain there, and why. */
-  residue?: { reason: string; at: number; lastError?: string };
+  /** What of this mount is still on it, one item per registration (`Remaining`). */
+  remaining: Remaining[];
+  /** Removal rounds made over the pending items, as a set (`UNWIRE_ATTEMPTS`); why the last one failed. */
+  attempts: number;
+  lastError: string | null;
 }
 
-/** After this many failed removals in a row, a pending one is given up on and kept as residue. */
+/**
+ * One registration of this mount's on another agent's box: its id where the provider answered one, its name where
+ * known. `pending` items have an id and are removed by it; `residue` items are given up on, with why:
+ * `wiring_without_ids` (never had a provable id, so never tried), `names_unknown` (the wiring's names were not
+ * known either), `unwire failed 3 times`, or `pending without details` (an older entry with nothing to retry).
+ */
+type Remaining = { id: string | null; name: string | null; state: "pending" | "residue"; reason?: string };
+
+/**
+ * How many removal rounds a pending removal gets. `attempts` counts the rounds actually made, and is advanced in one
+ * place (`removalRound`) around every round, wherever it runs: in the call that splits, on recovering an entry an
+ * interruption left, or in a later call's retry (`retryForeign`). A split's first write has 0; a round that leaves
+ * nothing clears the entry, and one that fails adds one; at this many it is given up on and kept as residue. So
+ * exactly this many rounds in all, and a recovered entry goes on from the count it had. Why a round failed is in
+ * `lastError` and `reason`; `attempts` only counts.
+ */
 export const UNWIRE_ATTEMPTS = 3;
 
 /**
@@ -702,13 +726,33 @@ export class BoxNotOurs extends Error {
 }
 
 /**
- * The boxes a call let go of as another agent's, by the call's context, for the sentence its result carries
- * (`notOursNote` in `sandboxPlugin`). Weak, so a context nobody holds any more takes its entry with it.
+ * The boxes this mount let go of as another agent's that its agent has not been told about yet, for the sentence the
+ * next tool result carries (`notOursNote` in `sandboxPlugin`).
  */
-const lettingGo = new WeakMap<PluginContext, LetGo[]>();
-/** What a call did about a foreign box: let go of it, with how its account registrations ended, or gave up on them. */
-type LetGo = { boxId: string; machine: string | null; outcome: "clean" | "pending" | "residue" | "given_up" };
-const noteLetGo = (ctx: PluginContext, g: LetGo) => { lettingGo.set(ctx, [...(lettingGo.get(ctx) ?? []), g]); };
+export const NOTICES_KEY = "notices";
+/** What was done about a foreign box: let go of it, with how its account registrations ended, or gave up on them. */
+type LetGo = {
+  /** The row's own id: rows are delivered and cleared by it, never by box. */
+  id?: string;
+  boxId: string; machine: string | null;
+  /** `split` when the record let go of it, with which item states its set holds; or a later turn of its removal. */
+  outcome: "split" | "given_up" | "remains";
+  pending?: boolean; residue?: boolean;
+};
+/**
+ * Kept in the mount's own storage until a tool's result has carried it: a split is often found outside any tool call
+ * (the idle lease's switch-off, an operator's release, a withdrawal), and the agent's next call is then the first
+ * place it can be told why its machine is gone.
+ */
+// One row per event, never merged by box: the same box can give two events at different times (let go of with a
+// removal pending, then that removal given up on), and the second is the only place the agent hears it could not be
+// removed. The same note is not repeated, but different outcomes for the same box are different notes.
+const noteLetGo = async (ctx: PluginContext, g: LetGo) => {
+  const v = await ctx.db.get(BOX_STORE, NOTICES_KEY);
+  const owed = Array.isArray(v) ? (v as LetGo[]) : [];
+  const id = `${Date.now().toString(36)}-${[...crypto.getRandomValues(new Uint8Array(4))].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+  await ctx.db.put(BOX_STORE, [...owed, { ...g, id }] as unknown as Json, NOTICES_KEY);
+};
 
 /** Every split this mount recorded, by box id. An entry that does not read is left out. */
 async function readForeign(ctx: PluginContext): Promise<Record<string, ForeignBox>> {
@@ -722,8 +766,9 @@ async function readForeign(ctx: PluginContext): Promise<Record<string, ForeignBo
   return out;
 }
 
+/** The one writer of a split entry. `unwire` is derived here from `remaining`, never taken from the caller, so the two cannot drift. */
 async function writeSplit(ctx: PluginContext, e: ForeignBox): Promise<void> {
-  await ctx.db.put(BOX_STORE, e as unknown as Json, splitKey(e.box));
+  await ctx.db.put(BOX_STORE, { ...e, unwire: outcomeOf(e.remaining) } as unknown as Json, splitKey(e.box));
 }
 
 /**
@@ -732,6 +777,52 @@ async function writeSplit(ctx: PluginContext, e: ForeignBox): Promise<void> {
  * same kind of account under the same name), and one already gone counts as removed. What could not be removed, and
  * the last refusal's code.
  */
+/**
+ * A wiring's registrations as name and id pairs. One recorded with its pairs reads as them; one recorded before them
+ * (names alone, which is every wiring made before ids were kept, or names with an `ids` list from the build between)
+ * reads its ids only from a list as long as its names, and otherwise has none: never matched up by position from a
+ * shorter one. Null where not even the names are known. Read only: an old wiring is never rewritten to this shape.
+ */
+function pairsOf(w: Wired): Array<{ name: string; id: string | null }> | null {
+  if (Array.isArray(w.pairs)) return w.pairs;
+  if (w.names === null) return null;
+  const ids = (w as { ids?: unknown }).ids;
+  const full = Array.isArray(ids) && ids.length === w.names.length && ids.every((x) => typeof x === "string");
+  return w.names.map((name, i) => ({ name, id: full ? (ids as string[])[i]! : null }));
+}
+
+/** A wiring as read: with its pairs (`pairsOf`), the one place an older shape is converted. */
+function withPairs(w: Wired): Wired {
+  const pairs = pairsOf(w);
+  const { ids: _ids, ...rest } = w as Wired & { ids?: unknown };
+  return pairs ? { ...rest, pairs } : rest;
+}
+
+/** The set's state: pending while any item is, residue when only given-up items are left, removed when none is. */
+const outcomeOf = (remaining: readonly Remaining[]): ForeignBox["unwire"] =>
+  remaining.some((r) => r.state === "pending") ? "pending" : remaining.length ? "residue" : "removed";
+
+/**
+ * One removal round for a pending entry, and what the entry becomes: removed when nothing is left, otherwise pending
+ * with one more attempt, or residue once `UNWIRE_ATTEMPTS` rounds have been made. The ids left and their names are
+ * narrowed together, so what is said to remain is what remains.
+ */
+async function removalRound(inner: SandboxProvider, e: ForeignBox): Promise<ForeignBox> {
+  // Only items with an id are ever pending, so only ids are ever sent.
+  const pending = e.remaining.filter((r) => r.state === "pending" && typeof r.id === "string");
+  const { left, error } = await unwireForeign(inner, e.box, pending.map((r) => r.id!));
+  const attempts = e.attempts + 1;
+  const exhausted = left.length > 0 && attempts >= UNWIRE_ATTEMPTS;
+  // Residue is terminal: no path retries or removes it; it goes away only when the owner removes those
+  // registrations or the box is released.
+  const remaining = e.remaining.flatMap((r): Remaining[] => {
+    if (r.state !== "pending") return [r];
+    if (!left.includes(r.id!)) return [];
+    return [exhausted ? { ...r, state: "residue", reason: `unwire failed ${UNWIRE_ATTEMPTS} times` } : r];
+  });
+  return { ...e, remaining, unwire: outcomeOf(remaining), attempts: left.length ? attempts : e.attempts + 1, lastError: left.length ? error : e.lastError };
+}
+
 async function unwireForeign(inner: SandboxProvider, boxId: string, secretIds: string[]): Promise<{ left: string[]; error: string }> {
   const left: string[] = [];
   let error = "";
@@ -747,15 +838,21 @@ async function unwireForeign(inner: SandboxProvider, boxId: string, secretIds: s
   return { left, error };
 }
 
+/** Two texts as sentences: the second's first letter raised, so "…a new one." and "nothing was running" read as two. */
+export function joinSentences(first: string, second: string): string {
+  if (!second) return first;
+  return `${first} ${second.charAt(0).toUpperCase()}${second.slice(1)}`;
+}
+
 /** A tool's result with that sentence in front of its `note`, or of a handed-over job's. */
 function withNotOursNote(result: Json, note: string | null): Json {
   if (!note) return result;
   if (result instanceof Backgrounded) {
-    return new Backgrounded(result.handle, result.note ? `${note} ${result.note}` : note) as unknown as Json;
+    return new Backgrounded(result.handle, result.note ? joinSentences(note, result.note) : note) as unknown as Json;
   }
   if (!result || typeof result !== "object" || Array.isArray(result)) return result;
   const r = result as Record<string, Json>;
-  return { ...r, note: typeof r.note === "string" && r.note ? `${note} ${r.note}` : note };
+  return { ...r, note: typeof r.note === "string" && r.note ? joinSentences(note, r.note) : note };
 }
 
 /** The provider's methods whose first argument is a box id: every request that reaches a box. */
@@ -829,48 +926,57 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
       // Nothing written and nothing removed: the agent's next call does both, and tells the agent why.
       throw new BoxNotOurs(id, machine);
     }
-    let outcome: LetGo["outcome"] = "clean";
-    if (machine !== null) {
-      const now = await readView(ctx, machine);
-      if (now.boxId === id) {
-        const wired = now.wired ?? [];
-        const names = [...new Set(wired.flatMap((w) => w.names ?? []))];
-        // Proven by id only when every wiring recorded the ids it was made under; anything older cannot be told
-        // from the owner's own registrations, so nothing is removed and it is kept as residue.
-        const provable = wired.every((w) => w.names !== null && Array.isArray(w.ids));
-        const ids = provable ? wired.flatMap((w) => w.ids ?? []) : [];
-        const base = { box: id, mount: ctx.alias, machine, reason: "foreign_owner" as const, names, detectedAt: Date.now() };
-        // Written as soon as the split is decided, before anything is sent: from here only `unwire` and what goes with
-        // it change, and `detectedAt` stays the moment it was found.
-        await writeSplit(ctx, { ...base, unwire: "pending" });
-        let entry: ForeignBox = { ...base, unwire: "removed" };
-        if (!provable) {
-          entry = { ...base, unwire: "residue", residue: { reason: wired.some((w) => w.names === null) ? "names_unknown" : "wiring_without_ids", at: Date.now() } };
-          outcome = "residue";
-        } else if (ids.length) {
-          const { left, error } = await unwireForeign(inner, id, ids);
-          if (left.length) {
-            entry = { ...base, unwire: "pending", pending: { secretIds: left, attempts: 1, lastError: error } };
-            outcome = "pending";
-          }
-        }
+    let states = { pending: false, residue: false };
+    // A machine's record or a stranded box's: the same split either way, and only if the record still names it.
+    const held: (MachineState & { wired?: Wired[] }) | undefined = machine !== null
+      ? await readView(ctx, machine).then((v) => (v.boxId === id ? v : undefined))
+      : (await readMount(ctx))?.stranded?.[id];
+    if (held) {
+      // Proven item by item (`Wired.pairs`, converted on read): one with an id is removed by that id; one without (an
+      // older wiring, or a registration the provider answered no id for) cannot be told from the owner's own, so it
+      // is residue and never tried. A wiring whose names are not known at all is one residue item with neither.
+      const wired = held.wired ?? [];
+      const registeredNames = wired.some((w) => !w.pairs) ? null : wired.flatMap((w) => w.pairs!.map((x) => x.name));
+      const items: Remaining[] = wired.flatMap((w): Remaining[] => !w.pairs
+        ? [{ id: null, name: null, state: "residue", reason: "names_unknown" }]
+        : w.pairs.map((x): Remaining => typeof x.id === "string"
+          ? { id: x.id, name: x.name, state: "pending" }
+          : { id: null, name: x.name, state: "residue", reason: "wiring_without_ids" }));
+      // Found once: a split interrupted before the record let go is found again, and keeps the moment it was first.
+      const before = (await readForeign(ctx))[id];
+      // Written as soon as the split is decided, before anything is sent, with everything that describes it: what is
+      // to be removed is in it, so an interruption from here leaves an entry `retryForeign` finishes. Every later write
+      // updates this entry's outcome (`unwire`, `remaining`, `attempts`, `lastError`) and nothing else.
+      const first: ForeignBox = {
+        box: id, mount: ctx.alias, machine, reason: "foreign_owner", registeredNames,
+        secretIds: items.flatMap((r) => (r.id ? [r.id] : [])), detectedAt: before?.detectedAt ?? Date.now(),
+        unwire: outcomeOf(items), remaining: items, attempts: 0, lastError: null,
+      };
+      await writeSplit(ctx, first);
+      let entry = first;
+      if (first.unwire === "pending") {
+        entry = await removalRound(inner, first);
         await writeSplit(ctx, entry);
+      }
+      states = { pending: entry.remaining.some((r) => r.state === "pending"), residue: entry.remaining.some((r) => r.state === "residue") };
+      if (machine !== null) {
+        const now = await readView(ctx, machine);
         await writeView(ctx, machine, {
           boxId: "", createdAt: 0, lastUsedAt: 0,
           ...(now.sessions ? { sessions: now.sessions } : {}), ...(now.envs ? { envs: now.envs } : {}),
           ...(now.startFrom ? { startFrom: now.startFrom } : {}),
         });
-      }
-    } else {
-      const now = await readMount(ctx);
-      if (now?.stranded?.[id]) {
-        const { [id]: _gone, ...rest } = now.stranded;
-        await writeMount(ctx, { ...now, stranded: rest });
+      } else {
+        const now = await readMount(ctx);
+        if (now?.stranded?.[id]) {
+          const { [id]: _gone, ...rest } = now.stranded;
+          await writeMount(ctx, { ...now, stranded: rest });
+        }
       }
     }
     // Said once per box, where the record lets go of it, so the rows count the pairs as they come apart.
-    say("box_not_ours", id, machine, { unwire: outcome === "clean" ? "removed" : outcome });
-    noteLetGo(ctx, { boxId: id, machine, outcome });
+    say("box_not_ours", id, machine, { unwire: states.pending ? "pending" : states.residue ? "residue" : "removed" });
+    await noteLetGo(ctx, { boxId: id, machine, outcome: "split", ...states });
     throw new BoxNotOurs(id, machine);
   };
   const out: Record<string, unknown> = {};
@@ -889,17 +995,33 @@ function ownedProvider(inner: SandboxProvider, ctx: PluginContext, look = false)
    */
   out.retryForeign = async (): Promise<void> => {
     for (const [boxId, e] of Object.entries(await readForeign(ctx))) {
-      if (!e.pending) continue;
-      const { left, error } = await unwireForeign(inner, boxId, e.pending.secretIds);
-      const { pending: _p, ...rest } = e;
-      if (!left.length) { await writeSplit(ctx, { ...rest, unwire: "removed" }); continue; }
-      const attempts = e.pending.attempts + 1;
-      if (attempts >= UNWIRE_ATTEMPTS) {
-        await writeSplit(ctx, { ...rest, unwire: "residue", residue: { reason: `unwire failed ${attempts} times`, at: Date.now(), lastError: error } });
-        say("unwire_given_up", boxId, e.machine, { accounts: e.names.join(","), lastError: error });
-        noteLetGo(ctx, { boxId, machine: e.machine, outcome: "given_up" });
-      } else {
-        await writeSplit(ctx, { ...e, pending: { secretIds: left, attempts, lastError: error } });
+      if (e.unwire !== "pending") continue;
+      let entry = e;
+      // Marked pending with no items written (an interrupted write of an earlier build). With the ids the split
+      // recorded, the items are rebuilt from them and go on from the rounds already counted; without them there is
+      // nothing to try, and it is residue.
+      if (!Array.isArray(e.remaining)) {
+        const old = e as unknown as { secretIds?: unknown; names?: unknown; registeredNames?: unknown };
+        const names = Array.isArray(old.registeredNames) ? old.registeredNames as string[] : Array.isArray(old.names) ? old.names as string[] : null;
+        const ids = Array.isArray(old.secretIds) ? old.secretIds as string[] : null;
+        const named = names !== null && ids !== null && names.length === ids.length;
+        const remaining: Remaining[] = ids && ids.length
+          ? ids.map((sid, i) => ({ id: sid, name: named ? names![i]! : null, state: "pending" as const }))
+          : (names ?? [null]).map((n) => ({ id: null, name: n, state: "residue" as const, reason: "pending without details" }));
+        entry = { ...e, registeredNames: names, secretIds: ids ?? [], remaining, unwire: outcomeOf(remaining),
+          attempts: typeof e.attempts === "number" ? e.attempts : 0, lastError: e.lastError ?? null };
+        if (entry.unwire !== "pending") {
+          await writeSplit(ctx, entry);
+          say("unwire_given_up", boxId, e.machine, { lastError: "pending without details" });
+          await noteLetGo(ctx, { boxId, machine: e.machine, outcome: "remains" });
+          continue;
+        }
+      }
+      const next = await removalRound(inner, entry);
+      await writeSplit(ctx, next);
+      if (next.unwire === "residue" && next.remaining.some((r) => r.reason === `unwire failed ${UNWIRE_ATTEMPTS} times`)) {
+        say("unwire_given_up", boxId, e.machine, { accounts: next.remaining.map((r) => r.name).filter(Boolean).join(","), lastError: next.lastError ?? "" });
+        await noteLetGo(ctx, { boxId, machine: e.machine, outcome: "given_up" });
       }
     }
   };
@@ -1059,7 +1181,7 @@ function readBox(v: Json): BoxState | null {
   // it matches none and is redone the same way.
   const { sessions, envs, wired, leftOut, githubPlaceholder, githubTokenDigest: _d, githubWithheld: _w, ...rest } = o;
   const wiring = Array.isArray(wired)
-    ? (wired.every(isWired) ? wired : [UNKNOWN_WIRING])
+    ? (wired.every(isWired) ? (wired as Wired[]).map(withPairs) : [UNKNOWN_WIRING])
     : wired !== undefined ? [UNKNOWN_WIRING]
     : typeof githubPlaceholder === "string"
       ? [{ alias: "", plugin: "github", placeholder: githubPlaceholder, digest: "", names: ["GH_TOKEN", "GH_TOKEN_GIT"] }]
@@ -1079,7 +1201,8 @@ function isWired(v: unknown): v is Wired {
   return typeof w.alias === "string" && typeof w.plugin === "string" && typeof w.placeholder === "string"
     && typeof w.digest === "string"
     && (w.names === null || (Array.isArray(w.names) && w.names.every((x) => typeof x === "string")))
-    && (w.ids === undefined || (Array.isArray(w.ids) && w.ids.every((x) => typeof x === "string")))
+    && (w.pairs === undefined || (Array.isArray(w.pairs) && w.pairs.every((x) => !!x && typeof x === "object"
+      && typeof (x as { name?: unknown }).name === "string" && ((x as { id?: unknown }).id === null || typeof (x as { id?: unknown }).id === "string"))))
     && (w.summary === undefined || typeof w.summary === "string")
     && (w.env === undefined || (typeof w.env === "object" && w.env !== null && !Array.isArray(w.env)
       && Object.values(w.env).every((x) => typeof x === "string")));
@@ -1793,10 +1916,11 @@ interface Wired {
   /** The registrations made for it on the box, by name; `null` means unknown, so every one on the box. */
   names: string[] | null;
   /**
-   * The provider's ids for those registrations, when it answered every one. Only these prove a registration on a
-   * box is this mount's: a box another agent also used may hold its own under the same names (`unwireForeign`).
+   * Each registration made for it, its name with the id the provider answered for it (null where it answered none),
+   * from the same call. Only an id proves a registration on a box is this mount's: a box another agent also used may
+   * hold its own under the same names (`unwireForeign`). Absent on wirings recorded before it (`pairsOf`).
    */
-  ids?: string[];
+  pairs?: Array<{ name: string; id: string | null }>;
   /** The environment its commands run with; holds the placeholder, never the credential. */
   env?: Record<string, string>;
   /** The plugin's own sentence for the model (`SandboxForm.summary`). */
@@ -1805,7 +1929,10 @@ interface Wired {
 
 interface LeftOut { alias: string; why: string }
 
-/** A wiring this record cannot account for; the next command clears the box and wires again. */
+/**
+ * Placeholder put in on read when a wired entry cannot be read; no code path writes it deliberately. The record read
+ * is written back as-is, so a failed read leaves it stored — conversions must happen before this layer (`pairsOf`).
+ */
 const UNKNOWN_WIRING: Wired = { alias: "", plugin: "", placeholder: "", digest: "", names: null };
 
 /**
@@ -1964,12 +2091,11 @@ async function accountsWanted(ctx: PluginContext, cfg: ReturnType<typeof cfgOf>)
 async function register(provider: SandboxProvider, boxId: string, c: Candidate & { credential: string; digest: string }): Promise<Wired> {
   const placeholder = placeholderFor(c.alias, boxId);
   const regs = registrationsFor(c.form, c.credential, placeholder);
-  const ids: Array<string | null> = [];
-  for (const g of regs) ids.push(await provider.addSecret(boxId, g));
+  const pairs: Array<{ name: string; id: string | null }> = [];
+  for (const g of regs) pairs.push({ name: g.name, id: await provider.addSecret(boxId, g) });
   await c.used();
   return {
-    alias: c.alias, plugin: c.plugin, placeholder, digest: c.digest, names: regs.map((g) => g.name),
-    ...(ids.every((x) => typeof x === "string") ? { ids: ids as string[] } : {}),
+    alias: c.alias, plugin: c.plugin, placeholder, digest: c.digest, names: regs.map((g) => g.name), pairs,
     env: c.form.env(placeholder), summary: c.form.summary,
   };
 }
@@ -2671,26 +2797,44 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
    * (`ownedProvider`): it cannot see the trace, and without this the files and installs it expected would be gone
    * with no reason given. Said once, on that call: by the next one the record no longer names the box.
    */
-  async function notOursNote(ctx: PluginContext): Promise<string | null> {
-    const found = lettingGo.get(ctx);
-    if (!found?.length) return null;
-    const mount = await readMount(ctx);
-    return found.map((f) => {
+  // Notes describe an event and are said once. A queued note may contain only facts already true when it was queued,
+  // and the one fixed instruction "there is nothing for you to do": nothing about what will happen next (a retry, a
+  // new machine, a release) and no count that changes (how many were removed or remain), which belong to the holds
+  // list (`withdraw`) and result fields. So a row reads the same whenever it is delivered, whatever came after it. A later change for the same box (a removal pending, then given up on) is a new event
+  // with a note of its own; the sequence only goes one way (residue never returns to pending). Not one note per box.
+  async function notOursNote(ctx: PluginContext): Promise<{ text: string; ids: string[] } | null> {
+    const v = await ctx.db.get(BOX_STORE, NOTICES_KEY);
+    const found = Array.isArray(v) ? (v as LetGo[]) : [];
+    if (!found.length) return null;
+    const text = found.map((f) => {
       if (f.outcome === "given_up") {
         return "Taking this mount's accounts off a machine that belonged to another agent failed three times, so some of " +
           "its account registrations may remain there; there is nothing for you to do about them.";
       }
-      const which = f.machine === null || f.machine === MAIN_MACHINE ? "The machine" : `Machine "${f.machine}"`;
-      const now = f.machine === null ? undefined : mount?.machines[f.machine]?.boxId;
-      const split = now && now !== f.boxId
-        ? `${which} you were using belonged to another agent, so it was left to them and a new one was made for you; nothing you had on the old one is here.`
-        : `${which} you were using belonged to another agent, so it was left to them; nothing you had on it is here, and the next call makes a new one.`;
-      return split + (f.outcome === "pending"
-        ? " Taking this mount's accounts off that machine did not finish and will be retried; there is nothing for you to do."
-        : f.outcome === "residue"
-          ? " Some of this mount's account registrations may remain on that machine; there is nothing for you to do about them."
-          : "");
-    }).join(" ");
+      if (f.outcome === "remains") {
+        return "Some of this mount's account registrations may remain on a machine that belonged to another agent; there is nothing for you to do about them.";
+      }
+      // A box set aside earlier (`stranded`), not the agent's machine: only what of its accounts was left is said.
+      if (f.machine === null) {
+        return [
+          f.pending ? "Some of this mount's account registrations on a machine that belonged to another agent were not removed at the time; there is nothing for you to do." : "",
+          f.residue ? "Some of this mount's account registrations may remain on a machine that belonged to another agent; there is nothing for you to do about them." : "",
+        ].filter(Boolean).join(" ");
+      }
+      const which = f.machine === MAIN_MACHINE ? "The machine" : `Machine "${f.machine}"`;
+      // Each state the set held at the split, said once: a set with items of both kinds says both.
+      return `${which} you were using belonged to another agent, so it was left to them; nothing you had on it is here.`
+        + (f.pending ? " Some of this mount's account registrations on that machine were not removed at the time; there is nothing for you to do." : "")
+        + (f.residue ? " Some of this mount's account registrations may remain on that machine; there is nothing for you to do about them." : "");
+    }).filter(Boolean).join(" ");
+    return { text, ids: found.map((f) => String(f.id)) };
+  }
+  /** Drops the notices a result has just carried, by their ids and only those: one owed meanwhile stays for the next. */
+  async function delivered(ctx: PluginContext, ids: string[]): Promise<void> {
+    const v = await ctx.db.get(BOX_STORE, NOTICES_KEY);
+    const left = (Array.isArray(v) ? (v as LetGo[]) : []).filter((f) => !ids.includes(String(f.id)));
+    if (left.length) await ctx.db.put(BOX_STORE, left as unknown as Json, NOTICES_KEY);
+    else await ctx.db.delete(BOX_STORE, NOTICES_KEY);
   }
 
   const plugin: Plugin = {
@@ -2810,12 +2954,16 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // Boxes of other agents this mount's registrations may still be on: pending ones a later delete tries again,
       // given-up ones a person has to look at. Removed ones are not this mount's to report.
       for (const e of Object.values(await readForeign(ctx))) {
-        if (e.unwire === "pending") {
-          things.push({ id: e.box, clean: false, ownKey: false, code: "listing_failed",
-            why: `another agent's box: this mount's registrations (${e.names.join(", ")}) were not all removed yet (${e.pending?.lastError ?? "unknown"})` });
-        } else if (e.unwire === "residue") {
-          things.push({ id: e.box, clean: false, ownKey: false, code: "foreign_residue",
-            why: `another agent's box: this mount's registrations (${e.names.join(", ")}) may remain on it (${e.residue?.reason ?? "unknown"})` });
+        // One line per item, each by its own state: a set with items of both kinds lists both.
+        for (const r of Array.isArray(e.remaining) ? e.remaining : []) {
+          const name = r.name ?? "unnamed";
+          if (r.state === "pending") {
+            things.push({ id: e.box, clean: false, ownKey: false, code: "listing_failed",
+              why: `another agent's box: this mount's registration ${name} is not removed yet (${e.lastError ?? "not tried yet"})` });
+          } else {
+            things.push({ id: e.box, clean: false, ownKey: false, code: "foreign_residue",
+              why: `another agent's box: this mount's registration ${name} may remain on it (${r.reason ?? "unknown"})` });
+          }
         }
       }
       for (const id of Object.keys(mount?.stranded ?? {})) {
@@ -3653,19 +3801,25 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
   // Every call, whichever tool and however it ends, carries the sentence `notOursNote` says when it let go of a box.
   const invokeTool = plugin.invoke.bind(plugin);
   plugin.invoke = async (tool, args, ctx) => {
-    lettingGo.delete(ctx);
     // Removals left pending on another agent's box get another try on each call, whichever tool it is; one that
     // cannot be made now is no reason to fail the call (`retryForeign`).
     if (ctx.credential && tool !== "machines") {
       try { await openProvider(cfgOf(ctx), ctx).retryForeign(); } catch { /* counted on its own entry, or tried again next call */ }
     }
+    let result: Json;
     try {
-      return withNotOursNote(await invokeTool(tool, args, ctx), await notOursNote(ctx));
+      result = await invokeTool(tool, args, ctx);
     } catch (e) {
       const note = await notOursNote(ctx);
-      if (note && e instanceof Error) e.message = `${note} ${e.message}`;
+      if (note?.text && e instanceof Error) { e.message = joinSentences(note.text, e.message); await delivered(ctx, note.ids); }
       throw e;
     }
+    const note = await notOursNote(ctx);
+    if (!note) return result;
+    const told = withNotOursNote(result, note.text || null);
+    // Cleared once a result carries it, and kept while none could (a result with no `note` to put it in).
+    if (!note.text || told !== result) await delivered(ctx, note.ids);
+    return told;
   };
   return plugin;
 }
