@@ -800,10 +800,17 @@ async function updateSplit(
 /** A well-formed entry as stored: one with its items. */
 const settledEntry = (e: ForeignBox | undefined): ForeignBox | undefined => (e && Array.isArray(e.remaining) ? e : undefined);
 
-/** The note owed when a round turns a told split's pending items into residue: a new event, told on its own. */
-const gaveUpNote = (stored: ForeignBox | undefined, next: ForeignBox, machine: string | null): LetGo | undefined =>
-  stored?.told && outcomeOf(stored.remaining) === "pending" && outcomeOf(next.remaining) === "residue"
-    ? { boxId: next.box, machine, outcome: "given_up" } : undefined;
+/**
+ * The note owed when a round gives up on a told split's pending items: a new event, told on its own. Only when the
+ * round made items residue for failing (`unwire failed …`): a split whose pending items were all removed, leaving only
+ * residue it had from the start (`wiring_without_ids`), gave up on nothing, and that residue was told at the split.
+ */
+const gaveUpNote = (stored: ForeignBox | undefined, next: ForeignBox, machine: string | null): LetGo | undefined => {
+  if (!stored?.told) return undefined;
+  const wasPending = new Set(stored.remaining.filter((r) => r.state === "pending").map((r) => r.id));
+  const givenUp = next.remaining.some((r) => r.state === "residue" && wasPending.has(r.id));
+  return givenUp ? { boxId: next.box, machine, outcome: "given_up" } : undefined;
+};
 
 /**
  * A wiring's registrations as name and id pairs. One recorded with its pairs reads as them; one recorded before them
