@@ -337,7 +337,7 @@ await check("workspace-files/read carries the sha256 of the bytes its content st
     workspace: {
       state: { list: async () => [], get: async (_t: string, _a: string, key: string) => key === "MEMORY.md" ? { value: "héllo", ref: null, bytes: 7, updatedAt: 1 } : null },
       artifacts: { list: async () => ({ objects: [], prefixes: [] }), head: async (k: string) => object(k), get: async (k: string) => object(k) ? { ...object(k)!, bytes: objects[k]! } : null },
-      sandbox: { list: async () => ({ running: false }) as never, read: async () => ({ running: false }) as never },
+      sandbox: { list: async () => ({ running: false, why: "none" as const }), read: async () => ({ running: false, why: "none" as const }) },
     },
   } as unknown as SurfaceDeps;
   const deps = { ...f.deps, surface };
