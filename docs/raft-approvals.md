@@ -583,8 +583,9 @@ plugin `Interrupt`): Raft's SDK holds a `messages_send` when the conversation ha
   question with it, **once**, as the plugin's own resume of the same operation. For Raft that is only a send held
   for unread messages: it is re-sent with the same `idempotencyKey` and with the hold's boundary as `seen.upToSeq`.
   Raft dedups by the key, so the resume cannot send twice. If the resume is held again (more messages arrived in
-  between), it is not answered again: nothing is sent, the hold ends `failed` with `asked_before_acting` in
-  `outcome`, and the agent is told it was answered once and asked again. The decision (CTO and Raft platform
+  between), it is not answered again: nothing is sent, the hold ends `failed` with the `outcome`
+  `cancelled: asked_before_acting (unread_messages); nothing was done` (the reason only, never the held messages), and
+  the agent is told it was answered once and asked again, with the question. The decision (CTO and Raft platform
   owner): the unread check is a reminder to the agent, not an authorization, and the owner has already decided.
   `unseen_card`, `thread_target`, replies and task writes declare nothing.
 - **Nothing declared**: the call is not run. The question is cancelled, the operation ends `cancelled`, the hold

@@ -677,7 +677,7 @@ await check("a plugin writes only its own trace kinds: a kernel kind, or the ret
  * for `unread_messages` unless it attests (`seenUpToSeq`) the latest seq, answered with the latest seq as its boundary
  * at the time it is held, and an idempotencyKey that commits a message once. Every send attempt is kept as sent.
  */
-function raftServer(o: { latest: number; notShown?: number }) {
+function raftServer(o: { latest: number; notShown?: number; ownerTalks?: boolean }) {
   const committed: Array<{ seq: number; content: string; idempotencyKey: string; sender: string }> = [];
   const messages: Array<{ seq: number; content: string; sender: string }> = [];
   for (let seq = 1; seq <= o.latest; seq++) messages.push({ seq, content: `earlier ${seq}`, sender: "tygg" });
@@ -691,6 +691,8 @@ function raftServer(o: { latest: number; notShown?: number }) {
     if (!path.endsWith("/send")) { other.push(path); return json(404, { error: "not found", code: "NOT_FOUND" }); }
     const b = JSON.parse(String(init?.body ?? "{}"));
     sends.push(b);
+    // A busy conversation: the owner posts again just before every send lands.
+    if (o.ownerTalks) messages.push({ seq: latest() + 1, content: `OWNER-WORDS-${latest() + 1}`, sender: "owner" });
     const done = committed.find((c) => c.idempotencyKey === b.idempotencyKey);
     if (done) { answers.push("sent"); return json(200, { ok: true, state: "sent", messageId: `m-${done.seq}`, messageSeq: done.seq }); }
     const seen = typeof b.seenUpToSeq === "number" ? b.seenUpToSeq : 0;
@@ -755,6 +757,23 @@ await check("raft, end to end: an approved send held with more unread than the h
   must(JSON.stringify(server.answers) === JSON.stringify(["held:unread_messages", "sent"]), `held, then sent: ${JSON.stringify(server.answers)}`);
   must(server.committed.length === 1 && server.sends.length === 2 && server.sends[1].seenUpToSeq === 21, `once, at 21: ${JSON.stringify(server.sends)}`);
   must(decided.ok && decided.executed, `approved: ${JSON.stringify(decided)}`);
+});
+
+await check("raft, end to end: an approved send that is held again after its one answer is recorded not run, and the held messages reach neither the outcome nor the card, only the agent", async () => {
+  const f = await raftFixture();
+  const server = raftServer({ latest: 20, ownerTalks: true });
+  const pending: any = await f.gw.invoke(CTX, "raft.messages_send", { target: "#general", content: "shipping it", idempotencyKey: "k-busy" }, { confirm: true });
+  must(pending.status === "pending", `held: ${JSON.stringify(pending)}`);
+  const decided: any = await f.gw.applyApproval("t", pending.operationId, "approved", "person");
+  const a: any = await f.store.getApproval("t", pending.operationId);
+  must(a?.state === "failed" && a.outcome?.summary === "cancelled: asked_before_acting (unread_messages); nothing was done",
+    `hold: ${JSON.stringify({ state: a?.state, outcome: a?.outcome })}`);
+  must(!JSON.stringify(a.outcome).includes("OWNER-WORDS"), `the held messages reached the outcome: ${JSON.stringify(a.outcome)}`);
+  must(JSON.stringify(server.answers) === JSON.stringify(["held:unread_messages", "held:unread_messages"]) && server.committed.length === 0,
+    `held twice, answered once, nothing sent: ${JSON.stringify({ answers: server.answers, committed: server.committed })}`);
+  const told: any = (await f.store.untoldApprovals("t")).find((u: any) => u.operationId === pending.operationId);
+  must(/OWNER-WORDS/.test(told?.notice ?? "") && /answered for you once/.test(told?.notice ?? ""), `control: the agent's notice has the question: ${String(told?.notice).slice(0, 300)}`);
+  must(decided.ok && !decided.executed, `approved: ${JSON.stringify(decided).slice(0, 300)}`);
 });
 
 await check("raft: resume \"drop\" sends nothing, and an answer outside send/drop is refused with the same token", async () => {
