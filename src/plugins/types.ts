@@ -1556,22 +1556,37 @@ export class Backgrounded {
  * is lost when the object restarts and the model is told the token is gone;
  * correctness must not depend on it surviving. It must never carry a
  * credential: `resume` is given the same context a call is.
+ *
+ * Only the model answers, with exactly one exception, `ifApproved`: the answer
+ * the gateway gives on the agent's behalf when a person already approved this
+ * exact call and no model is there to ask (an approved call's replay,
+ * gateway.ts `#runApproved`). It is for a question that is a reminder, not a
+ * decision: one whose "go ahead" adds nothing a person's approval of the same
+ * call did not already decide (Raft's hold of a send for unread messages, a
+ * CTO and Raft-owner decision, docs/raft-approvals.md). The gateway answers it
+ * once; a question the resume asks in turn is not answered again, and the
+ * call is recorded as not run. Absent: an approved call that asks is not run.
+ * Host-side like `state`: never shown to the model or a program, and it must
+ * be one of the answers `answer` allows. Never set it for a question whose
+ * answer is a judgment the approval did not cover.
  */
 export class Interrupt {
   readonly question: string;
   readonly context?: Json;
   readonly answer: AnswerSpec;
   readonly state: Json;
-  constructor(o: { question: string; context?: Json; answer: AnswerSpec; state?: Json }) {
+  readonly ifApproved?: Json;
+  constructor(o: { question: string; context?: Json; answer: AnswerSpec; state?: Json; ifApproved?: Json }) {
     this.question = o.question;
     if (o.context !== undefined) this.context = o.context;
     this.answer = o.answer;
     this.state = o.state ?? null;
+    if (o.ifApproved !== undefined) this.ifApproved = o.ifApproved;
   }
 }
 
-/** `return interrupt({ question, context, answer: { choices: [...] }, state })` — see {@link Interrupt}. */
-export function interrupt(o: { question: string; context?: Json; answer: AnswerSpec; state?: Json }): Interrupt {
+/** `return interrupt({ question, context, answer: { choices: [...] }, state, ifApproved })` — see {@link Interrupt}. */
+export function interrupt(o: { question: string; context?: Json; answer: AnswerSpec; state?: Json; ifApproved?: Json }): Interrupt {
   return new Interrupt(o);
 }
 

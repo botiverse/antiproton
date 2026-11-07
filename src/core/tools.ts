@@ -44,6 +44,13 @@ export interface ToolInterrupt {
    * `PluginContext.operationId` on resume and cancel. Host-side like `state`; absent on a question built elsewhere.
    */
   operationId?: string;
+  /**
+   * The answer the gateway gives on the agent's behalf when a person already approved this exact call and no model is
+   * there to ask (`#runApproved`), for a question that is a reminder, not a decision. Absent: an approved call that
+   * asks is not run. Host-side like `state`: never shown to the model or a program (pi-tools.ts picks the question, the
+   * context and the answer spec by name, so neither field can ride along). See plugins/types.ts `Interrupt`.
+   */
+  ifApproved?: Json;
 }
 
 import type { CredentialRefKind, CredentialState } from "../plugins/types.ts";

@@ -72,6 +72,15 @@ function sqlPlugin(db: Db): Plugin {
           state: { sql, step: "delete", secret: SECRET },
         });
       }
+      // A reminder, not a decision (`Interrupt.ifApproved`): an approved replay answers it "confirm" for the agent.
+      // `... TWICE` asks again when answered, as a Raft send does when the conversation moved again in between.
+      const truncate = /^\s*truncate\s+(\w+)(\s+twice)?\s*$/i.exec(sql);
+      if (truncate) {
+        return interrupt({
+          question: `Truncate ${truncate[1]}?`, answer: { choices: ["confirm", "cancel"] }, ifApproved: "confirm",
+          state: { sql: `DELETE FROM ${truncate[1]}`, step: truncate[2] ? "truncate-again" : "truncate", secret: SECRET },
+        });
+      }
       const drop = /^\s*drop\s+table\s+(\w+)\s*$/i.exec(sql);
       if (drop) {
         return interrupt({
@@ -85,7 +94,13 @@ function sqlPlugin(db: Db): Plugin {
       async resume(_tool, state, answer) {
         db.resumes.push({ state, answer });
         const s = state as { sql: string; step: string; table?: string };
-        if (s.step === "delete") return answer === "confirm" ? exec(s.sql) : { cancelled: true };
+        if (s.step === "delete" || s.step === "truncate") return answer === "confirm" ? exec(s.sql) : { cancelled: true };
+        if (s.step === "truncate-again") {
+          return interrupt({
+            question: `More rows arrived; truncate anyway?`, answer: { choices: ["confirm", "cancel"] }, ifApproved: "confirm",
+            state: { ...s, step: "truncate-again" },
+          });
+        }
         if (s.step === "drop-1") {
           if (answer !== true) return { kept: s.table! };
           return interrupt({
@@ -294,6 +309,62 @@ await check("a held call (confirm: true) that a person approves and that then as
     && /nothing was done/.test(decided.result.error.message) && /every row/.test(decided.result.error.message), `approved: ${JSON.stringify(decided)}`);
   must(!JSON.stringify(decided).includes(SECRET), "the plugin's state rode the completion");
   must(f.db.cancels.length === 1 && f.db.ran.length === 0, `nothing ran: ${JSON.stringify(f.db)}`);
+});
+
+await check("an approved call whose question declares ifApproved is answered once for the agent: resumed exactly once, ran once, executed", async () => {
+  const f = await fixture();
+  const pending: any = await f.gw.invoke(CTX, "db.query", { sql: "TRUNCATE users" }, { confirm: true });
+  must(pending.status === "pending", `held: ${JSON.stringify(pending)}`);
+  const decided: any = await f.gw.applyApproval("t", pending.operationId, "approved", "person");
+  // Stored state first: what outlives the turn says it ran, once.
+  const a: any = await f.store.getApproval("t", pending.operationId);
+  must(a?.state === "executed", `hold: ${JSON.stringify({ state: a?.state, outcome: a?.outcome })}`);
+  const op: any = await f.store.getOperation("t", pending.operationId);
+  must(op?.status === "succeeded", `operation: ${JSON.stringify(op?.status)}`);
+  must(f.db.resumes.length === 1 && f.db.resumes[0]!.answer === "confirm" && f.db.ran.length === 1 && f.db.cancels.length === 0,
+    `resumed once, ran once: ${JSON.stringify({ resumes: f.db.resumes.length, ran: f.db.ran, cancels: f.db.cancels.length })}`);
+  must(JSON.stringify(f.db.rows.get("users")) === "[]", `rows: ${JSON.stringify(f.db.rows.get("users"))}`);
+  must(decided.ok && decided.executed && decided.result.status === "succeeded" && decided.result.operationId === pending.operationId
+    && decided.result.result?.deleted === 3, `approved: ${JSON.stringify(decided)}`);
+  must(!JSON.stringify(decided).includes(SECRET), "the plugin's state rode the completion");
+});
+
+await check("an approved call answered once for the agent that asks AGAIN is not answered twice: not run, the second question cancelled", async () => {
+  const f = await fixture();
+  const pending: any = await f.gw.invoke(CTX, "db.query", { sql: "TRUNCATE users TWICE" }, { confirm: true });
+  must(pending.status === "pending", `held: ${JSON.stringify(pending)}`);
+  const decided: any = await f.gw.applyApproval("t", pending.operationId, "approved", "person");
+  const a: any = await f.store.getApproval("t", pending.operationId);
+  must(a?.state === "failed" && /^cancelled: asked_before_acting/.test(a.outcome?.summary ?? ""), `hold: ${JSON.stringify({ state: a?.state, outcome: a?.outcome })}`);
+  const op: any = await f.store.getOperation("t", pending.operationId);
+  must(op?.status === "cancelled", `operation: ${JSON.stringify(op?.status)}`);
+  must(f.db.resumes.length === 1, `resumed ${f.db.resumes.length} times, not once`);
+  must(f.db.ran.length === 0 && JSON.stringify(f.db.rows.get("users")) === "[1,2,3]", `nothing ran: ${JSON.stringify(f.db.ran)}`);
+  must(f.db.cancels.length === 1 && (f.db.cancels[0] as any).step === "truncate-again", `the second question cancelled: ${JSON.stringify(f.db.cancels)}`);
+  must(decided.ok && !decided.executed && decided.result.status === "cancelled" && decided.result.error?.code === "asked_before_acting"
+    && /answered for you once/.test(decided.result.error.message) && /asked again/.test(decided.result.error.message)
+    && /More rows arrived/.test(decided.result.error.message), `approved: ${JSON.stringify(decided)}`);
+  must(!JSON.stringify(decided).includes(SECRET), "the plugin's state rode the completion");
+});
+
+await check("an approval whose run has ended is never run again: runApproved answers null and nothing resumes or runs", async () => {
+  const f = await fixture();
+  const pending: any = await f.gw.invoke(CTX, "db.query", { sql: "TRUNCATE users" }, { confirm: true });
+  await f.gw.applyApproval("t", pending.operationId, "approved", "person");
+  must((await f.store.getApproval("t", pending.operationId) as any)?.state === "executed", "control: the first run executed");
+  must(f.db.resumes.length === 1 && f.db.ran.length === 1, `control: ${JSON.stringify({ resumes: f.db.resumes.length, ran: f.db.ran })}`);
+  const again = await f.gw.runApproved("t", pending.operationId);
+  must(again === null, `ran again: ${JSON.stringify(again)}`);
+  must(f.db.resumes.length === 1 && f.db.ran.length === 1, `ran again: ${JSON.stringify({ resumes: f.db.resumes.length, ran: f.db.ran })}`);
+});
+
+await check("ifApproved is host-side: a model's own call that asks it shows the question, never the answer the gateway would give", async () => {
+  const f = await fixture();
+  const out = await f.query.execute("c1", { sql: "TRUNCATE users" });
+  const y = body(out);
+  must(y.state === "yielded" && /Truncate users/.test(y.question), `yielded: ${JSON.stringify(y)}`);
+  must(!out.content[0].text.includes("ifApproved") && !JSON.stringify(out.details).includes("ifApproved"), `ifApproved reached the model: ${out.content[0].text}`);
+  must(f.db.ran.length === 0 && f.db.resumes.length === 0, "nothing answered for the model");
 });
 
 await check("resume after the mount was switched off is refused like a call, and nothing runs", async () => {
@@ -544,7 +615,7 @@ async function raftFixture() {
   const traced: any[] = [];
   const record = store.recordTrace.bind(store);
   store.recordTrace = async (rows) => { traced.push(...rows); return record(rows); };
-  return { send: tools.find((t) => t.name === "raft__messages_send"), resume: resumeTool(reg, { scope: "s" }) as any, reg, traced, store };
+  return { send: tools.find((t) => t.name === "raft__messages_send"), resume: resumeTool(reg, { scope: "s" }) as any, reg, traced, store, gw };
 }
 
 await check("raft: a held send yields send/drop with the SDK's held text; resume \"send\" sends it once, attesting what was shown", async () => {
@@ -599,6 +670,116 @@ await check("a plugin writes only its own trace kinds: a kernel kind, or the ret
   const own = traced.filter((r) => r.kind !== "tool.call" || r.attrs?.forged);
   must(own.length === 1 && own[0].kind === "raft.state_failed" && own[0].attrs.mount === "p" && own[0].attrs.phase === "load" && own[0].spanId === out.operationId,
     `the plugin's rows: ${JSON.stringify(traced)}`);
+});
+
+/**
+ * A Raft server with one conversation, #general, as far as a send needs it: messages with seqs, a send that is held
+ * for `unread_messages` unless it attests (`seenUpToSeq`) the latest seq, answered with the latest seq as its boundary
+ * at the time it is held, and an idempotencyKey that commits a message once. Every send attempt is kept as sent.
+ */
+function raftServer(o: { latest: number; notShown?: number; ownerTalks?: boolean }) {
+  const committed: Array<{ seq: number; content: string; idempotencyKey: string; sender: string }> = [];
+  const messages: Array<{ seq: number; content: string; sender: string }> = [];
+  for (let seq = 1; seq <= o.latest; seq++) messages.push({ seq, content: `earlier ${seq}`, sender: "tygg" });
+  const sends: any[] = [];
+  /** What each send attempt was answered: "held:<reason>" or "sent". */
+  const answers: string[] = [];
+  const other: string[] = [];
+  const latest = () => messages.at(-1)?.seq ?? 0;
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const path = new URL(String(url)).pathname;
+    if (!path.endsWith("/send")) { other.push(path); return json(404, { error: "not found", code: "NOT_FOUND" }); }
+    const b = JSON.parse(String(init?.body ?? "{}"));
+    sends.push(b);
+    // A busy conversation: the owner posts again just before every send lands.
+    if (o.ownerTalks) messages.push({ seq: latest() + 1, content: `OWNER-WORDS-${latest() + 1}`, sender: "owner" });
+    const done = committed.find((c) => c.idempotencyKey === b.idempotencyKey);
+    if (done) { answers.push("sent"); return json(200, { ok: true, state: "sent", messageId: `m-${done.seq}`, messageSeq: done.seq }); }
+    const seen = typeof b.seenUpToSeq === "number" ? b.seenUpToSeq : 0;
+    if (seen < latest()) {
+      const unread = messages.filter((m) => m.seq > seen).slice(-1);
+      answers.push("held:unread_messages");
+      return json(200, {
+        ok: true, state: "held", newMessageCount: unread.length + (o.notShown ?? 0), seenUpToSeq: latest(), omittedMessageCount: 0, freshnessContextMode: "inline",
+        heldMessages: unread.map((m) => ({ seq: m.seq, id: `abcdef${m.seq}-0000`, content: m.content, sender_type: "human", sender_name: m.sender,
+          channel_name: "general", channel_type: "channel", timestamp: "2026-09-28T10:00:00Z" })),
+      });
+    }
+    const seq = latest() + 1;
+    messages.push({ seq, content: String(b.content), sender: "agent" });
+    committed.push({ seq, content: String(b.content), idempotencyKey: String(b.idempotencyKey), sender: "agent" });
+    answers.push("sent");
+    return json(200, { ok: true, state: "sent", messageId: `m-${seq}`, messageSeq: seq });
+  }) as any;
+  return {
+    sends, answers, committed, other, latest,
+    /** A person posts in #general, outside any agent: the conversation moves on. */
+    post(content: string) { messages.push({ seq: latest() + 1, content, sender: "owner" }); },
+  };
+}
+
+await check("raft, end to end: a confirm:true send, the owner posts after the card and before approving, approve: the replay is held at the NEW latest seq, answered once with that boundary under the same key, and lands once", async () => {
+  const f = await raftFixture();
+  const server = raftServer({ latest: 20 });
+  // (1) The agent's send, held for approval: the card exists, nothing reached Raft.
+  const pending: any = await f.gw.invoke(CTX, "raft.messages_send", { target: "#general", content: "shipping it", idempotencyKey: "k-e2e" }, { confirm: true });
+  must(pending.status === "pending" && (await f.store.getApproval("t", pending.operationId) as any)?.state === "pending" && server.sends.length === 0,
+    `held for approval: ${JSON.stringify({ pending, sends: server.sends })}`);
+  // (2) After the card, before the decision, the owner posts: latest moves from 20 to 21.
+  server.post("hold on, use the new branch");
+  must(server.latest() === 21, "control: the owner's message is the latest");
+  // (3) Approved: the replay is held for unread messages at 21, and answered once with 21 under the same key.
+  const decided: any = await f.gw.applyApproval("t", pending.operationId, "approved", "person");
+  const a: any = await f.store.getApproval("t", pending.operationId);
+  must(a?.state === "executed", `hold: ${JSON.stringify({ state: a?.state, outcome: a?.outcome, sends: server.sends })}`);
+  const op: any = await f.store.getOperation("t", pending.operationId);
+  must(op?.status === "succeeded", `operation: ${JSON.stringify(op?.status)}`);
+  must(server.committed.length === 1 && server.committed[0]!.content === "shipping it" && server.committed[0]!.idempotencyKey === "k-e2e",
+    `committed once: ${JSON.stringify(server.committed)}`);
+  // Precondition: the replay's first attempt really was held for unread messages, else this proves nothing.
+  must(JSON.stringify(server.answers) === JSON.stringify(["held:unread_messages", "sent"]), `held, then sent: ${JSON.stringify(server.answers)}`);
+  must(server.sends.length === 2 && server.sends.every((b) => b.idempotencyKey === "k-e2e"), `two attempts, one key: ${JSON.stringify(server.sends)}`);
+  must(server.sends[0].seenUpToSeq === undefined && server.sends[1].seenUpToSeq === 21, `the resume attests the boundary of the replay's hold (21, the owner's message): ${JSON.stringify(server.sends)}`);
+  must(decided.ok && decided.executed && decided.result.status === "succeeded", `approved: ${JSON.stringify(decided)}`);
+});
+
+await check("raft, end to end: an approved send held with more unread than the hold shows still goes out once, at Raft's boundary", async () => {
+  const f = await raftFixture();
+  // Raft holds counting 3 more new messages than it shows or reports omitted: the question is incomplete
+  // (`contextComplete: false`), so the SDK attests nothing for a model.
+  const server = raftServer({ latest: 20, notShown: 3 });
+  const pending: any = await f.gw.invoke(CTX, "raft.messages_send", { target: "#general", content: "shipping it", idempotencyKey: "k-omit" }, { confirm: true });
+  must(pending.status === "pending", `held: ${JSON.stringify(pending)}`);
+  server.post("one more thing");
+  const decided: any = await f.gw.applyApproval("t", pending.operationId, "approved", "person");
+  const a: any = await f.store.getApproval("t", pending.operationId);
+  must(a?.state === "executed", `hold: ${JSON.stringify({ state: a?.state, outcome: a?.outcome, sends: server.sends })}`);
+  must(JSON.stringify(server.answers) === JSON.stringify(["held:unread_messages", "sent"]), `held, then sent: ${JSON.stringify(server.answers)}`);
+  must(server.committed.length === 1 && server.sends.length === 2 && server.sends[1].seenUpToSeq === 21, `once, at 21: ${JSON.stringify(server.sends)}`);
+  must(decided.ok && decided.executed, `approved: ${JSON.stringify(decided)}`);
+});
+
+await check("raft, end to end: an approved send that is held again after its one answer is recorded not run, and the held messages reach neither the outcome nor the card, only the agent", async () => {
+  const f = await raftFixture();
+  const server = raftServer({ latest: 20, ownerTalks: true });
+  const pending: any = await f.gw.invoke(CTX, "raft.messages_send", { target: "#general", content: "shipping it", idempotencyKey: "k-busy" }, { confirm: true });
+  must(pending.status === "pending", `held: ${JSON.stringify(pending)}`);
+  // Every log line the run writes (logEvent and plain console output), kept to check that none carries the held messages.
+  const lines: string[] = [];
+  const saved = { log: console.log, warn: console.warn, error: console.error };
+  for (const k of ["log", "warn", "error"] as const) console[k] = (...a: unknown[]) => { lines.push(a.map((x) => typeof x === "string" ? x : JSON.stringify(x)).join(" ")); };
+  let decided: any;
+  try { decided = await f.gw.applyApproval("t", pending.operationId, "approved", "person"); } finally { Object.assign(console, saved); }
+  must(!lines.some((l) => l.includes("OWNER-WORDS")), `a log line carries the held messages: ${lines.find((l) => l.includes("OWNER-WORDS"))?.slice(0, 300)}`);
+  const a: any = await f.store.getApproval("t", pending.operationId);
+  must(a?.state === "failed" && a.outcome?.summary === "cancelled: asked_before_acting (unread_messages); nothing was done",
+    `hold: ${JSON.stringify({ state: a?.state, outcome: a?.outcome })}`);
+  must(!JSON.stringify(a.outcome).includes("OWNER-WORDS"), `the held messages reached the outcome: ${JSON.stringify(a.outcome)}`);
+  must(JSON.stringify(server.answers) === JSON.stringify(["held:unread_messages", "held:unread_messages"]) && server.committed.length === 0,
+    `held twice, answered once, nothing sent: ${JSON.stringify({ answers: server.answers, committed: server.committed })}`);
+  const told: any = (await f.store.untoldApprovals("t")).find((u: any) => u.operationId === pending.operationId);
+  must(/OWNER-WORDS/.test(told?.notice ?? "") && /answered for you once/.test(told?.notice ?? ""), `control: the agent's notice has the question: ${String(told?.notice).slice(0, 300)}`);
+  must(decided.ok && !decided.executed, `approved: ${JSON.stringify(decided).slice(0, 300)}`);
 });
 
 await check("raft: resume \"drop\" sends nothing, and an answer outside send/drop is refused with the same token", async () => {
