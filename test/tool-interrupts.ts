@@ -282,9 +282,12 @@ await check("a held call (confirm: true) that a person approves and that then as
   // Recorded as not run everywhere a person or the agent reads it, never `executed` / `succeeded`: checked first, so
   // a change that records it as run fails here, on what outlives the turn, not on the text the agent is handed.
   const a: any = await f.store.getApproval("t", pending.operationId);
-  must(a?.state === "failed" && /^cancelled: asked_before_acting/.test(a.outcome?.summary ?? ""), `hold: ${JSON.stringify({ state: a?.state, outcome: a?.outcome })}`);
+  // Its outcome, which Raft's card shows to whoever decided, is the reason alone: the question (here the table's row
+  // count; for Raft the held messages) goes to the agent only.
+  must(a?.state === "failed" && a.outcome?.summary === "cancelled: asked_before_acting; nothing was done", `hold: ${JSON.stringify({ state: a?.state, outcome: a?.outcome })}`);
+  must(!/every row|3 rows/.test(JSON.stringify(a.outcome)), `the question reached the outcome: ${JSON.stringify(a.outcome)}`);
   const told: any = (await f.store.untoldApprovals("t")).find((u: any) => u.operationId === pending.operationId);
-  must(/but not run: cancelled/.test(told?.notice ?? "") && /asked_before_acting/.test(told?.notice ?? ""), `notice: ${told?.notice}`);
+  must(/but not run: cancelled/.test(told?.notice ?? "") && /asked_before_acting/.test(told?.notice ?? "") && /every row/.test(told?.notice ?? ""), `notice: ${told?.notice}`);
   const op: any = await f.store.getOperation("t", pending.operationId);
   must(op?.status === "cancelled", `operation: ${JSON.stringify(op?.status)}`);
   must(decided.ok && !decided.executed && decided.result.status === "cancelled" && decided.result.error?.code === "asked_before_acting"

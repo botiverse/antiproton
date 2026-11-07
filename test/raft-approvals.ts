@@ -338,6 +338,33 @@ await check("decide: an approved call whose run fails ends failed, with its erro
   must(!listed.text.includes(LEAKED), "the outcome or the arguments carry the credential");
 });
 
+await check("outcome: what an approved run gave back or said never reaches the card or the record, only its status and code; the agent's notice has it", async () => {
+  const w = await world();
+  const MARK = "MARKER-only-in-the-result-7f3a";
+  // A first approved write leaves the marker in the agent's state (the card shows a held call's arguments by design).
+  const put = await hold(w, MARK);
+  must((await decide(w, put, "approve")).status === 200, "decide put");
+  await w.D.alarm();
+  // A second hold, rewritten to read it back: its run returns the marker, which only the agent may see.
+  const get = await hold(w, "x");
+  w.raw.sql.exec("UPDATE approvals SET request = ? WHERE operation_id = ?", JSON.stringify({ tool: "state.get", args: { key: "plan" }, heldBy: "policy" }), get);
+  must((await decide(w, get, "approve")).status === 200, "decide get");
+  await w.D.alarm();
+  const r = row(w, get);
+  must(r.state === "executed" && JSON.parse(r.outcome).summary === "succeeded; the result went to the agent", `stored: ${show({ state: r.state, outcome: r.outcome })}`);
+  must(String(r.notice ?? "").includes(MARK), `control: the agent's notice carries the result: ${String(r.notice ?? "").slice(0, 200)}`);
+  // And a run that fails with the marker in its error's sentence: the code is kept, the sentence is not.
+  const bad = await hold(w, "y");
+  w.raw.sql.exec("UPDATE approvals SET request = ? WHERE operation_id = ?", JSON.stringify({ tool: `state.${MARK}`, args: {}, heldBy: "policy" }), bad);
+  must((await decide(w, bad, "approve")).status === 200, "decide bad");
+  await w.D.alarm();
+  const f = row(w, bad);
+  must(f.state === "failed" && /^[a-z]+: [A-Za-z0-9_.:-]+$/.test(JSON.parse(f.outcome).summary) && !f.outcome.includes(MARK), `stored failure: ${show({ state: f.state, outcome: f.outcome })}`);
+  const listed = await call(w, "GET", `agents/${A}/approvals`);
+  const items = listed.body.approvals.filter((a: any) => a.operationId === get || a.operationId === bad);
+  must(items.length === 2 && items.every((a: any) => !JSON.stringify(a.outcome).includes(MARK) && !String(a.description).includes(MARK)), `the card: ${listed.text.slice(0, 600)}`);
+});
+
 await check("decide: a run the object stopped during is ended failed after the grace, and never run again", async () => {
   const w = await world();
   const op = await hold(w);

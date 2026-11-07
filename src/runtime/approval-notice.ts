@@ -27,12 +27,27 @@ function bounded(v: unknown): string {
 const head = (a: Pick<ApprovalRecord, "operationId" | "mountAlias" | "tool">, what: string) =>
   `[approval ${a.operationId} — ${a.mountAlias}.${a.tool} — ${what}; a notice from the harness, not a message from the user]`;
 
-/** Where an approved call's run leaves its hold, and what it gave back, bounded: the hold's `outcome`. */
-export function approvalOutcome(result: ToolResult): { state: "executed" | "failed"; summary: string } {
-  if (result.status === "succeeded") return { state: "executed", summary: bounded(result.result) };
+/** A code is a machine token (`policy_denied`, `NOT_FOUND`); anything else is not written as one. */
+const OUTCOME_CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/**
+ * Where an approved call's run leaves its hold, and its `outcome`: metadata only, never what the tool gave back or
+ * said. The summary is shown on Raft's card to whoever decided (the agent's owner, or a server owner or admin), who need
+ * not be able to see what the call read or where it wrote — a message held for unread messages quotes them, a read
+ * returns a channel's content, an error can carry a response body — so it is the status, the error's code, and for a
+ * call that asked before acting, the reason it asked (`asked`), and nothing else, for every tool alike (Raft contract,
+ * slock #13438). The full result goes to the agent only, in its notice (`approvedNotice`).
+ */
+export function approvalOutcome(result: ToolResult, asked?: string): { state: "executed" | "failed"; summary: string } {
+  if (result.status === "succeeded") return { state: "executed", summary: "succeeded; the result went to the agent" };
   if (result.status === "running") return { state: "executed", summary: "started in the background; its result goes to the agent when it ends" };
-  const error = "error" in result && result.error ? `${result.error.code}: ${result.error.message}` : `${result.status}, with no error given`;
-  return { state: "failed", summary: bounded(`${result.status}: ${error}`) };
+  const raw = "error" in result && result.error ? result.error.code : "";
+  const code = OUTCOME_CODE.test(raw) ? raw : raw ? "error" : "no error given";
+  if (code === "asked_before_acting") {
+    const why = asked && OUTCOME_CODE.test(asked) ? ` (${asked})` : "";
+    return { state: "failed", summary: `${result.status}: asked_before_acting${why}; nothing was done` };
+  }
+  return { state: "failed", summary: `${result.status}: ${code}` };
 }
 
 /** An approved call, after it was run: its status and, bounded, what it gave back. */

@@ -222,8 +222,9 @@ export const AUDIT_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
  * The item's fields a deleted agent's copy drops: the free text of what was asked (the arguments' summary, a bridged
  * request's body), the agent's to keep. Kept: the route's method, path, repository and pull request, which say what
  * the decision applied to; `outcome`, which tells `policy_denied` from a failed run; and the description, built from
- * the mount, tool and route alone. `outcome` is the run's result or error, redacted and bounded (`outcomeSummary`), and
- * can still carry free text of the result's own.
+ * the mount, tool and route alone. `outcome` is the run's status and error code only
+ * (src/runtime/approval-notice.ts `approvalOutcome`), redacted and bounded (`outcomeSummary`); rows written before that
+ * change can still carry free text of the result's own.
  */
 const AUDIT_DROPS = "'$.args', '$.route.body'";
 /** When the row's agent was deleted, by the registry; null for a live agent. Correlated on `provider_approvals`. */
