@@ -274,12 +274,21 @@ await check("a plugin that asks but cannot take an answer, or asks with an unusa
   must(f.reg.size === 0, "nothing held");
 });
 
-await check("a held call (confirm: true) that a person approves and that then asks has nobody to ask: dropped, nothing runs, the question rides back", async () => {
+await check("a held call (confirm: true) that a person approves and that then asks has nobody to ask: dropped, nothing runs, recorded as not run, the question rides back", async () => {
   const f = await fixture();
   const pending: any = await f.gw.invoke(CTX, "db.query", { sql: "DELETE FROM users" }, { confirm: true });
   must(pending.status === "pending", `held: ${JSON.stringify(pending)}`);
   const decided: any = await f.gw.applyApproval("t", pending.operationId, "approved", "person");
-  must(decided.ok && decided.result.status === "succeeded" && decided.result.result.state === "interrupted", `approved: ${JSON.stringify(decided)}`);
+  // Recorded as not run everywhere a person or the agent reads it, never `executed` / `succeeded`: checked first, so
+  // a change that records it as run fails here, on what outlives the turn, not on the text the agent is handed.
+  const a: any = await f.store.getApproval("t", pending.operationId);
+  must(a?.state === "failed" && /^cancelled: asked_before_acting/.test(a.outcome?.summary ?? ""), `hold: ${JSON.stringify({ state: a?.state, outcome: a?.outcome })}`);
+  const told: any = (await f.store.untoldApprovals("t")).find((u: any) => u.operationId === pending.operationId);
+  must(/but not run: cancelled/.test(told?.notice ?? "") && /asked_before_acting/.test(told?.notice ?? ""), `notice: ${told?.notice}`);
+  const op: any = await f.store.getOperation("t", pending.operationId);
+  must(op?.status === "cancelled", `operation: ${JSON.stringify(op?.status)}`);
+  must(decided.ok && !decided.executed && decided.result.status === "cancelled" && decided.result.error?.code === "asked_before_acting"
+    && /nothing was done/.test(decided.result.error.message) && /every row/.test(decided.result.error.message), `approved: ${JSON.stringify(decided)}`);
   must(!JSON.stringify(decided).includes(SECRET), "the plugin's state rode the completion");
   must(f.db.cancels.length === 1 && f.db.ran.length === 0, `nothing ran: ${JSON.stringify(f.db)}`);
 });

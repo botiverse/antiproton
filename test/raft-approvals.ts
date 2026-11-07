@@ -21,7 +21,7 @@ import { d1ProviderTokens } from "../cf/src/control-plane.ts";
 import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts";
 import { sessionCookieFor } from "../cf/src/auth.ts";
 import { PROVIDER_HOME } from "../cf/src/provision/steps.ts";
-import { verifyHint, signHint, importSigningKey, hintKeyId, SIGNATURE_HEADER, TIMESTAMP_HEADER, hintTarget, publishBackoffMs } from "../cf/src/approvals.ts";
+import { verifyHint, signHint, importSigningKey, hintKeyId, SIGNATURE_HEADER, TIMESTAMP_HEADER, hintTarget, publishBackoffMs, approvalDescription } from "../cf/src/approvals.ts";
 import { expiredNotice } from "../src/runtime/approval-notice.ts";
 import { DurableObjectStore } from "../src/store/durable-object.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
@@ -634,6 +634,14 @@ await check("wording: no notice, description, error or doc says an expired hold 
   }
   must(texts.every((t) => !t.includes("denied as expired") && !t.includes("denied as `expired`")), texts.find((t) => t.includes("denied as"))?.slice(0, 300) ?? "");
   must(late.status === 409 && late.body.error.message.includes("nothing was run"), late.text);
+});
+
+await check("description: an approved call that asked before acting says it was not run, not that the run failed or that it ran", () => {
+  const base = { status: "failed" as const, mount: "raft", tool: "messages_send", service: null, action: null, route: null, expiresAt: null };
+  const asked = approvalDescription({ ...base, outcome: { summary: "cancelled: asked_before_acting: Approved, but before acting …" } });
+  must(asked.startsWith("Approved, but not run:") && asked.includes("nothing was done") && !/executed|run once|failed/.test(asked), asked);
+  const ran = approvalDescription({ ...base, outcome: { summary: "failed: boom: it broke" } });
+  must(ran.startsWith("Approved, but the run failed"), ran);
 });
 
 await check("hand-off: the approval.requested hint is recorded accepted, failed, or not_sent when this deployment has no hint channel", async () => {

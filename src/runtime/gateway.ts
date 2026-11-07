@@ -886,19 +886,25 @@ export class ToolGateway {
     // An approved call that asks the model a question has nobody to ask: it
     // runs after a person's decision, not inside a model's tool call, so no
     // token could reach the model. It is ended as a cancel would end it, and
-    // the question rides back as the result, so the model sees what the tool
-    // found and can call it again. Its `state` never leaves this function.
+    // recorded as what it was, a call that was not run (`cancelled`, so the
+    // hold ends `failed` and the card does not say it ran): the question rides
+    // back in the error, so the model sees what the tool found and can call it
+    // again. Its `state` never leaves this function.
     if (result.status === "interrupted") {
       const i = result.interrupt;
       await this.cancelInterrupt(ctx, i);
+      const why = i.context && typeof i.context === "object" && !Array.isArray(i.context) ? (i.context as Record<string, Json>).reason : undefined;
+      const reason = typeof why === "string" ? ` (${why})` : "";
       result = {
-        status: "succeeded", operationId: result.operationId,
-        result: {
-          state: "interrupted", question: i.question, ...(i.context !== undefined ? { context: i.context } : {}),
-          note: "Approved, but before acting the tool asked for a decision that could not be put to you here, " +
-            "so nothing was done. Call it again if it still applies.",
+        status: "cancelled", operationId: result.operationId,
+        error: {
+          code: "asked_before_acting",
+          message: `Approved, but before acting the tool asked for a decision${reason} that could not be put to you here, ` +
+            `so nothing was done. Call it again if it still applies, which asks for a new approval. The question was:\n${i.question}`,
         },
       };
+      await this.#store.completeOperation(tenantId, operationId, "cancelled", null, result as unknown as Json);
+      return { executed: false, result };
     }
     // A replay the gateway refused (a route the table refuses now, a request it no longer takes) never ran: recorded
     // as the refusal it was, not as a failure of something that ran.

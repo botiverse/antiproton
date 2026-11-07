@@ -43,7 +43,7 @@ export function approvedNotice(a: ApprovalRecord, result: ToolResult): string {
     return `${head(a, `approved by ${who} and started in the background`)}\nIts result arrives in a notice of its own when it ends.`;
   }
   const error = "error" in result && result.error ? `${result.error.code}: ${result.error.message}` : "no error was given";
-  if (result.status === "rejected") return `${head(a, `approved by ${who}, but not run: rejected`)}\n${bounded(error)}`;
+  if (result.status === "rejected" || result.status === "cancelled") return `${head(a, `approved by ${who}, but not run: ${result.status}`)}\n${bounded(error)}`;
   return `${head(a, `approved by ${who} and run: ${result.status}`)}\n${bounded(error)}`;
 }
 

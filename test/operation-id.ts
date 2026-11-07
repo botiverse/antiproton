@@ -195,7 +195,7 @@ for (const engine of ["pi085", "pd"] as const) {
       const [card2] = await w.r.rt.store.listApprovals("t", "pending");
       must(card2 && card2.operationId !== card!.operationId, `the second card: ${show(card2)}`);
       const ok2 = await w.r.rt.gateway().applyApproval("t", card2!.operationId, "approved", "tygg");
-      must(ok2.ok && ok2.executed, `approval: ${show(ok2)}`);
+      must(ok2.ok && !ok2.executed && ok2.result?.status === "cancelled", `approval: ${show(ok2)}`);
       const asked = stepsOf(w.seen, "ask").map((s) => s.op), dropped = stepsOf(w.seen, "ask:cancel").map((s) => s.op);
       must(show(asked) === show([card2!.operationId]) && show(dropped) === show([card2!.operationId]), `ask ${show(asked)}, cancel ${show(dropped)}, held under ${card2!.operationId}`);
     } finally { w.host.dispose(); }
