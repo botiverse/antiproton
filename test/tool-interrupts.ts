@@ -764,7 +764,13 @@ await check("raft, end to end: an approved send that is held again after its one
   const server = raftServer({ latest: 20, ownerTalks: true });
   const pending: any = await f.gw.invoke(CTX, "raft.messages_send", { target: "#general", content: "shipping it", idempotencyKey: "k-busy" }, { confirm: true });
   must(pending.status === "pending", `held: ${JSON.stringify(pending)}`);
-  const decided: any = await f.gw.applyApproval("t", pending.operationId, "approved", "person");
+  // Every log line the run writes (logEvent and plain console output), kept to check that none carries the held messages.
+  const lines: string[] = [];
+  const saved = { log: console.log, warn: console.warn, error: console.error };
+  for (const k of ["log", "warn", "error"] as const) console[k] = (...a: unknown[]) => { lines.push(a.map((x) => typeof x === "string" ? x : JSON.stringify(x)).join(" ")); };
+  let decided: any;
+  try { decided = await f.gw.applyApproval("t", pending.operationId, "approved", "person"); } finally { Object.assign(console, saved); }
+  must(!lines.some((l) => l.includes("OWNER-WORDS")), `a log line carries the held messages: ${lines.find((l) => l.includes("OWNER-WORDS"))?.slice(0, 300)}`);
   const a: any = await f.store.getApproval("t", pending.operationId);
   must(a?.state === "failed" && a.outcome?.summary === "cancelled: asked_before_acting (unread_messages); nothing was done",
     `hold: ${JSON.stringify({ state: a?.state, outcome: a?.outcome })}`);
