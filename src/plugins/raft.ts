@@ -1481,7 +1481,8 @@ async function keepShown(read: Raft, ctx: PluginContext, result: Record<string, 
  *   is the first one that run asked and the run stopped cleanly (`deliverRun`, src/runtime/pi-tools.ts); otherwise it
  *   is dropped unseen. An approved call's replay has nobody to show it to at all. So nothing is recorded now; the
  *   state carries what the question would attest (`attest`), and the model's answer records it (`interrupts.resume`),
- *   since only the model can answer.
+ *   since only the model can answer. (The one other answer is an approved replay's own, `ifApproved` below, which
+ *   books nothing: nobody looked.)
  * The SDK attests no messages when the context was withheld, does not account for every new message, or came without
  * a boundary (`SeenFrontier.recordHeld`; an `unseen_card` hold never has one); its cards are booked whenever they were
  * shown, which is every time they were not withheld.
@@ -1522,10 +1523,18 @@ async function heldCall(
       ...(typeof held.threadTarget === "string" ? { threadTarget: held.threadTarget } : {}),
     },
   });
+  // The answer an approved replay gives for the agent (src/plugins/types.ts `Interrupt.ifApproved`): "send", for a send
+  // held for unread messages and nothing else. A CTO and Raft-owner decision: the unread check is a reminder to the
+  // agent, not an authorization, and once the owner approved this exact send there is nobody to remind and nothing
+  // left to decide, so the replay answers it once, under the same idempotencyKey and with the hold's boundary as
+  // `seen` (Raft dedups by the key, so it cannot land twice). Not for `unseen_card` or `thread_target`, whose answer is
+  // about where and with what the message goes, nor for a task write or a reply: those stay not run when approved.
+  const ifApproved = reason === "unread_messages" && op.name === "messages.send" && go === "send" ? { ifApproved: go } : {};
   return interrupt({
     question: held.context,
     context: { reason, target: held.target },
     answer: { choices: [go, "drop"] },
+    ...ifApproved,
     state: {
       op: op.name, args: { ...input, ...key, ...confirmed } as Json, heldAt, reason,
       ...(go === "send" && attested && held.seenUpToSeq !== null ? { seen: { upToSeq: held.seenUpToSeq } } : {}),
@@ -3451,17 +3460,23 @@ export function createRaftPlugin(deps: {
               "again only if it is not.",
           };
         }
-        // The answer is the model's (only the model can resume), and the question it answers showed the held
+        // The answer is the model's (only the model can resume, but for `ifApproved`, below), and the question it answers showed the held
         // messages and cards: they are seen now, in the context answering, so a later send there attests them and is
         // not held for the card again. Recorded before the call goes ahead, as the model's own hold records before
         // asking; a save that fails costs one more hold.
+        //
+        // Not when the answer comes with no model context (`caller.contextId` absent): that is the gateway answering an
+        // approved replay for the agent (`ifApproved`, `heldCall`), and nobody looked, so nothing is booked into the
+        // agent's saved frontier. The `seen` boundary below still goes with the send, so Raft's send record will say
+        // the send attested the boundary although it was the owner who decided — accepted; the approval record is
+        // the source for who decided (docs/raft-approvals.md, "An approved call that asks before acting").
         const attest = object(s.attest);
         const upTo = typeof attest.upToSeq === "number" && Number.isSafeInteger(attest.upToSeq) && attest.upToSeq > 0 ? attest.upToSeq : undefined;
         const cards = keptCards(attest.cards);
-        if (typeof attest.target === "string" && (upTo !== undefined || cards)) {
+        if (typeof ctx.caller.contextId === "string" && typeof attest.target === "string" && (upTo !== undefined || cards)) {
           const raft = raftFor(ctx);
           await raft.state.load();
-          const seen = raft.frontier.inContext(typeof ctx.caller.contextId === "string" ? ctx.caller.contextId : undefined);
+          const seen = raft.frontier.inContext(ctx.caller.contextId);
           if (upTo !== undefined) seen.recordUpTo(attest.target, upTo);
           if (cards) seen.recordCardsShown(attest.target, cards);
           await raft.state.save();

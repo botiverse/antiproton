@@ -991,6 +991,25 @@ await check("a question raised inside a program records nothing as seen; the mod
   }
 });
 
+await check("an answer with no model context (an approved replay's ifApproved) books nothing into the saved frontier, and still sends the hold's boundary under the same key", async () => {
+  const fresh = freshDb();
+  const noContext = { ...ctx(), db: fresh.db };
+  const bodies = attestingServer();
+  const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-replay" }, noContext) as any;
+  if (!(held instanceof Interrupt) || held.ifApproved !== "send" || (held.state as any).attest?.upToSeq !== 20 || (held.state as any).seen?.upToSeq !== 20) {
+    throw new Error(`control: the hold carries what it would attest: ${JSON.stringify(held?.state)}`);
+  }
+  const saved = () => JSON.stringify((fresh.tables.get(fresh.scope, INBOX_STORE, "state") as any)?.frontier ?? null);
+  const before = saved();
+  const out = await raftPlugin.interrupts!.resume("messages_send", held.state, held.ifApproved, noContext) as any;
+  if (out instanceof Interrupt || out.state !== "sent") throw new Error(`not sent: ${JSON.stringify(out)}`);
+  if (saved() !== before || bookedIn(fresh) !== null) throw new Error(`the replay booked reads: ${before} -> ${saved()}`);
+  const sent = bodies.at(-1);
+  if (bodies.length !== 2 || sent?.seenUpToSeq !== 20 || sent?.idempotencyKey !== "k-replay" || sent?.content !== "done") {
+    throw new Error(`the send: ${JSON.stringify(bodies)}`);
+  }
+});
+
 await check("control: a question that is the model's own call's result records what it shows at once", async () => {
   const fresh = freshDb();
   const model = { ...inTurn(ctx(), "ctx_turn"), db: fresh.db };
@@ -1084,6 +1103,45 @@ await check("an unseen_card hold raised inside a program books nothing; the mode
   if (sent.state !== "sent" || bodies[1]?.idempotencyKey !== "k-pcard" || !/^v1:/.test(String(bodies[1]?.seenCards?.channel)) ||
       !observed().some((o: any) => o.contextId === "ctx_turn" && o.type === "channel")) {
     throw new Error(`the answer: ${JSON.stringify({ sent, bodies, observed: observed() })}`);
+  }
+});
+
+await check("ifApproved (the answer an approved replay gives): \"send\" for a send held for unread messages, and for no other hold", async () => {
+  // unread_messages on messages_send, the model's own call and a call with no context (an approved replay): "send".
+  for (const [who, caller] of [["the model's call", (c: any) => inTurn(c)], ["a call with no context", (c: any) => c]] as const) {
+    const fresh = freshDb();
+    attestingServer();
+    const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-ia" }, caller({ ...ctx(), db: fresh.db })) as any;
+    if (!(held instanceof Interrupt) || (held.context as any)?.reason !== "unread_messages" || held.ifApproved !== "send") {
+      throw new Error(`${who}: unread send: ${JSON.stringify({ context: held?.context, ifApproved: held?.ifApproved })}`);
+    }
+  }
+  // A task write held for unread messages: nothing declared.
+  {
+    attestingServer();
+    const held = await raftPlugin.invoke("tasks_claim", { target: "#general", taskNumbers: [7] }, inTurn(ctx())) as any;
+    if (!(held instanceof Interrupt) || (held.context as any)?.reason !== "unread_messages" || held.ifApproved !== undefined) {
+      throw new Error(`task write: ${JSON.stringify({ context: held?.context, ifApproved: held?.ifApproved })}`);
+    }
+  }
+  // unseen_card: nothing declared.
+  {
+    const m = cardsMount();
+    cardServer();
+    const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-ia-card" }, m.ctx) as any;
+    if (!(held instanceof Interrupt) || (held.context as any)?.reason !== "unseen_card" || held.ifApproved !== undefined) {
+      throw new Error(`unseen_card: ${JSON.stringify({ context: held?.context, ifApproved: held?.ifApproved })}`);
+    }
+  }
+  // thread_target: nothing declared.
+  {
+    const m = cardsMount({});
+    threadServer();
+    await raftPlugin.invoke("messages_read", { target: THREAD }, m.ctx);
+    const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "wrap-up", idempotencyKey: "k-ia-tt" }, m.ctx) as any;
+    if (!(held instanceof Interrupt) || (held.context as any)?.reason !== "thread_target" || held.ifApproved !== undefined) {
+      throw new Error(`thread_target: ${JSON.stringify({ context: held?.context, ifApproved: held?.ifApproved })}`);
+    }
   }
 });
 

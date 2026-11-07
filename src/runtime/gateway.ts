@@ -3,12 +3,13 @@ import type { StorageAdapter } from "../core/store.ts";
 import type { Json, MountPolicy, MountRecord, OperationStatus, PolicyDecision } from "../core/types.ts";
 import { agentKeyName, agentRef, isAgentRef, KEPT_NAME, KEPT_PREFIX, OWNER_PREFIX, secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
+import type { AnswerSpec } from "../core/execution.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { AgentLoginAnswer, Plugin, PluginContext, PluginDatabase, PluginNext, PromptPart, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead, ListedTools, TurnEnd } from "../plugins/types.ts";
 import type { TurnEndEvent } from "./activity.ts";
 import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
-import { answerSpecOf } from "./run-js-resume.ts";
+import { answerProblem, answerSpecOf } from "./run-js-resume.ts";
 import { keyedOperationId } from "./operation-id.ts";
 import type { PluginErrorFields, ToolSnapshot, Withdrawal } from "../plugins/types.ts";
 import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf, BRIDGE_TOOL, classifyRoute, isJsonContentType, policyKeyOf, refusalOf, stricter } from "../plugins/types.ts";
@@ -885,7 +886,25 @@ export class ToolGateway {
     let result = await this.invoke(ctx, req.tool, req.args, { approved: true, operationId });
     // An approved call that asks the model a question has nobody to ask: it
     // runs after a person's decision, not inside a model's tool call, so no
-    // token could reach the model. It is ended as a cancel would end it, and
+    // token could reach the model. A question that declares what a person's
+    // approval already answers (`ifApproved`, plugins/types.ts `Interrupt`: a
+    // reminder, not a decision — Raft's hold of a send for unread messages) is
+    // answered with that, ONCE, as the plugin's own resume under the same
+    // operation (so the same key: Raft dedups the send by its idempotencyKey).
+    // What the resume returns is the replay's result. A resume that asks again
+    // (the conversation moved again in between) is not answered a second time:
+    // no loop, and no retry anywhere else — `runApproved` is claimed once
+    // (`claimApprovalRun`), so this runs at most once per approval.
+    let answeredOnce = false;
+    if (result.status === "interrupted" && result.interrupt.ifApproved !== undefined) {
+      const i = result.interrupt;
+      const resumed = await this.resumeInterrupt(ctx, { alias: i.alias, tool: i.tool, state: i.state, ...(i.operationId !== undefined ? { operationId: i.operationId } : {}) }, i.ifApproved!);
+      answeredOnce = true;
+      result = resumed.status === "interrupted" || resumed.status === "rejected"
+        ? resumed
+        : { ...resumed, operationId } as ToolResult;
+    }
+    // Otherwise, or asked again, it is ended as a cancel would end it, and
     // recorded as what it was, a call that was not run (`cancelled`, so the
     // hold ends `failed` and the card does not say it ran): the question rides
     // back in the error, so the model sees what the tool found and can call it
@@ -897,12 +916,15 @@ export class ToolGateway {
       const reason = typeof why === "string" ? ` (${why})` : "";
       // The question (for Raft, the held messages themselves) goes to the agent in the error, which its notice
       // carries; the hold's `outcome` gets the reason alone (`approvalOutcome`), so it never reaches the card.
+      const asked = answeredOnce
+        ? `Approved, and the tool's first question before acting was answered for you once, as the approval already decided it; ` +
+          `it then asked again${reason}, which could not be put to you here, so nothing was done.`
+        : `Approved, but before acting the tool asked for a decision${reason} that could not be put to you here, so nothing was done.`;
       result = {
-        status: "cancelled", operationId: result.operationId,
+        status: "cancelled", operationId,
         error: {
           code: "asked_before_acting",
-          message: `Approved, but before acting the tool asked for a decision${reason} that could not be put to you here, ` +
-            `so nothing was done. Call it again if it still applies, which asks for a new approval. The question was:\n${i.question}`,
+          message: `${asked} Call it again if it still applies, which asks for a new approval. The question was:\n${i.question}`,
         },
       };
       await this.#store.completeOperation(tenantId, operationId, "cancelled", null, result as unknown as Json);
@@ -1698,6 +1720,11 @@ export class ToolGateway {
             // The operation the question belongs to rides with it, so its resume and its cancel are told the same
             // one (`resumeInterrupt`, `cancelInterrupt`), and so is a question the resume asks in turn.
             operationId: serves,
+            // The answer an approved replay gives for the agent (plugins/types.ts `Interrupt.ifApproved`), host-side like
+            // `state`. Carried only when the spec allows it: an answer the plugin itself would refuse is no answer, and
+            // the replay then records the call as not run, as it does a question that declares none.
+            ...(result.ifApproved !== undefined && answerProblem((spec as { spec: AnswerSpec }).spec, result.ifApproved) === null
+              ? { ifApproved: result.ifApproved } : {}),
           },
         };
       }

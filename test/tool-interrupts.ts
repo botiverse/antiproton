@@ -72,6 +72,15 @@ function sqlPlugin(db: Db): Plugin {
           state: { sql, step: "delete", secret: SECRET },
         });
       }
+      // A reminder, not a decision (`Interrupt.ifApproved`): an approved replay answers it "confirm" for the agent.
+      // `... TWICE` asks again when answered, as a Raft send does when the conversation moved again in between.
+      const truncate = /^\s*truncate\s+(\w+)(\s+twice)?\s*$/i.exec(sql);
+      if (truncate) {
+        return interrupt({
+          question: `Truncate ${truncate[1]}?`, answer: { choices: ["confirm", "cancel"] }, ifApproved: "confirm",
+          state: { sql: `DELETE FROM ${truncate[1]}`, step: truncate[2] ? "truncate-again" : "truncate", secret: SECRET },
+        });
+      }
       const drop = /^\s*drop\s+table\s+(\w+)\s*$/i.exec(sql);
       if (drop) {
         return interrupt({
@@ -85,7 +94,13 @@ function sqlPlugin(db: Db): Plugin {
       async resume(_tool, state, answer) {
         db.resumes.push({ state, answer });
         const s = state as { sql: string; step: string; table?: string };
-        if (s.step === "delete") return answer === "confirm" ? exec(s.sql) : { cancelled: true };
+        if (s.step === "delete" || s.step === "truncate") return answer === "confirm" ? exec(s.sql) : { cancelled: true };
+        if (s.step === "truncate-again") {
+          return interrupt({
+            question: `More rows arrived; truncate anyway?`, answer: { choices: ["confirm", "cancel"] }, ifApproved: "confirm",
+            state: { ...s, step: "truncate-again" },
+          });
+        }
         if (s.step === "drop-1") {
           if (answer !== true) return { kept: s.table! };
           return interrupt({
@@ -294,6 +309,62 @@ await check("a held call (confirm: true) that a person approves and that then as
     && /nothing was done/.test(decided.result.error.message) && /every row/.test(decided.result.error.message), `approved: ${JSON.stringify(decided)}`);
   must(!JSON.stringify(decided).includes(SECRET), "the plugin's state rode the completion");
   must(f.db.cancels.length === 1 && f.db.ran.length === 0, `nothing ran: ${JSON.stringify(f.db)}`);
+});
+
+await check("an approved call whose question declares ifApproved is answered once for the agent: resumed exactly once, ran once, executed", async () => {
+  const f = await fixture();
+  const pending: any = await f.gw.invoke(CTX, "db.query", { sql: "TRUNCATE users" }, { confirm: true });
+  must(pending.status === "pending", `held: ${JSON.stringify(pending)}`);
+  const decided: any = await f.gw.applyApproval("t", pending.operationId, "approved", "person");
+  // Stored state first: what outlives the turn says it ran, once.
+  const a: any = await f.store.getApproval("t", pending.operationId);
+  must(a?.state === "executed", `hold: ${JSON.stringify({ state: a?.state, outcome: a?.outcome })}`);
+  const op: any = await f.store.getOperation("t", pending.operationId);
+  must(op?.status === "succeeded", `operation: ${JSON.stringify(op?.status)}`);
+  must(f.db.resumes.length === 1 && f.db.resumes[0]!.answer === "confirm" && f.db.ran.length === 1 && f.db.cancels.length === 0,
+    `resumed once, ran once: ${JSON.stringify({ resumes: f.db.resumes.length, ran: f.db.ran, cancels: f.db.cancels.length })}`);
+  must(JSON.stringify(f.db.rows.get("users")) === "[]", `rows: ${JSON.stringify(f.db.rows.get("users"))}`);
+  must(decided.ok && decided.executed && decided.result.status === "succeeded" && decided.result.operationId === pending.operationId
+    && decided.result.result?.deleted === 3, `approved: ${JSON.stringify(decided)}`);
+  must(!JSON.stringify(decided).includes(SECRET), "the plugin's state rode the completion");
+});
+
+await check("an approved call answered once for the agent that asks AGAIN is not answered twice: not run, the second question cancelled", async () => {
+  const f = await fixture();
+  const pending: any = await f.gw.invoke(CTX, "db.query", { sql: "TRUNCATE users TWICE" }, { confirm: true });
+  must(pending.status === "pending", `held: ${JSON.stringify(pending)}`);
+  const decided: any = await f.gw.applyApproval("t", pending.operationId, "approved", "person");
+  const a: any = await f.store.getApproval("t", pending.operationId);
+  must(a?.state === "failed" && /^cancelled: asked_before_acting/.test(a.outcome?.summary ?? ""), `hold: ${JSON.stringify({ state: a?.state, outcome: a?.outcome })}`);
+  const op: any = await f.store.getOperation("t", pending.operationId);
+  must(op?.status === "cancelled", `operation: ${JSON.stringify(op?.status)}`);
+  must(f.db.resumes.length === 1, `resumed ${f.db.resumes.length} times, not once`);
+  must(f.db.ran.length === 0 && JSON.stringify(f.db.rows.get("users")) === "[1,2,3]", `nothing ran: ${JSON.stringify(f.db.ran)}`);
+  must(f.db.cancels.length === 1 && (f.db.cancels[0] as any).step === "truncate-again", `the second question cancelled: ${JSON.stringify(f.db.cancels)}`);
+  must(decided.ok && !decided.executed && decided.result.status === "cancelled" && decided.result.error?.code === "asked_before_acting"
+    && /answered for you once/.test(decided.result.error.message) && /asked again/.test(decided.result.error.message)
+    && /More rows arrived/.test(decided.result.error.message), `approved: ${JSON.stringify(decided)}`);
+  must(!JSON.stringify(decided).includes(SECRET), "the plugin's state rode the completion");
+});
+
+await check("an approval whose run has ended is never run again: runApproved answers null and nothing resumes or runs", async () => {
+  const f = await fixture();
+  const pending: any = await f.gw.invoke(CTX, "db.query", { sql: "TRUNCATE users" }, { confirm: true });
+  await f.gw.applyApproval("t", pending.operationId, "approved", "person");
+  must((await f.store.getApproval("t", pending.operationId) as any)?.state === "executed", "control: the first run executed");
+  must(f.db.resumes.length === 1 && f.db.ran.length === 1, `control: ${JSON.stringify({ resumes: f.db.resumes.length, ran: f.db.ran })}`);
+  const again = await f.gw.runApproved("t", pending.operationId);
+  must(again === null, `ran again: ${JSON.stringify(again)}`);
+  must(f.db.resumes.length === 1 && f.db.ran.length === 1, `ran again: ${JSON.stringify({ resumes: f.db.resumes.length, ran: f.db.ran })}`);
+});
+
+await check("ifApproved is host-side: a model's own call that asks it shows the question, never the answer the gateway would give", async () => {
+  const f = await fixture();
+  const out = await f.query.execute("c1", { sql: "TRUNCATE users" });
+  const y = body(out);
+  must(y.state === "yielded" && /Truncate users/.test(y.question), `yielded: ${JSON.stringify(y)}`);
+  must(!out.content[0].text.includes("ifApproved") && !JSON.stringify(out.details).includes("ifApproved"), `ifApproved reached the model: ${out.content[0].text}`);
+  must(f.db.ran.length === 0 && f.db.resumes.length === 0, "nothing answered for the model");
 });
 
 await check("resume after the mount was switched off is refused like a call, and nothing runs", async () => {

@@ -573,6 +573,31 @@ The decider is named by role: "your owner in Raft", "the Raft server's owner" or
 decision made on the antiproton console is named by its console sign-in. Raft user ids are never shown to the
 agent.
 
+## An approved call that asks before acting
+
+An approved call is replayed with no model reading it. Some tools ask the agent a question before they act (a
+plugin `Interrupt`): Raft's SDK holds a `messages_send` when the conversation has messages the agent has not seen
+(`unread_messages`). There is nobody to ask during a replay, so the gateway (`#runApproved`) does one of two things:
+
+- **The plugin declared `ifApproved`** (the answer a person's approval already gives): the gateway answers the
+  question with it, **once**, as the plugin's own resume of the same operation. For Raft that is only a send held
+  for unread messages: it is re-sent with the same `idempotencyKey` and with the hold's boundary as `seen.upToSeq`.
+  Raft dedups by the key, so the resume cannot send twice. If the resume is held again (more messages arrived in
+  between), it is not answered again: nothing is sent, the hold ends `failed` with `asked_before_acting` in
+  `outcome`, and the agent is told it was answered once and asked again. The decision (CTO and Raft platform
+  owner): the unread check is a reminder to the agent, not an authorization, and the owner has already decided.
+  `unseen_card`, `thread_target`, replies and task writes declare nothing.
+- **Nothing declared**: the call is not run. The question is cancelled, the operation ends `cancelled`, the hold
+  ends `failed` with `asked_before_acting`, and the agent is shown the question so it can call again.
+
+What this costs in the record: Raft's send record reads as if the agent attested the boundary (`seenUpToSeq`),
+while it was the owner who decided. The source for who decided is the approval record (`decidedBy`), not the send.
+Nothing is booked into the agent's saved seen-frontier, because nobody looked: a resume with no model context
+(`caller.contextId` absent) records no reads.
+
+Not yet verified in production: that an approved send is delivered exactly once end to end. The tests cover the
+gateway (one resume, then not run) and the plugin (same key, the boundary passed, nothing booked).
+
 ## Failure modes
 
 | What fails | What happens |
