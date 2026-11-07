@@ -682,6 +682,8 @@ function raftServer(o: { latest: number; notShown?: number }) {
   const messages: Array<{ seq: number; content: string; sender: string }> = [];
   for (let seq = 1; seq <= o.latest; seq++) messages.push({ seq, content: `earlier ${seq}`, sender: "tygg" });
   const sends: any[] = [];
+  /** What each send attempt was answered: "held:<reason>" or "sent". */
+  const answers: string[] = [];
   const other: string[] = [];
   const latest = () => messages.at(-1)?.seq ?? 0;
   globalThis.fetch = (async (url: any, init?: any) => {
@@ -690,10 +692,11 @@ function raftServer(o: { latest: number; notShown?: number }) {
     const b = JSON.parse(String(init?.body ?? "{}"));
     sends.push(b);
     const done = committed.find((c) => c.idempotencyKey === b.idempotencyKey);
-    if (done) return json(200, { ok: true, state: "sent", messageId: `m-${done.seq}`, messageSeq: done.seq });
+    if (done) { answers.push("sent"); return json(200, { ok: true, state: "sent", messageId: `m-${done.seq}`, messageSeq: done.seq }); }
     const seen = typeof b.seenUpToSeq === "number" ? b.seenUpToSeq : 0;
     if (seen < latest()) {
       const unread = messages.filter((m) => m.seq > seen).slice(-1);
+      answers.push("held:unread_messages");
       return json(200, {
         ok: true, state: "held", newMessageCount: unread.length + (o.notShown ?? 0), seenUpToSeq: latest(), omittedMessageCount: 0, freshnessContextMode: "inline",
         heldMessages: unread.map((m) => ({ seq: m.seq, id: `abcdef${m.seq}-0000`, content: m.content, sender_type: "human", sender_name: m.sender,
@@ -703,10 +706,11 @@ function raftServer(o: { latest: number; notShown?: number }) {
     const seq = latest() + 1;
     messages.push({ seq, content: String(b.content), sender: "agent" });
     committed.push({ seq, content: String(b.content), idempotencyKey: String(b.idempotencyKey), sender: "agent" });
+    answers.push("sent");
     return json(200, { ok: true, state: "sent", messageId: `m-${seq}`, messageSeq: seq });
   }) as any;
   return {
-    sends, committed, other, latest,
+    sends, answers, committed, other, latest,
     /** A person posts in #general, outside any agent: the conversation moves on. */
     post(content: string) { messages.push({ seq: latest() + 1, content, sender: "owner" }); },
   };
@@ -730,6 +734,8 @@ await check("raft, end to end: a confirm:true send, the owner posts after the ca
   must(op?.status === "succeeded", `operation: ${JSON.stringify(op?.status)}`);
   must(server.committed.length === 1 && server.committed[0]!.content === "shipping it" && server.committed[0]!.idempotencyKey === "k-e2e",
     `committed once: ${JSON.stringify(server.committed)}`);
+  // Precondition: the replay's first attempt really was held for unread messages, else this proves nothing.
+  must(JSON.stringify(server.answers) === JSON.stringify(["held:unread_messages", "sent"]), `held, then sent: ${JSON.stringify(server.answers)}`);
   must(server.sends.length === 2 && server.sends.every((b) => b.idempotencyKey === "k-e2e"), `two attempts, one key: ${JSON.stringify(server.sends)}`);
   must(server.sends[0].seenUpToSeq === undefined && server.sends[1].seenUpToSeq === 21, `the resume attests the boundary of the replay's hold (21, the owner's message): ${JSON.stringify(server.sends)}`);
   must(decided.ok && decided.executed && decided.result.status === "succeeded", `approved: ${JSON.stringify(decided)}`);
@@ -746,6 +752,7 @@ await check("raft, end to end: an approved send held with more unread than the h
   const decided: any = await f.gw.applyApproval("t", pending.operationId, "approved", "person");
   const a: any = await f.store.getApproval("t", pending.operationId);
   must(a?.state === "executed", `hold: ${JSON.stringify({ state: a?.state, outcome: a?.outcome, sends: server.sends })}`);
+  must(JSON.stringify(server.answers) === JSON.stringify(["held:unread_messages", "sent"]), `held, then sent: ${JSON.stringify(server.answers)}`);
   must(server.committed.length === 1 && server.sends.length === 2 && server.sends[1].seenUpToSeq === 21, `once, at 21: ${JSON.stringify(server.sends)}`);
   must(decided.ok && decided.executed, `approved: ${JSON.stringify(decided)}`);
 });
