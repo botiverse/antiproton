@@ -154,7 +154,7 @@ needs the raw arguments.
 | `args.redactions` | How many credential-looking values were replaced with `<redacted:KIND>`. This is the transcript exports' redaction, using the agent's own sealed values and the known credential shapes. |
 | `args.truncated` | The summary was cut. |
 | `args.withheld` | The agent's sealed values could not be opened. The summary is empty and `route` is `null`: nothing is shown rather than something unredacted. |
-| `outcome` | Once an approved call's run has ended (`executed` or `failed`): `{summary, truncated, redactions, withheld}`, the run's result or error, redacted and bounded like `args`. Otherwise `null`. The full result goes to the agent only. |
+| `outcome` | Once an approved call's run has ended (`executed` or `failed`): `{summary, truncated, redactions, withheld}`, metadata only, for every tool: the status, the error's code, and for a call that asked before acting the reason it asked (`succeeded; the result went to the agent`, `failed: policy_denied`, `cancelled: asked_before_acting (unread_messages); nothing was done`). Never what the tool returned or said, since whoever decides need not be able to see what the call read or where it wrote (Raft contract, slock #13438). Otherwise `null`. The full result goes to the agent only, in its notice. |
 | `heldBy` | `policy`: the mount's policy holds this tool. `agent`: the agent asked for a person itself. |
 | `policyKey` | For a bridged call, the second policy name the call was decided under, or `null`. |
 | `route` | For a bridged request: `method`, `path`, `repo` and `pr` when known, `contentType`, and `body`, redacted and cut at the card limit (with `bodyTruncated` and `bodySize`). Otherwise `null`. |

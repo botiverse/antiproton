@@ -99,7 +99,7 @@ export function outcomeSummary(text: string, redact: Redact): { summary: string;
 
 /** The one-line description of what deciding does, or what was decided. */
 export function approvalDescription(a: { status: ApprovalState; mount: string; tool: string; service: string | null; action: string | null;
-  route: Json | null; expiresAt: string | null; delivery?: { outcome: ApprovalDelivery["outcome"] } | null }): string {
+  route: Json | null; expiresAt: string | null; delivery?: { outcome: ApprovalDelivery["outcome"] } | null; outcome?: { summary: string } | null }): string {
   const what = a.service && a.action ? `${a.service} ${a.action} (${a.mount}.${a.tool})` : `${a.mount}.${a.tool}`;
   const route = a.route && typeof a.route === "object" ? a.route as Record<string, unknown> : null;
   const via = route ? `, sending ${String(route.method ?? "")} ${String(route.path ?? "")}` : "";
@@ -109,6 +109,12 @@ export function approvalDescription(a: { status: ApprovalState; mount: string; t
   }
   if (a.status === "approved") return `Approved: ${what} is being run once, as shown; the agent is told the result when it ends.`;
   if (a.status === "executed") return `Approved and executed: ${what} was run once, as shown, and the agent was told the result.`;
+  // An approved call that asked before acting was never run (src/runtime/gateway.ts, `asked_before_acting`): said so,
+  // not worded as a run that failed.
+  if (a.status === "failed" && a.outcome?.summary.startsWith("cancelled: asked_before_acting")) {
+    return `Approved, but not run: before acting, ${what} asked a question nobody could answer here, so nothing was done, and the agent was told. ` +
+      "Running it now needs a new approval.";
+  }
   if (a.status === "failed") return `Approved, but the run failed: ${what} did not succeed, and the agent was told why.`;
   if (a.status === "denied") return `Denied: ${what} was not run, and the agent was told.`;
   // As recorded now, unlike the agent's notice, which says what was recorded when the hold expired.
@@ -216,8 +222,9 @@ export const AUDIT_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
  * The item's fields a deleted agent's copy drops: the free text of what was asked (the arguments' summary, a bridged
  * request's body), the agent's to keep. Kept: the route's method, path, repository and pull request, which say what
  * the decision applied to; `outcome`, which tells `policy_denied` from a failed run; and the description, built from
- * the mount, tool and route alone. `outcome` is the run's result or error, redacted and bounded (`outcomeSummary`), and
- * can still carry free text of the result's own.
+ * the mount, tool and route alone. `outcome` is the run's status and error code only
+ * (src/runtime/approval-notice.ts `approvalOutcome`), redacted and bounded (`outcomeSummary`); rows written before that
+ * change can still carry free text of the result's own.
  */
 const AUDIT_DROPS = "'$.args', '$.route.body'";
 /** When the row's agent was deleted, by the registry; null for a live agent. Correlated on `provider_approvals`. */

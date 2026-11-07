@@ -801,18 +801,18 @@ export class ToolGateway {
    * Run one approved call and end its hold: `executed` when the call succeeded (or went to the background), `failed`
    * otherwise. Null when the run was not this caller's to take (`claimApprovalRun`): taken already, or not approved.
    */
-  async runApproved(tenantId: string, operationId: string): Promise<{ executed: boolean; result: ToolResult } | null> {
+  async runApproved(tenantId: string, operationId: string): Promise<{ executed: boolean; result: ToolResult; asked?: string } | null> {
     if (!(await this.#store.claimApprovalRun(tenantId, operationId, Date.now()))) return null;
     const a = await this.#store.getApproval(tenantId, operationId);
     if (!a) return null;
-    let r0: { executed: boolean; result: ToolResult };
+    let r0: { executed: boolean; result: ToolResult; asked?: string };
     try {
       r0 = await this.#runApproved(tenantId, operationId, a);
     } catch (e) {
       // The run threw past the gateway's own handling: it is ended as failed, saying so, rather than left approved.
       r0 = { executed: false, result: { status: "failed", operationId, error: { code: "run_failed", message: String((e as Error)?.message ?? e).slice(0, 300) } } };
     }
-    const out = approvalOutcome(r0.result);
+    const out = approvalOutcome(r0.result, r0.asked);
     await this.#store.finishApproval(tenantId, operationId, out.state, { summary: out.summary }, approvedNotice(a, r0.result));
     return r0;
   }
@@ -859,7 +859,7 @@ export class ToolGateway {
     return done;
   }
 
-  async #runApproved(tenantId: string, operationId: string, a: ApprovalRecord): Promise<{ executed: boolean; result: ToolResult }> {
+  async #runApproved(tenantId: string, operationId: string, a: ApprovalRecord): Promise<{ executed: boolean; result: ToolResult; asked?: string }> {
     const req = a.request as { tool: string; args: Json };
     const ctx: CallContext = { tenantId, agentId: a.agentId, taskId: a.taskId };
     // A model-only tool (`ToolSchema.modelOnly`) run here runs with no model reading the result, which is the one
@@ -886,19 +886,27 @@ export class ToolGateway {
     // An approved call that asks the model a question has nobody to ask: it
     // runs after a person's decision, not inside a model's tool call, so no
     // token could reach the model. It is ended as a cancel would end it, and
-    // the question rides back as the result, so the model sees what the tool
-    // found and can call it again. Its `state` never leaves this function.
+    // recorded as what it was, a call that was not run (`cancelled`, so the
+    // hold ends `failed` and the card does not say it ran): the question rides
+    // back in the error, so the model sees what the tool found and can call it
+    // again. Its `state` never leaves this function.
     if (result.status === "interrupted") {
       const i = result.interrupt;
       await this.cancelInterrupt(ctx, i);
+      const why = i.context && typeof i.context === "object" && !Array.isArray(i.context) ? (i.context as Record<string, Json>).reason : undefined;
+      const reason = typeof why === "string" ? ` (${why})` : "";
+      // The question (for Raft, the held messages themselves) goes to the agent in the error, which its notice
+      // carries; the hold's `outcome` gets the reason alone (`approvalOutcome`), so it never reaches the card.
       result = {
-        status: "succeeded", operationId: result.operationId,
-        result: {
-          state: "interrupted", question: i.question, ...(i.context !== undefined ? { context: i.context } : {}),
-          note: "Approved, but before acting the tool asked for a decision that could not be put to you here, " +
-            "so nothing was done. Call it again if it still applies.",
+        status: "cancelled", operationId: result.operationId,
+        error: {
+          code: "asked_before_acting",
+          message: `Approved, but before acting the tool asked for a decision${reason} that could not be put to you here, ` +
+            `so nothing was done. Call it again if it still applies, which asks for a new approval. The question was:\n${i.question}`,
         },
       };
+      await this.#store.completeOperation(tenantId, operationId, "cancelled", null, result as unknown as Json);
+      return { executed: false, result, ...(typeof why === "string" ? { asked: why } : {}) };
     }
     // A replay the gateway refused (a route the table refuses now, a request it no longer takes) never ran: recorded
     // as the refusal it was, not as a failure of something that ran.

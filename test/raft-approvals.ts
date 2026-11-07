@@ -21,7 +21,7 @@ import { d1ProviderTokens } from "../cf/src/control-plane.ts";
 import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts";
 import { sessionCookieFor } from "../cf/src/auth.ts";
 import { PROVIDER_HOME } from "../cf/src/provision/steps.ts";
-import { verifyHint, signHint, importSigningKey, hintKeyId, SIGNATURE_HEADER, TIMESTAMP_HEADER, hintTarget, publishBackoffMs } from "../cf/src/approvals.ts";
+import { verifyHint, signHint, importSigningKey, hintKeyId, SIGNATURE_HEADER, TIMESTAMP_HEADER, hintTarget, publishBackoffMs, approvalDescription } from "../cf/src/approvals.ts";
 import { expiredNotice } from "../src/runtime/approval-notice.ts";
 import { DurableObjectStore } from "../src/store/durable-object.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
@@ -338,6 +338,33 @@ await check("decide: an approved call whose run fails ends failed, with its erro
   must(!listed.text.includes(LEAKED), "the outcome or the arguments carry the credential");
 });
 
+await check("outcome: what an approved run gave back or said never reaches the card or the record, only its status and code; the agent's notice has it", async () => {
+  const w = await world();
+  const MARK = "MARKER-only-in-the-result-7f3a";
+  // A first approved write leaves the marker in the agent's state (the card shows a held call's arguments by design).
+  const put = await hold(w, MARK);
+  must((await decide(w, put, "approve")).status === 200, "decide put");
+  await w.D.alarm();
+  // A second hold, rewritten to read it back: its run returns the marker, which only the agent may see.
+  const get = await hold(w, "x");
+  w.raw.sql.exec("UPDATE approvals SET request = ? WHERE operation_id = ?", JSON.stringify({ tool: "state.get", args: { key: "plan" }, heldBy: "policy" }), get);
+  must((await decide(w, get, "approve")).status === 200, "decide get");
+  await w.D.alarm();
+  const r = row(w, get);
+  must(r.state === "executed" && JSON.parse(r.outcome).summary === "succeeded; the result went to the agent", `stored: ${show({ state: r.state, outcome: r.outcome })}`);
+  must(String(r.notice ?? "").includes(MARK), `control: the agent's notice carries the result: ${String(r.notice ?? "").slice(0, 200)}`);
+  // And a run that fails with the marker in its error's sentence: the code is kept, the sentence is not.
+  const bad = await hold(w, "y");
+  w.raw.sql.exec("UPDATE approvals SET request = ? WHERE operation_id = ?", JSON.stringify({ tool: `state.${MARK}`, args: {}, heldBy: "policy" }), bad);
+  must((await decide(w, bad, "approve")).status === 200, "decide bad");
+  await w.D.alarm();
+  const f = row(w, bad);
+  must(f.state === "failed" && /^[a-z]+: [A-Za-z0-9_.:-]+$/.test(JSON.parse(f.outcome).summary) && !f.outcome.includes(MARK), `stored failure: ${show({ state: f.state, outcome: f.outcome })}`);
+  const listed = await call(w, "GET", `agents/${A}/approvals`);
+  const items = listed.body.approvals.filter((a: any) => a.operationId === get || a.operationId === bad);
+  must(items.length === 2 && items.every((a: any) => !JSON.stringify(a.outcome).includes(MARK) && !String(a.description).includes(MARK)), `the card: ${listed.text.slice(0, 600)}`);
+});
+
 await check("decide: a run the object stopped during is ended failed after the grace, and never run again", async () => {
   const w = await world();
   const op = await hold(w);
@@ -634,6 +661,14 @@ await check("wording: no notice, description, error or doc says an expired hold 
   }
   must(texts.every((t) => !t.includes("denied as expired") && !t.includes("denied as `expired`")), texts.find((t) => t.includes("denied as"))?.slice(0, 300) ?? "");
   must(late.status === 409 && late.body.error.message.includes("nothing was run"), late.text);
+});
+
+await check("description: an approved call that asked before acting says it was not run, not that the run failed or that it ran", () => {
+  const base = { status: "failed" as const, mount: "raft", tool: "messages_send", service: null, action: null, route: null, expiresAt: null };
+  const asked = approvalDescription({ ...base, outcome: { summary: "cancelled: asked_before_acting: Approved, but before acting …" } });
+  must(asked.startsWith("Approved, but not run:") && asked.includes("nothing was done") && !/executed|run once|failed/.test(asked), asked);
+  const ran = approvalDescription({ ...base, outcome: { summary: "failed: boom: it broke" } });
+  must(ran.startsWith("Approved, but the run failed"), ran);
 });
 
 await check("hand-off: the approval.requested hint is recorded accepted, failed, or not_sent when this deployment has no hint channel", async () => {
