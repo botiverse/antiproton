@@ -1538,6 +1538,11 @@ async function heldCall(
     state: {
       op: op.name, args: { ...input, ...key, ...confirmed } as Json, heldAt, reason,
       ...(go === "send" && attested && held.seenUpToSeq !== null ? { seen: { upToSeq: held.seenUpToSeq } } : {}),
+      // The boundary an approved replay's answer sends with (`ifApproved`), kept apart from `seen`: Raft's boundary
+      // for this hold whether or not the question showed every new message, since nobody reads it either way and the
+      // owner's approval is the decision. A model's own answer never uses it (`interrupts.resume`: only with no model
+      // context), so a model is never made to attest messages it was not shown.
+      ...("ifApproved" in ifApproved && held.seenUpToSeq !== null ? { approvedSeen: { upToSeq: held.seenUpToSeq } } : {}),
       ...(attested || cards ? {
         attest: {
           target: held.target,
@@ -3481,7 +3486,9 @@ export function createRaftPlugin(deps: {
           if (cards) seen.recordCardsShown(attest.target, cards);
           await raft.state.save();
         }
-        const seen = object(s.seen);
+        // An approved replay's answer (no model context) sends with Raft's boundary for the hold (`approvedSeen`); a
+        // model's answer only with what its question showed (`seen`).
+        const seen = typeof ctx.caller.contextId !== "string" && s.approvedSeen !== undefined ? object(s.approvedSeen) : object(s.seen);
         let result: Json | Interrupt;
         try {
           result = await operate(op, s.args, ctx, {

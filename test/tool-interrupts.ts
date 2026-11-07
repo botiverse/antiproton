@@ -677,7 +677,7 @@ await check("a plugin writes only its own trace kinds: a kernel kind, or the ret
  * for `unread_messages` unless it attests (`seenUpToSeq`) the latest seq, answered with the latest seq as its boundary
  * at the time it is held, and an idempotencyKey that commits a message once. Every send attempt is kept as sent.
  */
-function raftServer(o: { latest: number }) {
+function raftServer(o: { latest: number; notShown?: number }) {
   const committed: Array<{ seq: number; content: string; idempotencyKey: string; sender: string }> = [];
   const messages: Array<{ seq: number; content: string; sender: string }> = [];
   for (let seq = 1; seq <= o.latest; seq++) messages.push({ seq, content: `earlier ${seq}`, sender: "tygg" });
@@ -695,7 +695,7 @@ function raftServer(o: { latest: number }) {
     if (seen < latest()) {
       const unread = messages.filter((m) => m.seq > seen).slice(-1);
       return json(200, {
-        ok: true, state: "held", newMessageCount: unread.length, seenUpToSeq: latest(), omittedMessageCount: 0, freshnessContextMode: "inline",
+        ok: true, state: "held", newMessageCount: unread.length + (o.notShown ?? 0), seenUpToSeq: latest(), omittedMessageCount: 0, freshnessContextMode: "inline",
         heldMessages: unread.map((m) => ({ seq: m.seq, id: `abcdef${m.seq}-0000`, content: m.content, sender_type: "human", sender_name: m.sender,
           channel_name: "general", channel_type: "channel", timestamp: "2026-09-28T10:00:00Z" })),
       });
@@ -733,6 +733,21 @@ await check("raft, end to end: a confirm:true send, the owner posts after the ca
   must(server.sends.length === 2 && server.sends.every((b) => b.idempotencyKey === "k-e2e"), `two attempts, one key: ${JSON.stringify(server.sends)}`);
   must(server.sends[0].seenUpToSeq === undefined && server.sends[1].seenUpToSeq === 21, `the resume attests the boundary of the replay's hold (21, the owner's message): ${JSON.stringify(server.sends)}`);
   must(decided.ok && decided.executed && decided.result.status === "succeeded", `approved: ${JSON.stringify(decided)}`);
+});
+
+await check("raft, end to end: an approved send held with more unread than the hold shows still goes out once, at Raft's boundary", async () => {
+  const f = await raftFixture();
+  // Raft holds counting 3 more new messages than it shows or reports omitted: the question is incomplete
+  // (`contextComplete: false`), so the SDK attests nothing for a model.
+  const server = raftServer({ latest: 20, notShown: 3 });
+  const pending: any = await f.gw.invoke(CTX, "raft.messages_send", { target: "#general", content: "shipping it", idempotencyKey: "k-omit" }, { confirm: true });
+  must(pending.status === "pending", `held: ${JSON.stringify(pending)}`);
+  server.post("one more thing");
+  const decided: any = await f.gw.applyApproval("t", pending.operationId, "approved", "person");
+  const a: any = await f.store.getApproval("t", pending.operationId);
+  must(a?.state === "executed", `hold: ${JSON.stringify({ state: a?.state, outcome: a?.outcome, sends: server.sends })}`);
+  must(server.committed.length === 1 && server.sends.length === 2 && server.sends[1].seenUpToSeq === 21, `once, at 21: ${JSON.stringify(server.sends)}`);
+  must(decided.ok && decided.executed, `approved: ${JSON.stringify(decided)}`);
 });
 
 await check("raft: resume \"drop\" sends nothing, and an answer outside send/drop is refused with the same token", async () => {
