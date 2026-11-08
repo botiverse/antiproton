@@ -152,7 +152,7 @@ const OWN = ["receive_events", "enable_push", "disable_push", "push_status", "in
  * by a snapshot that lists them, never by the no-snapshot fallback (test/raft-assistant.ts and
  * test/raft-assistant-mode.ts hold them).
  */
-const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages", "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner", "assistant_reminder", "note_decision"];
+const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages", "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner", "assistant_forward_as_owner", "assistant_search_forward_targets", "assistant_reminder", "note_decision"];
 /** The image view: hand-written, and offered exactly where the download is (test/raft-attachments-view.ts holds it). */
 const VIEW = "attachments_view";
 /** The upload: hand-written, offered with storage to a credential holding `send` (test/raft-attachments-upload.ts holds it). */

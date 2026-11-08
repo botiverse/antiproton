@@ -1166,6 +1166,36 @@ answered its read by name with (200 for any answer), null when Raft was not aske
 the message, a name or an id. The trace export forwards only the fields the receiver keeps, which do not
 include these five yet.
 
+When the owner explicitly asks the assistant to forward messages somewhere, it does so with
+`assistant_forward_as_owner`, and finds a destination they named with `assistant_search_forward_targets`,
+both offered in the chat only and listed exactly where `assistant_send_as_owner` is: Raft's
+`POST /assistant/forward-as-owner` and `GET /assistant/forward-targets` (SDK 0.33.0
+`routes.assistant.forwardAsOwner` / `searchForwardTargets`), which forward the way the owner forwards in
+the web, to 1-10 destinations at once, and send the owner one receipt with an undo, so the assistant
+sends no confirmation of its own. Raft enforces the owner's switch for sending as them, and their DM
+setting. The body is the model's `messages`, `to` (each `{ to }`, or `{ to, join: true }` for a public
+channel the owner has not joined) and `note`, never `dryRun` (the prompt says to forward straight away, so
+the tool does not offer it), and a `requestId` the plugin derives: a hash of
+the turn (`caller.turnId`) and the sorted message ids, as a UUID, so every call in one reply that
+forwards the same messages carries the same id and a retry after fixing failed destinations never sends
+twice, while the owner asking again in a later reply is a new forward. Code keeps, whatever the model
+does: a call from a check or the brief, from any session but the chat, or from a program is refused
+before anything is read, each in its own words; with no owner kept, refused before Raft is asked; one
+request per call, never retried. Raft's answer reaches the model as Raft sent it: each destination's
+result whole (`status`, `code`, `error`, `link`, `joined`, `createsDm`, `warnings`), a refusal of the whole forward with its status, code and `error` (a 5xx or no answer is
+`uncertain`), and the search's `targets`, `omitted` and `omittedReason`. A call writes a
+`raft.assistant_forward_as_owner` log line of counts and Raft's status and code, and a trace row of the
+same kind (not forwarded) that also carries, for a forward that reached Raft, its `request_id`, each
+destination's status, code, channel and message ids (`destination_results`, `sent_message_ids`), and
+whether the reply read a conversation other than the forwarded messages' own before it
+(`after_foreign_read`). What the reply read is noted per turn (`read_in_turn`, ids only): each owner
+conversation read with `assistant_owner_messages` and the message ids it showed, the inbox's rows, and a
+count of `messages_read` calls on the assistant's own credential. The source is the conversation whose
+read or inbox row in this reply showed a forwarded message's id; when one was not shown, the source is
+not known (`source_known: false`) and every conversation read counts as foreign. Inbox reads are counted
+apart (`inbox_reads`), never as foreign. Two reads at once may each write over the other's note, so the
+row can under-count. Never a message, the note, a destination's name, a link or Raft's text.
+
 An assistant's one Raft app is the Reminder app (Raft offers an assistant no other, slock#10764), used
 through `assistant_reminder`, offered in the chat only (`src/plugins/raft-assistant-reminder.ts`) and
 built on the Raft SDK's `raft.integrations` (SDK 0.29). It takes an `action` and its `params`, nothing
