@@ -2429,6 +2429,118 @@ function forwardTo(value: unknown): ForwardTo[] | null {
   return out;
 }
 
+// ---- what the owner's chat read in this reply, for the forward's trace row -------------------------------------------
+
+/**
+ * What the owner's chat read in the current turn (`caller.turnId`), kept so each forward's trace row can say whether the
+ * reply read any conversation other than the forwarded messages' own before forwarding: a model that read injected text
+ * in one conversation and then forwarded in the same reply is what the row lets us count. Ids only, never content:
+ * - `reads`: each owner conversation read with `assistant_owner_messages`, by its channelId, with the message ids that
+ *   read showed (full and short, lowercased), so a forwarded message can be traced to the conversation it was read in;
+ * - `listed`: the same for the owner inbox's rows (each row's conversation and the ids it names), used only to find a
+ *   forwarded message's conversation; an inbox read counts in `inbox` and is never a conversation read here, though its
+ *   previews are other people's words too (the row says how many there were, so they can be counted apart);
+ * - `own`: reads on the assistant's own credential (`messages_read`), which for an assistant reach only its DM with
+ *   its owner: counted, never named.
+ * Only the chat's reads (`CHAT_SESSION`) are noted, where the forward runs. One record, replaced when a call carries
+ * another turn: never more than the current reply's. Bounded per conversation
+ * and in conversations; past the bound a new conversation is counted in `more`, never dropped silently. Kept only on a
+ * mount that offers the forward, and never failing the read it notes. Two reads running at once may each write over
+ * the other's note; the row then under-counts, which its readers are told (docs/plugins.md).
+ */
+export const READ_IN_TURN_KEY = "read_in_turn";
+type ReadIds = { c: string; ids: string[] };
+type ReadInTurn = { turn: string; reads: ReadIds[]; listed: ReadIds[]; inbox: number; own: number; more: number };
+/** The most conversations a turn's record keeps, the most ids per conversation, and how many of them a trace row names. */
+export const READ_IN_TURN_CONVERSATIONS = 50;
+const READ_IN_TURN_IDS = 200;
+export const FOREIGN_READS_SHOWN = 10;
+
+/** One read to note: an owner conversation and the ids it showed, an inbox page's rows, or a read on the agent's own credential. */
+export type TurnRead = { kind: "messages"; channelId: string; ids: readonly string[] } | { kind: "inbox"; rows: readonly ReadIds[] } | { kind: "own" };
+
+async function readInTurn(ctx: PluginContext, turn: string): Promise<ReadInTurn> {
+  const kept = await ctx.db.get(ASSISTANT_STORE, READ_IN_TURN_KEY) as Partial<ReadInTurn> | undefined;
+  if (!kept || kept.turn !== turn) return { turn, reads: [], listed: [], inbox: 0, own: 0, more: 0 };
+  const list = (v: unknown): ReadIds[] => Array.isArray(v) ? v.filter((r): r is ReadIds => !!r && typeof r.c === "string" && Array.isArray(r.ids)) : [];
+  const n = (v: unknown) => (typeof v === "number" && v >= 0 ? v : 0);
+  return { turn, reads: list(kept.reads), listed: list(kept.listed), inbox: n(kept.inbox), own: n(kept.own), more: n(kept.more) };
+}
+
+/** `ids` of conversation `c` merged into `into`, both bounded; true when the conversation is new and past the bound. */
+function mergeRead(into: ReadIds[], c: string, ids: readonly string[]): boolean {
+  const key = c.toLowerCase();
+  const fresh = ids.filter((i) => typeof i === "string" && i).map((i) => i.toLowerCase());
+  const at = into.find((r) => r.c === key);
+  if (at) { at.ids = [...new Set([...at.ids, ...fresh])].slice(-READ_IN_TURN_IDS); return false; }
+  if (into.length >= READ_IN_TURN_CONVERSATIONS) return true;
+  into.push({ c: key, ids: [...new Set(fresh)].slice(-READ_IN_TURN_IDS) });
+  return false;
+}
+
+/** Note one read of the owner's chat in the current turn (`READ_IN_TURN_KEY`). Never throws. */
+export async function noteReadInTurn(ctx: PluginContext, read: TurnRead): Promise<void> {
+  const turn = ctx.caller.turnId;
+  // The chat's reads alone: a check's, in a short session of its own, would replace the chat's record mid-reply.
+  if (!turn || ctx.caller.taskId !== CHAT_SESSION || !ctx.offered?.includes(FORWARD_AS_OWNER_TOOL)) return;
+  try {
+    const r = await readInTurn(ctx, turn);
+    if (read.kind === "messages") { if (mergeRead(r.reads, read.channelId, read.ids)) r.more++; }
+    else if (read.kind === "inbox") { r.inbox++; for (const row of read.rows) mergeRead(r.listed, row.c, row.ids); }
+    else r.own++;
+    await ctx.db.put(ASSISTANT_STORE, r as unknown as Json, READ_IN_TURN_KEY);
+  } catch { /* a note is never worth a failed read */ }
+}
+
+/**
+ * What the forward's trace row says of this reply's reads, for the forwarded `messages`. A forwarded message's
+ * conversation (its source) is the one whose read, or inbox row, in this turn showed its id (a short id matches the
+ * full one it begins); Raft does not say it. When every forwarded message was found, the foreign reads are the
+ * conversations read other than those; when one was not (it was forwarded by an id read in an earlier reply, or given
+ * by the owner), the source is not known and every conversation read counts as foreign, so the flag errs towards
+ * true. A conversation past the record's bound counts as foreign too. Without a turn nothing can be said (`reads_known`
+ * false, the flag false).
+ */
+export async function forwardReads(ctx: PluginContext, messages: readonly string[]): Promise<{
+  reads_known: boolean; source_known: boolean; after_foreign_read: boolean; foreign: string[]; foreign_count: number; sources: string[]; inbox: number; own: number;
+}> {
+  const turn = ctx.caller.turnId;
+  if (!turn) return { reads_known: false, source_known: false, after_foreign_read: false, foreign: [], foreign_count: 0, sources: [], inbox: 0, own: 0 };
+  const r = await readInTurn(ctx, turn).catch(() => null);
+  if (!r) return { reads_known: false, source_known: false, after_foreign_read: false, foreign: [], foreign_count: 0, sources: [], inbox: 0, own: 0 };
+  const sources = new Set<string>();
+  let found = 0;
+  for (const m of messages.map((x) => x.trim().toLowerCase())) {
+    const at = [...r.reads, ...r.listed].filter((x) => x.ids.some((i) => i === m || i.startsWith(m) || m.startsWith(i)));
+    if (at.length) found++;
+    for (const x of at) sources.add(x.c);
+  }
+  const source_known = messages.length > 0 && found === messages.length;
+  const foreign = r.reads.map((x) => x.c).filter((c) => !source_known || !sources.has(c));
+  const foreign_count = foreign.length + r.more;
+  return { reads_known: true, source_known, after_foreign_read: foreign_count > 0, foreign, foreign_count, sources: [...sources], inbox: r.inbox, own: r.own };
+}
+
+/** Raft's code as a trace row keeps it: a code's shape, or nothing. */
+const TRACE_CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/**
+ * One destination's result as the forward's trace row keeps it: its status and Raft's code, and the ids, so a
+ * retraction on Raft's side can be joined to it later (`message_id`, `channel_id`), each only in an id's shape; never
+ * the destination as named (`to`), the link, Raft's error text or a warning.
+ */
+function traceResult(r: unknown): Record<string, string | boolean> {
+  const o = r && typeof r === "object" && !Array.isArray(r) ? r as Record<string, unknown> : {};
+  const id = (v: unknown) => (typeof v === "string" && UUID.test(v) ? v.toLowerCase() : null);
+  const out: Record<string, string | boolean> = { status: typeof o.status === "string" && TRACE_CODE.test(o.status) ? o.status : "other" };
+  if (typeof o.code === "string" && TRACE_CODE.test(o.code)) out.code = o.code;
+  if (id(o.channelId)) out.channel_id = id(o.channelId)!;
+  if (id(o.messageId)) out.message_id = id(o.messageId)!;
+  if (o.joined === true) out.joined = true;
+  if (o.createsDm === true) out.creates_dm = true;
+  return out;
+}
+
 /**
  * The forward tool, for the owner's chat alone. Code holds, whatever the model does:
  * - only the model's own call in the owner's chat (`notInOwnerChat`), refused before anything is read; the tool is not
@@ -2437,45 +2549,61 @@ function forwardTo(value: unknown): ForwardTo[] | null {
  * - one request to Raft per call, never retried here, under the reply's own `requestId` (`forwardRequestId`);
  * - what Raft answers reaches the model as Raft said it: each destination's result whole, and a refusal of the whole
  *   forward with its status, code and `error`, never reworded.
- * Its log line counts the messages, destinations and results, with Raft's status and code: never an id, a name or the note.
+ * Its log line counts the messages, destinations and results, with Raft's status and code: never an id, a name or the
+ * note. Its trace row (`raft.assistant_forward_as_owner`) says the same, and for a forward that reached Raft also the
+ * requestId, each destination's status, code and ids (`traceResult`), and what this reply read before it
+ * (`forwardReads`): conversation ids and counts only, never content, a name or the note.
  */
 export async function forwardAsOwner(args: unknown, ctx: PluginContext, deps: ForwardDeps): Promise<Json> {
   const a = args && typeof args === "object" && !Array.isArray(args) ? args as Record<string, unknown> : {};
-  const log = (result: string, extra: Record<string, number | string | boolean | null> = {}) =>
-    logEvent("raft.assistant_forward_as_owner", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, result, ...extra });
+  // The row's most telling keys first: a row over its size drops keys from the end (src/trace/outbox.ts `attrsOf`).
+  const log = (result: string, verdict: "ok" | "failed" | "blocked", extra: Record<string, unknown> = {}) => {
+    ctx.trace?.({ kind: "raft.assistant_forward_as_owner", status: result, verdict, attrs: { result, ...extra } });
+    const line = Object.fromEntries(Object.entries(extra).filter(([, v]) => v === null || ["number", "string", "boolean"].includes(typeof v)));
+    delete line.request_id;
+    logEvent("raft.assistant_forward_as_owner", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, result, ...line });
+  };
   const outside = notInOwnerChat(FORWARD_AS_OWNER_TOOL, ctx);
   if (outside) {
-    log("refused:not_chat");
+    log("refused:not_chat", "blocked");
     throw refusal(outside);
   }
   const messages = Array.isArray(a.messages) ? a.messages : [];
   if (!messages.length || messages.length > FORWARD_MESSAGES_MAX || !messages.every((m) => typeof m === "string" && m.trim())) {
-    log("refused:messages");
+    log("refused:messages", "blocked");
     throw refusal(`messages must be 1-${FORWARD_MESSAGES_MAX} message ids, all from one conversation`);
   }
   const to = forwardTo(a.to);
   if (!to) {
-    log("refused:to");
+    log("refused:to", "blocked");
     throw refusal(`to must be 1-${FORWARD_TO_MAX} destinations, each #channel, @name, a conversation id or { to, join: true }`);
   }
   if ((a.note !== undefined && typeof a.note !== "string") || (a.dryRun !== undefined && typeof a.dryRun !== "boolean")) {
-    log("refused:args");
+    log("refused:args", "blocked");
     throw refusal("note must be text, and dryRun true or false");
   }
   if (!(await loadOwner(ctx))) {
-    log("refused:no_owner");
+    log("refused:no_owner", "blocked");
     throw refusal(`${FORWARD_AS_OWNER_TOOL}: this agent is not anyone's assistant now`);
   }
   const ids = (messages as string[]).map((m) => m.trim());
   const note = typeof a.note === "string" && a.note.trim() ? a.note : null;
   const dryRun = a.dryRun === true;
   const body: ForwardBody = { messages: ids, to, ...(note !== null ? { note } : {}), requestId: forwardRequestId(ctx, ids), ...(dryRun ? { dryRun: true as const } : {}) };
-  const sizes = { messages: ids.length, destinations: to.length, joins: to.filter((t) => typeof t !== "string").length, dry_run: dryRun };
+  // Read before the request: what the reply had read when it forwarded.
+  const reads = await forwardReads(ctx, ids);
+  const head = {
+    request_id: body.requestId, after_foreign_read: reads.after_foreign_read, reads_known: reads.reads_known, source_known: reads.source_known,
+    foreign_read_count: reads.foreign_count, inbox_reads: reads.inbox, own_reads: reads.own,
+    messages: ids.length, destinations: to.length, joins: to.filter((t) => typeof t !== "string").length, dry_run: dryRun,
+  };
+  const tail = { foreign_reads: reads.foreign.slice(0, FOREIGN_READS_SHOWN), sources: reads.sources.slice(0, FOREIGN_READS_SHOWN) };
   const out = await deps.forward(ctx, body);
   if (!out.ok) {
     // A 5xx is Raft's own failure after the request arrived: some destinations may have been sent.
     const uncertain = out.status === null || out.status >= 500;
-    log(uncertain ? "uncertain" : "refused", { ...sizes, http_status: out.status, code: out.code });
+    log(uncertain ? "uncertain" : "refused", uncertain ? "failed" : "blocked",
+      { ...head, http_status: out.status, code: out.code !== null && TRACE_CODE.test(out.code) ? out.code : null, ...tail });
     // Raft no longer has this agent as an assistant: paused, as send-as-owner's and every owner read's refusal pauses.
     if (out.code === NOT_ENABLED) await pauseOn(ctx, new Error(NOT_ENABLED));
     return {
@@ -2487,7 +2615,11 @@ export async function forwardAsOwner(args: unknown, ctx: PluginContext, deps: Fo
   const results = Array.isArray(out.data.results) ? out.data.results as Json[] : [];
   const status = (s: string) => results.filter((r) => r && typeof r === "object" && !Array.isArray(r) && (r as Record<string, unknown>).status === s).length;
   const counts = { sent: status("sent"), failed: status("failed"), would_send: status("would_send") };
-  log("answered", { ...sizes, ...counts });
+  const kept = results.map(traceResult);
+  log("answered", results.length > 0 && counts.failed === results.length ? "failed" : "ok", {
+    ...head, ...counts, sent_message_ids: kept.map((r) => r.message_id).filter((m): m is string => typeof m === "string"),
+    ...tail, destination_results: kept,
+  });
   const notes = [dryRun ? FORWARD_DRY_RUN_NOTE : null, counts.sent ? FORWARD_SENT_NOTE : null, counts.failed ? FORWARD_FAILED_NOTE : null];
   return {
     results, ...(typeof out.data.preview === "string" ? { preview: out.data.preview } : {}),

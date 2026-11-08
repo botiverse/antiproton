@@ -30,7 +30,7 @@ import {
   notifyOwner, noteChatNotice, noteOwnerReply, noteToldInChat, pauseOn, replyFallback, preferences, type PersonResolve, type OwnerResolveRead, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
   checkEnded, pushBriefImport, turnDelivered, type AssistantApi, type DeliveredReport, type RaftAnswer,
   NOTE_DECISION_TOOL, WakeReads, decisionEnded, noteDecision,
-  FORWARD_AS_OWNER_TOOL, SEARCH_FORWARD_TARGETS_TOOL, forwardAsOwner, searchForwardTargets, type ForwardAnswer, type ForwardBody,
+  FORWARD_AS_OWNER_TOOL, SEARCH_FORWARD_TARGETS_TOOL, forwardAsOwner, searchForwardTargets, noteReadInTurn, type ForwardAnswer, type ForwardBody, type TurnRead,
 } from "./raft-assistant.ts";
 import type { RaftCheck, RefusedCheck } from "./raft-assistant-check.ts";
 import { clearIntegrationSessions, INTEGRATION_SESSIONS_STORE, REMINDER_TOOL, reminderTool } from "./raft-assistant-reminder.ts";
@@ -2500,7 +2500,7 @@ export async function probeOwnerMessages(ctx: PluginContext, channelId: string, 
 /** One owner read, end to end: offered on this mount, its arguments checked, the wire asked, the answer checked. */
 async function ownerRead(
   name: typeof OWNER_INBOX_TOOL | typeof OWNER_MESSAGES_TOOL, args: unknown, ctx: PluginContext, wire: AssistantWire,
-  unoffered: ReadonlySet<string>, saw: (ids: string[]) => void = () => {},
+  unoffered: ReadonlySet<string>, saw: (ids: string[], read: TurnRead) => void = () => {},
 ): Promise<string> {
   if (!ctx.offered?.includes(name)) {
     throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant, or its tool list has not been taken since it became one`);
@@ -2514,19 +2514,20 @@ async function ownerRead(
       const again = await wire.ownerInbox(ctx, unread);
       if (!again.ok) throw ownerFailure(again);
       const shown = renderOwnerInbox(again.data, ctx.alias, unread.filter, { untoldUnknown: true });
-      saw(inboxIds(again.data));
+      saw(inboxIds(again.data), { kind: "inbox", rows: inboxRows(again.data) });
       return shown;
     }
     if (!out.ok) throw ownerFailure(out);
     const shown = renderOwnerInbox(out.data, ctx.alias, request.filter);
-    saw(inboxIds(out.data));
+    saw(inboxIds(out.data), { kind: "inbox", rows: inboxRows(out.data) });
     return shown;
   }
-  const out = await wire.ownerMessages(ctx, ownerMessagesRequest(args));
+  const request = ownerMessagesRequest(args);
+  const out = await wire.ownerMessages(ctx, request);
   if (!out.ok) throw ownerFailure(out);
   const ids: string[] = [];
   const shown = renderOwnerMessages(out.data, ctx.alias, unoffered, ids);
-  saw(ids);
+  saw(ids, { kind: "messages", channelId: request.channelId, ids });
   return shown;
 }
 
@@ -2541,6 +2542,24 @@ function inboxIds(data: unknown): string[] {
   if (!Array.isArray(rows)) return [];
   const keys = ["firstUnreadMessageId", "parentMessageId"];
   return rows.flatMap((r) => keys.map((k) => (r as Record<string, unknown>)?.[k]).filter((v): v is string => typeof v === "string" && v.length > 0));
+}
+
+/**
+ * An inbox read's rows as the forward's note of this reply's reads takes them (src/plugins/raft-assistant.ts
+ * `noteReadInTurn`): each row's conversation with the id it names, a thread's parent message under its parent
+ * channel, where that message lives. Ids only.
+ */
+function inboxRows(data: unknown): Array<{ c: string; ids: string[] }> {
+  const rows = (data as Record<string, unknown>).items;
+  if (!Array.isArray(rows)) return [];
+  const str = (v: unknown) => (typeof v === "string" && v.length > 0 ? v : null);
+  return rows.flatMap((r) => {
+    const o = r && typeof r === "object" ? r as Record<string, unknown> : {};
+    const out: Array<{ c: string; ids: string[] }> = [];
+    if (str(o.channelId) && str(o.firstUnreadMessageId)) out.push({ c: str(o.channelId)!, ids: [str(o.firstUnreadMessageId)!] });
+    if (str(o.parentChannelId) && str(o.parentMessageId)) out.push({ c: str(o.parentChannelId)!, ids: [str(o.parentMessageId)!] });
+    return out;
+  });
 }
 
 /**
@@ -3547,6 +3566,8 @@ export function createRaftPlugin(deps: {
       if (op) {
         const result = await operate(op, args, ctx);
         await toldInChat(op, args, result, ctx);
+        // A read on the assistant's own credential, counted for the forward's trace row (`noteReadInTurn`).
+        if (op.name === "messages.read") await noteReadInTurn(ctx, { kind: "own" });
         return result as Json;
       }
       // Answered wherever the download is generated, as the download is: with no storage it says why nothing was kept.
@@ -3559,7 +3580,11 @@ export function createRaftPlugin(deps: {
       if (name === ACTIONS_TOOL) return integrationsActions(args, ctx, agentLogin(ctx), manifests);
       if (name === INVOKE_TOOL) return integrationsInvoke(args, ctx, agentLogin(ctx), manifests);
       if (name === OWNER_INBOX_TOOL || name === OWNER_MESSAGES_TOOL) {
-        return ownerRead(name, args, ctx, assistant, unofferedFor(ctx), (ids) => wakeReads.saw(ctx, ids));
+        // What the read showed is noted for the forward's trace row too (`noteReadInTurn`), once it has been shown.
+        let read: TurnRead | null = null;
+        const shown = await ownerRead(name, args, ctx, assistant, unofferedFor(ctx), (ids, r) => { wakeReads.saw(ctx, ids); read = r; });
+        if (read) await noteReadInTurn(ctx, read);
+        return shown;
       }
       if (name === NOTE_DECISION_TOOL) {
         if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);

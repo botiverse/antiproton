@@ -111,7 +111,7 @@ export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "contain
   "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check", "raft.session_unsealable",
   "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner", "stamp.agent_login", "state.dropped",
   "raft.assistant_decision", "memory.shadow_due", "memory.shadow", "memory.observe", "memory.shadow_redact", "memory.shadow_clear",
-  "raft.assistant_owner_actions", "sandbox.box_owner"] as const;
+  "raft.assistant_owner_actions", "sandbox.box_owner", "raft.assistant_forward_as_owner"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
@@ -190,6 +190,14 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * status `called`, one per call, with the tool, the `result` (`ok`, the SDK's failure code, or `refused:not_chat`),
  * Raft's HTTP `status`, its `error_code` and a confirm's `state` (`runOwnerAction`). Never an argument or Raft's text.
  * Not forwarded.
+ * `raft.assistant_forward_as_owner` is one call of a personal assistant's forward tool (src/plugins/raft-assistant.ts
+ * `forwardAsOwner`): status the `result` (`answered`, `refused` or `uncertain` for a forward that reached Raft,
+ * `refused:<code>` for one refused before it), and for one that reached Raft its `request_id`, whether the reply read
+ * a conversation other than the forwarded messages' own before it (`after_foreign_read`, with `reads_known`,
+ * `source_known`, `foreign_read_count`, `inbox_reads`, `own_reads`, and the first conversation ids as `foreign_reads`
+ * and `sources`), the counts of messages, destinations, joins and each result, the sent forwards' `sent_message_ids`,
+ * and each destination's status, code, channel and message ids (`destination_results`). Ids, codes and counts only:
+ * never a message, the note, a destination as named, a link or Raft's text. Not forwarded.
  * `sandbox.box_owner` is a box a sandbox mount's record named, read for whose it is before anything was sent to it
  * (src/plugins/sandbox.ts `ownedProvider`): status `box_not_ours` (verdict `blocked`) when it was made for another
  * agent and the record let go of it, or `owner_unknown` (verdict `blocked`) when the provider lists it with no owner,
@@ -200,7 +208,7 @@ export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_
   "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check",
   "raft.session_unsealable", "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner",
   "stamp.agent_login", "state.dropped", "raft.assistant_decision", "memory.shadow_due", "memory.shadow_redact",
-  "raft.assistant_owner_actions", "sandbox.box_owner"] as const satisfies readonly TraceKind[];
+  "raft.assistant_owner_actions", "sandbox.box_owner", "raft.assistant_forward_as_owner"] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;
