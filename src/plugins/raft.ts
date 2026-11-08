@@ -30,6 +30,7 @@ import {
   notifyOwner, noteChatNotice, noteOwnerReply, noteToldInChat, pauseOn, replyFallback, preferences, type PersonResolve, type OwnerResolveRead, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
   checkEnded, pushBriefImport, turnDelivered, type AssistantApi, type DeliveredReport, type RaftAnswer,
   NOTE_DECISION_TOOL, WakeReads, decisionEnded, noteDecision,
+  FORWARD_AS_OWNER_TOOL, SEARCH_FORWARD_TARGETS_TOOL, forwardAsOwner, searchForwardTargets, type ForwardAnswer, type ForwardBody,
 } from "./raft-assistant.ts";
 import type { RaftCheck, RefusedCheck } from "./raft-assistant-check.ts";
 import { clearIntegrationSessions, INTEGRATION_SESSIONS_STORE, REMINDER_TOOL, reminderTool } from "./raft-assistant-reminder.ts";
@@ -3584,6 +3585,10 @@ export function createRaftPlugin(deps: {
           messages: (c, r) => assistant.ownerMessages(c, { channelId: r.channelId, around: r.around, limit: r.limit }),
         });
       }
+      if (name === FORWARD_AS_OWNER_TOOL || name === SEARCH_FORWARD_TARGETS_TOOL) {
+        if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
+        return name === FORWARD_AS_OWNER_TOOL ? forwardAsOwner(args, ctx, { forward: forwardRaft }) : searchForwardTargets(args, ctx, { search: searchForwardRaft });
+      }
       if (name === "receive_events") {
         const limit = integer(a.limit, "limit", 1, EVENTS_LIMIT) ?? EVENTS_LIMIT;
         // The listing's snapshot is read off its response (`snapshotTap`); nothing else this client fetches matches.
@@ -3938,6 +3943,47 @@ export async function postAsOwner(ctx: PluginContext, body: { channelId: string;
     const err = e as { httpStatus?: unknown; code?: unknown };
     return { ok: false, status: typeof err.httpStatus === "number" ? err.httpStatus : null, code: typeof err.code === "string" ? err.code : null };
   }
+}
+
+/**
+ * One answer of Raft's forward or its search as a `ForwardAnswer`: an HTTP failure is Raft's status, its code and its
+ * `error` text as it sent them (cut past `OWNER_ERROR_TEXT_MAX`, as an owner read's is: Raft's own are one sentence);
+ * no answer, or one the SDK's contract refused, a null status, since a forward may then have gone. A request the
+ * contract refused before sending is a refusal saying what it refused: nothing was sent.
+ */
+function forwardAnswer(out: RouteAnswer, tool: string): ForwardAnswer {
+  if (out.ok) return { ok: true, data: object(out.data) };
+  const e = out.error;
+  if (e.kind === "http") {
+    const body = e.response;
+    const text = body && typeof body === "object" && "error" in body && typeof body.error === "string" ? oneLine(body.error).trim() : "";
+    const code = typeof e.errorCode === "string" && SERVER_CODE.test(e.errorCode) ? e.errorCode : null;
+    return { ok: false, status: e.status, code, error: text ? (text.length > OWNER_ERROR_TEXT_MAX ? `${text.slice(0, OWNER_ERROR_TEXT_MAX)}… (cut)` : text) : null };
+  }
+  if (e.kind === "validation" && e.reason === "request_contract_mismatch") {
+    throw ownerRefusal(`${tool}: the arguments were refused before anything was sent (${contractIssues(e.cause)})`);
+  }
+  return { ok: false, status: null, code: null, error: null };
+}
+
+/**
+ * Raft's forward as the owner (SDK 0.33.0 `routes.assistant.forwardAsOwner`, `POST /assistant/forward-as-owner`) and
+ * its search for where to (`routes.assistant.searchForwardTargets`), on the mount's own client with no saved state:
+ * neither marks anything read. One request each: the forward's route is a keyed write, which the SDK sends once, and
+ * a throw from it is no answer, never a retry.
+ */
+export async function forwardRaft(ctx: PluginContext, body: ForwardBody): Promise<ForwardAnswer> {
+  let out: RouteAnswer;
+  try { out = await raftFor(ctx, { state: false }).routes.assistant.forwardAsOwner({ body }); }
+  catch { return { ok: false, status: null, code: null, error: null }; }
+  return forwardAnswer(out, FORWARD_AS_OWNER_TOOL);
+}
+export async function searchForwardRaft(ctx: PluginContext, q: { q: string; limit?: number }): Promise<ForwardAnswer> {
+  const query = { q: q.q, ...(q.limit !== undefined ? { limit: String(q.limit) } : {}) };
+  let out: RouteAnswer;
+  try { out = await raftFor(ctx, { state: false }).routes.assistant.searchForwardTargets({ query }); }
+  catch { return { ok: false, status: null, code: null, error: null }; }
+  return forwardAnswer(out, SEARCH_FORWARD_TARGETS_TOOL);
 }
 
 /**

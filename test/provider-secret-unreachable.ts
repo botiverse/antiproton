@@ -313,7 +313,7 @@ await check("setup: the provisioned agent is a personal assistant, offered exact
   // added it to re-check the paths in this file's header.
   const EXPECTED = ["raft__receive_events", "raft__identity_whoami", "raft__messages_send", "raft__messages_read", "raft__messages_react",
     "raft__messages_unreact", "raft__attachments_download_url", "raft__attachments_view", "raft__attachments_upload", "raft__assistant_owner_inbox",
-    "raft__assistant_owner_messages", "raft__assistant_preferences", "raft__assistant_send_as_owner", "raft__assistant_reminder",
+    "raft__assistant_owner_messages", "raft__assistant_preferences", "raft__assistant_send_as_owner", "raft__assistant_forward_as_owner", "raft__assistant_search_forward_targets", "raft__assistant_reminder",
     "state__remember", "state__put", "state__get", "state__list", "state__forget", "state__revise", "state__insert", "artifacts__read", "resume"];
   must(show([...offered].sort()) === show([...EXPECTED].sort()),
     `an assistant's tools changed: added ${offered.filter((n) => !EXPECTED.includes(n))}, removed ${EXPECTED.filter((n) => !offered.includes(n))}`);
@@ -346,7 +346,7 @@ await check("the allowlists that bound every assistant session (chat and check) 
   const m = await import("../src/plugins/raft-assistant.ts");
   must(show(m.CHAT_TOOLS) === show(["receive_events", "identity_whoami", "messages_send", "messages_read", "messages_react", "messages_unreact",
     "attachments_download_url", "attachments_view", "attachments_upload", "assistant_owner_inbox", "assistant_owner_messages", "assistant_preferences",
-    "assistant_send_as_owner", "assistant_reminder"]), `CHAT_TOOLS changed: ${show(m.CHAT_TOOLS)}`);
+    "assistant_send_as_owner", "assistant_forward_as_owner", "assistant_search_forward_targets", "assistant_reminder"]), `CHAT_TOOLS changed: ${show(m.CHAT_TOOLS)}`);
   must(show(m.CHECK_TOOLS) === show(["assistant_owner_inbox", "assistant_owner_messages", "assistant_notify_owner", "note_decision"]), `CHECK_TOOLS changed: ${show(m.CHECK_TOOLS)}`);
   must(show(m.MEMORY_TOOLS) === show(["remember", "put", "get", "list", "forget", "revise", "insert"]), `MEMORY_TOOLS changed: ${show(m.MEMORY_TOOLS)}`);
   const catalogue = ["raft.receive_events", "raft.assistant_notify_owner", "raft.enable_push", "web.send", "sandbox.run", "state.get", "state.secret_get", "x.run_js"]
@@ -370,7 +370,7 @@ await check("setup, with owner actions in Raft's context: the chat is offered th
     const offered: string[] = (await wo.rt.offeredTools(T, A))!.tools.map((t: { name: string }) => t.name);
     const CHAT = ["raft__receive_events", "raft__identity_whoami", "raft__messages_send", "raft__messages_read", "raft__messages_react",
       "raft__messages_unreact", "raft__attachments_download_url", "raft__attachments_view", "raft__attachments_upload", "raft__assistant_owner_inbox",
-      "raft__assistant_owner_messages", "raft__assistant_preferences", "raft__assistant_send_as_owner", "raft__assistant_reminder",
+      "raft__assistant_owner_messages", "raft__assistant_preferences", "raft__assistant_send_as_owner", "raft__assistant_forward_as_owner", "raft__assistant_search_forward_targets", "raft__assistant_reminder",
       "raft__save_message", "raft__move_agent", "raft__list_owner_channels",
       "state__remember", "state__put", "state__get", "state__list", "state__forget", "state__revise", "state__insert", "artifacts__read", "resume"];
     must(show([...offered].sort()) === show([...CHAT].sort()),
@@ -526,6 +526,8 @@ const ARGS: Record<string, Record<string, unknown>> = {
   raft__assistant_owner_messages: { channelId: "env" },
   raft__assistant_preferences: { action: "list" },
   raft__assistant_send_as_owner: { target: "dm:@owner", content: "env?" },
+  raft__assistant_forward_as_owner: { messages: ["/proc/self/environ"], to: [{ to: "dm:@owner" }], note: "env?" },
+  raft__assistant_search_forward_targets: { q: "/proc/self/environ" },
   raft__assistant_reminder: { action: "list" },
   // A check's two writes really run (a POST to Raft, a row here): they are given the names of credentials, never a
   // canary, since a canary the model supplied would be forwarded faithfully and prove nothing.

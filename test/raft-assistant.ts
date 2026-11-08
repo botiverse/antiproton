@@ -16,7 +16,7 @@ import { SqliteStore } from "../src/store/sqlite.ts";
 const INBOX = "assistant_owner_inbox";
 const MESSAGES = "assistant_owner_messages";
 // With the assistant's own two tools (test/raft-assistant-mode.ts), offered exactly where the reads are.
-const ASSISTANT = [INBOX, MESSAGES, "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner", "assistant_reminder", "note_decision"];
+const ASSISTANT = [INBOX, MESSAGES, "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner", "assistant_forward_as_owner", "assistant_search_forward_targets", "assistant_reminder", "note_decision"];
 // A UUID, as Raft sends it (the SDK's contract takes any text since 0.13.1; 0.13.0 required a UUID).
 const OWNER = { userId: "7a0e1b2c-3d4e-4f50-8a61-72839405a6b7", name: "Ada" };
 const CH = "c0ffee00-0000-4000-8000-000000000001";
@@ -217,7 +217,7 @@ await check("mountTools: a mount with no snapshot is not offered them; a snapsho
   // The same holds for every assistant tool that writes (notify writes to the owner, preferences to their rules): each
   // is pinned on its own line so a missing flag fails on that tool's name.
   const offeredTools = toolsOf(plugin, { ...base, toolSnapshot: assistantSnap });
-  for (const name of ["assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner"]) {
+  for (const name of ["assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner", "assistant_forward_as_owner"]) {
     const w = offeredTools.find((t) => t.name === name);
     must(w?.sideEffects === "write" && w.modelOnly === true, `${name}: sideEffects=${w?.sideEffects} modelOnly=${w?.modelOnly}`);
   }
