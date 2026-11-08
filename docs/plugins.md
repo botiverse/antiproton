@@ -1174,7 +1174,8 @@ both offered in the chat only and listed exactly where `assistant_send_as_owner`
 the web, to 1-10 destinations at once, and send the owner one receipt with an undo, so the assistant
 sends no confirmation of its own. Raft enforces the owner's switch for sending as them, and their DM
 setting. The body is the model's `messages`, `to` (each `{ to }`, or `{ to, join: true }` for a public
-channel the owner has not joined), `note` and `dryRun`, and a `requestId` the plugin derives: a hash of
+channel the owner has not joined) and `note`, never `dryRun` (the prompt says to forward straight away, so
+the tool does not offer it), and a `requestId` the plugin derives: a hash of
 the turn (`caller.turnId`) and the sorted message ids, as a UUID, so every call in one reply that
 forwards the same messages carries the same id and a retry after fixing failed destinations never sends
 twice, while the owner asking again in a later reply is a new forward. Code keeps, whatever the model
