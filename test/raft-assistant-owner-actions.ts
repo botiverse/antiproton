@@ -226,12 +226,20 @@ await check("only in the chat: assistantTools adds owner actions to the chat's l
 });
 
 await check("only in the chat: a call from a check's short session, another session, or a program is refused before any request to Raft", async () => {
-  for (const [what, session, program] of [["check", newIsolatedSessionId(), false], ["agents API session", "sess_abc", false], ["program", "main", true]] as const) {
+  const when = "save_message works only while you are replying in your chat with your owner.";
+  for (const [what, session, program, said] of [
+    // A check can still tell the owner (assistant_notify_owner), so it is pointed there.
+    ["check", newIsolatedSessionId(), false, `${when} Here, leave it undone; if it still needs doing, say so to your owner in that chat.`],
+    // Another session cannot reach the owner: it only leaves it undone.
+    ["agents API session", "sess_abc", false, `${when} Leave it undone.`],
+    // A program in the chat is in the chat already; what it lacks is being the model's own call.
+    ["program", "main", true, "save_message works only when you call it yourself, not from a program. Call it directly in your reply to your owner."],
+  ] as const) {
     const r = raft();
     const m = mount(MADE, session, program);
     let error = "";
     try { await raftPlugin.invoke("save_message", { message: "m-1", saved: true }, m.ctx); } catch (e) { error = String((e as Error).message); }
-    must(error === "save_message is only for your chat with your owner", `${what}: ${error}`);
+    must(error === said, `${what}: ${error}`);
     must(r.calls.length === 0 && r.contexts === 0, `${what}: reached Raft: ${show(r.calls)} contexts ${r.contexts}`);
     const row = m.traced.find((t) => t.kind === "raft.assistant_owner_actions");
     must(row?.status === "called" && row.attrs.result === "refused:not_chat" && row.verdict === "blocked", `${what}: ${show(row)}`);

@@ -26,6 +26,7 @@
  * Compiled by both typecheck programs.
  */
 import { logEvent } from "../core/log.ts";
+import { isIsolatedSession } from "../runtime/isolated-session.ts";
 import type { Json } from "../core/types.ts";
 import type { RaftOwnerAction, RaftOwnerActionList, RaftOwnerActionRunResult } from "@botiverse/raft-sdk";
 import type { PluginContext, ToolSchema } from "./types.ts";
@@ -155,6 +156,20 @@ export function ownerActionNames(snapshot: { tools: readonly ToolSchema[] } | nu
   return (snapshot?.tools ?? []).filter(isMarked).map((t) => t.name);
 }
 
+/**
+ * Why an owner action is refused outside the owner's chat, and what to do instead (Sage's wording): when it can be
+ * used, then what to do now, so the model does not retry. A check or the brief (`isIsolatedSession`) can still tell
+ * the owner (`assistant_notify_owner`), so it is pointed there; any other session cannot, so it only leaves it undone.
+ * A program run from the chat is in that chat already: what it lacks is being the model's own call.
+ */
+function notChatRefusal(tool: string, ctx: PluginContext): string {
+  if (ctx.caller.taskId === CHAT_SESSION) return `${tool} works only when you call it yourself, not from a program. Call it directly in your reply to your owner.`;
+  const when = `${tool} works only while you are replying in your chat with your owner.`;
+  return isIsolatedSession(ctx.caller.taskId)
+    ? `${when} Here, leave it undone; if it still needs doing, say so to your owner in that chat.`
+    : `${when} Leave it undone.`;
+}
+
 /** The SDK call an owner action makes (`raft.assistant.ownerActions.run`). */
 export type OwnerActionRun = (tool: string, args: Record<string, unknown>) => Promise<RaftOwnerActionRunResult>;
 
@@ -172,7 +187,7 @@ export async function runOwnerAction(tool: string, args: unknown, ctx: PluginCon
   };
   if (ctx.caller.taskId !== CHAT_SESSION || ctx.caller.fromProgram) {
     trace("refused:not_chat");
-    throw Object.assign(new Error(`${tool} is only for your chat with your owner`), { retryable: false, transient: false });
+    throw Object.assign(new Error(notChatRefusal(tool, ctx)), { retryable: false, transient: false });
   }
   const a = args && typeof args === "object" && !Array.isArray(args) ? args as Record<string, unknown> : {};
   const out = await run(tool, a);
