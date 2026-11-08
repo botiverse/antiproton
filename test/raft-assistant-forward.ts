@@ -9,7 +9,7 @@
 //   node test/raft-assistant-forward.ts
 import { raftPlugin } from "../src/plugins/raft.ts";
 import {
-  CHAT_TOOLS, CHECK_TOOLS, FORWARD_AS_OWNER_SUMMARY, FORWARD_AS_OWNER_TOOL, FORWARD_FAILED_NOTE, FORWARD_REFUSED_NOTE, FORWARD_SENT_NOTE, SEARCH_FORWARD_TARGETS_SUMMARY,
+  CHAT_TOOLS, CHECK_TOOLS, FORWARD_AS_OWNER_SUMMARY, FORWARD_AS_OWNER_TOOL, FORWARD_FAILED_NOTE, FORWARD_REFUSED_NOTE, FORWARD_SENT_NOTE, SEARCH_FORWARD_TARGETS_SUMMARY, FORWARD_FAILED_NOTE_NO_RETRY, FORWARD_UNCERTAIN_NOTE_NO_RETRY,
   FORWARD_UNCERTAIN_NOTE, READ_IN_TURN_KEY, SEARCH_FORWARD_TARGETS_TOOL, noteReadInTurn, SEND_AS_OWNER_TOOL, assistantCheckPrompt, assistantPrecedence, assistantPrompt, assistantTools,
 } from "../src/plugins/raft-assistant.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
@@ -235,8 +235,10 @@ await check("an agent that is no one's assistant now is refused the way send-as-
 await check("forward: the body Raft takes is the model's messages, destinations (join kept) and note, with a derived requestId, never dryRun; one request", async () => {
   const a = await assistant();
   a.r.forwardAnswer = { status: 200, body: { results: [RESULTS[0]] } };
-  // A dryRun the model passes anyway is not sent: the tool does not offer it.
-  await forward(a, { ...ARGS, dryRun: true });
+  // A dryRun the model passes anyway is refused, never dropped: dropped, the preview it meant would go out.
+  const dry = await forward(a, { ...ARGS, dryRun: true }).then(() => null, (x) => x as Error & { retryable?: unknown });
+  must(dry && /has no dry run: nothing was sent/.test(dry.message) && dry.retryable === false && a.r.forwards.length === 0, show(dry?.message));
+  await forward(a, ARGS);
   must(a.r.forwards.length === 1, `requests: ${a.r.forwards.length}`);
   const body = a.r.forwards[0];
   must(show(body.messages) === show(ARGS.messages) && show(body.to) === show(RAFT_TO) && body.note === ARGS.note, show(body));
@@ -250,6 +252,23 @@ await check("forward: the body Raft takes is the model's messages, destinations 
   // A plain string, as Raft's own description writes a destination, is taken as it is.
   await forward(a, { messages: ["3f2a9c1b"], to: ["#design", { to: "#launch", join: true }] });
   must(show(a.r.forwards[2].to) === show(["#design", { to: "#launch", join: true }]), show(a.r.forwards[2]));
+  // The same id twice is one message, and the note goes trimmed.
+  await forward(a, { messages: ["3f2a9c1b", " 3f2a9c1b "], to: ["#design"], note: "  FYI  " });
+  must(show(a.r.forwards[3].messages) === show(["3f2a9c1b"]) && a.r.forwards[3].note === "FYI", show(a.r.forwards[3]));
+  must(a.r.forwards[3].requestId === a.r.forwards[2].requestId, "a repeated id changed the request id");
+});
+
+await check("forward: outside a turn (no turnId, the pd engine) the request id is not stable, so no result says calling again is safe", async () => {
+  const a = await assistant();
+  a.ctx.caller = { ...a.ctx.caller, turnId: undefined };
+  const failed = await forward(a, ARGS);
+  must(failed.note.includes(FORWARD_FAILED_NOTE_NO_RETRY) && !failed.note.includes(FORWARD_FAILED_NOTE) && !/call again/i.test(failed.note), failed.note);
+  a.r.forwardAnswer = { status: 502, body: { error: "Bad gateway" } };
+  const unsure = await forward(a, ARGS);
+  must(unsure.state === "uncertain" && unsure.note === FORWARD_UNCERTAIN_NOTE_NO_RETRY, show(unsure));
+  // Control: in a turn, the retry advice is there.
+  a.ctx.caller = { ...a.ctx.caller, turnId: "turn-9" };
+  must((await forward(a, ARGS)).note === FORWARD_UNCERTAIN_NOTE, "in a turn: no retry advice");
 });
 
 await check("forward: each destination's result reaches the model as Raft sent it, with what to do about the sent and the failed", async () => {

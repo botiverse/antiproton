@@ -1182,8 +1182,7 @@ twice, while the owner asking again in a later reply is a new forward. Code keep
 does: a call from a check or the brief, from any session but the chat, or from a program is refused
 before anything is read, each in its own words; with no owner kept, refused before Raft is asked; one
 request per call, never retried. Raft's answer reaches the model as Raft sent it: each destination's
-result whole (`status`, `code`, `error`, `link`, `joined`, `createsDm`, `warnings`), the dry run's
-`preview`, a refusal of the whole forward with its status, code and `error` (a 5xx or no answer is
+result whole (`status`, `code`, `error`, `link`, `joined`, `createsDm`, `warnings`), a refusal of the whole forward with its status, code and `error` (a 5xx or no answer is
 `uncertain`), and the search's `targets`, `omitted` and `omittedReason`. A call writes a
 `raft.assistant_forward_as_owner` log line of counts and Raft's status and code, and a trace row of the
 same kind (not forwarded) that also carries, for a forward that reached Raft, its `request_id`, each

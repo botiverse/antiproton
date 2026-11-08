@@ -2391,6 +2391,13 @@ export const FORWARD_FAILED_NOTE = "For a failed destination, tell your owner Ra
 export const FORWARD_REFUSED_NOTE = "Raft refused the forward and sent nothing: tell your owner its error as it is. Do not call again for it unless they ask again.";
 export const FORWARD_UNCERTAIN_NOTE = "Raft's answer could not be read, so it may have gone to some destinations. Calling again in this reply with the same messages and note is safe: " +
   "a destination already sent is not sent again. If it fails again, tell your owner you couldn't tell whether it went through.";
+/**
+ * The same, outside a turn (no \`caller.turnId\`: the pd engine keeps no turn record), where the request id is random
+ * (\`forwardRequestId\`) and calling again would send a destination already sent a second time: no retry advice.
+ */
+export const FORWARD_FAILED_NOTE_NO_RETRY = "For a failed destination, tell your owner Raft's error as it is.";
+export const FORWARD_UNCERTAIN_NOTE_NO_RETRY = "Raft's answer could not be read, so it may have gone to some destinations. " +
+  "Do not call again for it: tell your owner you couldn't tell whether it went through.";
 
 /**
  * The forward's `requestId`, derived here rather than asked of the model, as send-as-owner keeps its own key for the
@@ -2580,12 +2587,21 @@ export async function forwardAsOwner(args: unknown, ctx: PluginContext, deps: Fo
     log("refused:args", "blocked");
     throw refusal("note must be text");
   }
+  // Not offered (the prompt says to forward straight away). Raft's own description of the route suggests one, so a
+  // model may pass it anyway: refused rather than dropped, since a dropped dryRun would send what it meant to preview.
+  if (a.dryRun !== undefined) {
+    log("refused:args", "blocked");
+    throw refusal(`${FORWARD_AS_OWNER_TOOL} has no dry run: nothing was sent. Forward straight away when your owner asked for it.`);
+  }
   if (!(await loadOwner(ctx))) {
     log("refused:no_owner", "blocked");
     throw refusal(`${FORWARD_AS_OWNER_TOOL}: this agent is not anyone's assistant now`);
   }
-  const ids = (messages as string[]).map((m) => m.trim());
-  const note = typeof a.note === "string" && a.note.trim() ? a.note : null;
+  // The same id twice is one message (and one request id for it, \`forwardRequestId\`).
+  const ids = [...new Set((messages as string[]).map((m) => m.trim()))];
+  // Trimmed, so a retry whose note differs only in spacing is the same note to Raft, not its \`request_conflict\`.
+  const note = typeof a.note === "string" && a.note.trim() ? a.note.trim() : null;
+  const retryable = typeof ctx.caller.turnId === "string" && ctx.caller.turnId !== "";
   const body: ForwardBody = { messages: ids, to, ...(note !== null ? { note } : {}), requestId: forwardRequestId(ctx, ids) };
   // Read before the request: what the reply had read when it forwarded.
   const reads = await forwardReads(ctx, ids);
@@ -2606,7 +2622,7 @@ export async function forwardAsOwner(args: unknown, ctx: PluginContext, deps: Fo
     return {
       state: uncertain ? "uncertain" : "not_sent",
       ...(out.status !== null ? { status: out.status } : {}), ...(out.code ? { code: out.code } : {}), ...(out.error ? { error: out.error } : {}),
-      note: uncertain ? FORWARD_UNCERTAIN_NOTE : FORWARD_REFUSED_NOTE,
+      note: uncertain ? (retryable ? FORWARD_UNCERTAIN_NOTE : FORWARD_UNCERTAIN_NOTE_NO_RETRY) : FORWARD_REFUSED_NOTE,
     };
   }
   const results = Array.isArray(out.data.results) ? out.data.results as Json[] : [];
@@ -2617,9 +2633,9 @@ export async function forwardAsOwner(args: unknown, ctx: PluginContext, deps: Fo
     ...head, ...counts, sent_message_ids: kept.map((r) => r.message_id).filter((m): m is string => typeof m === "string"),
     ...tail, destination_results: kept,
   });
-  const notes = [counts.sent ? FORWARD_SENT_NOTE : null, counts.failed ? FORWARD_FAILED_NOTE : null];
+  const notes = [counts.sent ? FORWARD_SENT_NOTE : null, counts.failed ? (retryable ? FORWARD_FAILED_NOTE : FORWARD_FAILED_NOTE_NO_RETRY) : null];
   return {
-    results, ...(typeof out.data.preview === "string" ? { preview: out.data.preview } : {}),
+    results,
     note: notes.filter((n): n is string => n !== null).join(" "),
   };
 }
