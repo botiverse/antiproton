@@ -8,8 +8,7 @@
  */
 import { keepRaftIdentity, raftIdentityOf } from "../src/plugins/raft-identity.ts";
 import {
-  CONTEXT_STORE, FEATURES_KEY, FEATURES_REFRESH_MS, FEATURES_TIMEOUT_MS, VAULT_LINE, createRaftPlugin, featuresOf, featuresParagraph, raftPlugin as raftWithoutStorage,
-} from "../src/plugins/raft.ts";
+  CONTEXT_STORE, FEATURES_KEY, FEATURES_REFRESH_MS, FEATURES_TIMEOUT_MS, VAULT_LINE, createRaftPlugin, featuresOf, featuresParagraph, raftPlugin as raftWithoutStorage, questionCardLine } from "../src/plugins/raft.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
@@ -276,15 +275,21 @@ async function agent(withRaft: boolean) {
   return { gw, now, prompt, list };
 }
 
-await check("with every flag off, or none given, the system prompt is byte for byte the prompt of an agent with no raft paragraph", async () => {
-  const without = await (await agent(false)).prompt();
-  must(without.includes("the deploy window is 06:53Z"), `the state mount's paragraph is missing, so nothing is compared: ${without.slice(-300)}`);
+await check("with every flag off, or none given, the system prompt is byte for byte the prompt of an agent with no raft paragraph, but for the question-card line", async () => {
+  const bare = await (await agent(false)).prompt();
+  must(bare.includes("the deploy window is 06:53Z"), `the state mount's paragraph is missing, so nothing is compared: ${bare.slice(-300)}`);
+  // The one line a raft mount adds whatever its flags: the question card's, since actions_prepare is offered (slock
+  // #13713). Static, so it never moves the cached prefix between turns; everything else must still be byte for byte.
+  // Before a listing the mount offers every generated tool, actions_prepare included; this listing's snapshot grants no
+  // capability, so after it the tool is not offered and the line goes with it: the prompt is then byte for byte bare.
+  const withLine = `${bare}\n\n${questionCardLine("raft")}`;
   for (const features of [undefined, { reminderApp: false, vaultApp: false }]) {
     const a = await agent(true);
-    must(await a.prompt() === without, "a raft mount with nothing kept moved the prompt");
+    must(await a.prompt() === withLine, "a raft mount with nothing kept moved the prompt beyond the question-card line");
     await a.list(features);
-    must(await a.prompt() === without, `features ${JSON.stringify(features)} moved the prompt`);
+    must(await a.prompt() === bare, `features ${JSON.stringify(features)} moved the prompt`);
   }
+  const without = bare;
   // Control: a flag on does move it, at the end, after the state mount's paragraph.
   const on = await agent(true);
   await on.list({ reminderApp: false, vaultApp: true });
