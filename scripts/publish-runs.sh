@@ -144,7 +144,7 @@ sha() { sha256sum "$1" | cut -d' ' -f1; }
 
 manifest_sha() { [ -f "$MANIFEST" ] && awk -F'\t' -v k="$1" '$1==k {print $2}' "$MANIFEST" | head -1; }
 
-uploaded=0 skipped=0 refused=0 changed=0
+uploaded=0 skipped=0 refused=0 changed=0 waiting=0
 unpaired=()
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
@@ -172,6 +172,24 @@ for f in $(find "$ROOT/report/runs" -type f ! -path "$ROOT/report/runs/README.md
     0) ;;
     1) echo "REFUSED  $key — its build and driver are not on one history; it was not uploaded"; refused=$((refused+1)); continue;;
     *) echo "STOPPED  the provenance check could not judge $key; nothing further was uploaded"; exit 2;;
+  esac
+
+  # A run's log is written as it goes and its record only at the end, so a log
+  # with no record beside it is a run still in progress. Published then, the key
+  # holds a snapshot, and a published key is never overwritten: the finished log
+  # has to go out under another name, twice in two days (Vera, 2026-11-08 and
+  # 2026-11-09). So it waits for its record. A run that died before writing one
+  # leaves its log as the only evidence; PUBLISH_LOG_WITHOUT_RECORD=1 sends it
+  # anyway, by a person's choice rather than by running the script too early.
+  # A finished log republished under a second name after a snapshot took the
+  # first (`<run>-full.log`) belongs to the same run's `<run>.json` (Vera, #1182).
+  case "$f" in
+    *.log)
+      stem=${f%.log}; stem=${stem%-full}
+      if [ ! -f "$stem.json" ] && [ "${PUBLISH_LOG_WITHOUT_RECORD:-}" != 1 ]; then
+        echo "WAITING  $key — its run has not written its record yet; not uploaded (PUBLISH_LOG_WITHOUT_RECORD=1 sends it anyway)"
+        waiting=$((waiting+1)); continue
+      fi;;
   esac
 
   # Whether the bucket already has it is answered by the bytes, not by a 200:
@@ -237,7 +255,7 @@ for f in $(find "$ROOT/report/runs" -type f ! -path "$ROOT/report/runs/README.md
   fi
 done
 
-echo "uploaded=$uploaded verified=$skipped refused=$refused changed=$changed"
+echo "uploaded=$uploaded verified=$skipped refused=$refused changed=$changed waiting=$waiting"
 if [ ${#unpaired[@]} -gt 0 ]; then
   echo "NOTE     ${#unpaired[@]} record(s) published with no log beside them:"
   printf '           %s\n' "${unpaired[@]}"

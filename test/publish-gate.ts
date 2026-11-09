@@ -135,6 +135,9 @@ check("publishing the same key twice leaves one row for it, not two", () => {
   // PUBLISH_RUNS_BASE points at a closed port, so the "already in the bucket?"
   // fetch fails and falls through to the upload.
   const dir = root("an ordinary line\n", WORKING);
+  // The log's record beside it: a log alone is a run still in progress and waits (below), which would leave nothing
+  // to publish twice and this case green for the wrong reason.
+  writeFileSync(join(dir, "report/runs/2026-01-01/record.json"), `${JSON.stringify({ bench: "t", results: [] })}\n`);
   // The manifest must already list something else. With only the key being
   // published in it, "one row per key" is satisfied by a manifest holding a
   // single row — so a script that threw the existing rows away would read
@@ -296,6 +299,44 @@ check("a record published beside its log says nothing about logs", () => {
   rmSync(dir, { recursive: true, force: true });
   if (code !== 0) throw new Error(`a paired record ended with ${code}: ${out}`);
   if (out.includes("NOTE")) throw new Error(`a record with its log beside it was still noted: ${out}`);
+});
+
+check("a log whose run has not written its record yet waits, and is sent once the record is there", () => {
+  // Published mid-run, the key holds a snapshot that can never be replaced (a published key is immutable), so the
+  // finished log has to go out under another name: it happened on 2026-11-08 and again on 2026-11-09 (Vera).
+  const dir = root("line one of a run still going\n", WORKING);
+  const bin = join(dir, "bin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "npx"), "#!/bin/sh\nexit 0\n");
+  chmodSync(join(bin, "npx"), 0o755);
+  const env = { ...WITH_TOKEN, PATH: `${bin}:${process.env.PATH ?? ""}`, PUBLISH_RUNS_BASE: "http://127.0.0.1:9" };
+  const manifest = join(dir, "report/runs/manifest.tsv");
+  const listed = () => { try { return readFileSync(manifest, "utf8"); } catch { return ""; } };
+  const early = run(dir, env);
+  const earlyRows = listed();
+  // The run ends: its record is written, and the same command now sends both.
+  writeFileSync(join(dir, "report/runs/2026-01-01/record.json"), `${JSON.stringify({ bench: "t", results: [] })}\n`);
+  const done = run(dir, env);
+  const doneRows = listed();
+  // A run that died before its record: a person sends its log on purpose.
+  const dead = root("the only trace of a run that died\n", WORKING);
+  mkdirSync(join(dead, "bin"), { recursive: true });
+  writeFileSync(join(dead, "bin/npx"), "#!/bin/sh\nexit 0\n");
+  chmodSync(join(dead, "bin/npx"), 0o755);
+  // A finished log republished as `<run>-full.log` after a snapshot took `<run>.log` pairs with `<run>.json`.
+  writeFileSync(join(dir, "report/runs/2026-01-01/record-full.log"), "the finished log, under its second name\n");
+  const full = run(dir, env);
+  const fullRows = listed();
+  const forced = run(dead, { ...env, PATH: `${join(dead, "bin")}:${process.env.PATH ?? ""}`, PUBLISH_LOG_WITHOUT_RECORD: "1" });
+  let deadRows = "";
+  try { deadRows = readFileSync(join(dead, "report/runs/manifest.tsv"), "utf8"); } catch { /* none */ }
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(dead, { recursive: true, force: true });
+  if (full.out.includes("WAITING") || !fullRows.includes("runs/2026-01-01/record-full.log")) throw new Error(`a -full.log beside its run's record was held as waiting: ${full.out}\n${fullRows}`);
+  if (early.code !== 0) throw new Error(`a waiting log ended with ${early.code}, not 0 — waiting is not a refusal: ${early.out}`);
+  if (!early.out.includes("WAITING") || earlyRows.includes("record.log")) throw new Error(`a log with no record was published mid-run: ${early.out}\n${earlyRows}`);
+  if (!doneRows.includes("runs/2026-01-01/record.log") || !doneRows.includes("runs/2026-01-01/record.json")) throw new Error(`once the record was there, the pair was not sent: ${done.out}\n${doneRows}`);
+  if (!deadRows.includes("runs/2026-01-01/record.log")) throw new Error(`PUBLISH_LOG_WITHOUT_RECORD=1 did not send the log of a run that died: ${forced.out}\n${deadRows}`);
 });
 
 check("a record naming only one of the two commits stops the publish", () => {
