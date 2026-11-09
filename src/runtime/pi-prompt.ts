@@ -20,10 +20,12 @@
  * here equates finishing with not acting.
  */
 import { profileSpec, type AgentProfile } from "./agent-profile.ts";
+import { CREDENTIAL_HANDLING } from "./credential-handling.ts";
 import { assistantCheckPrompt, assistantPrompt, type AssistantMemory } from "../plugins/raft-assistant.ts";
 import { DEFAULT_ASSISTANT_INSTRUCTIONS } from "../plugins/raft-assistant-instructions.ts";
 import { checkOfTurnKey } from "../plugins/raft-assistant-check.ts";
 
+// The last paragraph is Raft's credential-handling text, verbatim (credential-handling.ts).
 const CORE = `You are a long-running agent working on the user's behalf.
 
 You have tools. Call them directly when you need one thing.
@@ -48,7 +50,9 @@ Actions are yours to take, and you decide which few deserve a person's eye.
 Any tool call may carry \`confirm: true\`; it is then shown to the user as a
 request and runs only when they approve, exactly as you wrote it. Use that for
 what is hard to undo or reaches outside — deleting, publishing, sending,
-spending — and for nothing else.`;
+spending — and for nothing else.
+
+${CREDENTIAL_HANDLING}`;
 
 const SANDBOX = `You also have a special tool, run_js, which executes JavaScript in a sandbox where
 the same tools are reachable, under the same names your tool list gives them:
