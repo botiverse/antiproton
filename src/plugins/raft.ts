@@ -945,24 +945,41 @@ function goAhead(op: RaftOperationSpec): "send" | "proceed" {
   return op.name.startsWith("messages.") ? "send" : "proceed";
 }
 
+/** What `actions_prepare` adds to its description: which cards, and how to ask a person with one (Sage's wording). */
+export const QUESTION_CARD_TOOL_TEXT = [
+  "A channel or agent card is the route for a change your role does not allow you to make yourself (a person whose role allows it carries it out), or one you want a person to confirm; what Raft lets you do directly, do with its own tool, with no card.",
+  "Ask a person to choose (question:ask): they answer on the card, and the answer comes back as a reply that mentions you (don't poll for it):",
+  '  {"target":"#ops","action":{"type":"question:ask","to":"@alice","questions":[{"id":"window","kind":"single","text":"Which window do we deploy in?","options":[{"value":"tue_am","label":"Tue 10:00"},{"value":"wed_pm","label":"Wed 15:00"}]}]}}',
+  'Up to 4 questions in one card. "single" and "multiple" take 2-4 options (Raft adds Other… itself: don\'t add one); "text" takes a short answer. In a DM leave out "to"; in a channel it is a person\'s handle (not an agent\'s), or "anyone".',
+  "Use a card when the answer decides what you do next: concrete choices, or a short answer you will act on. Ask in a message when you are already talking it through, and don't ask what you can decide yourself.",
+  "Only channel:create, channel:add_member, agent:create and question:ask cards can be prepared here: the integration cards take ids you have no way to know, and are made by Raft's own integration commands.",
+].join("\n");
+
 /**
  * What this plugin refuses of an operation's arguments before any request, and the sentence its tool's
  * description gains so the model knows before calling. The manifest's schema stays as it is; this narrows it.
  */
 const ARGUMENT_CHECKS: Readonly<Record<string, { check(input: Record<string, unknown>): string | null; described: string }>> = {
-  // The three cards a model may prepare. The integration cards take ids a model has no way to know, and are made
-  // by Raft's own integration commands.
+  // The four cards a model may prepare. The integration cards take ids a model has no way to know, and are made
+  // by Raft's own integration commands. A question card (`question:ask`, slock #13713) asks a person to choose; its
+  // text follows Raft's own CLI help (`QUESTION_CARD_HELP`), with the example in this tool's `{ target, action }`,
+  // as Sage settled it. Pinned word for word in test/raft-plugin.ts.
   "actions.prepare": {
     check: (input) => {
       const type = (input.action as { type?: unknown } | undefined)?.type;
-      return type === "channel:create" || type === "channel:add_member" || type === "agent:create" ? null
-        : "action.type must be channel:create, channel:add_member or agent:create: the integration cards take ids you have no way to know, and are made by Raft's own integration commands";
+      return type === "channel:create" || type === "channel:add_member" || type === "agent:create" || type === "question:ask" ? null
+        : "action.type must be channel:create, channel:add_member, agent:create or question:ask: the integration cards take ids you have no way to know, and are made by Raft's own integration commands";
     },
-    described: " A card is the route for a change your role does not allow you to make yourself (a person whose role allows it carries it out), or one you want a person to confirm;" +
-      " what Raft lets you do directly, do with its own tool, with no card." +
-      " Only channel:create, channel:add_member and agent:create cards can be prepared here: the integration cards take ids you have no way to know, and are made by Raft's own integration commands.",
+    described: `\n${QUESTION_CARD_TOOL_TEXT}`,
   },
 };
+
+/** The question card's prompt line, Raft's own sentence with this mount's tool in the parentheses (Sage). */
+export function questionCardLine(alias: string): string {
+  return "When a person must choose between concrete options before your work can go on, ask with one question card " +
+    `(\`${modelToolName(alias, "actions_prepare")}\`, with an action of type \`question:ask\` and your questions in it) holding all such questions; ` +
+    "the answer comes back as a reply that @mentions you. Not for what you can decide yourself, or are already talking through with them: ask that in a plain message.";
+}
 
 /**
  * Arguments of an operation's manifest schema that its tool does not offer, each with the reason: left out of the
@@ -3248,7 +3265,9 @@ export function createRaftPlugin(deps: {
       // One line per managed MCP connector that needs reconnecting and per catalogue tool this agent is not offered, so
       // the agent tells the person what is wrong instead of saying the connector has no such tool (`mcpLines`).
       const reconnect = mcpLines(keptMcpOf(await ctx.db.get(CONTEXT_STORE, MCP_KEY)));
-      const parts = [features, reconnect.length ? reconnect.join("\n") : null].filter((p): p is string => p !== null);
+      // The question card's line only where the tool is offered (`ctx.offered`, given by the gateway for the prompt).
+      const question = ctx.offered?.includes("actions_prepare") ? questionCardLine(ctx.alias) : null;
+      const parts = [features, question, reconnect.length ? reconnect.join("\n") : null].filter((p): p is string => p !== null);
       return parts.length ? parts.join("\n\n") : null;
     },
     /** A turn's start lists the mount again when its managed MCP catalogue has aged or a call found it stale (`mcpClock`). */

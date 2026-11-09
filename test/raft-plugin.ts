@@ -1,6 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS, type RaftOperationSpec } from "@botiverse/raft-sdk";
-import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction, renderInboxSummary, INBOX_SUMMARY, RAFTBENCH_TOOL, RAFTBENCH_READER_BASIS, isRaftbenchReader, appOf, enabledApps } from "../src/plugins/raft.ts";
+import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction, renderInboxSummary, INBOX_SUMMARY, RAFTBENCH_TOOL, RAFTBENCH_READER_BASIS, isRaftbenchReader, appOf, enabledApps, QUESTION_CARD_TOOL_TEXT, questionCardLine } from "../src/plugins/raft.ts";
 import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
@@ -1400,15 +1400,42 @@ await check("actions_prepare posts the card the manifest describes, as a write t
   // An integration card needs ids a model cannot know: refused before anything is sent, and the description says so.
   for (const type of ["integration:register_app", "integration:approve_agent_login", undefined]) {
     const why = await failure(() => raftPlugin.invoke("actions_prepare", { target: "#general", action: { type, name: "x", returnUrl: "https://x" } }, inTurn(ctx())));
-    if (sent !== 0 || !/action\.type must be channel:create, channel:add_member or agent:create: the integration cards take ids/.test(why.message)) throw new Error(`${type}: sent=${sent} ${why.message}`);
+    if (sent !== 0 || !/action\.type must be channel:create, channel:add_member, agent:create or question:ask: the integration cards take ids/.test(why.message)) throw new Error(`${type}: sent=${sent} ${why.message}`);
   }
-  if (!/Only channel:create, channel:add_member and agent:create cards can be prepared here/.test(toolNamed("actions_prepare")!.summary)) throw new Error(toolNamed("actions_prepare")!.summary);
-  // Control: the three a model may prepare all reach Raft.
+  if (!/Only channel:create, channel:add_member, agent:create and question:ask cards can be prepared here/.test(toolNamed("actions_prepare")!.summary)) throw new Error(toolNamed("actions_prepare")!.summary);
+  // Control: the four a model may prepare all reach Raft.
   for (const type of ["channel:create", "channel:add_member", "agent:create"]) {
     one(json(200, { messageId: "abcdef12-3456", metadata: { kind: "action-card" } }));
     const action = type === "channel:add_member" ? { type, channel: "#general", humans: ["tygg"] } : { type, name: "launch-room" };
     await raftPlugin.invoke("actions_prepare", { target: "#general", action }, inTurn(ctx()));
   }
+  // A question card (slock #13713) reaches Raft as the model wrote it: the example its description gives, verbatim.
+  const asked = one(json(200, { messageId: "abcdef12-3456", metadata: { kind: "action-card" } }));
+  const question = { type: "question:ask", to: "@alice", questions: [{ id: "window", kind: "single", text: "Which window do we deploy in?",
+    options: [{ value: "tue_am", label: "Tue 10:00" }, { value: "wed_pm", label: "Wed 15:00" }] }] };
+  await raftPlugin.invoke("actions_prepare", { target: "#ops", action: question }, inTurn(ctx()));
+  const sentQ = JSON.parse(String(asked[0]!.init.body));
+  if (sentQ.target !== "#ops" || sentQ.action?.type !== "question:ask" || sentQ.action.to !== "@alice" || sentQ.action.questions?.[0]?.options?.length !== 2) {
+    throw new Error(`question card: ${JSON.stringify(sentQ)}`);
+  }
+});
+
+await check("actions_prepare's description carries Sage's question-card text verbatim, and the prompt names the tool only where it is offered", async () => {
+  // Raft's CLI help (QUESTION_CARD_HELP) adapted to this tool's { target, action }, as Sage settled it: pinned line by line.
+  const summary = toolNamed("actions_prepare")!.summary;
+  for (const line of QUESTION_CARD_TOOL_TEXT.split("\n")) if (!summary.includes(line)) throw new Error(`missing from the description: ${line}`);
+  for (const must of ['"to":"@alice"', "Up to 4 questions in one card.", "2-4 options (Raft adds Other… itself: don't add one)", 'In a DM leave out "to"', "(don't poll for it)"]) {
+    if (!QUESTION_CARD_TOOL_TEXT.includes(must)) throw new Error(`the settled text lost: ${must}`);
+  }
+  // The prompt line is Raft's sentence word for word, "@mentions" kept, with this mount's qualified tool name.
+  const line = questionCardLine("raft");
+  if (line !== "When a person must choose between concrete options before your work can go on, ask with one question card (`raft__actions_prepare`, with an action of type `question:ask` and your questions in it) holding all such questions; the answer comes back as a reply that @mentions you. Not for what you can decide yourself, or are already talking through with them: ask that in a plain message.") {
+    throw new Error(line);
+  }
+  const offered = await raftPlugin.promptContribution!({ ...ctx(), offered: ["actions_prepare", "messages_send"] } as any);
+  if (!offered?.includes(line)) throw new Error(`offered, but the prompt has no question-card line: ${offered}`);
+  const without = await raftPlugin.promptContribution!({ ...ctx(), offered: ["messages_send"] } as any);
+  if (without?.includes("question card")) throw new Error(`not offered, yet the prompt speaks of it: ${without}`);
 });
 
 await check("a truncated pull says so in words, and a complete one carries no such note", async () => {

@@ -58,6 +58,19 @@ await check("paragraphs come in registry order, whatever the aliases are called"
     `registry order expected, got ${JSON.stringify(out)}`);
 });
 
+await check("a paragraph is told which tools its mount offers, so it speaks only of tools the model has", async () => {
+  // The question card's line (src/plugins/raft.ts) appears only where actions_prepare is offered; that needs the
+  // offered names in the prompt's context, as a call's context has them.
+  let seen: unknown = "unset";
+  const p = says("offers", () => "TEXT", {
+    tools: [{ name: "alpha", summary: "a", input: { type: "object", properties: {} } }, { name: "beta", summary: "b", input: { type: "object", properties: {} } }],
+    async promptContribution(ctx: any) { seen = ctx.offered; return "TEXT"; },
+  } as any);
+  const { gw } = await fixture([p], [["m", "offers"]]);
+  await gw.promptContributions({ tenantId: "t", agentId: "a", taskId: "k" } as any);
+  must(JSON.stringify(seen) === JSON.stringify(["alpha", "beta"]), `offered in the prompt's context: ${JSON.stringify(seen)}`);
+});
+
 await check("two mounts of one plugin keep alias order, so the set of mounts fixes the prompt", async () => {
   const { gw } = await fixture([says("p", (alias) => `from ${alias}`)], [["m2", "p"], ["m1", "p"]]);
   const out = await gw.promptContributions({ tenantId: "t", agentId: "a", taskId: "k" } as any);

@@ -983,6 +983,8 @@ export class ToolGateway {
         const pctx = {
           caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
           alias: mount.alias,
+          // What this mount offers, as a call's context has it, so a paragraph can speak only of tools the model has.
+          offered: toolsOf(plugin, mount).map((t) => t.name),
           credential: null,
           publicConfig: mount.publicConfig,
           db: this.#db(ctx, mount),
