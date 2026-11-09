@@ -181,9 +181,12 @@ for f in $(find "$ROOT/report/runs" -type f ! -path "$ROOT/report/runs/README.md
   # 2026-11-09). So it waits for its record. A run that died before writing one
   # leaves its log as the only evidence; PUBLISH_LOG_WITHOUT_RECORD=1 sends it
   # anyway, by a person's choice rather than by running the script too early.
+  # A finished log republished under a second name after a snapshot took the
+  # first (`<run>-full.log`) belongs to the same run's `<run>.json` (Vera, #1182).
   case "$f" in
     *.log)
-      if [ ! -f "${f%.log}.json" ] && [ "${PUBLISH_LOG_WITHOUT_RECORD:-}" != 1 ]; then
+      stem=${f%.log}; stem=${stem%-full}
+      if [ ! -f "$stem.json" ] && [ "${PUBLISH_LOG_WITHOUT_RECORD:-}" != 1 ]; then
         echo "WAITING  $key — its run has not written its record yet; not uploaded (PUBLISH_LOG_WITHOUT_RECORD=1 sends it anyway)"
         waiting=$((waiting+1)); continue
       fi;;

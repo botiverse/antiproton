@@ -323,11 +323,16 @@ check("a log whose run has not written its record yet waits, and is sent once th
   mkdirSync(join(dead, "bin"), { recursive: true });
   writeFileSync(join(dead, "bin/npx"), "#!/bin/sh\nexit 0\n");
   chmodSync(join(dead, "bin/npx"), 0o755);
+  // A finished log republished as `<run>-full.log` after a snapshot took `<run>.log` pairs with `<run>.json`.
+  writeFileSync(join(dir, "report/runs/2026-01-01/record-full.log"), "the finished log, under its second name\n");
+  const full = run(dir, env);
+  const fullRows = listed();
   const forced = run(dead, { ...env, PATH: `${join(dead, "bin")}:${process.env.PATH ?? ""}`, PUBLISH_LOG_WITHOUT_RECORD: "1" });
   let deadRows = "";
   try { deadRows = readFileSync(join(dead, "report/runs/manifest.tsv"), "utf8"); } catch { /* none */ }
   rmSync(dir, { recursive: true, force: true });
   rmSync(dead, { recursive: true, force: true });
+  if (full.out.includes("WAITING") || !fullRows.includes("runs/2026-01-01/record-full.log")) throw new Error(`a -full.log beside its run's record was held as waiting: ${full.out}\n${fullRows}`);
   if (early.code !== 0) throw new Error(`a waiting log ended with ${early.code}, not 0 — waiting is not a refusal: ${early.out}`);
   if (!early.out.includes("WAITING") || earlyRows.includes("record.log")) throw new Error(`a log with no record was published mid-run: ${early.out}\n${earlyRows}`);
   if (!doneRows.includes("runs/2026-01-01/record.log") || !doneRows.includes("runs/2026-01-01/record.json")) throw new Error(`once the record was there, the pair was not sent: ${done.out}\n${doneRows}`);
