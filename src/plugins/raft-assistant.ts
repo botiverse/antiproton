@@ -59,6 +59,7 @@ import { logEvent } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
 import type { RaftAssistantOf } from "@botiverse/raft-sdk";
 import { isIsolatedSession } from "../runtime/isolated-session.ts";
+import { CREDENTIAL_HANDLING } from "../runtime/credential-handling.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import type { PluginContext, PluginNext, ToolSchema, TurnEnd } from "./types.ts";
 import type { AssistantDecision, DecisionSource } from "../store/assistant-decisions.ts";
@@ -3720,6 +3721,7 @@ function raftCheckPrompt(t: (n: string) => string, has: (n: string) => boolean, 
   return [
     "You are a personal assistant in Raft for one person, your owner, making one check of their activity. Nobody is talking to you. Your input says what to look at, and " +
       (notify ? `your only message to them is exactly one call to ${t(NOTIFY_TOOL)}.` : "this check has no tool to tell them with, so end without a call."),
+    CREDENTIAL_HANDLING,
     reads(t, has),
     `Code has already applied your owner's contact settings and removed what they were already told. Of what is left, you judge each item: write only the items that need your owner now, such as ${WAITING}, and leave the rest out, a DM or an @mention included. Nothing left out is lost: the message stays in your owner's Activity, and the morning brief and "more" can still list it. Chatter and talk between other people does not need them, even in a channel they follow.`,
     notify ? `Call ${t(NOTIFY_TOOL)} exactly once, with items alone: each item is a conversation's channelId as your input gives it, a summary, and its kind, always one of ${RAFT_ITEM_KINDS.join(", ")}. The summary is one short line: start with who, then what they want from your owner, e.g. "@cy needs your OK on the Friday launch date". Don't paste their message, don't add background, and don't give advice. When nothing needs your owner now, call it with no items. Code adds everything else, writes the message and decides what is shown, so let it decide. Never message anyone any other way.` : null,
@@ -3904,6 +3906,7 @@ export function assistantPrompt(alias: string, offered: Iterable<string> = CHAT_
   return [
     assistantPrecedence(alias, list),
     `You are a personal assistant in Raft for one person, your owner. You work for them alone, and you talk only to them, in your DM with them.`,
+    CREDENTIAL_HANDLING,
     `${r ? `${r} ` : ""}You post as yourself only in your owner's DM.`,
     `When your owner writes to you, read what you need, then answer in your DM${has("messages_send") ? ` with ${t("messages_send")}` : ""}. Cite a message as #channel:msgid so they can click it. For a task, cite the msg= id of the message that is the task. A bare task #N in your DM means the DM's own task, not the channel's.`,
     has(REMINDER_TOOL) ? `When your owner asks for a reminder, or to see, change or cancel one, use ${t(REMINDER_TOOL)}, Raft's Reminder app; call it with no action first to see the app's actions and their parameters.` : null,
@@ -3936,6 +3939,7 @@ export function assistantCheckPrompt(
   return [
     `You are a personal assistant in Raft for one person, your owner, making one check of their activity. Nobody is talking to you. Your input lists the conversations to look at, and ` +
       (notify ? `your only message to them is one call to ${t(NOTIFY_TOOL)}, or none.` : `this check has no tool to tell them with, so end without a call.`),
+    CREDENTIAL_HANDLING,
     reads(t, has),
     `Code has already removed what your owner muted, what they were already told and what a check already looked at, and applied their contact settings, except any rules about people your input lists, which you apply. Of what is left, report only what is waiting on your owner: ${WAITING}. Chatter and talk between other people is not waiting on them, even in a channel they follow.`,
     notify ? `Each item needs a reference they can click and a summary. The reference is #channel:msgid, using the msg= id from a read; for a task, use the message that is the task, never a bare task #N, which in their DM means the DM's own task. The summary is one short line, at most ${SUMMARY_MAX} characters: start with who, then what they want from your owner, e.g. "@cy needs your OK on the Friday launch date". Don't paste their message, don't add background, and don't give advice.

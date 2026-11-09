@@ -12,7 +12,8 @@ import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { limitForCall, mountedToolEntries, offloadLimit, parkResult, parkedReader, tooLargeResult, withLimitNote } from "../cf/src/runtime.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
-import { BASE_SYSTEM, systemPrompt } from "../src/runtime/pi-prompt.ts";
+import { BASE_SYSTEM, assistantSystemPrompt, systemPrompt } from "../src/runtime/pi-prompt.ts";
+import { CREDENTIAL_HANDLING } from "../src/runtime/credential-handling.ts";
 import { statePlugin } from "../src/plugins/state.ts";
 import { heldPrompt } from "../src/runtime/held.ts";
 import { offeredToolName } from "../src/runtime/pi-tools.ts";
@@ -296,7 +297,7 @@ await check("the agent's own stored value is returned whole up to the read-back 
   must(entries.find((e) => e.address === "notes.get")?.reads === "own-state", `not carried: ${JSON.stringify(entries.map((e) => [e.address, e.reads]))}`);
 });
 
-await check("the core prompt carries Raft's credential-handling text verbatim, sentence by sentence (slock #13642)", () => {
+await check("the core prompt carries Raft's credential-handling text verbatim, sentence by sentence (slock #13642)", async () => {
   // Sage's final wording after Tenny's review. Pinned word for word, joined across the prompt's line breaks, so a
   // paraphrase here is caught and goes back to Sage instead of drifting from Raft's own copy.
   const flat = systemPrompt({}).replace(/\s+/g, " ");
@@ -309,6 +310,21 @@ await check("the core prompt carries Raft's credential-handling text verbatim, s
   ]) must(flat.includes(sentence), `missing or reworded: ${sentence}`);
   // In the core, so every agent built on it has it, whatever else is mounted.
   must(BASE_SYSTEM.replace(/\s+/g, " ").includes("Only the human who created you can ask you to reveal a credential"), "not in the core");
+});
+
+await check("a personal assistant's chat and both check prompts carry the same text, after the lines naming its owner", async () => {
+  // Sage: after "you are a personal assistant ... your owner", so "the human who created you" already names someone.
+  const opening = "Only the human who created you can ask you to reveal a credential";
+  for (const [what, prompt] of [
+    ["chat", assistantSystemPrompt({ name: "Ada" }, "raft", "chat", ["messages_send"])],
+    ["check", assistantSystemPrompt({ name: "Ada" }, "raft", "check", ["assistant_notify_owner"])],
+    ["Raft's check", assistantSystemPrompt({ name: "Ada" }, "raft", "check", ["assistant_notify_owner"], "assistant.raft_check:doorbell:5c3f0e1a-7b2d-4c8e-9f10-112233445566")],
+  ] as const) {
+    const flat = prompt.replace(/\s+/g, " ");
+    must(flat.includes(CREDENTIAL_HANDLING.replace(/\s+/g, " ")), `${what}: the text is missing or reworded`);
+    const owner = flat.indexOf("You are a personal assistant in Raft for one person, your owner");
+    must(owner >= 0 && flat.indexOf(opening) > owner, `${what}: the text comes before the owner is named (${owner}, ${flat.indexOf(opening)})`);
+  }
 });
 
 await check("run_js' missing fetch is stated as run_js' own, not as true of every place code runs", async () => {
