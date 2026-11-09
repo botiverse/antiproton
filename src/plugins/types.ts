@@ -427,8 +427,8 @@ export interface PluginContext {
    * Set by the gateway (`#contextFor`, src/runtime/gateway.ts) on every context it builds for one of the agent's
    * mounts: a call's `invoke`, `interrupts.resume`/`cancel`, `background.poll`/`cancel`, `receive`,
    * `reportActivity` and `unmount`. Absent from `snapshotTools`'s context, which is asking what the list should be — the list it
-   * would be handed is the one being replaced — and from the contexts built without a call (`promptContribution`,
-   * `Holding.activity`/`activities`/`usage`/`release`/`files`, `checkCredential`). A plugin reads absence as "not
+   * would be handed is the one being replaced — and from the contexts built without a call (except `promptContribution`,
+   * which is given it so a paragraph speaks only of offered tools; `Holding.activity`/`activities`/`usage`/`release`/`files`, `checkCredential`). A plugin reads absence as "not
    * reported", never as "offers nothing", and falls back to its static `tools`.
    */
   offered?: readonly string[];
