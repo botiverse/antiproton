@@ -1398,12 +1398,12 @@ await check("actions_prepare posts the card the manifest describes, as a write t
   const tooLong = await failure(() => raftPlugin.invoke("actions_prepare", { target: "#general", action: { type: "channel:create", name: "x".repeat(121) } }, inTurn(ctx())));
   if (sent !== 0 || tooLong.mayHaveLanded === true || !/Invalid request/.test(tooLong.message)) throw new Error(`contract refusal: sent=${sent} ${tooLong.message}`);
   // An integration card needs ids a model cannot know: refused before anything is sent, and the description says so.
-  for (const type of ["integration:register_app", "integration:approve_agent_login", undefined]) {
+  for (const type of ["integration:register_app", "integration:approve_agent_login", "plan:upgrade", undefined]) {
     const why = await failure(() => raftPlugin.invoke("actions_prepare", { target: "#general", action: { type, name: "x", returnUrl: "https://x" } }, inTurn(ctx())));
-    if (sent !== 0 || !/action\.type must be channel:create, channel:add_member, agent:create or question:ask: the integration cards take ids/.test(why.message)) throw new Error(`${type}: sent=${sent} ${why.message}`);
+    if (sent !== 0 || !/action\.type must be channel:create, channel:add_member, agent:create, question:ask or feedback:submit: other card types come from Raft's own commands\./.test(why.message)) throw new Error(`${type}: sent=${sent} ${why.message}`);
   }
-  if (!/Only channel:create, channel:add_member, agent:create and question:ask cards can be prepared here/.test(toolNamed("actions_prepare")!.summary)) throw new Error(toolNamed("actions_prepare")!.summary);
-  // Control: the four a model may prepare all reach Raft.
+  if (!/Only channel:create, channel:add_member, agent:create, question:ask and feedback:submit cards can be prepared here; other card types come from Raft's own commands\./.test(toolNamed("actions_prepare")!.summary)) throw new Error(toolNamed("actions_prepare")!.summary);
+  // Control: the five a model may prepare all reach Raft.
   for (const type of ["channel:create", "channel:add_member", "agent:create"]) {
     one(json(200, { messageId: "abcdef12-3456", metadata: { kind: "action-card" } }));
     const action = type === "channel:add_member" ? { type, channel: "#general", humans: ["tygg"] } : { type, name: "launch-room" };
@@ -1418,13 +1418,18 @@ await check("actions_prepare posts the card the manifest describes, as a write t
   if (sentQ.target !== "#ops" || sentQ.action?.type !== "question:ask" || sentQ.action.to !== "@alice" || sentQ.action.questions?.[0]?.options?.length !== 2) {
     throw new Error(`question card: ${JSON.stringify(sentQ)}`);
   }
+  // A feedback card needs no id (Sage, #proj-raft-computer:29845d4c): it reaches Raft as the model wrote it.
+  const fed = one(json(200, { messageId: "abcdef12-3456", metadata: { kind: "action-card" } }));
+  await raftPlugin.invoke("actions_prepare", { target: "#general", action: { type: "feedback:submit", feedbackType: "problem", message: "Search misses threads" } }, inTurn(ctx()));
+  const sentF = JSON.parse(String(fed[0]!.init.body));
+  if (sentF.action?.type !== "feedback:submit" || sentF.action.feedbackType !== "problem" || sentF.action.message !== "Search misses threads") throw new Error(`feedback card: ${JSON.stringify(sentF)}`);
 });
 
 await check("actions_prepare's description carries Sage's question-card text verbatim, and the prompt names the tool only where it is offered", async () => {
   // Raft's CLI help (QUESTION_CARD_HELP) adapted to this tool's { target, action }, as Sage settled it: pinned line by line.
   const summary = toolNamed("actions_prepare")!.summary;
   for (const line of QUESTION_CARD_TOOL_TEXT.split("\n")) if (!summary.includes(line)) throw new Error(`missing from the description: ${line}`);
-  for (const must of ['"to":"@alice"', "Up to 4 questions in one card.", "2-4 options (Raft adds Other… itself: don't add one)", 'In a DM leave out "to"', "(don't poll for it)"]) {
+  for (const must of ['"to":"@alice"', "Up to 4 questions in one card.", "2-4 options (Raft adds Other… itself: don't add one)", 'In a DM leave out "to"', "(don't poll for it)", "Prepare a feedback:submit card when a person wants to send the Raft team an idea or a problem about Raft itself: draft only what they asked to send; they can edit it before it is filed as their own feedback."]) {
     if (!QUESTION_CARD_TOOL_TEXT.includes(must)) throw new Error(`the settled text lost: ${must}`);
   }
   // The prompt line is Raft's sentence word for word, "@mentions" kept, with this mount's qualified tool name.
