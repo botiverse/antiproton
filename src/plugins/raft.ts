@@ -1171,6 +1171,9 @@ function argumentsFor(op: RaftOperationSpec, args: unknown): Record<string, unkn
 const UNOFFERED_SAY: Readonly<Record<string, string>> = {
   // The SDK names `inbox.check` for "check for new messages"; on this mount that is receive_events.
   inbox_check: "receive_events()",
+  // Since 0.34.0 an inbox listing with items names `inbox.read` for every row and its next step; it is excluded here
+  // (it consumes what it returns, a second reader of receive_events' inbox). The row already shows the target.
+  inbox_read: "messages_read with that conversation's target and unread: true",
   // Since 0.11.0 the SDK's notify hint names mentions_notify and its add hint mentions_add, both generated; the add
   // hint is said in words only on a mount whose credential lacks the `mentions` capability.
   mentions_add: "adding them to the conversation, which this mount does not offer",
@@ -1301,8 +1304,8 @@ function quotedCalls(value: unknown, pattern: RegExp, depth = 0, out: string[] =
     }
   } else if (Array.isArray(value)) for (const v of value) quotedCalls(v, pattern, depth + 1, out);
   else if (value && typeof value === "object") {
-    // The SDK's own command fields are hints, not quotes.
-    for (const [k, v] of Object.entries(value)) if (!/^(?:command|nextCommand|openCommand|text)$/.test(k)) quotedCalls(v, pattern, depth + 1, out);
+    // The SDK's own command fields are hints, not quotes (`readCommand`: an inbox item's read step, SDK 0.34.0).
+    for (const [k, v] of Object.entries(value)) if (!/^(?:command|nextCommand|openCommand|readCommand|text)$/.test(k)) quotedCalls(v, pattern, depth + 1, out);
   }
   return out;
 }

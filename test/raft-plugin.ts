@@ -3663,6 +3663,21 @@ await check("a pull whose result is parked shows the model a preview, so its tur
   must(JSON.stringify(posts[0]?.turnEnded) === JSON.stringify({ snapshotId: SNAP, outcome: "completed", shownUnreadTargets: [] }), JSON.stringify(posts));
 });
 
+await check("an inbox listing with items (SDK 0.34) names inbox_read on every row and its next step; the model reads the replacement instead, never the excluded tool", async () => {
+  const items = [background("#general", 3)];
+  const rows = [{ target: "#general", kind: "conversation", conversationKind: "channel", mentions: 0, lastReadSeq: 1, activitySeq: 4, unread: 3, latestSender: { name: "tygg", type: "user" }, preview: "hello", previewTruncated: false, firstUnreadAt: "2026-10-20T06:58:00Z", latestAt: "2026-10-20T07:00:00Z", preLaunch: false }];
+  globalThis.fetch = (async (url: any) => {
+    const path = new URL(String(url)).pathname.replace("/internal/agent-api", "");
+    if (path === "/inbox/conversations") return json(200, { view: "unread", items, rows, preLaunch: null, omitted: null, hasMore: false, nextBeforeSeq: null, totals: { conversations: 1, dms: 0, mentions: 0 }, snapshotId: SNAP });
+    return json(404, { error: "not found", code: "NOT_FOUND" });
+  }) as any;
+  const out = await raftPlugin.invoke("inbox_list", {}, turnMount().ctx) as any;
+  const said = JSON.stringify(out);
+  must(said.includes("#general"), `control: the row is listed: ${said}`);
+  must(!said.includes("inbox_read") && !said.includes("inbox.read"), `the excluded tool is named: ${said}`);
+  must(said.includes("messages_read with that conversation's target and unread: true"), `no replacement: ${said}`);
+});
+
 await check("the model's own inbox_list keeps the snapshot naming nothing; a later listing with another id is counted on the trace, not merged", async () => {
   const server = turnServer([background("#general", 1294)], { snapshotId: "snap_A" });
   const m = turnMount();
