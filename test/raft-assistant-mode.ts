@@ -2927,7 +2927,7 @@ await check("send as owner end to end: a chat turn that calls it twice with the 
 });
 
 for (const [rows, cut] of [[100, true], [40, false]] as const) await check(`an owner read of ${rows} long messages is ${cut ? "cut" : "handed back whole"} and never parked, though a reader is mounted`, async () => {
-  // The line is the read-back line (32 KB) since the owner reads declare reads: "asked-page" (Artea): 40 rows of ~340
+  // The line is the read-back line (32 KB) for owner reads, by address (Artea): 40 rows of ~340
   // characters (~15 KB) used to be cut at 4 KB and now come back whole; 100 rows (~37 KB, the messages max) are still cut.
   const CH = "c0ffee00-0000-4000-8000-000000000001";
   const big = Array.from({ length: rows }, (_, i) => ({ seq: i + 1, id: `0000000${i % 10}-aaaa-4bbb-8ccc-dddddddddddd`, timestamp: "2026-10-20T09:00:00.000Z",

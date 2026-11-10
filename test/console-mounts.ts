@@ -135,15 +135,6 @@ await check("only mcp declares readsOwnerSecrets, the grant the gateway reads", 
 
 // The runtime trusts the declaration and lifts the parking line for it (cf/src/runtime.ts `limitForCall`), without
 // looking at what the tool returns: so only the agent's own stored values may claim it.
-await check("only raft.ts declares reads: asked-page, on the owner inbox and owner messages alone", async () => {
-  const declared = await pluginFilesMatching(/reads\s*:\s*"asked-page"/);
-  must(show(declared) === show(["raft.ts"]), `plugins that declare reads: "asked-page": ${show(declared)}`);
-  const { readFileSync } = await import("node:fs");
-  const src = readFileSync(new URL("raft.ts", pluginsDir), "utf8");
-  const count = src.match(/reads\s*:\s*"asked-page"/g)?.length ?? 0;
-  must(count === 2, `raft.ts declares reads: "asked-page" ${count} times; only the owner inbox and owner messages may`);
-});
-
 await check("only state.get declares reads: own-state, the line limitForCall lifts", async () => {
   const declared = await pluginFilesMatching(/reads\s*:\s*"own-state"/);
   must(show(declared) === show(["state.ts"]), `plugins that declare reads: "own-state": ${show(declared)}`);

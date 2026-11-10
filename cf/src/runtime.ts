@@ -514,10 +514,12 @@ export function offloadLimit(readBack: string | null): number {
  * playbook and FAQ, 2026-10-20). Only that declaration widens the line: any
  * other tool's result, however small the step to read it back, stays at 4 KiB.
  *
- * A tool that returns a page of short rows the model asked for by `limit`
- * (`reads: "asked-page"`: the assistant's owner inbox and owner messages) is
- * held there too: parked, the model reads a preview and pages again for rows it
- * was about to read (Artea, 2026-11-10).
+ * A personal assistant's owner reads (`isOwnerReadAddress`) are held there
+ * too, reader or not. They are never parked, only cut (`ownerReadTooLarge`), so
+ * the line is only where a page of the owner's inbox or messages is cut: at
+ * 4 KiB a 20-row inbox page was, and the assistant paged for rows it was
+ * about to read (Artea, 2026-11-10). Their content stays in the conversation
+ * with the owner either way; the wider line costs context, nothing else.
  *
  * Compared by address, because that is what reaches the host: both the
  * bridge and run_js resolve the offered name before they invoke. `reads` is
@@ -528,7 +530,8 @@ export function offloadLimit(readBack: string | null): number {
  * has to, is pinned there as one that does not.
  */
 export function limitForCall(tool: string, reader: { name: string; address: string } | null, reads?: ToolReads): number {
-  return reader && (tool === reader.address || reads === "own-state" || reads === "asked-page") ? offloadLimit(null) : offloadLimit(reader?.name ?? null);
+  if (isOwnerReadAddress(tool)) return offloadLimit(null);
+  return reader && (tool === reader.address || reads === "own-state") ? offloadLimit(null) : offloadLimit(reader?.name ?? null);
 }
 
 /**
@@ -658,12 +661,13 @@ export function withLimitNote<T extends { description: string; address: string; 
   reader: { name: string; address: string } | null,
 ): T[] {
   // Each tool's own line (`limitForCall`), so a tool held to the read-back line is not told the parking line.
-  const sentence = (kb: number) => reader
+  // An owner read is cut, never parked (`isOwnerReadAddress`), so it is never offered the reader.
+  const sentence = (kb: number, address: string) => reader && !isOwnerReadAddress(address)
     ? ` A result over ${kb} KB comes back as a summary (preview) and a note with the ${reader.name} call that reads all of it.`
     : ` A result over ${kb} KB comes back as a summary (preview); the rest is discarded.`;
   return tools.map((t) =>
     reader && t.address === reader.address ? t
-      : { ...t, description: `${t.description ?? ""}${sentence(limitForCall(t.address, reader, t.reads) / 1024)}` });
+      : { ...t, description: `${t.description ?? ""}${sentence(limitForCall(t.address, reader, t.reads) / 1024, t.address)}` });
 }
 
 /**
