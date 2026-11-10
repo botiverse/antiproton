@@ -326,7 +326,8 @@ await check("owner inbox through the SDK: GET assistant/owner-inbox with filter,
   // The defaults are sent explicitly; no offset when none is given.
   const { plugin: p2, urls: u2 } = realWire(() => json(200, inboxAnswer({ hasMore: false, nextOffset: null })));
   await p2.invoke(INBOX, {}, ctx(ASSISTANT).ctx);
-  must(JSON.stringify(query(u2[0]!)) === JSON.stringify({ filter: "unread", limit: "10" }), `default query: ${u2[0]}`);
+  must(JSON.stringify(query(u2[0]!)) === JSON.stringify({ filter: "unread", limit: "20" }), `default query: ${u2[0]}`);
+  // Raft's own default since Artea's report (#proj-assistant:5d774876): 10 left the sidebar to be read page by page.
 });
 
 await check("owner messages through the SDK: GET assistant/owner-messages with channelId, one anchor and limit; lines in seq order", async () => {
@@ -647,7 +648,7 @@ await check("arguments: at most one anchor, limits within Raft's bounds, a known
   await plugin.invoke(INBOX, { filter: "unread_mentions", limit: 50, offset: 40 }, ctx(ASSISTANT).ctx);
   await plugin.invoke(INBOX, {}, ctx(ASSISTANT).ctx);
   must(JSON.stringify(asked.messages) === JSON.stringify([{ channelId: "ch-1", limit: 100, around: "abc12345" }, { channelId: "ch-1", limit: 10 }]), `messages asked: ${JSON.stringify(asked.messages)}`);
-  must(JSON.stringify(asked.inbox) === JSON.stringify([{ filter: "unread_mentions", limit: 50, offset: 40 }, { filter: "unread", limit: 10 }]), `inbox asked: ${JSON.stringify(asked.inbox)}`);
+  must(JSON.stringify(asked.inbox) === JSON.stringify([{ filter: "unread_mentions", limit: 50, offset: 40 }, { filter: "unread", limit: 20 }]), `inbox asked: ${JSON.stringify(asked.inbox)}`);
 });
 
 // ---- whoami ------------------------------------------------------------------------------------------------------------

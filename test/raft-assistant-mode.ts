@@ -2926,13 +2926,15 @@ await check("send as owner end to end: a chat turn that calls it twice with the 
   } finally { w.host.dispose(); }
 });
 
-await check("an owner read too large to hand back is cut and never parked, though a reader is mounted", async () => {
+for (const [rows, cut] of [[100, true], [40, false]] as const) await check(`an owner read of ${rows} long messages is ${cut ? "cut" : "handed back whole"} and never parked, though a reader is mounted`, async () => {
+  // The line is the read-back line (32 KB) for owner reads, by address (Artea): 40 rows of ~340
+  // characters (~15 KB) used to be cut at 4 KB and now come back whole; 100 rows (~37 KB, the messages max) are still cut.
   const CH = "c0ffee00-0000-4000-8000-000000000001";
-  const big = Array.from({ length: 40 }, (_, i) => ({ seq: i + 1, id: `0000000${i % 10}-aaaa-4bbb-8ccc-dddddddddddd`, timestamp: "2026-10-20T09:00:00.000Z",
+  const big = Array.from({ length: rows }, (_, i) => ({ seq: i + 1, id: `0000000${i % 10}-aaaa-4bbb-8ccc-dddddddddddd`, timestamp: "2026-10-20T09:00:00.000Z",
     sender_type: "human", sender_name: "bob", channel_type: "channel", channel_name: "general", content: `OWNER-PRIVATE ${"x".repeat(300)} ${i}` }));
   let step = 0;
   const w = await runtimeWith(true, () => step++ === 0
-    ? { text: "", finishReason: "tool_calls", truncated: false, usage, toolCalls: [{ id: "r1", name: "raft__assistant_owner_messages", arguments: { channelId: CH, limit: 40 } }] } as ModelResponse
+    ? { text: "", finishReason: "tool_calls", truncated: false, usage, toolCalls: [{ id: "r1", name: "raft__assistant_owner_messages", arguments: { channelId: CH, limit: rows } }] } as ModelResponse
     : say("noted"));
   try {
     const inner = globalThis.fetch;
@@ -2941,7 +2943,8 @@ await check("an owner read too large to hand back is cut and never parked, thoug
       : inner(url, init)) as typeof fetch;
     await w.turn("what is happening in #general?");
     const result = JSON.stringify(w.calls.at(-1)!.messages.filter((m: any) => m.role === "toolResult"));
-    must(/never kept outside this conversation/.test(result) && !/"ref"/.test(result), `the tool result: ${result.slice(0, 600)}`);
+    must(/never kept outside this conversation/.test(result) === cut && !/"ref"/.test(result), `the tool result: ${result.slice(0, 600)}`);
+    must(result.includes(`OWNER-PRIVATE ${"x".repeat(300)} ${rows - 1}`) === !cut, `the last row ${cut ? "was not cut" : "is missing"}`);
     must(w.r2.puts.length === 0, `parked: ${show(w.r2.puts)}`);
     const refs = w.host.sql.exec("SELECT COUNT(*) AS n FROM operations WHERE result_ref IS NOT NULL").toArray()[0].n;
     must(refs === 0, `operations with a stored result: ${refs}`);

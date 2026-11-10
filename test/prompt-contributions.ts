@@ -310,6 +310,26 @@ await check("the agent's own stored value is returned whole up to the read-back 
   must(entries.find((e) => e.address === "notes.get")?.reads === "own-state", `not carried: ${JSON.stringify(entries.map((e) => [e.address, e.reads]))}`);
 });
 
+await check("a personal assistant's owner reads are held to the read-back line, and told they are cut, not parked (Artea)", async () => {
+  // At 4 KB a 20-row inbox page was cut, and the assistant paged through rows it was about to read.
+  const reader = { name: "artifacts__read", address: "artifacts.read" };
+  const fullPage = 50 * 400; // the inbox max at about 400 characters a row
+  for (const address of ["raft.assistant_owner_inbox", "my-raft.assistant_owner_messages"]) {
+    must(fullPage <= limitForCall(address, reader), `${address}: a full inbox page must arrive whole (limit ${limitForCall(address, reader)})`);
+    must(limitForCall(address, reader) === limitForCall("artifacts.read", reader), `${address}: the reader's line, not a third number`);
+    must(limitForCall(address, null) === offloadLimit(null), `${address}: without a reader the line is the one it always was`);
+  }
+  must(fullPage > limitForCall("raft.messages_read", reader), "control: another raft read still parks at 4 KB");
+  must(fullPage > limitForCall("raft.assistant_notify_owner", reader), "control: another assistant tool still parks at 4 KB");
+  // The model is told the wider line on those tools, and that the rest is discarded: they are cut, never parked.
+  const noted = withLimitNote([
+    { name: "raft__assistant_owner_inbox", address: "raft.assistant_owner_inbox", description: "Read the inbox." },
+    { name: "raft__messages_read", address: "raft.messages_read", description: "Read messages." },
+  ], reader);
+  must(noted[0]!.description.includes(`over ${offloadLimit(null) / 1024} KB`) && /the rest is discarded/.test(noted[0]!.description) && !noted[0]!.description.includes(reader.name), `inbox: ${noted[0]!.description}`);
+  must(noted[1]!.description.includes(`over ${offloadLimit("artifacts__read") / 1024} KB`) && noted[1]!.description.includes(reader.name), `messages_read: ${noted[1]!.description}`);
+});
+
 await check("the core prompt carries Raft's credential-handling text verbatim, sentence by sentence (slock #13642)", async () => {
   // Sage's final wording after Tenny's review. Pinned word for word, joined across the prompt's line breaks, so a
   // paraphrase here is caught and goes back to Sage instead of drifting from Raft's own copy.
