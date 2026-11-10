@@ -2057,11 +2057,11 @@ const OWNER_INBOX_FILTERS = ["unread", "all", "mentions", "unread_mentions", "un
 type OwnerInboxFilter = (typeof OWNER_INBOX_FILTERS)[number];
 /**
  * Each read's bounds. `max` is Raft's own: a limit over it is refused rather than cut down, so the model knows.
- * `default` is ours, sent explicitly, and below Raft's (20 and 50): `PAGE_ROWS`, the page that stays under the
- * parking line, so the usual read on waking (the latest few) comes back whole instead of parked; the model asks for
- * more with `limit` or pages.
+ * `default` is ours, sent explicitly. The inbox takes Raft's own default (20); both tools declare the asked-page read,
+ * so a page up to the max (about 400 characters a row) comes back whole at the read-back line instead of parked at
+ * 4 KB (Artea, #proj-assistant:5d774876). Messages keep `PAGE_ROWS`: a message row can be long.
  */
-export const OWNER_INBOX_LIMIT = { default: PAGE_ROWS, max: 50 } as const;
+export const OWNER_INBOX_LIMIT = { default: 20, max: 50 } as const;
 export const OWNER_MESSAGES_LIMIT = { default: PAGE_ROWS, max: 100 } as const;
 const OWNER_ANCHORS = ["before", "after", "around"] as const;
 
@@ -2092,6 +2092,7 @@ const ASSISTANT_TOOLS: readonly ToolSchema[] = [
       },
     },
     sideEffects: "read",
+    reads: "asked-page",
     idempotency: "native",
     modelOnly: true,
   },
@@ -2114,6 +2115,7 @@ const ASSISTANT_TOOLS: readonly ToolSchema[] = [
       },
     },
     sideEffects: "read",
+    reads: "asked-page",
     idempotency: "native",
     modelOnly: true,
   },

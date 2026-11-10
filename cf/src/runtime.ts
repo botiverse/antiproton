@@ -514,6 +514,11 @@ export function offloadLimit(readBack: string | null): number {
  * playbook and FAQ, 2026-10-20). Only that declaration widens the line: any
  * other tool's result, however small the step to read it back, stays at 4 KiB.
  *
+ * A tool that returns a page of short rows the model asked for by `limit`
+ * (`reads: "asked-page"`: the assistant's owner inbox and owner messages) is
+ * held there too: parked, the model reads a preview and pages again for rows it
+ * was about to read (Artea, 2026-11-10).
+ *
  * Compared by address, because that is what reaches the host: both the
  * bridge and run_js resolve the offered name before they invoke. `reads` is
  * the called tool's own declaration, found by that address. Only the
@@ -523,7 +528,7 @@ export function offloadLimit(readBack: string | null): number {
  * has to, is pinned there as one that does not.
  */
 export function limitForCall(tool: string, reader: { name: string; address: string } | null, reads?: ToolReads): number {
-  return reader && (tool === reader.address || reads === "own-state") ? offloadLimit(null) : offloadLimit(reader?.name ?? null);
+  return reader && (tool === reader.address || reads === "own-state" || reads === "asked-page") ? offloadLimit(null) : offloadLimit(reader?.name ?? null);
 }
 
 /**

@@ -6,7 +6,7 @@ import type { TurnEndEvent } from "../runtime/activity.ts";
 import type { AssistantDecision } from "../store/assistant-decisions.ts";
 
 /** What a tool declares it reads back (`ToolSchema.reads`); the one place the values are listed. */
-export type ToolReads = "parked-result" | "own-state";
+export type ToolReads = "parked-result" | "own-state" | "asked-page";
 
 export interface ToolSchema {
   name: string;
@@ -39,6 +39,11 @@ export interface ToolSchema {
    * agent read the same bytes back with one more call. The runtime trusts the
    * declaration and never looks at what the tool returns, so only the state
    * plugin's `get` declares it (pinned in test/console-mounts.ts).
+   *
+   * `"asked-page"`: this tool returns one page of short rows the model asked for by `limit`, which it reads at once
+   * (the assistant's owner inbox and owner messages). Held to the same read-back line, for the same reason: a parked
+   * page is a preview the model pages through again (Artea, #proj-assistant:5d774876). The row count stays bounded by
+   * the tool's own `limit` maximum. Pinned to those two tools in test/console-mounts.ts.
    */
   reads?: ToolReads;
   /**

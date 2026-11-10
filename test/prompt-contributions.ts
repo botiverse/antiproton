@@ -11,6 +11,7 @@ import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { limitForCall, mountedToolEntries, offloadLimit, parkResult, parkedReader, tooLargeResult, withLimitNote } from "../cf/src/runtime.ts";
+import { createRaftPlugin } from "../src/plugins/raft.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { BASE_SYSTEM, assistantSystemPrompt, systemPrompt } from "../src/runtime/pi-prompt.ts";
 import { CREDENTIAL_HANDLING } from "../src/runtime/credential-handling.ts";
@@ -308,6 +309,32 @@ await check("the agent's own stored value is returned whole up to the read-back 
   const state = statePlugin(null as any, null as any, "local");
   const entries = mountedToolEntries([{ alias: "notes", plugin: state.id } as any], new Map([[state.id, state]]));
   must(entries.find((e) => e.address === "notes.get")?.reads === "own-state", `not carried: ${JSON.stringify(entries.map((e) => [e.address, e.reads]))}`);
+});
+
+await check("a page the model asked for from its owner's inbox or messages comes back whole up to the read-back line (Artea)", async () => {
+  // At 4 KB a 20-row inbox page parked, and the assistant paged through previews of rows it was about to read.
+  const reader = { name: "artifacts__read", address: "artifacts.read" };
+  const fullPage = 50 * 400; // the inbox max at about 400 characters a row
+  must(fullPage <= limitForCall("raft.assistant_owner_inbox", reader, "asked-page"), `a full inbox page must arrive whole (limit ${limitForCall("raft.assistant_owner_inbox", reader, "asked-page")})`);
+  must(limitForCall("raft.assistant_owner_inbox", reader, "asked-page") === limitForCall("artifacts.read", reader), "the asked-page line is the reader's line, not a third number");
+  must(fullPage > limitForCall("raft.assistant_owner_inbox", reader), "without the declaration the same page parks");
+  must(fullPage > limitForCall("raft.messages_read", reader, undefined), "control: another raft read still parks at 4 KB");
+  must(limitForCall("raft.assistant_owner_inbox", null, "asked-page") === offloadLimit(null), "without a reader the line is the one it always was");
+  // The real plugin declares it on those two tools and no others, and it is carried to the offered tool by address.
+  const raft = createRaftPlugin();
+  const declaring = raft.tools.filter((t) => t.reads === "asked-page").map((t) => t.name).sort();
+  must(JSON.stringify(declaring) === JSON.stringify(["assistant_owner_inbox", "assistant_owner_messages"]), `asked-page declared on: ${JSON.stringify(declaring)}`);
+  // (A mount offers the assistant tools only from its Raft snapshot, so the carry is checked on a plugin holding the inbox tool alone.)
+  const inboxOnly = { id: "owner-read", tools: raft.tools.filter((t) => t.name === "assistant_owner_inbox") } as any;
+  const entries = mountedToolEntries([{ alias: "raft", plugin: inboxOnly.id } as any], new Map([[inboxOnly.id, inboxOnly]]));
+  must(entries.find((e) => e.address === "raft.assistant_owner_inbox")?.reads === "asked-page", `not carried: ${JSON.stringify(entries.filter((e) => e.reads).map((e) => [e.address, e.reads]))}`);
+  // And the model is told the wider line on those tools, the parking line elsewhere.
+  const noted = withLimitNote([
+    { name: "raft__assistant_owner_inbox", address: "raft.assistant_owner_inbox", description: "Read the inbox.", reads: "asked-page" as const },
+    { name: "raft__messages_read", address: "raft.messages_read", description: "Read messages." },
+  ], reader);
+  must(noted[0]!.description.includes(`over ${offloadLimit(null) / 1024} KB`), `inbox: ${noted[0]!.description}`);
+  must(noted[1]!.description.includes(`over ${offloadLimit("artifacts__read") / 1024} KB`), `messages_read: ${noted[1]!.description}`);
 });
 
 await check("the core prompt carries Raft's credential-handling text verbatim, sentence by sentence (slock #13642)", async () => {
