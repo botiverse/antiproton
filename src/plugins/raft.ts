@@ -850,7 +850,7 @@ function integer(value: unknown, name: string, min: number, max: number): number
  * The rule for what is left out: a hosted agent is offered every operation an agent inside Raft has (its CLI's
  * `raft mention add`, `raft profile update`, `raft task delete` among them). The Raft Server checks the agent's
  * permission on every call, so a call its role does not allow is refused there, not here. An entry here is for an
- * operation this mount does in another way (the three inbox operations, which `receive_events` replaces), never for
+ * operation this mount does in another way (the four inbox operations, which `receive_events` replaces), never for
  * one an agent "should not" do. `actions_prepare` stays for what the agent's role does not allow it to do itself
  * (a channel:create or channel:add_member card, which a person whose role allows it carries out), and for a proposal
  * a person should confirm.
@@ -859,6 +859,7 @@ export const EXCLUDED: Readonly<Record<string, string>> = {
   "inbox.check": "the inbox is read with receive_events, which commits what it showed and pulls the next in one call; a second reader would move the same cursor",
   "inbox.drain": "pulls until the inbox is empty and hands it all over in one result, with no bound; receive_events pages the same inbox",
   "inbox.commit": "receive_events commits only the messages it showed, which its next pull acknowledges; a separate commit could acknowledge a batch before the model has read it",
+  "inbox.read": "reads one inbox item and the Server consumes what it returns (never retried); receive_events reads the same inbox, so a second reader would consume items its pull and summary never showed",
 };
 
 /**
@@ -1170,6 +1171,9 @@ function argumentsFor(op: RaftOperationSpec, args: unknown): Record<string, unkn
 const UNOFFERED_SAY: Readonly<Record<string, string>> = {
   // The SDK names `inbox.check` for "check for new messages"; on this mount that is receive_events.
   inbox_check: "receive_events()",
+  // Since 0.34.0 an inbox listing with items names `inbox.read` for every row and its next step; it is excluded here
+  // (it consumes what it returns, a second reader of receive_events' inbox). The row already shows the target.
+  inbox_read: "messages_read with that conversation's target and unread: true",
   // Since 0.11.0 the SDK's notify hint names mentions_notify and its add hint mentions_add, both generated; the add
   // hint is said in words only on a mount whose credential lacks the `mentions` capability.
   mentions_add: "adding them to the conversation, which this mount does not offer",
@@ -1300,8 +1304,8 @@ function quotedCalls(value: unknown, pattern: RegExp, depth = 0, out: string[] =
     }
   } else if (Array.isArray(value)) for (const v of value) quotedCalls(v, pattern, depth + 1, out);
   else if (value && typeof value === "object") {
-    // The SDK's own command fields are hints, not quotes.
-    for (const [k, v] of Object.entries(value)) if (!/^(?:command|nextCommand|openCommand|text)$/.test(k)) quotedCalls(v, pattern, depth + 1, out);
+    // The SDK's own command fields are hints, not quotes (`readCommand`: an inbox item's read step, SDK 0.34.0).
+    for (const [k, v] of Object.entries(value)) if (!/^(?:command|nextCommand|openCommand|readCommand|text)$/.test(k)) quotedCalls(v, pattern, depth + 1, out);
   }
   return out;
 }

@@ -66,6 +66,8 @@ function paramSchema(p: Param): Record<string, Json> {
     case "enum": return { type: "string", enum: [...(p.values ?? [])], description };
     case "channel": case "channel_or_server": case "conversation": case "agent": case "text":
       return { type: "string", description };
+    // An ordered list of conversation refs (`#channel`, `dm:@peer`); the SDK resolves each and checks the list.
+    case "conversation_list": return { type: "array", items: { type: "string" }, description };
     // `position` is "top", "bottom" or `{ after }` (the SDK's `readPosition`), and a kind this build does not know is
     // whatever Raft says it is: neither has one JSON type, so neither is given one, and the SDK checks the value.
     default: return { description };
