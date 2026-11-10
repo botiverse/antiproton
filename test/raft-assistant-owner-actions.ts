@@ -62,13 +62,22 @@ const CHANNELS = {
   params: [{ name: "filter", kind: "text", description: "RAFT-PARAM filter: words in the name.", optional: true }],
   mapping: [{ param: "filter", into: "query", field: "filter" }],
 };
+const ARRANGE = {
+  tool: "arrange_conversations", tier: "direct", description: "RAFT-DESC arrange: set the order of one sidebar list.",
+  method: "PUT", path: "/api/servers/:id/sidebar-order",
+  params: [
+    { name: "list", kind: "enum", values: ["pinned", "channels", "external", "dms"], description: "RAFT-PARAM list." },
+    { name: "order", kind: "conversation_list", description: "RAFT-PARAM order: the conversations, top first." },
+  ],
+  mapping: [{ param: "list", into: "body", field: "list" }, { param: "order", into: "body_ref_list", field: "conversationIds" }],
+};
 /** A tier a newer Raft added: neither this SDK nor this file knows it. */
 const FUTURE = {
   tool: "delete_owner_account", tier: "irreversible", description: "RAFT-DESC future.", method: "DELETE", path: "/api/me",
   params: [], mapping: [],
 };
-const ALL = [SAVE, LEVEL, MOVE, CHANNELS, FUTURE];
-const MADE = ["save_message", "set_notification_level", "move_agent", "list_owner_channels"];
+const ALL = [SAVE, LEVEL, MOVE, CHANNELS, ARRANGE, FUTURE];
+const MADE = ["save_message", "set_notification_level", "move_agent", "list_owner_channels", "arrange_conversations"];
 
 /** Raft's answers, marked; each has text over several lines, so a cut or a fold shows. */
 const SAVE_ANSWER = { ok: true, assistant: { done: "RAFT-DONE Saved the message for Ada.", undo: { tool: "save_message", args: { message: "m-1", saved: false }, text: "RAFT-UNDO To unsave it,\ncall save_message with saved false." } } };
@@ -102,6 +111,8 @@ function raft(actions: unknown[] | null = ALL): Raft {
       const name = u.searchParams.get("name") ?? "";
       r.resolves.push(name);
       if (name === "@bot~agent") return json(200, { id: "ag-9", type: "agent", name: "bot" });
+      const conv: Record<string, string> = { "#design": "ch-design", "#eng": "ch-eng", "dm:@bob": "dm-bob" };
+      if (conv[name]) return json(200, { id: conv[name], type: name.startsWith("dm:") ? "dm" : "channel", name });
       return json(404, { error: "not found", code: "owner_resolve_not_found" });
     }
     if (u.pathname.startsWith("/api/")) {
@@ -169,8 +180,8 @@ await check("an entry with an unknown tier makes no tool and is counted filtered
   const { offered, traced } = await listed(raft());
   must(!offered.some((t) => t.name === FUTURE.tool), "the unknown tier was offered");
   const row = traced.find((t) => t.kind === "raft.assistant_owner_actions" && t.status === "listed");
-  must(row && row.attrs.entries === 5 && row.attrs.generated === 4 && row.attrs.filtered === 1 && row.attrs.sdk_skipped === 1 && row.attrs.unknown_tier === 0 &&
-    row.attrs.direct === 2 && row.attrs.confirm === 1 && row.attrs.read === 1 && row.attrs.left_out === "delete_owner_account:irreversible:sdk_skipped", `listed row: ${show(row)}`);
+  must(row && row.attrs.entries === 6 && row.attrs.generated === 5 && row.attrs.filtered === 1 && row.attrs.sdk_skipped === 1 && row.attrs.unknown_tier === 0 &&
+    row.attrs.direct === 3 && row.attrs.confirm === 1 && row.attrs.read === 1 && row.attrs.left_out === "delete_owner_account:irreversible:sdk_skipped", `listed row: ${show(row)}`);
   // A tier the SDK lists but this file does not know (a newer SDK's) is left out here too.
   const own = ownerActionTools([SAVE, FUTURE], { actions: [SAVE, FUTURE] as any, skipped: [] }, () => false);
   must(show(own.tools.map((t) => t.name)) === show(["save_message"]) && show(own.filtered) === show([{ tool: FUTURE.tool, tier: FUTURE.tier, why: "unknown_tier" }]), show(own));
@@ -251,6 +262,18 @@ await check("a name the mount's list does not offer is not an owner action: the 
   let error = "";
   try { await raftPlugin.invoke("save_message", {}, mount(["receive_events"]).ctx); } catch (e) { error = String((e as Error).message); }
   must(error === "unknown raft tool: save_message" && r.calls.length === 0, `${error} ${show(r.calls)}`);
+});
+
+await check("conversation_list: offered as an array of strings with Raft's description; the call sends each ref resolved, in order (body_ref_list)", async () => {
+  const r = raft();
+  const { offered } = await listed(r);
+  const order = named(offered, "arrange_conversations").parameters.properties.order;
+  must(show(order) === show({ type: "array", items: { type: "string" }, description: ARRANGE.params[1]!.description }), show(order));
+  r.answers["/api/servers/server-1/sidebar-order"] = [() => json(200, { ok: true, assistant: { done: "RAFT-DONE Reordered." } })];
+  const m = mount(MADE);
+  const out = await raftPlugin.invoke("arrange_conversations", { list: "channels", order: ["#eng", "dm:@bob", "#design"] }, m.ctx) as any;
+  must(out.ok === true && out.assistant?.done === "RAFT-DONE Reordered.", show(out));
+  must(r.calls.length === 1 && r.calls[0]!.method === "PUT" && show(r.calls[0]!.body) === show({ list: "channels", conversationIds: ["ch-eng", "dm-bob", "ch-design"] }), show(r.calls));
 });
 
 // ---- what the model reads ----------------------------------------------------------------------------------------------
