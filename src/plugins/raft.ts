@@ -952,7 +952,8 @@ export const QUESTION_CARD_TOOL_TEXT = [
   '  {"target":"#ops","action":{"type":"question:ask","to":"@alice","questions":[{"id":"window","kind":"single","text":"Which window do we deploy in?","options":[{"value":"tue_am","label":"Tue 10:00"},{"value":"wed_pm","label":"Wed 15:00"}]}]}}',
   'Up to 4 questions in one card. "single" and "multiple" take 2-4 options (Raft adds Other… itself: don\'t add one); "text" takes a short answer. In a DM leave out "to"; in a channel it is a person\'s handle (not an agent\'s), or "anyone".',
   "Use a card when the answer decides what you do next: concrete choices, or a short answer you will act on. Ask in a message when you are already talking it through, and don't ask what you can decide yourself.",
-  "Only channel:create, channel:add_member, agent:create and question:ask cards can be prepared here: the integration cards take ids you have no way to know, and are made by Raft's own integration commands.",
+  "Prepare a feedback:submit card when a person wants to send the Raft team an idea or a problem about Raft itself: draft only what they asked to send; they can edit it before it is filed as their own feedback.",
+  "Only channel:create, channel:add_member, agent:create, question:ask and feedback:submit cards can be prepared here; other card types come from Raft's own commands.",
 ].join("\n");
 
 /**
@@ -960,15 +961,16 @@ export const QUESTION_CARD_TOOL_TEXT = [
  * description gains so the model knows before calling. The manifest's schema stays as it is; this narrows it.
  */
 const ARGUMENT_CHECKS: Readonly<Record<string, { check(input: Record<string, unknown>): string | null; described: string }>> = {
-  // The four cards a model may prepare. The integration cards take ids a model has no way to know, and are made
-  // by Raft's own integration commands. A question card (`question:ask`, slock #13713) asks a person to choose; its
+  // The five cards a model may prepare. The others come from Raft's own commands: the integration cards take ids a
+  // model has no way to know, and plan:upgrade goes only to clients that declare it (antiproton does not; Sage e6ae598c). A question card (`question:ask`, slock #13713) asks a person to choose; its
   // text follows Raft's own CLI help (`QUESTION_CARD_HELP`), with the example in this tool's `{ target, action }`,
-  // as Sage settled it. Pinned word for word in test/raft-plugin.ts.
+  // as Sage settled it. Pinned word for word in test/raft-plugin.ts. A feedback card (`feedback:submit`) needs no id:
+  // the person reviews the text and sends it under their own name (Sage, #proj-raft-computer:29845d4c).
   "actions.prepare": {
     check: (input) => {
       const type = (input.action as { type?: unknown } | undefined)?.type;
-      return type === "channel:create" || type === "channel:add_member" || type === "agent:create" || type === "question:ask" ? null
-        : "action.type must be channel:create, channel:add_member, agent:create or question:ask: the integration cards take ids you have no way to know, and are made by Raft's own integration commands";
+      return type === "channel:create" || type === "channel:add_member" || type === "agent:create" || type === "question:ask" || type === "feedback:submit" ? null
+        : "action.type must be channel:create, channel:add_member, agent:create, question:ask or feedback:submit: other card types come from Raft's own commands.";
     },
     described: `\n${QUESTION_CARD_TOOL_TEXT}`,
   },
