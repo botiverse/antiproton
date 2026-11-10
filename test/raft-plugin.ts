@@ -220,6 +220,8 @@ const EXPECTED_GENERATED = [
   // (`messages.updateCard`, refused where the Server's message_cards flag is off), a question card's withdrawal
   // (`actions.withdraw`, beside `actions.prepare`), and the Artifacts app's review and publish check.
   "messages.updateCard", "actions.withdraw", "artifacts.review", "artifacts.check",
+  // SDK 0.34.0: resolve and reopen an artifact comment thread (the Server checks who may).
+  "artifacts.resolve", "artifacts.reopen",
 ];
 
 await check("every manifest operation is a generated tool or in the exclusion table, never both, and every exclusion names a real operation", async () => {
@@ -2343,7 +2345,7 @@ await check("raftbench_findings is listed only for an agent whose context says r
 
 await check("the Artifacts app's tools are listed only where the context's features.enabledApps names artifacts; elsewhere, or on an older Server, quietly none", async () => {
   const appTools = GENERATED.filter((op) => appOf(op) === "artifacts").map((op) => op.toolName);
-  must(appTools.length === 13 && GENERATED.every((op) => appOf(op) === (op.name.startsWith("artifacts.") ? "artifacts" : null)), `control: ${appTools.join(", ")}`);
+  must(appTools.length === 15 && GENERATED.every((op) => appOf(op) === (op.name.startsWith("artifacts.") ? "artifacts" : null)), `control: ${appTools.join(", ")}`);
   const listedUnder = async (features: unknown, capabilities = ["read", "send"]) => {
     one(json(200, {
       agent: { id: "agent-1", name: "raft-bot", displayName: null, description: null, runtime: "external", external: true },

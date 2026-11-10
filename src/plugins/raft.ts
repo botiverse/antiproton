@@ -850,7 +850,7 @@ function integer(value: unknown, name: string, min: number, max: number): number
  * The rule for what is left out: a hosted agent is offered every operation an agent inside Raft has (its CLI's
  * `raft mention add`, `raft profile update`, `raft task delete` among them). The Raft Server checks the agent's
  * permission on every call, so a call its role does not allow is refused there, not here. An entry here is for an
- * operation this mount does in another way (the three inbox operations, which `receive_events` replaces), never for
+ * operation this mount does in another way (the four inbox operations, which `receive_events` replaces), never for
  * one an agent "should not" do. `actions_prepare` stays for what the agent's role does not allow it to do itself
  * (a channel:create or channel:add_member card, which a person whose role allows it carries out), and for a proposal
  * a person should confirm.
@@ -859,6 +859,7 @@ export const EXCLUDED: Readonly<Record<string, string>> = {
   "inbox.check": "the inbox is read with receive_events, which commits what it showed and pulls the next in one call; a second reader would move the same cursor",
   "inbox.drain": "pulls until the inbox is empty and hands it all over in one result, with no bound; receive_events pages the same inbox",
   "inbox.commit": "receive_events commits only the messages it showed, which its next pull acknowledges; a separate commit could acknowledge a batch before the model has read it",
+  "inbox.read": "reads one inbox item and the Server consumes what it returns (never retried); receive_events reads the same inbox, so a second reader would consume items its pull and summary never showed",
 };
 
 /**
