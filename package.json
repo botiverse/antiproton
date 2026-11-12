@@ -40,7 +40,7 @@
     "typecheck-baseline": "node test/typecheck-baseline.ts"
   },
   "dependencies": {
-    "@botiverse/raft-sdk": "0.34.0",
+    "@botiverse/raft-sdk": "0.35.0",
     "@botiverse/stamp-sdk": "0.2.2",
     "@earendil-works/chord": "1.0.0",
     "@earendil-works/pi-agent-core": "0.85.1",
