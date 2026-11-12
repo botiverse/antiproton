@@ -227,7 +227,14 @@ export async function runHeldPass(deps: {
       { now: deps.now, prune, transaction: deps.transaction });
     const passes = recordSkips(deps.sql, billing.declared, blocked);
     const by = (k: Block) => Object.keys(blocked).filter((a) => blocked[a] === k);
-    const escalate = Object.keys(passes).filter((a) => passes[a]! >= ESCALATE_AFTER_PASSES);
+    // Past the threshold, what a person is asked to do depends on why the mount blocks. Only `incomplete` (the
+    // mount's own record is unreadable: `unreadable.unknown` or `machines > 0`) gets the menu of fixes, the last of
+    // which gives up pruning. `complete_missing` (the plugin does not send the field yet: a rollout gap) and
+    // `unanswered` (the call failed) are `stalled`: wait, or look at the mount. Never offer giving up the prune for a
+    // cause it cannot fix.
+    const over = (a: string) => passes[a]! >= ESCALATE_AFTER_PASSES;
+    const escalate = Object.keys(passes).filter((a) => over(a) && blocked[a] === "incomplete");
+    const stalled = Object.keys(passes).filter((a) => over(a) && blocked[a] !== "incomplete");
     const breakdowns = Object.values(billing.unreadable);
     Object.assign(log, {
       declared: billing.declared.length,
@@ -249,6 +256,8 @@ export async function runHeldPass(deps: {
         skipPasses: JSON.stringify(passes),
         escalate: escalate.length > 0,
         escalateAliases: escalate.join(","),
+        stalled: stalled.length > 0,
+        stalledAliases: stalled.join(","),
       }),
     });
     logEvent("usage.held_pass", log);

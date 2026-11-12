@@ -281,6 +281,18 @@ await check("console: #mountReports' map still reads on the page, and equals the
   assert("idle" in billing.reports && !("idle" in page), "billing must hear from the idle mount the console leaves out");
 });
 
+await check(`a mount that blocks for want of the field (complete_missing) or an answer is stalled at ${ESCALATE_AFTER_PASSES}, never escalated to the menu`, async () => {
+  const w = await world({ missing: "fake", broken: "fake", ok: "fake" });
+  answers.set("ok", { activity: EMPTY_COMPLETE });
+  answers.set("missing", { activity: { live: null } });
+  answers.set("broken", { activity: null, throws: new Error("down") });
+  for (let i = 1; i <= ESCALATE_AFTER_PASSES; i++) await w.pass(T0 + i * MIN);
+  const l = lastPassLog();
+  // The menu's last step gives up pruning; for a rollout gap or a failing call it would destroy for nothing.
+  assert(l.escalate === false && l.escalateAliases === "", `escalated to the menu: ${JSON.stringify(l)}`);
+  assert(l.stalled === true && String(l.stalledAliases).split(",").sort().join(",") === "broken,missing", `not stalled: ${JSON.stringify(l)}`);
+});
+
 await check(`consecutive blocked passes count up per mount, escalate at ${ESCALATE_AFTER_PASSES}, and reset on a complete answer`, async () => {
   const w = await world({ box: "fake", ok: "fake" });
   answers.set("ok", { activity: EMPTY_COMPLETE });
