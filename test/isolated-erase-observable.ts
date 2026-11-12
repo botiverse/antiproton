@@ -209,14 +209,18 @@ await check("a pass cut off before it has seen every row still writes its line: 
   await w.answer(session);
   // Make the erase's read of which sessions have work throw, and only there (by the caller in the stack), so the pass
   // fails outside the per-session try: the one way a pass ends without having seen every row.
+  // The match is on SQL text and a method name, so it can stop matching silently; `injected` makes that say so.
+  let injected = false;
   const exec = w.sql.exec.bind(w.sql);
   (w.sql as any).exec = (q: string, ...args: unknown[]) => {
-    if (/UNION SELECT session FROM background_jobs/.test(q) && /eraseIsolated/.test(String(new Error().stack))) throw new Error("cut off");
+    if (/UNION SELECT session FROM background_jobs/.test(q) && /eraseIsolated/.test(String(new Error().stack))) { injected = true; throw new Error("cut off"); }
     return exec(q, ...args);
   };
   let lines: Array<Record<string, unknown>> = [];
   setLogSink((line) => { lines.push(JSON.parse(line) as Record<string, unknown>); });
   try { await w.rt.step(T, A); } catch { /* the cut-off may surface from the step: the line is what is checked */ } finally { setLogSink(null); (w.sql as any).exec = exec; }
+  must(injected, "the cut-off was never injected (sessionsWithWork's SQL or #eraseIsolated's name changed): this test built no "
+    + "cut-off pass, so what follows would blame the implementation for the test's own setup");
   const p = lines.filter((l) => l.evt === "isolated.erase_pass");
   must(p.length === 1, `expected one pass line from the cut-off pass, found ${p.length}: ${show(lines)}`);
   must(p[0]!.completed === false, `a cut-off pass must say completed: false: ${show(p[0])}`);
