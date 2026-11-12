@@ -5731,8 +5731,8 @@ export class AgentRuntime {
           // A row here is a turn whose step ended without closing it (lost across a deploy or eviction), or one paused on
           // a caller's function (`turnPaused`). No one can answer that call: answers come only through the Agents API, which
           // looks the session up in its own index (`putSession`, `sess_` ids), and a short session's `iso_` id is never
-          // registered there (`newIsolatedSessionId` + `recordIsolated`). That a check session is offered the caller's
-          // functions at all is a separate fault, fixed in a follow-up. And its finished
+          // registered there (`newIsolatedSessionId` + `recordIsolated`). A short session is not offered the caller's
+          // functions in the first place (`callerFree` in `#turnTools`). And its finished
           // background calls only: a running one makes the session busy, so none should be here, and the condition keeps
           // this delete from taking a running job should the meaning of busy ever change.
           if (has("turn_timing")) sql.exec("DELETE FROM turn_timing WHERE session = ?", r.session);
