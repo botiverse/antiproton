@@ -11,7 +11,7 @@
  * The per-mount call (`askMount`) is shared with the console's map, so the two cannot ask differently; the
  * console's map keeps its shape (`consoleMountReports`) because the page parses it (cf/src/ui.ts asMountReports).
  */
-import type { MountActivity, MountUsage } from "../../src/plugins/types.ts";
+import type { MountActivity, MountUsage, UnreadableKinds } from "../../src/plugins/types.ts";
 import { asActivity, worthReporting, type MountReports } from "./mount-reports.ts";
 import { countHeldPass, heldReports } from "../../src/usage/container.ts";
 import { logEvent, type LogFields } from "../../src/core/log.ts";
@@ -69,8 +69,7 @@ export async function consoleMountReports(
  * Read for the log only: the prune is decided by `complete` and by answering, never by any of these counts (`other`
  * in particular is a bad session or environment row, which costs no container time).
  */
-export type UnreadableBreakdown = { unknown: boolean; machines: number; other: number };
-type SentKinds = { sent: false } | { sent: true; valid: UnreadableBreakdown | null; raw: unknown };
+type SentKinds = { sent: false } | { sent: true; valid: UnreadableKinds | null; raw: unknown };
 function readKinds(activity: unknown): SentKinds {
   const v = (activity as { unreadableKinds?: unknown }).unreadableKinds;
   if (v === undefined) return { sent: false };
@@ -108,7 +107,7 @@ export interface BillingReports {
   /** Each answered mount's `complete`, as it read (absent stays absent). */
   complete: Record<string, boolean | undefined>;
   /** Each answered mount's `unreadableKinds`, only where it sent a valid one with `unreadable > 0`. */
-  unreadable: Record<string, UnreadableBreakdown>;
+  unreadable: Record<string, UnreadableKinds>;
   /** Answered mounts with `unreadable > 0`: the denominator of `kindsMissing` (`kindsOf` on the pass line). */
   kindsOf: string[];
   /**

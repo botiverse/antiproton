@@ -17,9 +17,10 @@ import { ToolGateway } from "../src/runtime/gateway.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { pendingUsage } from "../src/usage/outbox.ts";
 import { setLogSink } from "../src/core/log.ts";
-import type { MountActivity, MountUsage, Plugin, PluginContext } from "../src/plugins/types.ts";
+import type { HeldActivity, MountUsage, Plugin, PluginContext } from "../src/plugins/types.ts";
 import { ESCALATE_AFTER_PASSES, aliasList, billingMountReports, consoleMountReports, runHeldPass } from "../cf/src/mount-billing.ts";
 import { asMountReports } from "../cf/src/mount-reports.ts";
+import { activitiesOf, asMountState, summaryActivity, unreadableKindsOf } from "../src/plugins/sandbox.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -53,15 +54,16 @@ const fake: Plugin = {
   id: "fake", version: "1.0.0", tools, async invoke() { return { ok: true }; },
   holds: {
     tools: { release: "release" },
-    async activity(c) { return answerOf(c).activity as MountActivity; },
-    async activities(c) { const a = answerOf(c); return (a.activities ?? [a.activity]) as MountActivity[]; },
+    // Cast on purpose: these answers are built to break the contract (no `complete`, a wrong type) as well as keep it.
+    async activity(c) { return answerOf(c).activity as HeldActivity; },
+    async activities(c) { const a = answerOf(c); return (a.activities ?? [a.activity]) as HeldActivity[]; },
     async usage(c) { return (answerOf(c).usage ?? []) as MountUsage[]; },
     async release() { return false; },
   },
 };
 const plain: Plugin = { id: "plain", version: "1.0.0", tools, async invoke() { return { ok: true }; } };
 /** The producer→caller test plugin: one fixed answer, `complete: true`, and nothing but `activity` to give it. */
-const FIXED: MountActivity = {
+const FIXED: HeldActivity = {
   live: { id: "fixed-box", startedAt: T0, lastUsedAt: T0 + 5 * MIN },
   quietUntil: null, billing: "a fixed sentence", complete: true,
 };
@@ -276,6 +278,55 @@ await check("valid kinds with unreadable 0: one kinds_without_count violation, n
   assert(l.kindsViolation === 1, `kindsViolation ${l.kindsViolation}`);
   assert(violations[0]?.reason === "kinds_without_count", `reason ${violations[0]?.reason}`);
   assert(l.otherUnreadable === 0 && Object.keys(p.billing.unreadable).length === 0, "a violating breakdown fed the counts");
+});
+
+// ---- The seam: the sandbox's real report, read by billing. The stored records are Piper's fixture DEFINITION from
+// test/sandbox-named.ts (#1191: `box`, `twoMachines`, and a third machine entry `web: { boxId: 3 }` that does not read),
+// copied rather than imported because that file runs its checks on import. The answers are produced here by the
+// sandbox's own code (`summaryActivity`/`activitiesOf` over `unreadableKindsOf`), exactly as its `holds` builds them.
+const SEAM_T0 = 1_700_000_000_000;
+const seamBox = (id: string, extra: Record<string, unknown> = {}) =>
+  ({ boxId: id, createdAt: SEAM_T0, lastUsedAt: SEAM_T0 + MIN, execs: 1, saved: [], ownerChecked: true, ...extra });
+const twoMachines = () => ({
+  main: seamBox("b-main", { createdAt: SEAM_T0, lastUsedAt: SEAM_T0 + 2 * MIN }),
+  build: seamBox("b-build", { createdAt: SEAM_T0 + MIN, lastUsedAt: SEAM_T0 + 7 * MIN }),
+});
+/** The sandbox's own answer for a stored record: its summary, and each machine on its own. */
+function sandboxAnswer(raw: any): Answer {
+  return { activity: summaryActivity(asMountState(raw), unreadableKindsOf(raw)), activities: activitiesOf(asMountState(raw), unreadableKindsOf(raw)) };
+}
+
+// One assertion per step, in order. Before merging two steps into one assertion, make sure a failure would still say which step broke.
+await check("seam: two good machines and one corrupt machine entry, from the sandbox's real report, block the prune as incomplete", async () => {
+  const w = await world({ box: "fake" });
+  const answer = sandboxAnswer({ machines: { ...twoMachines(), web: { boxId: 3 } } });
+  const a = answer.activity as HeldActivity;
+  const k = a.unreadableKinds;
+  assert((a.unreadable ?? 0) > 0, "fixture produced no bad entry");
+  assert(k !== undefined, `(b1) the sandbox's report carries no unreadableKinds: ${JSON.stringify(a)}`);
+  assert((k.unknown ? 1 : 0) + k.machines + k.other === a.unreadable, `(b2) kinds ${JSON.stringify(k)} do not sum to unreadable ${a.unreadable}`);
+  answers.set("box", answer);
+  const p = await w.pass(SEAM_T0 + HOUR);
+  const l = lastPassLog();
+  assert(l.kindsMissing === 0 && l.kindsViolation === 0, `(c1) the seam did not connect: kindsMissing ${l.kindsMissing}, kindsViolation ${l.kindsViolation}`);
+  assert(l.kindsOf === 1, `(c1) kindsOf ${l.kindsOf}, not the one mount with unreadable > 0`);
+  assert(l.machinesBlocking === 1, `(c2) the breakdown was not used: machinesBlocking ${l.machinesBlocking} (${JSON.stringify(p.billing.unreadable)})`);
+  assert(!p.prune && p.blocked.box === "incomplete", `(d) prune not blocked as incomplete: prune ${p.prune}, blocked ${JSON.stringify(p.blocked)}`);
+});
+
+await check("seam: one bad saved environment with both machines good, from the sandbox's real report, lets the prune run", async () => {
+  const w = await world({ box: "fake" });
+  const answer = sandboxAnswer({ machines: twoMachines(), envs: [{ name: "ok", snapId: "s1", savedAt: 1 }, { name: 7 }] });
+  const a = answer.activity as HeldActivity;
+  assert((a.unreadable ?? 0) > 0, "fixture produced no bad entry");
+  assert(a.complete === true, `precondition: the sandbox called a bad environment incomplete: ${JSON.stringify(a)}`);
+  answers.set("box", answer);
+  w.seedStale(SEAM_T0 + HOUR);
+  const p = await w.pass(SEAM_T0 + HOUR);
+  const l = lastPassLog();
+  assert(l.kindsMissing === 0 && l.kindsViolation === 0, `the seam did not connect: kindsMissing ${l.kindsMissing}, kindsViolation ${l.kindsViolation}`);
+  assert(l.otherUnreadable === 1, `otherUnreadable ${l.otherUnreadable}`);
+  assert(p.prune && p.deleted === 1, `prune did not run: ${JSON.stringify(p.blocked)}, deleted ${p.deleted}`);
 });
 
 await check("a stale watermark whose delete fails: deleted counts only executed deletes, the row stays, and the failure is named", async () => {
