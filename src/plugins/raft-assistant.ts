@@ -2801,9 +2801,15 @@ export const PUBLISH_REFUSAL_NOTES: Readonly<Record<string, string>> = {
   BASE_MOVED: `Nothing was published: it has a newer version than your base that changed the same files. Read it again with ${OWNER_ARTIFACT_TOOL}, ` +
     "make your files from its latest version, and publish with that version as base.",
 };
-/** A refusal for a limit on writes (Raft's rate limit, the server's upload quota or any budget): said plainly, not retried. */
-export const PUBLISH_LIMIT_NOTE = "Nothing was published: Raft refused it for a limit on Artifact writes. Tell your owner Raft's error as it is, " +
-  "and do not publish again in this reply.";
+/**
+ * Raft's two write limits (Grace, #raft-antiproton 3a80121a): `RATE_LIMITED` (429, with Retry-After, from the agent API's
+ * rate limiter before the route runs) passes with time; `FILE_UPLOAD_QUOTA_EXCEEDED` (403, the server's monthly upload
+ * quota) does not, and nothing was stored.
+ */
+export const PUBLISH_RATE_LIMITED_NOTE = "Nothing was published: Raft is limiting how fast you write (RATE_LIMITED). Wait at least a minute " +
+  "before you publish it again, once; if it is refused again, tell your owner.";
+export const PUBLISH_QUOTA_NOTE = "Nothing was published: the server's monthly upload quota for Artifacts is used up (FILE_UPLOAD_QUOTA_EXCEEDED). " +
+  "Retrying will not help: tell your owner, with Raft's error as it is.";
 export const PUBLISH_REFUSED_NOTE = "Nothing was published: tell your owner Raft's error as it is, or fix what it names and publish again.";
 export const PUBLISH_UNCERTAIN_NOTE = "Raft's answer could not be read, so it may have been published. Do not publish it again: " +
   "tell your owner you couldn't tell whether it went through.";
@@ -2814,7 +2820,8 @@ export const PUBLISH_UNCERTAIN_VERSION_NOTE = `Raft's answer could not be read, 
 export function publishRefusalNote(status: number, code: string | null): string {
   const known = code !== null ? PUBLISH_REFUSAL_NOTES[code] ?? PUBLISH_REFUSAL_NOTES[code.toLowerCase()] : undefined;
   if (known) return known;
-  if (status === 429 || (code !== null && /LIMIT|QUOTA|BUDGET/i.test(code))) return PUBLISH_LIMIT_NOTE;
+  if (code === "FILE_UPLOAD_QUOTA_EXCEEDED") return PUBLISH_QUOTA_NOTE;
+  if (code === "RATE_LIMITED" || status === 429) return PUBLISH_RATE_LIMITED_NOTE;
   return PUBLISH_REFUSED_NOTE;
 }
 
@@ -2916,7 +2923,14 @@ export async function ownerArtifact(args: unknown, ctx: PluginContext, deps: Pic
   } else {
     // A Raft server before comment paging: it sends no olderCursor, so there is no older page to ask for.
     notes.push("Raft did not say whether there are older comments, and paging to older ones is not available on this server: these are the comments it shows.");
-    if (!paging) seen = position;
+    // seen claims every comment was read, so it is set only when this answer shows all of them: the comments shown
+    // equal the Artifact's commentCount. Premise: commentCount is the server's total (it sits on the artifact, beside
+    // latestVersion), not the length of this page; were it derived from the same capped list, the equality would prove
+    // nothing. No default for a missing commentCount: then seen stays null and a publish meets UNSEEN_CHANGES, which
+    // fails safe. Revisit with withoutPaging once Raft #14633 is in production.
+    const total = whole(art.commentCount, 0);
+    if (!paging && total !== null && comments.items.length === total) seen = position;
+    else if (!paging) notes.push("Not every comment of this Artifact was shown, so no seen is given: a publish of a new version will be refused with UNSEEN_CHANGES until the rest can be read.");
   }
   if (!paging && seen === null && !(typeof older === "string" && older)) notes.push("Raft gave no position for this read to pass as seen.");
   log("answered", "ok", {

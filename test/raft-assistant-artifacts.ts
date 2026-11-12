@@ -10,7 +10,7 @@
 //   node test/raft-assistant-artifacts.ts
 import { raftPlugin, withoutPaging } from "../src/plugins/raft.ts";
 import {
-  ARTIFACT_TEXT_MAX, CHAT_TOOLS, CHECK_TOOLS, OWNER_ARTIFACT_TOOL, PUBLISH_ARTIFACT_TOOL, PUBLISH_LIMIT_NOTE, PUBLISH_REFUSAL_NOTES, PUBLISH_UNCERTAIN_NOTE,
+  ARTIFACT_TEXT_MAX, CHAT_TOOLS, CHECK_TOOLS, OWNER_ARTIFACT_TOOL, PUBLISH_ARTIFACT_TOOL, PUBLISH_QUOTA_NOTE, PUBLISH_RATE_LIMITED_NOTE, PUBLISH_REFUSAL_NOTES, PUBLISH_UNCERTAIN_NOTE,
   PUBLISH_UNCERTAIN_VERSION_NOTE, assistantCheckPrompt, assistantPrompt, assistantTools, isOwnerReadAddress, ownerArtifactLabel,
 } from "../src/plugins/raft-assistant.ts";
 import { OWNER_ACTION_MARK } from "../src/plugins/raft-assistant-owner-actions.ts";
@@ -260,6 +260,28 @@ await check("read: a Raft server without comment paging (no olderCursor, no newe
   must(withoutPaging(accepted as any) === accepted, "an accepted answer is changed");
 });
 
+await check("read: without paging, seen is given only when every comment is shown (items equal commentCount), with no default for a missing count", async () => {
+  const noPaging = (items: number, count: number | undefined) => {
+    const ans: any = readAnswer();
+    const one = ans.comments.items[0];
+    ans.comments = { items: Array.from({ length: items }, (_, i) => ({ ...one, id: `cm-${i}` })) };
+    if (count === undefined) delete ans.artifact.commentCount; else ans.artifact.commentCount = count;
+    return ans;
+  };
+  const a = await assistant();
+  a.r.readAnswer = { status: 200, body: noPaging(3, 3) };
+  const all = await read(a, { artifact: ART_ID });
+  must(all.seen === 17 && !all.notes.some((n: string) => n.includes("Not every comment")), `all shown: ${show(all.seen)} ${show(all.notes)}`);
+  a.r.readAnswer = { status: 200, body: noPaging(2, 5) };
+  const capped = await read(a, { artifact: ART_ID });
+  must(capped.seen === null && capped.notes.some((n: string) => n.includes("Not every comment") && n.includes("UNSEEN_CHANGES")), `capped: ${show(capped.seen)} ${show(capped.notes)}`);
+  // A missing commentCount never reaches a default: the SDK's contract requires it, and withoutPaging lets through only
+  // the two paging fields, so such an answer is refused as a whole and no seen is given.
+  a.r.readAnswer = { status: 200, body: noPaging(2, undefined) };
+  const e = await read(a, { artifact: ART_ID }).then(() => null, (x) => x as Error);
+  must(e !== null && /no answer from Raft that could be read/.test(e.message), `no commentCount must not be read with a defaulted count: ${show(e?.message)}`);
+});
+
 await check("read: paging: olderCursor is said with commentsBefore, the first page's newestPosition kept; commentsBefore is sent; the oldest page says so", async () => {
   const a = await assistant();
   a.r.readAnswer = { status: 200, body: readAnswer({ position: null, comments: { items: [], olderCursor: "cur-1", newestPosition: 21 } }) };
@@ -334,8 +356,8 @@ await check("publish: each refusal reaches the model with Raft's status, code an
     [{ status: 404, code: "artifact_not_found", error: "Artifact not found" }, PUBLISH_REFUSAL_NOTES.artifact_not_found!, VERSION],
     [{ status: 409, code: "UNSEEN_CHANGES", error: "There are comments you have not seen." }, PUBLISH_REFUSAL_NOTES.UNSEEN_CHANGES!, VERSION],
     [{ status: 409, code: "BASE_MOVED", error: "The base moved." }, PUBLISH_REFUSAL_NOTES.BASE_MOVED!, VERSION],
-    [{ status: 429, code: "RATE_LIMITED", error: "Too many Artifact writes; try again in 30 seconds." }, PUBLISH_LIMIT_NOTE, NEW],
-    [{ status: 403, code: "FILE_UPLOAD_QUOTA_EXCEEDED", error: "The server's monthly upload quota is used up." }, PUBLISH_LIMIT_NOTE, NEW],
+    [{ status: 429, code: "RATE_LIMITED", error: "Too many Artifact writes; try again in 30 seconds." }, PUBLISH_RATE_LIMITED_NOTE, NEW],
+    [{ status: 403, code: "FILE_UPLOAD_QUOTA_EXCEEDED", error: "The server's monthly upload quota is used up." }, PUBLISH_QUOTA_NOTE, NEW],
   ];
   for (const [answer, note, args] of cases) {
     const a = await assistant();
