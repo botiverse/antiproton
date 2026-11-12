@@ -19,10 +19,10 @@ import { readFileSync } from "node:fs";
 
 const src = readFileSync(new URL("../cf/src/runtime.ts", import.meta.url), "utf8");
 const lines = src.split("\n");
-let failed = 0;
+let failed = 0, passed = 0;
 function check(name: string, ok: boolean, detail: string) {
   console.log(`${ok ? "ok  " : "FAIL"} ${name}${ok ? "" : `\n      ${detail}`}`);
-  if (!ok) failed++;
+  if (ok) passed++; else failed++;
 }
 const where = (re: RegExp) => lines.flatMap((l, i) => (re.test(l) ? [`${i + 1}: ${l.trim()}`] : []));
 
@@ -48,5 +48,6 @@ check("the caller's functions are handed to an engine in exactly two places (pi0
   handOffs.length === 2 && handOffs.some((l) => /clientTools\(callerDefs/.test(l)) && handOffs.some((l) => /clientTools: callerDefs/.test(l)),
   `hand-offs:\n      ${handOffs.join("\n      ")}`);
 
-console.log(failed ? `\n${failed} failed` : "\nall passed");
+// The gate reads a "N/M passed" summary line (cf/scripts/suite-verdict.sh); a suite without one asserted nothing.
+console.log(`\n${passed}/${passed + failed} passed`);
 if (failed) process.exit(1);
