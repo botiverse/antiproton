@@ -717,7 +717,13 @@ export class AgentDO extends DurableObject<Env> {
    */
   async #countHeldTime(rt: AgentRuntime, tenantId: string, agentId: string) {
     try {
-      const mounts = await rt.store.listMounts(tenantId, agentId);
+      let mounts: Awaited<ReturnType<AgentRuntime["store"]["listMounts"]>>;
+      try { mounts = await rt.store.listMounts(tenantId, agentId); }
+      catch (e) {
+        // Same line as every pass, so a pass that never ran is not read as one that found nothing to bill.
+        logEvent("usage.held_pass", { tenantId, agentId, agentsEvaluated: 1, failed: "listMounts", error: String((e as Error)?.message ?? e).slice(0, 200) });
+        throw e;
+      }
       await runHeldPass({
         gw: rt.gateway(), sql: this.sql as any, ctx: { tenantId, agentId, taskId: LEGACY_TASK_ID }, mounts,
         // A mount's ledger rows and its watermarks, together or not at all (src/usage/container.ts countHeldPass).

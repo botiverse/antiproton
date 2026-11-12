@@ -40,6 +40,7 @@
  */
 import { appendUsage, msByHour, payerKey, type UsageRow } from "./outbox.ts";
 import { secretRefKind } from "../runtime/secrets.ts";
+import { logEvent } from "../core/log.ts";
 import type { SqlHost } from "../store/pi-storage.ts";
 import type { MountActivity } from "../plugins/types.ts";
 
@@ -319,6 +320,8 @@ export function countHeldPass(
     const { rows, marks } = heldRows(base, (b) => payerKey(plugin, boxIsOwn(b, own === true)), boxes, counted, now);
     // The marker has no box, so it goes under the mount's key.
     const marker = heldUnreadableRows(base, payerKey(plugin, own === true), (report as any)?.activity ?? null, now);
+    // Synchronous on purpose: an await inside this callback silently splits the transaction (transactionSync
+    // commits on return), and the rows after it would land without the watermark that covers them.
     opts.transaction(() => {
       if (rows.length || marker.length) appendUsage(sql, [...rows, ...marker]);
       for (const { id, mark } of marks) {
@@ -333,6 +336,15 @@ export function countHeldPass(
     for (const [key, n] of byKey) out.push({ key, rows: n });
   }
   const stale = [...counted].filter(([id, mark]) => !seen.has(id) && mark.through < now - KEEP_MARKS_MS).map(([id]) => id);
-  if (opts.prune) for (const id of stale) sql.exec("DELETE FROM usage_held WHERE box_id = ?", id);
-  return { lines: out, stale, deleted: opts.prune ? stale.length : 0 };
+  // Each delete on its own and outside the mounts' transactions: a stale box is one no report names (`!seen`), so
+  // it has no rows this pass, and a delete that fails only leaves a dead row for the next pass to try again — never
+  // a second bill. `deleted` is what was executed, not what was planned.
+  let deleted = 0;
+  if (opts.prune) {
+    for (const id of stale) {
+      try { sql.exec("DELETE FROM usage_held WHERE box_id = ?", id); deleted++; }
+      catch (e) { logEvent("usage.prune_failed", { ...base, boxId: id, errorName: String((e as Error)?.name ?? typeof e).slice(0, 200) }); }
+    }
+  }
+  return { lines: out, stale, deleted };
 }

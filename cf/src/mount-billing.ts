@@ -62,27 +62,38 @@ export async function consoleMountReports(
 }
 
 /**
- * The structured `unreadable` the producer's contract change adds (`{ unknown, machines, other }`), when a report
- * carries it; null for today's number or nothing. Read for the log only: the prune is decided by `complete` and by
- * answering, never by any of these counts (`other` in particular is a bad session or environment row, which costs
- * no container time).
+ * What kinds of entry made a mount's record unreadable (`MountActivity.unreadableKinds`), as the log reads it. First
+ * whether it was sent (the key absent is "not sent"), then whether it was sent well: a present value is either the
+ * contract's `{unknown: boolean, machines: finite number, other: finite number}` or a violation — `null`, a string, a
+ * number, an array, or an object with other keys or types — and a violation is never read as zero. Never throws.
+ * Read for the log only: the prune is decided by `complete` and by answering, never by any of these counts (`other`
+ * in particular is a bad session or environment row, which costs no container time).
  */
 export type UnreadableBreakdown = { unknown: boolean; machines: number; other: number };
-function breakdownOf(v: unknown): UnreadableBreakdown | null {
-  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
-  const o = v as Record<string, unknown>;
-  const n = (x: unknown) => (typeof x === "number" && Number.isFinite(x) ? x : 0);
-  return { unknown: o.unknown === true, machines: n(o.machines), other: n(o.other) };
+type SentKinds = { sent: false } | { sent: true; valid: UnreadableBreakdown | null; raw: unknown };
+function readKinds(activity: unknown): SentKinds {
+  const v = (activity as { unreadableKinds?: unknown }).unreadableKinds;
+  if (v === undefined) return { sent: false };
+  const num = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
+  if (v !== null && typeof v === "object" && !Array.isArray(v)) {
+    const o = v as Record<string, unknown>;
+    if (typeof o.unknown === "boolean" && num(o.machines) && num(o.other)) {
+      return { sent: true, valid: { unknown: o.unknown, machines: o.machines, other: o.other }, raw: v };
+    }
+  }
+  return { sent: true, valid: null, raw: v };
 }
 
-/**
- * Whether a report reads (`asActivity`, the console's own check). A structured `unreadable` is set aside for the
- * check: today's contract types it as a number, and refusing the producer's new shape here would turn every mount
- * that carries it into "did not answer" — a prune blocked forever by a reader that is behind.
- */
-function readActivity(v: unknown): MountActivity | null {
-  if (v && typeof v === "object" && breakdownOf((v as any).unreadable)) return asActivity({ ...(v as object), unreadable: undefined });
-  return asActivity(v);
+export type KindsViolation = "unrecognised_shape" | "incomplete_without_kinds" | "kinds_without_count";
+
+/** What a violation's log line says about the value that arrived: its type ("null"/"array" spelled out), its keys, a fragment of a string. */
+function describeReceived(v: unknown): LogFields {
+  const receivedType = v === null ? "null" : Array.isArray(v) ? "array" : typeof v;
+  return {
+    receivedType,
+    ...(receivedType === "object" ? { keys: Object.keys(v as object).sort().join(",").slice(0, 200) } : {}),
+    ...(typeof v === "string" ? { sampleFragment: v.slice(0, 60) } : {}),
+  };
 }
 
 export interface BillingReports {
@@ -96,8 +107,17 @@ export interface BillingReports {
   machines: Record<string, MountActivity[]>;
   /** Each answered mount's `complete`, as it read (absent stays absent). */
   complete: Record<string, boolean | undefined>;
-  /** Each answered mount's structured `unreadable`, when it carries one. */
+  /** Each answered mount's `unreadableKinds`, only where it sent a valid one with `unreadable > 0`. */
   unreadable: Record<string, UnreadableBreakdown>;
+  /** Answered mounts with `unreadable > 0`: the denominator of `kindsMissing` (`kindsOf` on the pass line). */
+  kindsOf: string[];
+  /**
+   * Answered mounts with `unreadable > 0` that sent no `unreadableKinds` (the key absent): an older producer, which
+   * heals on its own. Nothing else is counted missing.
+   */
+  kindsMissing: string[];
+  /** Answered mounts whose kinds break the producer's contract, each with why; never also in `kindsMissing`. */
+  kindsViolation: Array<{ alias: string; reason: KindsViolation }>;
 }
 
 /**
@@ -105,14 +125,14 @@ export interface BillingReports {
  * that holds nothing answering "nothing" is the answer that lets the prune run).
  */
 export async function billingMountReports(gw: ReportingGateway, ctx: Ask, mounts: readonly MountRow[]): Promise<BillingReports> {
-  const out: BillingReports = { reports: {}, unanswered: [], declared: [], machines: {}, complete: {}, unreadable: {} };
+  const out: BillingReports = { reports: {}, unanswered: [], declared: [], machines: {}, complete: {}, unreadable: {}, kindsOf: [], kindsMissing: [], kindsViolation: [] };
   for (const m of mounts) {
     if (!gw.declaresHolding(m.plugin)) continue;
     out.declared.push(m.alias);
     try {
       const [{ activity, usage }, machines] = await Promise.all([askMount(gw, ctx, m.alias), gw.mountActivities(ctx, m.alias)]);
-      const read = readActivity(activity);
-      if (!read || !Array.isArray(usage) || !Array.isArray(machines) || machines.some((a) => readActivity(a) === null)) {
+      const read = asActivity(activity);
+      if (!read || !Array.isArray(usage) || !Array.isArray(machines) || machines.some((a) => asActivity(a) === null)) {
         out.unanswered.push(m.alias);
         logEvent("usage.mount_unanswered", { tenantId: ctx.tenantId, agentId: ctx.agentId, alias: m.alias, cause: "unreadable" });
         continue;
@@ -120,8 +140,26 @@ export async function billingMountReports(gw: ReportingGateway, ctx: Ask, mounts
       out.reports[m.alias] = { activity, usage };
       out.machines[m.alias] = machines;
       out.complete[m.alias] = read.complete;
-      const b = breakdownOf((activity as any).unreadable);
-      if (b) out.unreadable[m.alias] = b;
+      const counted = (read.unreadable ?? 0) > 0;
+      if (counted) out.kindsOf.push(m.alias);
+      const kinds = readKinds(activity);
+      // Exactly one bucket per mount: breakdown, missing, violation, or nothing (a clean report sends no kinds).
+      let violation: KindsViolation | null = null;
+      if (!kinds.sent) {
+        if (counted) out.kindsMissing.push(m.alias);
+        else if (read.complete === false) violation = "incomplete_without_kinds";
+      } else if (!kinds.valid) violation = "unrecognised_shape";
+      else if (!counted) violation = "kinds_without_count";
+      else out.unreadable[m.alias] = kinds.valid;
+      if (violation) {
+        // kindsViolation is an alarm, not a metric: >0 means a producer broke the contract, not a trend.
+        // receivedType string ⇒ usually serialisation/boundary; array ⇒ an extra wrapper.
+        out.kindsViolation.push({ alias: m.alias, reason: violation });
+        logEvent("usage.kinds_violation", {
+          tenantId: ctx.tenantId, agentId: ctx.agentId, alias: m.alias, reason: violation,
+          ...(kinds.sent ? describeReceived(kinds.raw) : { receivedType: "undefined" }),
+        });
+      }
     } catch (e) {
       // Named, never swallowed: this mount's boxes are simply not counted this pass (their watermarks stay, so the
       // next answer counts from where they stood), and the prune waits for it.
@@ -192,6 +230,18 @@ export function recordSkips(sql: Sql, declared: readonly string[], blocked: Reco
   return passes;
 }
 
+/** A log field's cap on a list of aliases; past it the line says how many were left out. */
+const ALIASES_MAX = 200;
+export function aliasList(aliases: readonly string[]): string {
+  let out = "";
+  for (let i = 0; i < aliases.length; i++) {
+    const next = out ? `${out},${aliases[i]}` : aliases[i]!;
+    if (next.length > ALIASES_MAX) return `${out}…(+${aliases.length - i} more)`;
+    out = next;
+  }
+  return out;
+}
+
 export interface HeldPass {
   billing: BillingReports;
   prune: boolean;
@@ -219,6 +269,12 @@ export async function runHeldPass(deps: {
   const log: LogFields = { tenantId, agentId, agentsEvaluated: 1, mounts: deps.mounts.length };
   try {
     const billing = await billingMountReports(deps.gw, deps.ctx, deps.mounts);
+    // On the line as soon as known, so a pass that throws below says how far it got in the same shape.
+    Object.assign(log, {
+      declared: billing.declared.length,
+      answered: billing.declared.length - billing.unanswered.length,
+      unanswered: billing.unanswered.length,
+    });
     const { prune, blocked } = pruneDecision(billing);
     // What `countHeldTime` reads: the console's report plus each thing on its own (`activities`).
     const reports: Record<string, unknown> = {};
@@ -228,7 +284,7 @@ export async function runHeldPass(deps: {
     const passes = recordSkips(deps.sql, billing.declared, blocked);
     const by = (k: Block) => Object.keys(blocked).filter((a) => blocked[a] === k);
     // Past the threshold, what a person is asked to do depends on why the mount blocks. Only `incomplete` (the
-    // mount's own record is unreadable: `unreadable.unknown` or `machines > 0`) gets the menu of fixes, the last of
+    // mount's own record is unreadable: `unreadableKinds.unknown` or `machines > 0`) gets the menu of fixes, the last of
     // which gives up pruning. `complete_missing` (the plugin does not send the field yet: a rollout gap) and
     // `unanswered` (the call failed) are `stalled`: wait, or look at the mount. Never offer giving up the prune for a
     // cause it cannot fix.
@@ -237,27 +293,27 @@ export async function runHeldPass(deps: {
     const stalled = Object.keys(passes).filter((a) => over(a) && blocked[a] !== "incomplete");
     const breakdowns = Object.values(billing.unreadable);
     Object.assign(log, {
-      declared: billing.declared.length,
-      answered: billing.declared.length - billing.unanswered.length,
-      unanswered: billing.unanswered.length,
       // The daily report's breakdown of the answered mounts' unreadable record. `other` is informational only: it
       // is in neither the prune decision nor the escalation.
       unknownBlocking: breakdowns.filter((u) => u.unknown).length,
       machinesBlocking: breakdowns.filter((u) => u.machines > 0).length,
       otherUnreadable: breakdowns.filter((u) => u.other > 0).length,
+      kindsMissing: billing.kindsMissing.length,
+      kindsOf: billing.kindsOf.length,
+      kindsViolation: billing.kindsViolation.length,
       pruned: prune,
       wouldDelete: counted.stale.length,
       deleted: counted.deleted,
       ...(prune ? {} : {
         reasons: (["unanswered", "incomplete", "complete_missing"] as const).filter((k) => by(k).length).join(","),
-        unansweredAliases: by("unanswered").join(","),
-        incompleteAliases: by("incomplete").join(","),
-        completeMissingAliases: by("complete_missing").join(","),
+        unansweredAliases: aliasList(by("unanswered")),
+        incompleteAliases: aliasList(by("incomplete")),
+        completeMissingAliases: aliasList(by("complete_missing")),
         skipPasses: JSON.stringify(passes),
         escalate: escalate.length > 0,
-        escalateAliases: escalate.join(","),
+        escalateAliases: aliasList(escalate),
         stalled: stalled.length > 0,
-        stalledAliases: stalled.join(","),
+        stalledAliases: aliasList(stalled),
       }),
     });
     logEvent("usage.held_pass", log);

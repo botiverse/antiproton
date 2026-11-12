@@ -18,7 +18,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { pendingUsage } from "../src/usage/outbox.ts";
 import { setLogSink } from "../src/core/log.ts";
 import type { MountActivity, MountUsage, Plugin, PluginContext } from "../src/plugins/types.ts";
-import { ESCALATE_AFTER_PASSES, billingMountReports, consoleMountReports, runHeldPass } from "../cf/src/mount-billing.ts";
+import { ESCALATE_AFTER_PASSES, aliasList, billingMountReports, consoleMountReports, runHeldPass } from "../cf/src/mount-billing.ts";
 import { asMountReports } from "../cf/src/mount-reports.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -105,6 +105,11 @@ async function world(definition: Record<string, keyof typeof PLUGINS>) {
       ledger.sql.exec("CREATE TABLE IF NOT EXISTS usage_held(box_id TEXT PRIMARY KEY, through INTEGER NOT NULL, uses INTEGER NOT NULL)");
       ledger.sql.exec("INSERT INTO usage_held VALUES ('gone-box', ?, 0)", now - 8 * DAY);
     },
+    /** Any watermark, as an earlier pass would have left it. */
+    seedMark: (id: string, through: number) => {
+      ledger.sql.exec("CREATE TABLE IF NOT EXISTS usage_held(box_id TEXT PRIMARY KEY, through INTEGER NOT NULL, uses INTEGER NOT NULL)");
+      ledger.sql.exec("INSERT INTO usage_held VALUES (?, ?, 0)", id, through);
+    },
   };
 }
 
@@ -132,14 +137,25 @@ const live = (id: string, startedAt: number, extra: Record<string, unknown> = {}
 const EMPTY_COMPLETE = { live: null, complete: true };
 
 // ---------------------------------------------------------------------------------------------------------------
-await check("an empty answer with complete:true is answered and lets the prune run", async () => {
-  const w = await world({ box: "fake", notes: "plain" });
+await check("an empty answer with complete:true is answered and lets the prune run: the stale row goes, the reported one stays", async () => {
+  const w = await world({ box: "fake", held: "fake", notes: "plain" });
   answers.set("box", { activity: EMPTY_COMPLETE });
+  // `live-box`: a recent watermark a report still names (a finished session ending exactly at it, so this pass has
+  // nothing new to count and must leave the row exactly as it was).
+  const liveThrough = T0 - 30 * MIN;
+  answers.set("held", { activity: EMPTY_COMPLETE, usage: [{ id: "live-box", startedAt: T0 - 2 * HOUR, endedAt: liveThrough, lastUsedAt: liveThrough }] });
   w.seedStale(T0);
+  w.seedMark("live-box", liveThrough);
   const p = await w.pass(T0);
   await invariants(w, p);
   assert(Object.keys(p.billing.reports).includes("box") && p.billing.unanswered.length === 0, `box not answered: ${JSON.stringify(p.billing)}`);
-  assert(p.prune && p.deleted === 1 && !w.marks().has("gone-box"), `prune did not run: ${JSON.stringify({ prune: p.prune, blocked: p.blocked, deleted: p.deleted })}`);
+  assert(p.prune, `prune did not run: ${JSON.stringify(p.blocked)}`);
+  const marks = w.marks();
+  assert(!marks.has("gone-box"), `the stale watermark is still there: ${JSON.stringify([...marks])}`);
+  assert(marks.get("live-box") === liveThrough, `the reported watermark was touched: ${JSON.stringify([...marks])}`);
+  assert(p.deleted > 0, `no delete was executed: ${p.deleted}`);
+  const next = await w.pass(T0 + MIN);
+  assert(next.wouldDelete === 0, `the next pass still finds ${next.wouldDelete} to delete`);
 });
 
 await check("an empty answer with complete:false is answered, and blocks the prune as incomplete", async () => {
@@ -174,15 +190,137 @@ await check("complete that is not a boolean does not read: unanswered, not compl
   assert(p.billing.unanswered.includes("box") && p.blocked.box === "unanswered", `blocked: ${JSON.stringify(p.blocked)}`);
 });
 
-await check("unreadable {unknown:false, machines:0, other:1} with complete:true: the prune still runs (other is not a gate)", async () => {
+await check("unreadable:1 with unreadableKinds {other:1} and complete:true: the prune still runs (other is not a gate)", async () => {
   const w = await world({ box: "fake" });
-  answers.set("box", { activity: { live: null, complete: true, unreadable: { unknown: false, machines: 0, other: 1 } } });
+  answers.set("box", { activity: { live: null, complete: true, unreadable: 1, unreadableKinds: { unknown: false, machines: 0, other: 1 } } });
   w.seedStale(T0);
   const p = await w.pass(T0);
   await invariants(w, p);
   assert(p.prune && p.deleted === 1, `other blocked the prune: ${JSON.stringify({ blocked: p.blocked, unanswered: p.billing.unanswered })}`);
   const l = lastPassLog();
   assert(l.otherUnreadable === 1 && l.unknownBlocking === 0 && l.machinesBlocking === 0, `breakdown not logged: ${JSON.stringify(l)}`);
+  assert(l.kindsMissing === 0, `valid kinds counted as missing: ${JSON.stringify(l)}`);
+  assert(l.kindsViolation === 0, `valid kinds counted as a violation: ${JSON.stringify(l)}`);
+});
+
+/** One pass over one fake mount answering `activity`, with the kinds-violation lines that pass logged. */
+async function kindsPass(activity: Record<string, unknown>) {
+  const w = await world({ box: "fake" });
+  answers.set("box", { activity });
+  const from = logs.length;
+  const p = await w.pass(T0);
+  await invariants(w, p);
+  return { p, l: lastPassLog(), violations: logs.slice(from).filter((x) => x.evt === "usage.kinds_violation") };
+}
+
+await check("kinds absent with unreadable:2: missing 1 of 1, no violation", async () => {
+  const { p, l } = await kindsPass({ live: null, complete: true, unreadable: 2 });
+  assert(p.billing.unanswered.length === 0, `precondition: the mount answered: ${p.billing.unanswered}`);
+  assert(l.kindsMissing === 1, `kindsMissing ${l.kindsMissing}`);
+  assert(l.kindsOf === 1, `kindsOf ${l.kindsOf}`);
+  assert(l.kindsViolation === 0, `kindsViolation ${l.kindsViolation}`);
+  assert(Object.keys(p.billing.unreadable).length === 0, `absent kinds read as a breakdown: ${JSON.stringify(p.billing.unreadable)}`);
+});
+
+await check("kinds absent on a clean report: counted nowhere", async () => {
+  const { p, l, violations } = await kindsPass({ live: null, complete: true });
+  assert(p.billing.unanswered.length === 0, "precondition: the mount answered");
+  assert(l.kindsMissing === 0, `kindsMissing ${l.kindsMissing}`);
+  assert(l.kindsOf === 0, `kindsOf ${l.kindsOf}`);
+  assert(l.kindsViolation === 0 && violations.length === 0, `violation ${JSON.stringify(violations)}`);
+  assert(l.unknownBlocking === 0 && l.machinesBlocking === 0 && l.otherUnreadable === 0, `breakdown counted: ${JSON.stringify(l)}`);
+});
+
+await check("kinds sent as a JSON string: one unrecognised_shape violation with a fragment, not missing", async () => {
+  const text = JSON.stringify({ unknown: false, machines: 0, other: 1, padding: "x".repeat(100) });
+  const { p, l, violations } = await kindsPass({ live: null, complete: true, unreadable: 1, unreadableKinds: text });
+  assert(p.billing.unanswered.length === 0, "precondition: the mount answered");
+  assert(l.kindsViolation === 1, `kindsViolation ${l.kindsViolation}`);
+  assert(l.kindsMissing === 0, `the string was also counted missing: ${l.kindsMissing}`);
+  assert(violations.length === 1, `violation lines: ${JSON.stringify(violations)}`);
+  assert(violations[0]!.reason === "unrecognised_shape", `reason ${violations[0]!.reason}`);
+  assert(violations[0]!.receivedType === "string", `receivedType ${violations[0]!.receivedType}`);
+  assert(violations[0]!.sampleFragment === text.slice(0, 60), `sampleFragment ${violations[0]!.sampleFragment}`);
+  assert(Object.keys(p.billing.unreadable).length === 0 && l.otherUnreadable === 0, "a string was read as a breakdown");
+});
+
+await check("kinds sent as null: an unrecognised_shape violation with receivedType null", async () => {
+  const { p, l, violations } = await kindsPass({ live: null, complete: true, unreadable: 1, unreadableKinds: null });
+  assert(p.billing.unanswered.length === 0, "precondition: the mount answered");
+  assert(l.kindsViolation === 1 && l.kindsMissing === 0, `violation ${l.kindsViolation} missing ${l.kindsMissing}`);
+  assert(violations[0]?.reason === "unrecognised_shape", `reason ${violations[0]?.reason}`);
+  assert(violations[0]?.receivedType === "null", `receivedType ${violations[0]?.receivedType}`);
+});
+
+await check("kinds sent as an object with the wrong types or an array: violations naming keys and type", async () => {
+  const obj = await kindsPass({ live: null, complete: true, unreadable: 1, unreadableKinds: { unknown: "no", machines: 0, other: 1 } });
+  assert(obj.violations[0]?.reason === "unrecognised_shape" && obj.violations[0]?.receivedType === "object", `object: ${JSON.stringify(obj.violations)}`);
+  assert(obj.violations[0]?.keys === "machines,other,unknown", `keys ${obj.violations[0]?.keys}`);
+  const arr = await kindsPass({ live: null, complete: true, unreadable: 1, unreadableKinds: [{ unknown: false, machines: 0, other: 1 }] });
+  assert(arr.violations[0]?.receivedType === "array", `array: ${JSON.stringify(arr.violations)}`);
+});
+
+await check("complete:false with no kinds and no unreadable: no throw, no breakdown, one incomplete_without_kinds, prune still blocked", async () => {
+  const { p, l, violations } = await kindsPass({ live: null, complete: false });
+  assert(p.billing.unanswered.length === 0, "precondition: the mount answered (nothing threw)");
+  assert(Object.keys(p.billing.unreadable).length === 0, `breakdown entry: ${JSON.stringify(p.billing.unreadable)}`);
+  assert(l.kindsViolation === 1, `kindsViolation ${l.kindsViolation}`);
+  assert(violations[0]?.reason === "incomplete_without_kinds", `reason ${violations[0]?.reason}`);
+  assert(l.kindsMissing === 0, `counted missing too: ${l.kindsMissing}`);
+  assert(!p.prune && p.blocked.box === "incomplete", `blocked: ${JSON.stringify(p.blocked)}`);
+});
+
+await check("valid kinds with unreadable 0: one kinds_without_count violation, no breakdown", async () => {
+  const { p, l, violations } = await kindsPass({ live: null, complete: true, unreadable: 0, unreadableKinds: { unknown: false, machines: 0, other: 1 } });
+  assert(p.billing.unanswered.length === 0, "precondition: the mount answered");
+  assert(l.kindsViolation === 1, `kindsViolation ${l.kindsViolation}`);
+  assert(violations[0]?.reason === "kinds_without_count", `reason ${violations[0]?.reason}`);
+  assert(l.otherUnreadable === 0 && Object.keys(p.billing.unreadable).length === 0, "a violating breakdown fed the counts");
+});
+
+await check("a stale watermark whose delete fails: deleted counts only executed deletes, the row stays, and the failure is named", async () => {
+  const w = await world({ box: "fake" });
+  answers.set("box", { activity: EMPTY_COMPLETE });
+  w.seedStale(T0);
+  const exec = w.ledger.sql.exec.bind(w.ledger.sql);
+  w.ledger.sql.exec = ((q: string, ...b: unknown[]) => {
+    if (q.startsWith("DELETE FROM usage_held") && b[0] === "gone-box") throw new RangeError("locked");
+    return exec(q, ...b);
+  }) as any;
+  const p = await w.pass(T0);
+  assert(p.prune, `prune was not attempted: ${JSON.stringify(p.blocked)}`);
+  assert(p.deleted === 0, `deleted ${p.deleted} though no delete ran`);
+  assert(w.marks().has("gone-box"), "the watermark is gone though its delete failed");
+  const failed = logs.filter((x) => x.evt === "usage.prune_failed").at(-1);
+  assert(failed?.boxId === "gone-box" && failed.errorName === "RangeError", `no prune_failed line for it: ${JSON.stringify(failed)}`);
+});
+
+await check("a pass that throws logs failed:true with the counts it already had", async () => {
+  const w = await world({ box: "fake", broken: "fake" });
+  answers.set("box", { activity: EMPTY_COMPLETE });
+  answers.set("broken", { activity: null, throws: new Error("nope") });
+  const exec = w.ledger.sql.exec.bind(w.ledger.sql);
+  w.ledger.sql.exec = ((q: string, ...b: unknown[]) => {
+    if (q.startsWith("SELECT box_id, through, uses FROM usage_held")) throw new Error("table gone");
+    return exec(q, ...b);
+  }) as any;
+  let threw = false;
+  try { await w.pass(T0); } catch { threw = true; }
+  assert(threw, "the pass did not throw");
+  const l = lastPassLog();
+  assert(l.failed === true && l.agentsEvaluated === 1 && l.declared === 2 && l.answered === 1 && l.unanswered === 1, `failed line: ${JSON.stringify(l)}`);
+});
+
+await check("alias lists in the log are capped at 200 characters and say how many were cut", async () => {
+  const many = Array.from({ length: 40 }, (_, i) => `mount-number-${i}`);
+  const out = aliasList(many);
+  const m = /…\(\+(\d+) more\)$/.exec(out);
+  assert(m, `no cut marker: ${out}`);
+  const head = out.slice(0, m.index);
+  const kept = head.split(",");
+  assert(head.length <= 200, `kept part is ${head.length} chars`);
+  assert(kept.length + Number(m[1]) === many.length && isDeepStrictEqual(kept, many.slice(0, kept.length)), `kept ${kept.length} + cut ${m[1]} != ${many.length}`);
+  assert(aliasList(["a", "b"]) === "a,b", "a short list was changed");
 });
 
 await check("a mount that throws is unanswered, named in the log, blocks the prune, and the other mounts are still billed", async () => {
