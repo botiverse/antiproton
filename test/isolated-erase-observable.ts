@@ -209,7 +209,8 @@ await check("a pass cut off before it has seen every row still writes its line: 
   await w.answer(session);
   // Make the erase's read of which sessions have work throw, and only there (by the caller in the stack), so the pass
   // fails outside the per-session try: the one way a pass ends without having seen every row.
-  // The match is on SQL text and a method name, so it can stop matching silently; `injected` makes that say so.
+  // The match is on SQL text and a method name, so it can stop matching silently; `injected` makes that say so. It is
+  // set where the throw happens, not when the hook is installed: it proves a call was stopped, not that a hook exists.
   let injected = false;
   const exec = w.sql.exec.bind(w.sql);
   (w.sql as any).exec = (q: string, ...args: unknown[]) => {
