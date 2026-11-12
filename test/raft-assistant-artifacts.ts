@@ -300,27 +300,31 @@ await check("read: no answer and an unreadable answer are told apart, as a pair:
   must(!/older Raft server/.test(unreadable!.message), `claims a cause: ${unreadable!.message}`);
 });
 
-await check("read: a paging read the server did not page says so and never says call again: each sign on its own input, and neither", async () => {
-  const CALL_AGAIN = "call again with commentsBefore";
-  const second = async (o: { newest: number | null; olderBack: string }) => {
-    const a = await assistant();
-    const ans: any = readAnswer({ position: null });
-    ans.comments = { items: ans.comments.items, olderCursor: o.olderBack, ...(o.newest === null ? {} : { newestPosition: o.newest }) };
-    a.r.readAnswer = { status: 200, body: ans };
-    return read(a, { artifact: ART_ID, commentsBefore: "cur-1" });
-  };
-  const stopped = (out: any, why: string) =>
-    must(out.seen === null && !out.notes.some((n: string) => n.includes(CALL_AGAIN)) && out.notes.some((n: string) => n.includes("Stop paging")),
-      `${why}: ${show(out.seen)} ${show(out.notes)}`);
-  // Only the capability sign: no newestPosition, but the cursor moved.
-  stopped(await second({ newest: null, olderBack: "cur-2" }), "only newestPosition absent");
-  // Only the echo sign: newestPosition present, the same cursor came back.
-  stopped(await second({ newest: 30, olderBack: "cur-1" }), "only the cursor unchanged");
-  // Today's real shape: both signs (proves neither on its own).
-  stopped(await second({ newest: null, olderBack: "cur-1" }), "today's shape");
-  // Neither sign: a real next page. Call again, with the stop condition for a page that repeats.
-  const next = await second({ newest: 30, olderBack: "cur-2" });
-  must(next.notes.some((n: string) => n.includes(CALL_AGAIN) && n.includes("already read, stop")), `a real next page: ${show(next.notes)}`);
+// A paging read the server did not page: one case per input, so a reverse change shows exactly which inputs fail.
+const CALL_AGAIN = "call again with commentsBefore";
+async function secondRead(o: { newest: number | null; olderBack: string }) {
+  const a = await assistant();
+  const ans: any = readAnswer({ position: null });
+  ans.comments = { items: ans.comments.items, olderCursor: o.olderBack, ...(o.newest === null ? {} : { newestPosition: o.newest }) };
+  a.r.readAnswer = { status: 200, body: ans };
+  return read(a, { artifact: ART_ID, commentsBefore: "cur-1" });
+}
+const stopped = (out: any) =>
+  must(out.seen === null && !out.notes.some((n: string) => n.includes(CALL_AGAIN)) && out.notes.some((n: string) => n.includes("Stop paging")),
+    `${show(out.seen)} ${show(out.notes)}`);
+
+await check("read: paging, only the capability sign (no newestPosition, the cursor moved): says it cannot page, never call again", async () => {
+  stopped(await secondRead({ newest: null, olderBack: "cur-2" }));
+});
+await check("read: paging, only the echo sign (newestPosition present, the same cursor came back): says it cannot page, never call again", async () => {
+  stopped(await secondRead({ newest: 30, olderBack: "cur-1" }));
+});
+await check("read: paging, today's real shape (both signs; proves neither on its own): says it cannot page, never call again", async () => {
+  stopped(await secondRead({ newest: null, olderBack: "cur-1" }));
+});
+await check("read: paging, neither sign (a real next page): call again, with the stop condition for a page that repeats", async () => {
+  const next = await secondRead({ newest: 30, olderBack: "cur-2" });
+  must(next.notes.some((n: string) => n.includes(CALL_AGAIN) && n.includes("already read, stop")), show(next.notes));
 });
 
 await check("read: paging: olderCursor is said with commentsBefore, the first page's newestPosition kept; commentsBefore is sent; the oldest page says so", async () => {
