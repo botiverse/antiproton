@@ -61,7 +61,7 @@ import { skippedToolNotes } from "../../src/runtime/mount-tools.ts";
 
 /** What the plugins page is handed about each mount; declared and checked in cf/src/mount-reports.ts. */
 import type { MountReports } from "./mount-reports.ts";
-import { worthReporting } from "./mount-reports.ts";
+import { consoleMountReports, runHeldPass } from "./mount-billing.ts";
 export type { MountReports };
 import { qualifyMountedTools } from "../../src/runtime/pi-tools.ts";
 import { BenchState, chooseBenchEngine, type BenchEngine } from "./bench.ts";
@@ -97,7 +97,6 @@ import { pdVersion } from "../../src/runtime/pd-transcript.ts";
 import { compactionRefusal, refusingCompaction } from "./compact-refusal.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../src/usage/active.ts";
-import { countHeldTime, heldReports } from "../../src/usage/container.ts";
 import { benchPollBody } from "../../src/bench/poll-body.ts";
 import { flushUsage, parseUsageQuery, readAgentLedger, readUsage, priceFor, readTenantCosts, readUsageCosts, retainUsage, usageBacklogSince, usagePrices } from "./usage-d1.ts";
 import { adminUsageCosts, closedCostsTo, parseCostsQuery } from "./admin-usage-costs.ts";
@@ -710,15 +709,26 @@ export class AgentDO extends DurableObject<Env> {
    * knows that. A watermark per box (src/usage/container.ts) makes a box that
    * lives across ten passes count once.
    *
-   * The cost is one activity and one usage read per mount per pass, both from
+   * The cost is one activity, one activities and one usage read per mount per pass, all from
    * this object's own storage. A mount that holds nothing yields no rows.
+   *
+   * Not through `#mountReports`: that map leaves out a mount that could not answer, and usage read that absence
+   * as "the box is gone" and pruned its watermark (cf/src/mount-billing.ts says how it asks instead).
    */
   async #countHeldTime(rt: AgentRuntime, tenantId: string, agentId: string) {
     try {
-      const mounts = await rt.store.listMounts(tenantId, agentId);
-      const reports = await this.#mountReports(rt, tenantId, agentId, LEGACY_TASK_ID, mounts);
-      // Named by mount, and marked with whose run9 account each box runs on (`heldReports`).
-      countHeldTime(this.sql as any, heldReports(mounts, reports), { tenantId, agentId });
+      let mounts: Awaited<ReturnType<AgentRuntime["store"]["listMounts"]>>;
+      try { mounts = await rt.store.listMounts(tenantId, agentId); }
+      catch (e) {
+        // Same line as every pass, so a pass that never ran is not read as one that found nothing to bill.
+        logEvent("usage.held_pass", { tenantId, agentId, agentsEvaluated: 1, failed: "listMounts", error: String((e as Error)?.message ?? e).slice(0, 200) });
+        throw e;
+      }
+      await runHeldPass({
+        gw: rt.gateway(), sql: this.sql as any, ctx: { tenantId, agentId, taskId: LEGACY_TASK_ID }, mounts,
+        // A mount's ledger rows and its watermarks, together or not at all (src/usage/container.ts countHeldPass).
+        transaction: (fn) => this.ctx.storage.transactionSync(fn),
+      });
     } catch (e: any) {
       console.warn(`held-time accounting skipped: ${String(e?.message ?? e).slice(0, 200)}`);
     }
@@ -2034,23 +2044,9 @@ export class AgentDO extends DurableObject<Env> {
     // reading it twice would answer the same question twice (Rex, #402).
     mounts?: Awaited<ReturnType<AgentRuntime["store"]["listMounts"]>>,
   ): Promise<MountReports> {
-    const gw = rt.gateway();
-    const out: MountReports = {};
-    for (const m of mounts ?? await rt.store.listMounts(tenantId, agentId)) {
-      try {
-        const [activity, usage] = await Promise.all([
-          gw.mountActivity({ tenantId, agentId, taskId }, m.alias),
-          gw.mountUsage({ tenantId, agentId, taskId }, m.alias),
-        ]);
-        // Kept only when the report says something (worthReporting, shared with
-        // diagnose-read so the two surfaces cannot drift); an empty report
-        // would defeat the page's own emptiness check.
-        if (worthReporting(activity, usage)) out[m.alias] = { activity, usage };
-      } catch {
-        // One mount that cannot answer must not blank the panel for the rest.
-      }
-    }
-    return out;
+    // The body is shared with usage's own question (cf/src/mount-billing.ts), which asks the same way but keeps
+    // every mount and names the ones that did not answer; this map keeps its shape for the page.
+    return consoleMountReports(rt.gateway(), { tenantId, agentId, taskId }, mounts ?? await rt.store.listMounts(tenantId, agentId));
   }
 
   /** The console attaches a credential to one of this agent's mounts. The

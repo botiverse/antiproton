@@ -40,6 +40,7 @@
  */
 import { appendUsage, msByHour, payerKey, type UsageRow } from "./outbox.ts";
 import { secretRefKind } from "../runtime/secrets.ts";
+import { logEvent } from "../core/log.ts";
 import type { SqlHost } from "../store/pi-storage.ts";
 import type { MountActivity } from "../plugins/types.ts";
 
@@ -156,6 +157,15 @@ export function boxesOf(
       /** Held but set aside (`MountActivity.aside`): still alive and billed, so counted like `live`. */
       aside?: ReadonlyArray<{ id: string; startedAt: number; credentialRef?: string }>;
     } | null;
+    /**
+     * Every held thing on its own (`Holding.activities`), when the mount was asked that way: `activity` is one
+     * summary and names ONE machine (src/plugins/sandbox.ts `summaryActivity`), so a mount running two would have
+     * the other's time go unbilled and its watermark pruned. Read beside `activity`; a session named in both is one.
+     */
+    activities?: ReadonlyArray<{
+      live?: { id: string; startedAt: number; credentialRef?: string } | null;
+      aside?: ReadonlyArray<{ id: string; startedAt: number; credentialRef?: string }>;
+    }> | null;
     usage?: ReadonlyArray<{ id: string; startedAt: number; endedAt: number; uses?: number; credentialRef?: string }>;
   } | null | undefined,
 ): HeldBox[] {
@@ -165,6 +175,10 @@ export function boxesOf(
   const live = report?.activity?.live;
   if (live) out.set(session(live), { id: live.id, startedAt: live.startedAt, endedAt: null, ...under(live) });
   for (const a of report?.activity?.aside ?? []) out.set(session(a), { id: a.id, startedAt: a.startedAt, endedAt: null, ...under(a) });
+  for (const one of report?.activities ?? []) {
+    if (one?.live) out.set(session(one.live), { id: one.live.id, startedAt: one.live.startedAt, endedAt: null, ...under(one.live) });
+    for (const a of one?.aside ?? []) out.set(session(a), { id: a.id, startedAt: a.startedAt, endedAt: null, ...under(a) });
+  }
   for (const s of report?.usage ?? []) {
     out.set(session(s), { id: s.id, startedAt: s.startedAt, endedAt: s.endedAt, ...(s.uses === undefined ? {} : { uses: s.uses }), ...under(s) });
   }
@@ -272,6 +286,25 @@ export function countHeldTime(
   base: { tenantId: string; agentId: string },
   now = Date.now(),
 ): Array<{ key: string; rows: number }> {
+  return countHeldPass(sql, reports, base, { now, prune: true, transaction: (fn) => fn() }).lines;
+}
+
+/**
+ * `countHeldTime` with the two decisions the agent object makes itself (cf/src/mount-billing.ts):
+ *
+ * - `prune`: whether watermarks of boxes no report names may be dropped this pass. Only when every mount answered
+ *   and called itself complete; a mount that did not answer names no boxes, and reading that as "gone" is how a
+ *   live box lost its watermark and was billed again from its start. `stale` lists what would go either way.
+ * - `transaction`: one mount's ledger rows and its watermarks are written together or not at all. Rows without
+ *   the watermark that covers them are counted again by the next pass; a watermark without its rows is time lost.
+ */
+export function countHeldPass(
+  sql: Sql,
+  reports: Record<string, { plugin: string; report: unknown; own?: boolean }>,
+  base: { tenantId: string; agentId: string },
+  opts: { now?: number; prune: boolean; transaction: <T>(fn: () => T) => T },
+): { lines: Array<{ key: string; rows: number }>; stale: string[]; deleted: number } {
+  const now = opts.now ?? Date.now();
   sql.exec(WATERMARK);
   const counted = new Map<string, HeldMark>(sql.exec("SELECT box_id, through, uses FROM usage_held").toArray()
     .map((r: any) => [String(r.box_id), { through: Number(r.through), uses: Number(r.uses) }]));
@@ -287,19 +320,31 @@ export function countHeldTime(
     const { rows, marks } = heldRows(base, (b) => payerKey(plugin, boxIsOwn(b, own === true)), boxes, counted, now);
     // The marker has no box, so it goes under the mount's key.
     const marker = heldUnreadableRows(base, payerKey(plugin, own === true), (report as any)?.activity ?? null, now);
-    if (rows.length || marker.length) appendUsage(sql, [...rows, ...marker]);
-    for (const { id, mark } of marks) {
-      sql.exec(
-        "INSERT INTO usage_held(box_id, through, uses) VALUES (?, ?, ?) " +
-        "ON CONFLICT(box_id) DO UPDATE SET through = excluded.through, uses = excluded.uses",
-        id, Math.round(mark.through), Math.round(mark.uses));
-    }
+    // Synchronous on purpose: an await inside this callback silently splits the transaction (transactionSync
+    // commits on return), and the rows after it would land without the watermark that covers them.
+    opts.transaction(() => {
+      if (rows.length || marker.length) appendUsage(sql, [...rows, ...marker]);
+      for (const { id, mark } of marks) {
+        sql.exec(
+          "INSERT INTO usage_held(box_id, through, uses) VALUES (?, ?, ?) " +
+          "ON CONFLICT(box_id) DO UPDATE SET through = excluded.through, uses = excluded.uses",
+          id, Math.round(mark.through), Math.round(mark.uses));
+      }
+    });
     const byKey = new Map<string, number>();
     for (const r of [...rows, ...marker]) byKey.set(r.key, (byKey.get(r.key) ?? 0) + 1);
     for (const [key, n] of byKey) out.push({ key, rows: n });
   }
-  for (const [id, mark] of counted) {
-    if (!seen.has(id) && mark.through < now - KEEP_MARKS_MS) sql.exec("DELETE FROM usage_held WHERE box_id = ?", id);
+  const stale = [...counted].filter(([id, mark]) => !seen.has(id) && mark.through < now - KEEP_MARKS_MS).map(([id]) => id);
+  // Each delete on its own and outside the mounts' transactions: a stale box is one no report names (`!seen`), so
+  // it has no rows this pass, and a delete that fails only leaves a dead row for the next pass to try again — never
+  // a second bill. `deleted` is what was executed, not what was planned.
+  let deleted = 0;
+  if (opts.prune) {
+    for (const id of stale) {
+      try { sql.exec("DELETE FROM usage_held WHERE box_id = ?", id); deleted++; }
+      catch (e) { logEvent("usage.prune_failed", { ...base, boxId: id, errorName: String((e as Error)?.name ?? typeof e).slice(0, 200) }); }
+    }
   }
-  return out;
+  return { lines: out, stale, deleted };
 }
