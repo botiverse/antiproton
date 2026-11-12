@@ -19,7 +19,8 @@ export type MountReports = Record<string, { activity: MountActivity; usage: Moun
 const isNum = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 
-function asActivity(v: unknown): MountActivity | null {
+/** One activity as the contract type describes it, or null when it does not read (also usage's "answered" test, cf/src/mount-billing.ts). */
+export function asActivity(v: unknown): MountActivity | null {
   if (!isObj(v)) return null;
   let live: MountActivity["live"] = null;
   if (v.live !== null && v.live !== undefined) {

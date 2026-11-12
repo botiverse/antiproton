@@ -1048,6 +1048,15 @@ export class ToolGateway {
   }
 
   /**
+   * Whether mounts of this plugin answer `mountActivity` from a plugin of their own (`Plugin.holds`) rather than the
+   * gateway's stand-in `{ live: null }`: the mounts usage has to hear from before it may forget a box (cf/src/mount-billing.ts).
+   */
+  declaresHolding(plugin: string): boolean {
+    const p = this.#plugins.get(plugin);
+    return !!p && holdingOf(p) !== null;
+  }
+
+  /**
    * Every thing one mount is holding, each with its own activity (`Holding.activities`), for the callers
    * that act on each: the idle pass and the holding sentences. A plugin that holds at most one thing
    * answers with its one `activity`. Same rules as `mountActivity`: no credential is resolved.
