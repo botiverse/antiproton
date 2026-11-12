@@ -1358,6 +1358,9 @@ function callerShadows(tenantId: string, agentId: string, session: string, calle
   return shadows;
 }
 
+/** A short session alive this long is reported apart (`isolated.erase_pass`); a coarse screen, not a verdict. */
+const ISOLATED_OVERDUE_MS = 60 * 60_000;
+
 export class AgentRuntime {
   readonly store: DurableObjectStore;
   #deps: RuntimeDeps;
@@ -5676,26 +5679,76 @@ export class AgentRuntime {
     if (this.#isPd()) return;
     const sql = this.#deps.ctx.storage.sql;
     const rows = isolatedSessions(sql);
-    if (!rows.length) return;
-    const busy = new Set(sessionsWithWork(sql));
-    for (const r of rows) {
-      if (busy.has(r.session)) continue;
-      try {
-        // Anything a call of it parked, though an owner read never is (`ownerReadTooLarge`): the stored copies first,
-        // then their references, so a failed delete leaves the row that names what is still there.
-        const parked = (sql.exec("SELECT operation_id, result_ref FROM operations WHERE tenant_id = ? AND task_id = ? AND result_ref IS NOT NULL",
-          tenantId, r.session).toArray() as Array<{ operation_id: string; result_ref: string }>);
-        const keys = parked.map((p) => /^r2:\/\/[^/]+\/(.+)$/.exec(String(p.result_ref))?.[1]).filter((k): k is string => !!k);
-        if (keys.length) await this.#artifacts.delete(keys);
-        if (parked.length) sql.exec("UPDATE operations SET result_ref = NULL WHERE tenant_id = ? AND task_id = ? AND result_ref IS NOT NULL", tenantId, r.session);
-        this.#evictAgent(tenantId, agentId, r.session);
-        const t = piTables(r.session);
-        for (const table of [t.entries, t.usage, t.values, t.list, t.meta]) sql.exec(`DROP TABLE IF EXISTS ${table}`);
-        sql.exec("DELETE FROM pi_sessions WHERE session = ?", r.session);
-        sql.exec("DELETE FROM pi_model_jobs WHERE session = ?", r.session);
-        forgetIsolated(sql, r.session);
-        logEvent("isolated.erased", { tenantId, agentId, session: r.session, mount: r.alias, ms: Date.now() - r.at });
-      } catch (e) { console.error(`erasing ${tenantId}/${agentId}'s short session ${r.session} failed:`, e); }
+    // A pass with no short sessions still says so (rows: 0), so every pass that reached this step has its line and one
+    // that has none either did not reach it or is pd's (which never makes a short session: the return above).
+    if (!rows.length) { logEvent("isolated.erase_pass", { tenantId, agentId, rows: 0, completed: true }); return; }
+    // Every row ends this pass in exactly one of erased / failed / busy, so a finished pass's summary always adds up
+    // (rows = erased + failed + busy); a failure is a counted event of its own, never only a console line. The summary
+    // is written however the pass ends: one that throws before it has seen every row says so (`completed: false`,
+    // with how many it reached), so an unfinished pass is a line to count, not an absence. Whether the alarm pass as a
+    // whole finished is `alarm.start` / `alarm.end` (cf/src/index.ts); a pass that ended without reaching this step has
+    // an `alarm.end` and no `isolated.erase_pass`.
+    const now = Date.now();
+    const tally = { erased: 0, failed: 0, busy: 0, busyOverHour: 0, failedOverHour: 0 };
+    let completed = false;
+    try {
+      const busy = new Set(sessionsWithWork(sql));
+      for (const r of rows) {
+        const ms = now - r.at;
+        if (busy.has(r.session)) { tally.busy++; if (ms > ISOLATED_OVERDUE_MS) tally.busyOverHour++; continue; }
+        try {
+          // Anything a call of it parked, though an owner read never is (`ownerReadTooLarge`): the stored copies first,
+          // then their references, so a failed delete leaves the row that names what is still there.
+          const parked = (sql.exec("SELECT operation_id, result_ref FROM operations WHERE tenant_id = ? AND task_id = ? AND result_ref IS NOT NULL",
+            tenantId, r.session).toArray() as Array<{ operation_id: string; result_ref: string }>);
+          const keys = parked.map((p) => /^r2:\/\/[^/]+\/(.+)$/.exec(String(p.result_ref))?.[1]).filter((k): k is string => !!k);
+          if (keys.length) await this.#artifacts.delete(keys);
+          if (parked.length) sql.exec("UPDATE operations SET result_ref = NULL WHERE tenant_id = ? AND task_id = ? AND result_ref IS NOT NULL", tenantId, r.session);
+          this.#evictAgent(tenantId, agentId, r.session);
+          const t = piTables(r.session);
+          for (const table of [t.entries, t.usage, t.values, t.list, t.meta]) sql.exec(`DROP TABLE IF EXISTS ${table}`);
+          sql.exec("DELETE FROM pi_sessions WHERE session = ?", r.session);
+          // Everything else kept per session, each table only where it was ever made. The calls' ids are read before
+          // the rows that name them go: a call's image evidence (cf/src/image-evidence.ts) is keyed by its job id alone.
+          const has = (table: string) => sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", table).toArray().length > 0;
+          const jobIds = new Set<string>(sql.exec("SELECT id FROM pi_model_jobs WHERE session = ?", r.session).toArray().map((j: any) => String(j.id)));
+          if (has("model_input_digests")) {
+            for (const j of sql.exec("SELECT job_id FROM model_input_digests WHERE session_id = ?", r.session).toArray()) jobIds.add(String((j as any).job_id));
+          }
+          // The calls' image evidence (hashes and sizes), then their input digests (hashes and lengths, no text:
+          // cf/src/fresh-context.ts), then the calls themselves.
+          if (has("model_input_images")) for (const id of jobIds) sql.exec("DELETE FROM model_input_images WHERE job_id = ?", id);
+          if (has("model_input_digests")) sql.exec("DELETE FROM model_input_digests WHERE session_id = ?", r.session);
+          sql.exec("DELETE FROM pi_model_jobs WHERE session = ?", r.session);
+          // A turn still open on it (one lost without an end: src/runtime/turn-timing.ts), and its finished
+          // background calls (a running one makes it busy, so it is never erased then).
+          if (has("turn_timing")) sql.exec("DELETE FROM turn_timing WHERE session = ?", r.session);
+          if (has("background_jobs")) sql.exec("DELETE FROM background_jobs WHERE session = ? AND state <> 'running'", r.session);
+          // What its harness and requests were read against: the last open (src/runtime/harness-open.ts) and the last
+          // request's prefix hashes (src/runtime/request-prefix.ts), both under `<tenant>/<agent>#<conversation>`, and
+          // the prompt snapshot (src/runtime/prompt-context.ts) and tools offered (src/runtime/tools-seen.ts), under
+          // the conversation, which for a short session is its id (`#conversationOf`).
+          const conversationKey = `${tenantId}/${agentId}#${r.session}`;
+          if (has("harness_opens")) sql.exec("DELETE FROM harness_opens WHERE conversation_key = ?", conversationKey);
+          if (has("model_request_prefix")) sql.exec("DELETE FROM model_request_prefix WHERE conversation = ?", conversationKey);
+          if (has("prompt_context")) sql.exec("DELETE FROM prompt_context WHERE conversation = ?", r.session);
+          if (has("tools_seen")) sql.exec("DELETE FROM tools_seen WHERE conversation = ?", r.session);
+          forgetIsolated(sql, r.session);
+          tally.erased++;
+          logEvent("isolated.erased", { tenantId, agentId, session: r.session, mount: r.alias, ms: Date.now() - r.at });
+        } catch (e) {
+          // Same fields as `isolated.erased`, so the two reconcile; the error's name only, never its message (it may
+          // quote what the session held). The row stays and the next pass tries again.
+          tally.failed++;
+          if (ms > ISOLATED_OVERDUE_MS) tally.failedOverHour++;
+          logEvent("isolated.erase_failed", { tenantId, agentId, session: r.session, mount: r.alias, ms: Date.now() - r.at,
+            code: e instanceof Error ? e.name : typeof e });
+        }
+      }
+      completed = true;
+    } finally {
+      logEvent("isolated.erase_pass", { tenantId, agentId, rows: rows.length, ...tally,
+        processed: tally.erased + tally.failed + tally.busy, completed });
     }
   }
 
