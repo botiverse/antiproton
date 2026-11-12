@@ -2941,7 +2941,9 @@ export async function ownerArtifact(args: unknown, ctx: PluginContext, deps: Pic
     // seen claims every comment was read. Raft's own rule (Grace, #raft-antiproton b6ab423f, production 6212e3e7):
     // artifact.position is null whenever the comments run past one page (at most the newest 50 come back), and a
     // number only when every comment is in this answer. So position itself is the evidence; commentCount is the
-    // card's count and need not match what the owner can see, so it is not compared.
+    // card's count and need not match what the owner can see, so it is not compared. Premise gap, not covered by a
+    // test (an honest fake server cannot produce it): if Raft ever sent a number with a capped answer, seen would
+    // over-claim. Revisit this with withoutPaging after Raft #14633.
     if (!paging) seen = position;
   }
   if (!paging && seen === null && position === null && !(typeof older === "string" && older))
