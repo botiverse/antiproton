@@ -275,6 +275,7 @@ await check("read: without paging, seen is given only when every comment is show
   a.r.readAnswer = { status: 200, body: noPaging(2, 5) };
   const capped = await read(a, { artifact: ART_ID });
   must(capped.seen === null && capped.notes.some((n: string) => n.includes("Not every comment") && n.includes("UNSEEN_CHANGES")), `capped: ${show(capped.seen)} ${show(capped.notes)}`);
+  must(!capped.notes.some((n: string) => n.includes("no position")), `a position was given, so "no position" is wrong: ${show(capped.notes)}`);
   // A missing commentCount never reaches a default: the SDK's contract requires it, and withoutPaging lets through only
   // the two paging fields, so such an answer is refused as a whole and no seen is given.
   a.r.readAnswer = { status: 200, body: noPaging(2, undefined) };

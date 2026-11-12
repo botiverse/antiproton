@@ -2932,7 +2932,7 @@ export async function ownerArtifact(args: unknown, ctx: PluginContext, deps: Pic
     if (!paging && total !== null && comments.items.length === total) seen = position;
     else if (!paging) notes.push("Not every comment of this Artifact was shown, so no seen is given: a publish of a new version will be refused with UNSEEN_CHANGES until the rest can be read.");
   }
-  if (!paging && seen === null && !(typeof older === "string" && older)) notes.push("Raft gave no position for this read to pass as seen.");
+  if (!paging && seen === null && position === null && !(typeof older === "string" && older)) notes.push("Raft gave no position for this read to pass as seen.");
   log("answered", "ok", {
     ...asked, artifact_id: traceId(art.id), version: whole(art.version, 0), latest_version: whole(art.latestVersion, 0), file_kind: String(file.kind),
     file_bytes: whole(file.sizeBytes, 0), truncated: file.truncated === true, cut, files: files.length, versions: Array.isArray(d.versions) ? d.versions.length : 0,
