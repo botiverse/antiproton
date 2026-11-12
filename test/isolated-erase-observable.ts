@@ -224,6 +224,9 @@ await check("a pass cut off before it has seen every row still writes its line: 
   // processed < rows written as an inequality, not a number: it is what makes this the cut-off case at all.
   must(Number(p[0]!.processed) < Number(p[0]!.rows), `processed must be below rows when cut off: ${show(p[0])}`);
   must(tallied(p[0]), `processed != erased + failed + busy: ${show(p[0])}`);
+  // And here exactly none: the throw is before the first row, so this pass reached nothing (a pass that claims any
+  // processed row was cut off later than this one was).
+  must(p[0]!.processed === 0 && p[0]!.erased === 0 && p[0]!.failed === 0 && p[0]!.busy === 0, `cut off before any row, yet: ${show(p[0])}`);
   must(w.kept(session), "the session must still be there for the next pass");
   const next = await w.pass();
   const p2 = next.lines.find((l) => l.evt === "isolated.erase_pass");
