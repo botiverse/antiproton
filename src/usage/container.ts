@@ -183,6 +183,18 @@ export function boxIsOwn(box: Pick<HeldBox, "credentialRef">, mountOwn: boolean)
 }
 
 /**
+ * Whether an answer may leave a machine's time out: the marker's condition. `complete` decides when the answer has
+ * it — an unreadable entry that holds no machine costs no seconds, so it marks nothing — and an answer from code
+ * that predates it (a deploy's changeover) is read the way it always was, by its count: that code wrote the count
+ * only when it was not zero, so an answer with neither field is a clean one.
+ */
+export function readIncomplete(activity: Pick<MountActivity, "unreadable" | "complete"> | null | undefined): boolean {
+  if (!activity) return false;
+  if (typeof activity.complete === "boolean") return !activity.complete;
+  return (activity.unreadable ?? 0) > 0;
+}
+
+/**
  * Rows marking a pass whose mount records could not be fully read.
  *
  * `MountActivity.unreadable` is a predicate, not a quantity: the scalar mixes
@@ -191,7 +203,8 @@ export function boxIsOwn(box: Pick<HeldBox, "credentialRef">, mountOwn: boolean)
  * contributes no missing seconds at all, a corrupt session that session's,
  * and one corrupt top-level row can hide a live box's entire history. The
  * number is therefore never printed; presence is the signal, one row per
- * pass per mount, whatever the scalar said.
+ * pass per mount, whatever the scalar said. Which damage counts is
+ * `readIncomplete`'s: an entry that holds no machine marks nothing.
  *
  * The marker is written at record time, into the same table the seconds go
  * to, because a flag computed at read time would describe "now" while
@@ -206,18 +219,6 @@ export function boxIsOwn(box: Pick<HeldBox, "credentialRef">, mountOwn: boolean)
  * Which mount was damaged is diagnose's question — its mountReports are
  * alias-keyed and read the live field.
  */
-/**
- * Whether an answer may leave a machine's time out: the marker's condition. `complete` decides when the answer has
- * it — an unreadable entry that holds no machine costs no seconds, so it marks nothing — and an answer from code
- * that predates it (a deploy's changeover) is read the way it always was, by its count: that code wrote the count
- * only when it was not zero, so an answer with neither field is a clean one.
- */
-export function readIncomplete(activity: Pick<MountActivity, "unreadable" | "complete"> | null | undefined): boolean {
-  if (!activity) return false;
-  if (typeof activity.complete === "boolean") return !activity.complete;
-  return (activity.unreadable ?? 0) > 0;
-}
-
 export function heldUnreadableRows(
   base: { tenantId: string; agentId: string },
   key: string,
