@@ -177,6 +177,19 @@ await check("summary complete:true but one activities entry complete:false: inco
   assert(logs.some((l) => l.evt === "usage.complete_disagree" && l.alias === "box" && l.summary === "true"), "the disagreement was not logged");
 });
 
+await check("all entries complete:true, and an empty activities list: the guard lets the prune run (it is not \"never prune\")", async () => {
+  const w = await world({ box: "fake", idle: "fake", notes: "plain" });
+  const from = logs.length;
+  answers.set("box", { activity: EMPTY_COMPLETE, activities: [{ live: null, complete: true }, { live: null, complete: true }] });
+  answers.set("idle", { activity: EMPTY_COMPLETE, activities: [] });
+  w.seedStale(T0);
+  const p = await w.pass(T0);
+  await invariants(w, p);
+  assert(p.prune, `the prune did not run: ${JSON.stringify(p.blocked)}`);
+  assert(!w.marks().has("gone-box") && p.deleted > 0, `the stale watermark was not deleted: deleted ${p.deleted}`);
+  assert(!logs.slice(from).some((l) => l.evt === "usage.complete_disagree"), "a disagreement was logged where there was none");
+});
+
 await check("an entry's complete:true does not clear a summary's complete:false", async () => {
   const w = await world({ box: "fake", notes: "plain" });
   answers.set("box", { activity: { live: null, complete: false }, activities: [{ live: null, complete: true }] });

@@ -138,11 +138,17 @@ export async function billingMountReports(gw: ReportingGateway, ctx: Ask, mounts
       }
       out.reports[m.alias] = { activity, usage };
       out.machines[m.alias] = machines;
-      // The summary and the per-machine list are two reads (two gateway calls), not one snapshot. When they disagree
-      // the cautious answer wins: any entry that says it did not read its record whole makes the mount incomplete,
-      // whatever the summary said, because a prune taken on a wrong "complete" deletes a live box's watermark (the
-      // 11-06 double bill) while one skipped waits a pass. Never the other way: an entry's true cannot clear a
-      // summary's false or a missing field.
+      // The summary and the per-machine list are two reads (two gateway calls, each its own `get` of the record), not
+      // one snapshot: if the record changes between them (a machine created or released), they can disagree. Of what
+      // comes from the first read, only `complete` changes a decision (the prune); the kinds counts may lag a pass and
+      // decide nothing. So the guard covers exactly one direction: an entry that says it did not read its record whole
+      // makes the mount incomplete, whatever the summary said, because a prune on a wrong "complete" deletes a live
+      // box's watermark (the 11-06 double bill) while one skipped waits a pass. The other directions need nothing:
+      // a summary's false already blocks, and a box seen in only one read is still counted (`boxesOf` takes the union).
+      // Why `some(=== false)` and not `every(=== true)`: an idle mount answers `activities: []`, which must let the
+      // prune run, and a missing per-entry `complete` cannot occur in one read (the plugin computes it on every read).
+      // Transitional: to be replaced by the single-read `Holding` change (Piper), which removes the window; that change
+      // decides whether this guard stays as a second check.
       const entryIncomplete = machines.some((a) => asActivity(a)?.complete === false);
       if (entryIncomplete && read.complete !== false) {
         logEvent("usage.complete_disagree", { tenantId: ctx.tenantId, agentId: ctx.agentId, alias: m.alias, summary: String(read.complete) });
