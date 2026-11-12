@@ -236,6 +236,8 @@ await check("read: a Raft server without comment paging (no olderCursor, no newe
   const out = await read(a, { artifact: ART_ID });
   must(out.comments.items.length === 1 && !("olderCursor" in out.comments) && out.file.content === SECRET_FILE, `answer: ${show(out)}`);
   must(out.notes.some((n: string) => n.includes("paging to older ones is not available on this server")), show(out.notes));
+  // Paired with the paging case below: "this server cannot page" must not read as "this is the oldest page".
+  must(!out.notes.some((n: string) => n.includes("oldest page")), `cannot-page said as oldest page: ${show(out.notes)}`);
   must(out.seen === 17, `seen from position: ${out.seen}`);
   must(a.traced.at(-1)!.attrs.older === null && a.traced.at(-1)!.attrs.newest_position_known === false, show(a.traced.at(-1)));
   // No position either: said, nothing invented.
@@ -252,6 +254,10 @@ await check("read: a Raft server without comment paging (no olderCursor, no newe
   must(withoutPaging(other).ok === false, "another field refused is let through");
   const wrong = { ...refused, error: { ...refused.error, response: { comments: { items: [], newestPosition: "x" } }, cause: { issues: [{ path: ["comments", "newestPosition"] }] } } };
   must(withoutPaging(wrong).ok === false, "a malformed (present) paging field is let through");
+  // An answer the contract accepted (the fields present, as after Raft #14633) passes through untouched: the adapter
+  // only acts on that one refusal, so once servers send the fields it is unreachable and can be deleted.
+  const accepted = { ok: true as const, data: { comments: { items: [], olderCursor: null, newestPosition: 5 } } };
+  must(withoutPaging(accepted as any) === accepted, "an accepted answer is changed");
 });
 
 await check("read: paging: olderCursor is said with commentsBefore, the first page's newestPosition kept; commentsBefore is sent; the oldest page says so", async () => {
@@ -264,6 +270,7 @@ await check("read: paging: olderCursor is said with commentsBefore, the first pa
   const last = await read(a, { artifact: ART_ID, commentsBefore: "cur-1" });
   must(show(a.r.reads[1]) === show({ artifact: ART_ID, commentsBefore: "cur-1" }), `query: ${show(a.r.reads)}`);
   must(last.seen === null && last.notes.some((n: string) => n.includes("oldest page") && n.includes("newestPosition of the first page")), show(last.notes));
+  must(!last.notes.some((n: string) => n.includes("not available on this server")), `oldest page said as cannot-page: ${show(last.notes)}`);
 });
 
 await check(`read: a text over ${ARTIFACT_TEXT_MAX} characters is cut and says so; Raft's own truncation is said too`, async () => {
