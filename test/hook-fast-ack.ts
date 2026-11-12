@@ -917,6 +917,13 @@ function slowObject(w: World) {
   return hold;
 }
 const LIMIT_MS = 150;
+/**
+ * How early a `LIMIT_MS` timer may look when measured with `Date.now()`: the timer runs on a monotonic clock and
+ * `Date.now()` is whole milliseconds, so a 150 ms timer can fire when `Date.now()` has moved 149 (seen twice in the gate
+ * on 11-12, #1188 and #1192). A clock reading, not load: the bound only tolerates rounding, so an answer that does not
+ * wait for the limit at all (a few ms) still fails.
+ */
+const CLOCK_SLACK_MS = 5;
 
 await check("an object that never answers: the push is answered 503 Retry-After 5 at the limit, not held, nothing is queued, and the timeout is logged", async () => {
   const w = await world();
@@ -930,7 +937,7 @@ await check("an object that never answers: the push is answered 503 Retry-After 
   const took = Date.now() - started;
   must(r !== null, "no answer within 3 s: the worker is still waiting on the object");
   must(r.status === 503 && r.retryAfter === "5" && r.body === '{"outcome":"unavailable"}', `answer: ${show(r)}`);
-  must(took >= LIMIT_MS && took < LIMIT_MS + 1000, `answered after ${took} ms with a ${LIMIT_MS} ms limit`);
+  must(took >= LIMIT_MS - CLOCK_SLACK_MS && took < LIMIT_MS + 1000, `answered after ${took} ms with a ${LIMIT_MS} ms limit`);
   // The object was never reached, so it never made its tables: none is as empty as an empty one.
   const tables = (w.raw.sql.exec("SELECT name FROM sqlite_master WHERE name IN ('inbound_pending', 'inbound_events')").toArray() as any[]).length;
   must(tables === 0 || (pendingRows(w) === 0 && outcomes(w).length === 0), `the object recorded the push: ${tables} tables`);
@@ -974,7 +981,7 @@ await check("the limit bounds the re-route too: a fast first call that disowns a
   const took = Date.now() - started;
   must(hold.next.length === 0, `the object was called ${2 - hold.next.length} of 2 times`);
   must(r.status === 503 && r.retryAfter === "5" && r.body === '{"outcome":"unavailable"}', `answer: ${show(r)}`);
-  must(took >= LIMIT_MS && took < LIMIT_MS + 1000, `answered after ${took} ms with a ${LIMIT_MS} ms limit`);
+  must(took >= LIMIT_MS - CLOCK_SLACK_MS && took < LIMIT_MS + 1000, `answered after ${took} ms with a ${LIMIT_MS} ms limit`);
   const http = lines.find((l) => l.evt === "http" && l.route === "/hooks/:hook");
   must(http?.timedOut === true && http.lookup === "index-again", `http line: ${show(http)}`);
 });
