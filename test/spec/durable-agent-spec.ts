@@ -527,7 +527,11 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
   });
 
   add("jobs", "a lost dispatch is resent within the redelivery interval while parked, not at the poll backstop", async (storage) => {
-    const o = object(storage, [], { pollAfterMs: POLL_BACKSTOP_MS, redeliveryMs: 400 });
+    // The object's clock moves only when the case moves it (`manualClock`): on the wall clock the case slept
+    // `wakeInMs` and then needed `Date.now()` to read the job as due, and a whole-millisecond reading 1 ms short of
+    // it (the gate, 11-12) found it not yet due and failed with "not resent".
+    const clock = manualClock();
+    const o = object(storage, [], { pollAfterMs: POLL_BACKSTOP_MS, redeliveryMs: 400, now: clock.now });
     let fail = true;
     const sent: string[] = [];
     const a = o.agent(undefined, { dispatch: async (id) => { if (fail) { fail = false; throw new Error("queue down"); } sent.push(id); } });
@@ -535,21 +539,13 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     const parked = await a.step();
     check(sent.length as number === 0 && jobs(storage).length === 1, `control: the dispatch was not lost: ${show(jobs(storage))} / sent ${show(sent)}`);
     check(parked.wakeInMs !== null && parked.wakeInMs <= 400, `parked for ${parked.wakeInMs} ms, past the redelivery`);
-    await sleep(parked.wakeInMs);
-    const t0 = Date.now();
+    clock.advance(parked.wakeInMs!);
     const again = await a.step();
-    const t1 = Date.now();
     check(sent.length === 1, `not resent: ${show(jobs(storage))}`);
-    // Dispatched now: the park comes back at its redelivery, still before the backstop. Read as a time, not as a
-    // remainder: how much of the 400 ms is left depends on how long the step took after the resend. The step read
-    // its clock somewhere in [t0, t1], so a park at the resend's redelivery puts that read at
-    // dispatched_at + 400 - wakeInMs. A step longer than the interval finds the resend already due, and parks one
-    // interval from `PdHost.redeliveryDue`'s clock read; `step()` reads the clock again after it, also in [t0, t1],
-    // so that park is 400 less at most t1 - t0. The resend itself was stamped inside the step.
-    const resent = Number(jobs(storage)[0]!.dispatched_at), due = resent + 400;
-    check(resent >= t0 && resent <= t1 && again.wakeInMs !== null && again.wakeInMs > 0 && again.wakeInMs <= 400
-      && (again.wakeInMs >= 400 - (t1 - t0) || (due - again.wakeInMs >= t0 && due - again.wakeInMs <= t1)),
-      `after the resend: ${show(again)}, the resend's redelivery at ${due}, the step in [${t0}, ${t1}]`);
+    // Dispatched now, on the case's clock: the park comes back at the resend's redelivery, still before the backstop.
+    const resent = Number(jobs(storage)[0]!.dispatched_at);
+    check(resent === clock.now() && again.wakeInMs === 400,
+      `after the resend: ${show(again)}, resent at ${resent}, the clock at ${clock.now()}`);
     await a.close();
   });
 
