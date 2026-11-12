@@ -272,6 +272,9 @@ await check("complete:false with no kinds and no unreadable: no throw, no breakd
   assert(!p.prune && p.blocked.box === "incomplete", `blocked: ${JSON.stringify(p.blocked)}`);
 });
 
+// Built by hand on purpose: the one producer today (sandbox) cannot send kinds without a count (its own tests assert
+// "a count has kinds, kinds have a count" both ways), so no real output reaches this branch. A second producer is not
+// bound by that; when one appears, add a version of this case fed from its real output.
 await check("valid kinds with unreadable 0: one kinds_without_count violation, no breakdown", async () => {
   const { p, l, violations } = await kindsPass({ live: null, complete: true, unreadable: 0, unreadableKinds: { unknown: false, machines: 0, other: 1 } });
   assert(p.billing.unanswered.length === 0, "precondition: the mount answered");
