@@ -2468,7 +2468,15 @@ export type ForwardAnswer =
    * Refused, with Raft's HTTP status, its code and its `error` text as it sent them; `status` null when nothing came
    * back that could be read (no answer, or one the SDK's contract refused), so a forward may or may not have gone.
    */
-  | { ok: false; status: number | null; code: string | null; error: string | null };
+  | {
+    ok: false; status: number | null; code: string | null; error: string | null;
+    /**
+     * Raft did answer, but in a shape the SDK's contract refused (an older Raft server does this). Set only for that;
+     * a read says so and is not transient (the same answer comes back), while a write keeps treating status null as
+     * uncertain, since an answer it could not read most likely means it went through.
+     */
+    contract?: true;
+  };
 
 export interface ForwardDeps {
   /** The forward itself. Called at most once per tool call: never retried here, whatever it answers. */
@@ -2834,11 +2842,13 @@ const whole = (v: unknown, min: number, max = Number.MAX_SAFE_INTEGER) => (typeo
 const text = (v: unknown, max: number) => (typeof v === "string" && v.trim() && v.trim().length <= max ? v.trim() : null);
 
 /** Raft's refusal of a read, as the model reads it: its status, code and error as sent, and what to do for "not found". */
-function artifactReadFailure(out: { status: number | null; code: string | null; error: string | null }): Error {
-  const said = out.status === null ? "no answer from Raft that could be read" : `Raft answered ${out.status}${out.code ? ` ${out.code}` : ""}${out.error ? `: ${out.error}` : ""}`;
+function artifactReadFailure(out: { status: number | null; code: string | null; error: string | null; contract?: true }): Error {
+  const said = out.contract
+    ? "Raft answered, but not in a shape this client reads; nothing from it is shown, and asking again gives the same answer"
+    : out.status === null ? "no answer from Raft that could be read" : `Raft answered ${out.status}${out.code ? ` ${out.code}` : ""}${out.error ? `: ${out.error}` : ""}`;
   const notFound = out.status === 404 ? " Your owner can't open it, or it is in a DM they keep from you: tell them you can't open it." : "";
   return Object.assign(new Error(`${OWNER_ARTIFACT_TOOL}: ${said}.${notFound}`), {
-    retryable: false, transient: out.status === null || out.status >= 500 || out.status === 429,
+    retryable: false, transient: !out.contract && (out.status === null || out.status >= 500 || out.status === 429),
     ...(out.status !== null ? { httpStatus: out.status } : {}), ...(out.code ? { code: out.code } : {}),
   });
 }

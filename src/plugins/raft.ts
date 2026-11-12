@@ -4019,6 +4019,9 @@ function forwardAnswer(out: RouteAnswer, tool: string): ForwardAnswer {
   if (e.kind === "validation" && e.reason === "request_contract_mismatch") {
     throw ownerRefusal(`${tool}: the arguments were refused before anything was sent (${contractIssues(e.cause)})`);
   }
+  // Raft answered, in a shape the contract refused: said as such (status stays null, so a write still counts it as
+  // uncertain; only the read tells it apart).
+  if (e.kind === "validation" && e.reason === "response_contract_mismatch") return { ok: false, status: null, code: null, error: null, contract: true };
   return { ok: false, status: null, code: null, error: null };
 }
 

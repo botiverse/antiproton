@@ -284,6 +284,22 @@ await check("read: today's server (olderCursor sent, newestPosition not): seen i
   must(mismatch.seen === 17, `commentCount mismatch withheld seen: ${show(mismatch.seen)}`);
 });
 
+await check("read: no answer and an unreadable answer are told apart, as a pair: only no answer is 'no answer' and transient", async () => {
+  const a = await assistant();
+  a.r.readAnswer = "drop";
+  const none = await read(a, { artifact: ART_ID }).then(() => null, (x) => x as Error & { transient?: unknown });
+  must(none !== null && none.message.includes("no answer from Raft") && none.transient === true, `no answer: ${show(none?.message)} transient ${show(none?.transient)}`);
+  // Raft answers 200, but the SDK's contract refuses the shape (here artifact.url is missing): Raft did answer.
+  const bad: any = readAnswer();
+  delete bad.artifact.url;
+  a.r.readAnswer = { status: 200, body: bad };
+  const unreadable = await read(a, { artifact: ART_ID }).then(() => null, (x) => x as Error & { transient?: unknown });
+  must(unreadable !== null && !unreadable.message.includes("no answer from Raft") && unreadable.message.includes("not in a shape this client reads") &&
+    unreadable.transient === false, `unreadable answer: ${show(unreadable?.message)} transient ${show(unreadable?.transient)}`);
+  // The read's error does not claim a cause it has not seen.
+  must(!/older Raft server/.test(unreadable!.message), `claims a cause: ${unreadable!.message}`);
+});
+
 await check("read: paging: olderCursor is said with commentsBefore, the first page's newestPosition kept; commentsBefore is sent; the oldest page says so", async () => {
   const a = await assistant();
   a.r.readAnswer = { status: 200, body: readAnswer({ position: null, comments: { items: [], olderCursor: "cur-1", newestPosition: 21 } }) };
@@ -316,7 +332,7 @@ await check("read: Raft's refusal is thrown with its status, code and error, and
   must(a.traced.at(-1)!.status === "refused" && a.traced.at(-1)!.attrs.code === "artifact_not_found", show(a.traced.at(-1)));
   a.r.readAnswer = { status: 200, body: { ...readAnswer(), file: { kind: "text" } } };
   const m = await read(a, { artifact: ART_ID }).then(() => null, (x) => x as Error);
-  must(m && /not in the expected shape|did not match|refused|no answer/i.test(m.message) && !m.message.includes(SECRET_FILE), show(m?.message));
+  must(m && /not in the expected shape|not in a shape this client reads/i.test(m.message) && !m.message.includes(SECRET_FILE), show(m?.message));
   for (const args of [{}, { artifact: " " }, { artifact: ART_ID, version: 0 }, { artifact: ART_ID, version: 1.5 }, { artifact: ART_ID, path: "" }, { artifact: ART_ID, commentsBefore: 3 }]) {
     const before = a.r.reads.length;
     const x = await read(a, args).then(() => null, (y) => y as Error & { retryable?: unknown });
@@ -386,6 +402,13 @@ await check("publish: no answer, or a 5xx, is uncertain and never says to publis
     must(a.traced.at(-1)!.status === "uncertain" && a.traced.at(-1)!.verdict === "failed", show(a.traced.at(-1)));
   }
   must(/Do not publish it again/.test(PUBLISH_UNCERTAIN_NOTE), PUBLISH_UNCERTAIN_NOTE);
+  // Across the two tools: an answer the contract refuses is the read's "not in a shape" case, but a publish keeps
+  // saying it may have gone through. Unifying the two wordings must be a decision, not a side effect.
+  const a = await assistant();
+  a.r.publishAnswer = { status: 201, body: { artifact: { id: ART_ID } } };
+  const out = await publish(a, NEW);
+  must(out.state === "uncertain" && out.note === PUBLISH_UNCERTAIN_NOTE && !JSON.stringify(out).includes("not in a shape this client reads"),
+    `an unreadable publish answer: ${show(out)}`);
 });
 
 await check("publish: a body Raft would refuse is refused here first, with nothing sent", async () => {
