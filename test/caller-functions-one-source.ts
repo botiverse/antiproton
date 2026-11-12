@@ -7,6 +7,13 @@
  * test/subagents.ts; this one fails the day a second path hands the caller's functions to a session without going
  * through that check, which no behaviour test of the existing paths would notice. When it fails, route the new path
  * through `callerDefs`/`callerTools`, or, if the new path is right, update the counts here with why.
+ *
+ * Every check asserts an exact count (never "none found"), so a rename that makes a pattern match nothing fails too.
+ * SABOTAGE (each tried; each fails the named check):
+ *   - remove `isolated` from `const callerFree = …`        ⇒ "one check decides who is offered them…"
+ *   - add `const sneak = apiTools;` after `const apiTools`  ⇒ "apiTools is used only to derive callerDefs and callerTools"
+ *   - rename `callerFree`                                   ⇒ "one check decides…" and "both derived values start from that check"
+ *   - master before #1190 (no `callerFree`)                 ⇒ the same two
  */
 import { readFileSync } from "node:fs";
 
