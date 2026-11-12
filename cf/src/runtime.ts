@@ -5720,7 +5720,10 @@ export class AgentRuntime {
           if (has("model_input_images")) for (const id of jobIds) sql.exec("DELETE FROM model_input_images WHERE job_id = ?", id);
           if (has("model_input_digests")) sql.exec("DELETE FROM model_input_digests WHERE session_id = ?", r.session);
           sql.exec("DELETE FROM pi_model_jobs WHERE session = ?", r.session);
-          // A turn still open on it (one lost without an end: src/runtime/turn-timing.ts), and its finished
+          // A turn still open on it: `closeTurn` deletes its own row, and the stale path (turn-timing.ts `turnInbound`)
+          // runs only on the session's next message, which an erased session never gets, so nothing else ever takes it.
+          // A row here is a turn whose step ended without closing it (lost across a deploy or eviction), or one paused on
+          // a caller's function (`turnPaused`), which a short session's caller cannot answer. And its finished
           // background calls (a running one makes it busy, so it is never erased then).
           if (has("turn_timing")) sql.exec("DELETE FROM turn_timing WHERE session = ?", r.session);
           if (has("background_jobs")) sql.exec("DELETE FROM background_jobs WHERE session = ? AND state <> 'running'", r.session);
