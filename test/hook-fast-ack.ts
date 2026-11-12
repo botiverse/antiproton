@@ -918,10 +918,11 @@ function slowObject(w: World) {
 }
 const LIMIT_MS = 150;
 /**
- * How early a `LIMIT_MS` timer may look when measured with `Date.now()`: the timer runs on a monotonic clock and
- * `Date.now()` is whole milliseconds, so a 150 ms timer can fire when `Date.now()` has moved 149 (seen twice in the gate
- * on 11-12, #1188 and #1192). A clock reading, not load: the bound only tolerates rounding, so an answer that does not
- * wait for the limit at all (a few ms) still fails.
+ * How much shorter than `LIMIT_MS` the measured wait may be: an allowance, not a derived value. The failures seen were
+ * 149 against 150, which rounding of `Date.now()` (whole milliseconds, against a monotonic timer) explains, and that
+ * gives at most 1 ms. Idle sampling (200 runs) saw no timer fire early; the gate's load was not sampled, so 5 leaves room
+ * there. It stays far below "did not wait": an answer that returns without waiting for the limit still fails, and
+ * `timedOut` is asserted separately.
  */
 const CLOCK_SLACK_MS = 5;
 
