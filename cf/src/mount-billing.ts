@@ -138,7 +138,16 @@ export async function billingMountReports(gw: ReportingGateway, ctx: Ask, mounts
       }
       out.reports[m.alias] = { activity, usage };
       out.machines[m.alias] = machines;
-      out.complete[m.alias] = read.complete;
+      // The summary and the per-machine list are two reads (two gateway calls), not one snapshot. When they disagree
+      // the cautious answer wins: any entry that says it did not read its record whole makes the mount incomplete,
+      // whatever the summary said, because a prune taken on a wrong "complete" deletes a live box's watermark (the
+      // 11-06 double bill) while one skipped waits a pass. Never the other way: an entry's true cannot clear a
+      // summary's false or a missing field.
+      const entryIncomplete = machines.some((a) => asActivity(a)?.complete === false);
+      if (entryIncomplete && read.complete !== false) {
+        logEvent("usage.complete_disagree", { tenantId: ctx.tenantId, agentId: ctx.agentId, alias: m.alias, summary: String(read.complete) });
+      }
+      out.complete[m.alias] = entryIncomplete ? false : read.complete;
       const counted = (read.unreadable ?? 0) > 0;
       if (counted) out.kindsOf.push(m.alias);
       const kinds = readKinds(activity);

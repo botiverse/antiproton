@@ -160,6 +160,32 @@ await check("an empty answer with complete:true is answered and lets the prune r
   assert(next.wouldDelete === 0, `the next pass still finds ${next.wouldDelete} to delete`);
 });
 
+// The summary and the per-machine list are two gateway calls, not one snapshot (Ward, Piper, Antx 11-12). Whichever way
+// the fix is made (one read, or the cautious answer winning), this case must pass: a summary that says complete with an
+// entry that says not complete must not prune.
+await check("summary complete:true but one activities entry complete:false: incomplete wins, the prune is blocked, the disagreement is logged", async () => {
+  const w = await world({ box: "fake", notes: "plain" });
+  answers.set("box", { activity: EMPTY_COMPLETE, activities: [{ live: null, complete: true }, { live: null, complete: false }] });
+  w.seedStale(T0);
+  const p = await w.pass(T0);
+  await invariants(w, p);
+  // Precondition: the two reads really disagreed (the summary alone would have let the prune run).
+  assert((p.billing.reports.box?.activity as { complete?: unknown } | undefined)?.complete === true, `precondition: the summary did not say complete: ${JSON.stringify(p.billing.reports.box)}`);
+  assert(p.billing.unanswered.length === 0, `box counted unanswered: ${p.billing.unanswered}`);
+  assert(!p.prune && p.blocked.box === "incomplete", `the summary's true pruned past an entry's false: ${JSON.stringify(p.blocked)}`);
+  assert(w.marks().has("gone-box") && p.deleted === 0, `a watermark was pruned: deleted ${p.deleted}`);
+  assert(logs.some((l) => l.evt === "usage.complete_disagree" && l.alias === "box" && l.summary === "true"), "the disagreement was not logged");
+});
+
+await check("an entry's complete:true does not clear a summary's complete:false", async () => {
+  const w = await world({ box: "fake", notes: "plain" });
+  answers.set("box", { activity: { live: null, complete: false }, activities: [{ live: null, complete: true }] });
+  w.seedStale(T0);
+  const p = await w.pass(T0);
+  await invariants(w, p);
+  assert(!p.prune && p.blocked.box === "incomplete", `blocked: ${JSON.stringify(p.blocked)}`);
+});
+
 await check("an empty answer with complete:false is answered, and blocks the prune as incomplete", async () => {
   const w = await world({ box: "fake", notes: "plain" });
   answers.set("box", { activity: { live: null, complete: false } });
