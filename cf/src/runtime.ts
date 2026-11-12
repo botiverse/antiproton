@@ -5726,9 +5726,10 @@ export class AgentRuntime {
           // A turn still open on it: `closeTurn` deletes its own row, and the stale path (turn-timing.ts `turnInbound`)
           // runs only on the session's next message, which an erased session never gets, so nothing else ever takes it.
           // A row here is a turn whose step ended without closing it (lost across a deploy or eviction), or one paused on
-          // a caller's function (`turnPaused`), which no one can answer for a short session. Taking a paused row is safe only
-          // while a short session can never pause on a call someone could answer: today that holds only because a check
-          // session is wrongly offered the caller's functions, and a follow-up stops offering them. And its finished
+          // a caller's function (`turnPaused`). No one can answer that call: answers come only through the Agents API, which
+          // looks the session up in its own index (`putSession`, `sess_` ids), and a short session's `iso_` id is never
+          // registered there (`newIsolatedSessionId` + `recordIsolated`). That a check session is offered the caller's
+          // functions at all is a separate fault, fixed in a follow-up. And its finished
           // background calls only: a running one makes the session busy, so none should be here, and the condition keeps
           // this delete from taking a running job should the meaning of busy ever change.
           if (has("turn_timing")) sql.exec("DELETE FROM turn_timing WHERE session = ?", r.session);
