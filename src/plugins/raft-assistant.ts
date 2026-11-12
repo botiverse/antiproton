@@ -2914,7 +2914,12 @@ export async function ownerArtifact(args: unknown, ctx: PluginContext, deps: Pic
   const newest = whole(comments.newestPosition, 0);
   const position = whole(art.position, 0);
   let seen: number | null = null;
-  if (typeof older === "string" && older) {
+  if (typeof older === "string" && older && !paging && newest === null) {
+    // Today's server (Grace, b6ab423f): it sends olderCursor but not newestPosition, and commentsBefore only works
+    // from the release with #14633. Asking for the older page would return the same newest page again.
+    notes.push("There are more comments than this answer shows (at most the newest 50), and reading older ones is not available on this server yet. " +
+      "No seen is given: a new version will be refused with UNSEEN_CHANGES until the server can page.");
+  } else if (typeof older === "string" && older) {
     notes.push("There are older comments: call again with commentsBefore set to comments.olderCursor to read them.");
     if (!paging && newest !== null) notes.push(`Keep this first page's comments.newestPosition, ${newest}: once you have read back to the oldest page, pass ${newest} as seen when you publish a new version.`);
   } else if (older === null) {
@@ -2923,16 +2928,14 @@ export async function ownerArtifact(args: unknown, ctx: PluginContext, deps: Pic
   } else {
     // A Raft server before comment paging: it sends no olderCursor, so there is no older page to ask for.
     notes.push("Raft did not say whether there are older comments, and paging to older ones is not available on this server: these are the comments it shows.");
-    // seen claims every comment was read, so it is set only when this answer shows all of them: the comments shown
-    // equal the Artifact's commentCount. Premise: commentCount is the server's total (it sits on the artifact, beside
-    // latestVersion), not the length of this page; were it derived from the same capped list, the equality would prove
-    // nothing. No default for a missing commentCount: then seen stays null and a publish meets UNSEEN_CHANGES, which
-    // fails safe. Revisit with withoutPaging once Raft #14633 is in production.
-    const total = whole(art.commentCount, 0);
-    if (!paging && total !== null && comments.items.length === total) seen = position;
-    else if (!paging) notes.push("Not every comment of this Artifact was shown, so no seen is given: a publish of a new version will be refused with UNSEEN_CHANGES until the rest can be read.");
+    // seen claims every comment was read. Raft's own rule (Grace, #raft-antiproton b6ab423f, production 6212e3e7):
+    // artifact.position is null whenever the comments run past one page (at most the newest 50 come back), and a
+    // number only when every comment is in this answer. So position itself is the evidence; commentCount is the
+    // card's count and need not match what the owner can see, so it is not compared.
+    if (!paging) seen = position;
   }
-  if (!paging && seen === null && position === null && !(typeof older === "string" && older)) notes.push("Raft gave no position for this read to pass as seen.");
+  if (!paging && seen === null && position === null && !(typeof older === "string" && older))
+    notes.push("Raft gave no position for this read, so not every comment may be shown and no seen is given: a new version will be refused with UNSEEN_CHANGES until all can be read.");
   log("answered", "ok", {
     ...asked, artifact_id: traceId(art.id), version: whole(art.version, 0), latest_version: whole(art.latestVersion, 0), file_kind: String(file.kind),
     file_bytes: whole(file.sizeBytes, 0), truncated: file.truncated === true, cut, files: files.length, versions: Array.isArray(d.versions) ? d.versions.length : 0,

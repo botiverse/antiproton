@@ -260,27 +260,28 @@ await check("read: a Raft server without comment paging (no olderCursor, no newe
   must(withoutPaging(accepted as any) === accepted, "an accepted answer is changed");
 });
 
-await check("read: without paging, seen is given only when every comment is shown (items equal commentCount), with no default for a missing count", async () => {
-  const noPaging = (items: number, count: number | undefined) => {
-    const ans: any = readAnswer();
-    const one = ans.comments.items[0];
-    ans.comments = { items: Array.from({ length: items }, (_, i) => ({ ...one, id: `cm-${i}` })) };
-    if (count === undefined) delete ans.artifact.commentCount; else ans.artifact.commentCount = count;
+await check("read: today's server (olderCursor sent, newestPosition not): seen is artifact.position, given only when every comment is in the answer", async () => {
+  // Raft's rule (Grace, b6ab423f): position is null whenever the comments run past one page, a number only when all are here.
+  const today = (o: { position: number | null; older: string | null }) => {
+    const ans: any = readAnswer({ position: o.position });
+    ans.comments = { items: ans.comments.items, olderCursor: o.older };
     return ans;
   };
   const a = await assistant();
-  a.r.readAnswer = { status: 200, body: noPaging(3, 3) };
+  a.r.readAnswer = { status: 200, body: today({ position: 17, older: null }) };
   const all = await read(a, { artifact: ART_ID });
-  must(all.seen === 17 && !all.notes.some((n: string) => n.includes("Not every comment")), `all shown: ${show(all.seen)} ${show(all.notes)}`);
-  a.r.readAnswer = { status: 200, body: noPaging(2, 5) };
-  const capped = await read(a, { artifact: ART_ID });
-  must(capped.seen === null && capped.notes.some((n: string) => n.includes("Not every comment") && n.includes("UNSEEN_CHANGES")), `capped: ${show(capped.seen)} ${show(capped.notes)}`);
-  must(!capped.notes.some((n: string) => n.includes("no position")), `a position was given, so "no position" is wrong: ${show(capped.notes)}`);
-  // A missing commentCount never reaches a default: the SDK's contract requires it, and withoutPaging lets through only
-  // the two paging fields, so such an answer is refused as a whole and no seen is given.
-  a.r.readAnswer = { status: 200, body: noPaging(2, undefined) };
-  const e = await read(a, { artifact: ART_ID }).then(() => null, (x) => x as Error);
-  must(e !== null && /no answer from Raft that could be read/.test(e.message), `no commentCount must not be read with a defaulted count: ${show(e?.message)}`);
+  must(all.seen === 17 && !all.notes.some((n: string) => n.includes("UNSEEN_CHANGES")), `all here: ${show(all.seen)} ${show(all.notes)}`);
+  a.r.readAnswer = { status: 200, body: today({ position: null, older: "cur-today" }) };
+  const more = await read(a, { artifact: ART_ID });
+  must(more.seen === null && more.notes.some((n: string) => n.includes("not available on this server yet") && n.includes("UNSEEN_CHANGES")), `more than a page: ${show(more)}`);
+  // It must not send the model round in a loop asking for a page today's server cannot give.
+  must(!more.notes.some((n: string) => n.includes("call again with commentsBefore")), `asks for an older page today: ${show(more.notes)}`);
+  // commentCount is the card's count and is not compared: a mismatch does not withhold a position Raft gave.
+  const odd: any = today({ position: 17, older: null });
+  odd.artifact.commentCount = 9;
+  a.r.readAnswer = { status: 200, body: odd };
+  const mismatch = await read(a, { artifact: ART_ID });
+  must(mismatch.seen === 17, `commentCount mismatch withheld seen: ${show(mismatch.seen)}`);
 });
 
 await check("read: paging: olderCursor is said with commentsBefore, the first page's newestPosition kept; commentsBefore is sent; the oldest page says so", async () => {

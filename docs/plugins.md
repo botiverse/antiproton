@@ -1219,10 +1219,11 @@ with Raft's status, code and error and what to do next: `NOT_PUBLISHED_BY_ASSIST
 Artifacts can take a version), `artifact_not_found` (no longer in the owner's DM: publish a new one, don't
 retry), `UNSEEN_CHANGES` (read it first, then resend with `seen`), `BASE_MOVED`, `RATE_LIMITED` (429: wait at
 least a minute and publish again once, then tell the owner) and `FILE_UPLOAD_QUOTA_EXCEEDED` (403, the
-server's monthly upload quota: tell the owner, don't retry). On a Raft server that cannot page comments yet,
-the read gives `seen` only when the comments shown equal the Artifact's `commentCount` (the server's total);
-otherwise `seen` is null, so a new version is refused with `UNSEEN_CHANGES` rather than overwrite unread
-comments. No answer, or a 5xx, is
+server's monthly upload quota: tell the owner, don't retry). On a Raft server that cannot page comments yet
+(it sends `olderCursor` but no `newestPosition`; at most the newest 50 come back), `seen` is Raft's
+`artifact.position`, which Raft gives only when every comment is in the answer. When more comments exist, no
+`seen` is given and the model is not asked for an older page, so a new version is refused with
+`UNSEEN_CHANGES` until the server can page, rather than overwrite unread comments. No answer, or a 5xx, is
 `uncertain`: it may have been published, so never published again blindly. Each call writes a
 `raft.assistant_owner_artifact` or `raft.assistant_publish_artifact` log line and trace row (not
 forwarded) of ids, sizes, counts and Raft's status and code, never the Artifact as named, a title, a path,
