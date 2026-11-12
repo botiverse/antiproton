@@ -345,6 +345,10 @@ await check("AFTER ERASE: an erased short session leaves nothing but what is kep
   const { session, probe } = await aliveSession(w);
   // A short session whose turn was lost without an end (in flight across a deploy: src/runtime/turn-timing.ts), and
   // whose background call finished: no work, so it is erased, and its `turn_timing` row is not closed by any step.
+  // THE ONLY PROOF of the erase's turn_timing and background_jobs deletes: a normal session has no row in either at
+  // erase time (`closeTurn` took its timing row; it ran no background job), so without this session commenting out
+  // either delete stays green. Remove or skip it and those two deletes are untested; the `control` check just below
+  // fails first if its rows stop being made.
   const lost = newIsolatedSessionId();
   recordIsolated(w.sql, lost, "raft", Date.now(), { tools: [], turnKey: null });
   ensureTurnTiming(w.sql);
