@@ -332,7 +332,7 @@ await check("read: Raft's refusal is thrown with its status, code and error, and
   must(a.traced.at(-1)!.status === "refused" && a.traced.at(-1)!.attrs.code === "artifact_not_found", show(a.traced.at(-1)));
   a.r.readAnswer = { status: 200, body: { ...readAnswer(), file: { kind: "text" } } };
   const m = await read(a, { artifact: ART_ID }).then(() => null, (x) => x as Error);
-  must(m && /not in the expected shape|not in a shape this client reads/i.test(m.message) && !m.message.includes(SECRET_FILE), show(m?.message));
+  must(m && m.message.includes("not in a shape this client reads") && !m.message.includes("no answer") && !m.message.includes(SECRET_FILE), show(m?.message));
   for (const args of [{}, { artifact: " " }, { artifact: ART_ID, version: 0 }, { artifact: ART_ID, version: 1.5 }, { artifact: ART_ID, path: "" }, { artifact: ART_ID, commentsBefore: 3 }]) {
     const before = a.r.reads.length;
     const x = await read(a, args).then(() => null, (y) => y as Error & { retryable?: unknown });
