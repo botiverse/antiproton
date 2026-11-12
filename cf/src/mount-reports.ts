@@ -30,6 +30,12 @@ function asActivity(v: unknown): MountActivity | null {
   if (v.quietUntil !== undefined && v.quietUntil !== null && !isNum(v.quietUntil)) return null;
   if (v.billing !== undefined && typeof v.billing !== "string") return null;
   if (v.unreadable !== undefined && !isNum(v.unreadable)) return null;
+  if (v.complete !== undefined && typeof v.complete !== "boolean") return null;
+  // The split is a report's detail, not a fact anything decides by (`complete` is), so one that does not read is
+  // left out rather than costing the mount its whole answer; null reads as absent.
+  const k = v.unreadableKinds;
+  const kinds = isObj(k) && typeof k.unknown === "boolean" && isNum(k.machines) && isNum(k.other)
+    ? { unknown: k.unknown, machines: k.machines, other: k.other } : null;
   // An entry that does not read is left out, the rest kept: each names a box still billing.
   const aside = Array.isArray(v.aside)
     ? v.aside.filter((a): a is Record<string, unknown> => isObj(a) && typeof a.id === "string" && isNum(a.startedAt) && isNum(a.since))
@@ -41,6 +47,8 @@ function asActivity(v: unknown): MountActivity | null {
     ...(v.quietUntil !== undefined ? { quietUntil: v.quietUntil as number | null } : {}),
     ...(v.billing !== undefined ? { billing: v.billing as string } : {}),
     ...(v.unreadable !== undefined ? { unreadable: v.unreadable as number } : {}),
+    ...(v.complete !== undefined ? { complete: v.complete as boolean } : {}),
+    ...(kinds ? { unreadableKinds: kinds } : {}),
   };
 }
 

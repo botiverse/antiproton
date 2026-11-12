@@ -41,6 +41,7 @@
 import { appendUsage, msByHour, payerKey, type UsageRow } from "./outbox.ts";
 import { secretRefKind } from "../runtime/secrets.ts";
 import type { SqlHost } from "../store/pi-storage.ts";
+import type { MountActivity } from "../plugins/types.ts";
 
 type Sql = SqlHost["sql"];
 
@@ -205,13 +206,25 @@ export function boxIsOwn(box: Pick<HeldBox, "credentialRef">, mountOwn: boolean)
  * Which mount was damaged is diagnose's question — its mountReports are
  * alias-keyed and read the live field.
  */
+/**
+ * Whether an answer may leave a machine's time out: the marker's condition. `complete` decides when the answer has
+ * it — an unreadable entry that holds no machine costs no seconds, so it marks nothing — and an answer from code
+ * that predates it (a deploy's changeover) is read the way it always was, by its count: that code wrote the count
+ * only when it was not zero, so an answer with neither field is a clean one.
+ */
+export function readIncomplete(activity: Pick<MountActivity, "unreadable" | "complete"> | null | undefined): boolean {
+  if (!activity) return false;
+  if (typeof activity.complete === "boolean") return !activity.complete;
+  return (activity.unreadable ?? 0) > 0;
+}
+
 export function heldUnreadableRows(
   base: { tenantId: string; agentId: string },
   key: string,
-  activity: { unreadable?: number } | null | undefined,
+  activity: Pick<MountActivity, "unreadable" | "complete"> | null | undefined,
   now: number,
 ): UsageRow[] {
-  if (!activity?.unreadable) return [];
+  if (!readIncomplete(activity)) return [];
   return [{ at: Math.floor(now / 3_600_000) * 3_600_000, ...base, resource: "sandbox.container", key, quantity: 1, unit: "unreadable" }];
 }
 

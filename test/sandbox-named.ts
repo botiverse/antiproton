@@ -10,7 +10,7 @@
  * machines, against run9 answers given here rather than a live box.
  */
 import {
-  BOX_KEY, BOX_STORE, MAIN_MACHINE, asBoxState, asMountState, machineOf, sandboxPlugin, unreadableEntries, usageOf,
+  BOX_KEY, BOX_STORE, MAIN_MACHINE, activityOf, asBoxState, asMountState, machineOf, sandboxPlugin, unreadableEntries, unreadableKindsOf, usageOf,
 } from "../src/plugins/sandbox.ts";
 import type { MountActivity, Released } from "../src/plugins/types.ts";
 import { LEASE_KEY } from "../src/plugins/types.ts";
@@ -472,6 +472,73 @@ await check("forget drops a box only after run9 refuses its delete outright (4xx
     ? new Response("{}", { status: 401 }) : inner(url, init)))(globalThis.fetch) as any;
   try { await h.plugin.holds!.release(h.ctx); } catch { /* reported */ }
   must(h.mount().machines.main?.boxId === "b3", "a 4xx without forget let it go");
+});
+
+// ---- `complete`: whether the mount's own record was read whole (MountActivity.complete). Only a record that may hide a
+// machine makes it false: one that does not read, a map of machines that does not read, or a machine's own entry. What
+// holds no machine (a saved environment, a session) is counted in `unreadable` and leaves it true.
+
+/** Two readable machines with activity that differs in every field the answer carries, so an answer that swapped them shows. */
+const twoMachines = () => ({
+  main: box("b-main", { createdAt: T0, lastUsedAt: T0 + 2 * MIN }),
+  build: box("b-build", { createdAt: T0 + MIN, lastUsedAt: T0 + 7 * MIN }),
+});
+
+await check("complete: one machine's entry unreadable — the other two answer by id with their own times, the bad one is not among them, complete is false", async () => {
+  const f = fixture({ machines: { ...twoMachines(), web: { boxId: 3 } } });
+  const all = await f.plugin.holds!.activities!(f.ctx);
+  const ids = all.map((a) => a.live?.id).sort();
+  must(ids.join() === "b-build,b-main", `the two readable machines, and only they: ${JSON.stringify(all)}`);
+  const by = Object.fromEntries(all.map((a) => [a.live!.id, a.live!]));
+  must(by["b-main"]!.startedAt === T0 && by["b-main"]!.lastUsedAt === T0 + 2 * MIN, `b-main's own times: ${JSON.stringify(by["b-main"])}`);
+  must(by["b-build"]!.startedAt === T0 + MIN && by["b-build"]!.lastUsedAt === T0 + 7 * MIN, `b-build's own times: ${JSON.stringify(by["b-build"])}`);
+  for (const a of all) {
+    must(a.complete === false, `a record with a machine it cannot read is not whole: ${JSON.stringify(a)}`);
+    must(a.unreadable === 1 && JSON.stringify(a.unreadableKinds) === JSON.stringify({ unknown: false, machines: 1, other: 0 }), `counted as a machine: ${JSON.stringify(a)}`);
+  }
+  const one = await f.plugin.holds!.activity(f.ctx);
+  must(one.complete === false, `the single answer says the same: ${JSON.stringify(one)}`);
+});
+
+await check("complete: only a saved environment unreadable — both machines answer, complete is true, and the console's count is unchanged", async () => {
+  const f = fixture({ machines: twoMachines(), envs: [{ name: "ok", snapId: "s1", savedAt: 1 }, { name: 7 }] });
+  const all = await f.plugin.holds!.activities!(f.ctx);
+  must(all.map((a) => a.live?.id).sort().join() === "b-build,b-main", `both machines: ${JSON.stringify(all)}`);
+  for (const a of all) {
+    must(a.complete === true, `an entry that holds no machine does not make the read incomplete: ${JSON.stringify(a)}`);
+    must(a.unreadable === 1, `still counted for the console: ${JSON.stringify(a)}`);
+    must(JSON.stringify(a.unreadableKinds) === JSON.stringify({ unknown: false, machines: 0, other: 1 }), `as other: ${JSON.stringify(a)}`);
+  }
+});
+
+await check("complete: a record that does not read at all and an empty one both answer no machine; only the kinds and complete tell them apart", async () => {
+  const broken = fixture("not a record");
+  const b = await broken.plugin.holds!.activities!(broken.ctx);
+  must(b.length === 1 && b[0]!.live === null, `no machine can be named: ${JSON.stringify(b)}`);
+  must(b[0]!.complete === false && b[0]!.unreadableKinds?.unknown === true && b[0]!.unreadable === 1, `which machines exist is not known: ${JSON.stringify(b)}`);
+  const none = fixture(undefined);
+  const n = await none.plugin.holds!.activities!(none.ctx);
+  must(n.length === 1 && n[0]!.live === null, `nothing stored: ${JSON.stringify(n)}`);
+  must(n[0]!.complete === true && n[0]!.unreadable === undefined && n[0]!.unreadableKinds === undefined, `nothing stored is not damage: ${JSON.stringify(n)}`);
+  const map = fixture({ machines: [box("b-1")] });
+  const m = await map.plugin.holds!.activity(map.ctx);
+  must(m.complete === false && m.unreadableKinds?.unknown === true, `a map of machines that is not a map: ${JSON.stringify(m)}`);
+});
+
+await check("complete: the kinds add up to the count the console has always shown, for every shape the record has had", () => {
+  const shapes: unknown[] = [
+    null, "x", { boxId: 7 }, { boxId: "b", createdAt: 1, lastUsedAt: 1, sessions: "no", envs: [1, { name: "e", snapId: "s", savedAt: 1 }] },
+    { machines: [] }, { machines: { main: box("b-main"), "Bad Name": box("b-x"), web: { boxId: 3 } }, envs: [2] },
+    { machines: { main: box("b-main", { wired: "no", leftOut: [1] }) }, sessions: [3] },
+  ];
+  for (const v of shapes) {
+    const k = unreadableKindsOf(v as any);
+    must((k.unknown ? 1 : 0) + k.machines + k.other === unreadableEntries(v as any), `${JSON.stringify(v)}: ${JSON.stringify(k)} vs ${unreadableEntries(v as any)}`);
+    // Both ways: an answer with a count always carries its split, and one without a count carries none. This is the
+    // contract billing reads by (#1189 counts a count without its split as a split missing), held here for this producer.
+    const a = activityOf(null, k);
+    must((a.unreadable ?? 0) > 0 === (a.unreadableKinds !== undefined), `${JSON.stringify(v)}: a count without its split, or a split without a count: ${JSON.stringify(a)}`);
+  }
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

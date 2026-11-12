@@ -31,7 +31,7 @@ const box: Plugin = {
   async invoke(_t, _a, c) { invoked.push(c as PluginContext); return { ok: true }; },
   holds: {
     tools: { release: "release" },
-    async activity(c: PluginContext) { askedActivity.push(c); return { live: null }; },
+    async activity(c: PluginContext) { askedActivity.push(c); return { live: null, complete: true }; },
     async release() { return false; },
   },
 };

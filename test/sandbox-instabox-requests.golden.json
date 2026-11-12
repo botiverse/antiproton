@@ -1143,6 +1143,7 @@
       }
      },
      "quietUntil": null,
+     "complete": true,
      "billing": "paused: no compute is billed; its memory and disk are kept, and billed as storage, until it is deleted"
     }
    ]

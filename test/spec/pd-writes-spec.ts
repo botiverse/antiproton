@@ -91,7 +91,7 @@ export function testPlugins(seen: Seen, held: { lastUsedAt: number | null }, hoo
     async invoke(tool) { seen.push(`lease.${tool}`); held.lastUsedAt = tool === "take" ? Date.now() : null; return { ok: true }; },
     holds: {
       tools: { release: "let_go" },
-      async activity() { return { live: held.lastUsedAt === null ? null : { id: "thing-1", startedAt: held.lastUsedAt, lastUsedAt: held.lastUsedAt } }; },
+      async activity() { return { live: held.lastUsedAt === null ? null : { id: "thing-1", startedAt: held.lastUsedAt, lastUsedAt: held.lastUsedAt }, complete: true }; },
       async release() { seen.push("lease.release"); held.lastUsedAt = null; return true; },
     },
   } as Plugin;

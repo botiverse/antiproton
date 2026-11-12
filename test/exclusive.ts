@@ -55,7 +55,7 @@ function racer(id: string, exclusive: boolean) {
   if (exclusive) {
     plugin.holds = {
       tools: { release: "release" },
-      async activity() { return { live: null }; },
+      async activity() { return { live: null, complete: true }; },
       async release(c: any) {
         inside += 1;
         if (inside > 1) overlapped = true;
