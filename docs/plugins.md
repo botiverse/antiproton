@@ -1223,7 +1223,11 @@ server's monthly upload quota: tell the owner, don't retry). On a Raft server th
 (it sends `olderCursor` but no `newestPosition`; at most the newest 50 come back), `seen` is Raft's
 `artifact.position`, which Raft gives only when every comment is in the answer. When more comments exist, no
 `seen` is given and the model is not asked for an older page, so a new version is refused with
-`UNSEEN_CHANGES` until the server can page, rather than overwrite unread comments. No answer, or a 5xx, is
+`UNSEEN_CHANGES` until the server can page, rather than overwrite unread comments. A paging read the server
+did not page (no `newestPosition`, or the same `olderCursor` back) says so and never says to call again. A
+server that sends `newestPosition` and a fresh cursor but returns the same page passes both checks; the paging
+note asks the model to stop when a page repeats, which is an instruction, not something the tool enforces.
+No answer, or a 5xx, is
 `uncertain`: it may have been published, so never published again blindly. Each call writes a
 `raft.assistant_owner_artifact` or `raft.assistant_publish_artifact` log line and trace row (not
 forwarded) of ids, sizes, counts and Raft's status and code, never the Artifact as named, a title, a path,

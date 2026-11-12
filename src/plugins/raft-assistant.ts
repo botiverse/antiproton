@@ -2924,13 +2924,27 @@ export async function ownerArtifact(args: unknown, ctx: PluginContext, deps: Pic
   const newest = whole(comments.newestPosition, 0);
   const position = whole(art.position, 0);
   let seen: number | null = null;
-  if (typeof older === "string" && older && !paging && newest === null) {
+  // A paging read the server did not page (Ward, #plugins 9a2722a9): either sign is enough. The capability sign:
+  // newestPosition absent (Grace: it ships with paging, #14633, so its absence is a server that cannot page). The echo
+  // sign: the olderCursor that came back is the one sent, so this is the page already read. Saying "call again" here
+  // loops. These cover the known shapes, they do not detect the loop: a server that sends newestPosition, hands out a
+  // fresh cursor each time and returns the same page passes both. For that case the paging note below asks the model
+  // to stop when a page repeats; that is an instruction to the model, nothing in the tool or runtime is known to
+  // enforce it, and no tool-call cap was found that bounds it.
+  const notPaged = paging && (newest === null || (typeof older === "string" && older === before));
+  if (notPaged) {
+    notes.push((newest === null
+      ? "This server cannot page older comments yet: the page that came back is the newest one again. "
+      : "The same page came back for that olderCursor: this server is not paging older comments. ") +
+      "Stop paging and do not ask for older comments again. No seen is given: a new version will be refused with UNSEEN_CHANGES until the server can page.");
+  } else if (typeof older === "string" && older && !paging && newest === null) {
     // Today's server (Grace, b6ab423f): it sends olderCursor but not newestPosition, and commentsBefore only works
     // from the release with #14633. Asking for the older page would return the same newest page again.
     notes.push("There are more comments than this answer shows (at most the newest 50), and reading older ones is not available on this server yet. " +
       "No seen is given: a new version will be refused with UNSEEN_CHANGES until the server can page.");
   } else if (typeof older === "string" && older) {
-    notes.push("There are older comments: call again with commentsBefore set to comments.olderCursor to read them.");
+    notes.push("There are older comments: call again with commentsBefore set to comments.olderCursor to read them. " +
+      "If a page comes back that you have already read, stop: this server is not paging older comments, so tell your owner instead of calling again.");
     if (!paging && newest !== null) notes.push(`Keep this first page's comments.newestPosition, ${newest}: once you have read back to the oldest page, pass ${newest} as seen when you publish a new version.`);
   } else if (older === null) {
     if (paging) notes.push("This is the oldest page of comments. When you publish a new version, pass as seen the newestPosition of the first page you read, not this one's.");
