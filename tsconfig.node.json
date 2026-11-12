@@ -127,6 +127,7 @@
     "test/raft-attachments-view.ts",
     "test/mount-offered.ts",
     "test/model-queue.ts",
+    "test/isolated-erase-observable.ts",
     "test/model-refusal.ts",
     "test/spend-limit.ts",
     "test/onboarding-budget.ts",
