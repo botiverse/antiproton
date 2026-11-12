@@ -5711,7 +5711,10 @@ export class AgentRuntime {
           // Everything else kept per session, each table only where it was ever made. The calls' ids are read before
           // the rows that name them go: a call's image evidence (cf/src/image-evidence.ts) is keyed by its job id alone.
           const has = (table: string) => sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", table).toArray().length > 0;
-          const jobIds = new Set<string>(sql.exec("SELECT id FROM pi_model_jobs WHERE session = ?", r.session).toArray().map((j: any) => String(j.id)));
+          // Every table here is checked first, pi_model_jobs too: a missing one would throw on every pass, and the session
+          // would be counted failed forever rather than erased.
+          const jobIds = new Set<string>(has("pi_model_jobs")
+            ? sql.exec("SELECT id FROM pi_model_jobs WHERE session = ?", r.session).toArray().map((j: any) => String(j.id)) : []);
           if (has("model_input_digests")) {
             for (const j of sql.exec("SELECT job_id FROM model_input_digests WHERE session_id = ?", r.session).toArray()) jobIds.add(String((j as any).job_id));
           }
@@ -5719,12 +5722,13 @@ export class AgentRuntime {
           // cf/src/fresh-context.ts), then the calls themselves.
           if (has("model_input_images")) for (const id of jobIds) sql.exec("DELETE FROM model_input_images WHERE job_id = ?", id);
           if (has("model_input_digests")) sql.exec("DELETE FROM model_input_digests WHERE session_id = ?", r.session);
-          sql.exec("DELETE FROM pi_model_jobs WHERE session = ?", r.session);
+          if (has("pi_model_jobs")) sql.exec("DELETE FROM pi_model_jobs WHERE session = ?", r.session);
           // A turn still open on it: `closeTurn` deletes its own row, and the stale path (turn-timing.ts `turnInbound`)
           // runs only on the session's next message, which an erased session never gets, so nothing else ever takes it.
           // A row here is a turn whose step ended without closing it (lost across a deploy or eviction), or one paused on
           // a caller's function (`turnPaused`), which a short session's caller cannot answer. And its finished
-          // background calls (a running one makes it busy, so it is never erased then).
+          // background calls only: a running one makes the session busy, so none should be here, and the condition keeps
+          // this delete from taking a running job should the meaning of busy ever change.
           if (has("turn_timing")) sql.exec("DELETE FROM turn_timing WHERE session = ?", r.session);
           if (has("background_jobs")) sql.exec("DELETE FROM background_jobs WHERE session = ? AND state <> 'running'", r.session);
           // What its harness and requests were read against: the last open (src/runtime/harness-open.ts) and the last

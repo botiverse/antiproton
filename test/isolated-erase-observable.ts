@@ -90,7 +90,15 @@ async function world(opts: { evidence?: boolean } = {}) {
   return { rt, sql, bucket, open, answer, pending, pass, kept };
 }
 
-const adds = (p: Record<string, unknown> | undefined) => !!p && p.rows === Number(p.erased) + Number(p.failed) + Number(p.busy);
+/**
+ * A pass line's two equations, which hold in different cases:
+ * - `processed == erased + failed + busy` always holds, finished or not (every row it reached went exactly one way);
+ * - `rows == processed` holds only for a pass that finished (`completed: true`): one cut off reached fewer rows than it
+ *   read, and is a correct line, not wrong arithmetic.
+ * `adds` is for passes these tests expect to finish, so it asks for both; the cut-off pass is checked apart below.
+ */
+const tallied = (p: Record<string, unknown> | undefined) => !!p && p.processed === Number(p.erased) + Number(p.failed) + Number(p.busy);
+const adds = (p: Record<string, unknown> | undefined) => tallied(p) && p!.completed === true && p!.rows === p!.processed;
 
 await check("a check session whose run has ended is erased: one isolated.erased line, a pass of rows=1 erased=1, its row gone", async () => {
   const w = await world();
@@ -193,6 +201,33 @@ await check("a pass with no short sessions still writes its line (rows: 0), so e
   const { lines } = await w.pass();
   const p = lines.filter((l) => l.evt === "isolated.erase_pass");
   must(p.length === 1 && p[0]!.rows === 0 && p[0]!.completed === true, show(lines));
+});
+
+await check("a pass cut off before it has seen every row still writes its line: completed false, processed < rows, the tally adds up", async () => {
+  const w = await world();
+  const session = await w.open();
+  await w.answer(session);
+  // Make the erase's read of which sessions have work throw, and only there (by the caller in the stack), so the pass
+  // fails outside the per-session try: the one way a pass ends without having seen every row.
+  const exec = w.sql.exec.bind(w.sql);
+  (w.sql as any).exec = (q: string, ...args: unknown[]) => {
+    if (/UNION SELECT session FROM background_jobs/.test(q) && /eraseIsolated/.test(String(new Error().stack))) throw new Error("cut off");
+    return exec(q, ...args);
+  };
+  let lines: Array<Record<string, unknown>> = [];
+  setLogSink((line) => { lines.push(JSON.parse(line) as Record<string, unknown>); });
+  try { await w.rt.step(T, A); } catch { /* the cut-off may surface from the step: the line is what is checked */ } finally { setLogSink(null); (w.sql as any).exec = exec; }
+  const p = lines.filter((l) => l.evt === "isolated.erase_pass");
+  must(p.length === 1, `expected one pass line from the cut-off pass, found ${p.length}: ${show(lines)}`);
+  must(p[0]!.completed === false, `a cut-off pass must say completed: false: ${show(p[0])}`);
+  must(Number(p[0]!.rows) >= 1, `rows is what the pass read, the session included: ${show(p[0])}`);
+  // processed < rows written as an inequality, not a number: it is what makes this the cut-off case at all.
+  must(Number(p[0]!.processed) < Number(p[0]!.rows), `processed must be below rows when cut off: ${show(p[0])}`);
+  must(tallied(p[0]), `processed != erased + failed + busy: ${show(p[0])}`);
+  must(w.kept(session), "the session must still be there for the next pass");
+  const next = await w.pass();
+  const p2 = next.lines.find((l) => l.evt === "isolated.erase_pass");
+  must(adds(p2) && !w.kept(session), `the next pass must finish and erase it: ${show(p2)}`);
 });
 
 // ---- What a short session leaves in the agent's SQLite: everything there while it is alive, nothing once erased.
