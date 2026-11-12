@@ -308,7 +308,7 @@ await check("seam: two good machines and one corrupt machine entry, from the san
   answers.set("box", answer);
   const p = await w.pass(SEAM_T0 + HOUR);
   const l = lastPassLog();
-  assert(l.kindsMissing === 0 && l.kindsViolation === 0, `(c1) the seam did not connect: kindsMissing ${l.kindsMissing}, kindsViolation ${l.kindsViolation}`);
+  assert(l.kindsMissing === 0 && l.kindsViolation === 0, `(c1) the seam did not connect: the report itself was well-formed ((b1) kinds present and (b2) parts sum to unreadable both passed), so this is the billing reader reading the wrong field or shape, not the sandbox: kindsMissing ${l.kindsMissing}, kindsViolation ${l.kindsViolation}`);
   assert(l.kindsOf === 1, `(c1) kindsOf ${l.kindsOf}, not the one mount with unreadable > 0`);
   assert(l.machinesBlocking === 1, `(c2) the breakdown was not used: machinesBlocking ${l.machinesBlocking} (${JSON.stringify(p.billing.unreadable)})`);
   assert(!p.prune && p.blocked.box === "incomplete", `(d) prune not blocked as incomplete: prune ${p.prune}, blocked ${JSON.stringify(p.blocked)}`);
@@ -320,11 +320,14 @@ await check("seam: one bad saved environment with both machines good, from the s
   const a = answer.activity as HeldActivity;
   assert((a.unreadable ?? 0) > 0, "fixture produced no bad entry");
   assert(a.complete === true, `precondition: the sandbox called a bad environment incomplete: ${JSON.stringify(a)}`);
+  const k = a.unreadableKinds;
+  assert(k !== undefined && k !== null, `precondition: the sandbox sent no unreadableKinds: ${JSON.stringify(a)}`);
+  assert((k!.unknown ? 1 : 0) + k!.machines + k!.other === a.unreadable, `precondition: the sandbox's kinds do not sum to unreadable: ${JSON.stringify(a)}`);
   answers.set("box", answer);
   w.seedStale(SEAM_T0 + HOUR);
   const p = await w.pass(SEAM_T0 + HOUR);
   const l = lastPassLog();
-  assert(l.kindsMissing === 0 && l.kindsViolation === 0, `the seam did not connect: kindsMissing ${l.kindsMissing}, kindsViolation ${l.kindsViolation}`);
+  assert(l.kindsMissing === 0 && l.kindsViolation === 0, `the seam did not connect: the report was well-formed (kinds present and summing, asserted above), so this is the billing reader, not the sandbox: kindsMissing ${l.kindsMissing}, kindsViolation ${l.kindsViolation}`);
   assert(l.otherUnreadable === 1, `otherUnreadable ${l.otherUnreadable}`);
   assert(p.prune && p.deleted === 1, `prune did not run: ${JSON.stringify(p.blocked)}, deleted ${p.deleted}`);
 });
