@@ -4053,7 +4053,9 @@ const PAGING_FIELDS = ["olderCursor", "newestPosition"];
  * refuses an answer without `comments.olderCursor` or `comments.newestPosition`, which every server before that release
  * gives. When those absent fields are all the contract refused, the answer is taken as sent; `ownerArtifact` checks
  * the rest of its shape itself and says that there is no older page to ask for. Anything else the contract refused
- * stays refused.
+ * stays refused. It adds no value of its own: a present field (including a null `olderCursor`, "no older page") passes
+ * through untouched, so "this server cannot page" and "there is no older page" stay distinct for the caller.
+ * Remove once production runs Raft #14633 and the SDK no longer requires the two fields (Grace asked for 0.35.1).
  */
 export function withoutPaging(out: RouteAnswer): RouteAnswer {
   if (out.ok || out.error.kind !== "validation" || out.error.reason !== "response_contract_mismatch") return out;
