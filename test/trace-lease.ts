@@ -32,7 +32,7 @@ const plugin = (id: string, o: {
   id, version: "1.0.0",
   tools: [{ name: "go", summary: "", parameters: {}, sideEffects: "write", idempotency: "none" }],
   async invoke() { if (o.throwOnInvoke) throw o.throwOnInvoke; return o.result ?? { ok: true }; },
-  ...(o.release ? { holds: { tools: { release: "go" }, release: o.release, async activity() { return { live: null }; } } } : {}),
+  ...(o.release ? { holds: { tools: { release: "go" }, release: o.release, async activity() { return { live: null, complete: true }; } } } : {}),
 });
 
 async function fixture(plugins: Plugin[]) {
@@ -155,7 +155,7 @@ await check("a release of one held thing passes its id to the plugin; activities
     holds: {
       tools: { release: "go" },
       async release(_ctx: unknown, opts?: unknown) { seen.push(opts); return FACT; },
-      async activity() { return { live: { id: "box-7", startedAt: 1, lastUsedAt: 2 } }; },
+      async activity() { return { live: { id: "box-7", startedAt: 1, lastUsedAt: 2 }, complete: true }; },
     },
   } as unknown as Plugin;
   const f = await fixture([p]);

@@ -131,6 +131,18 @@ check("a mount whose records do not read is marked with a predicate, not a count
   eq(heldUnreadableRows(base, "sandbox", null, H0), [], "in both spellings");
 });
 
+check("the marker follows `complete` when the answer has it, and the old count only when it does not", () => {
+  const marked = (a: Parameters<typeof heldUnreadableRows>[2]) => heldUnreadableRows(base, "sandbox", a, H0).length;
+  // An answer that says it read its record whole marks nothing, whatever it could not read beside the machines.
+  eq(marked({ unreadable: 1, complete: true }), 0, "an unreadable environment costs no machine its seconds");
+  eq(marked({ complete: false }), 1, "a record not read whole marks the hour");
+  eq(marked({ unreadable: 2, complete: false }), 1, "once, whatever the count");
+  // From code before `complete` (a deploy's changeover): that code wrote the count only when it was not zero.
+  eq(marked({ unreadable: 2 }), 1, "an old answer with a count marks, as it always did");
+  eq(marked({ unreadable: 0 }), 0, "an old answer with a zero does not");
+  eq(marked({ live: null } as any), 0, "nor one with neither field: the old code's clean answer, not an unknown one");
+});
+
 check("against a real table: the marker is written where the seconds are not, and beside them where they are", () => {
   const host = sqliteHost();
   countHeldTime(host.sql, { m: { plugin: "sandbox", report: { activity: { live: null, unreadable: 3 }, usage: [] } } }, base, H0 + 60_000);

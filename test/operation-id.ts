@@ -429,8 +429,8 @@ await check("a context that serves no operation has no operationId: prompt, hold
     async promptContribution(c) { note("promptContribution", c); return "keeper"; },
     holds: {
       tools: { release: "x" },
-      async activity(c) { note("activity", c); return { live: null }; },
-      async activities(c) { note("activities", c); return [{ live: null }]; },
+      async activity(c) { note("activity", c); return { live: null, complete: true }; },
+      async activities(c) { note("activities", c); return [{ live: null, complete: true }]; },
       async usage(c) { note("usage", c); return []; },
       async release(c) { note("release", c); },
       files: {

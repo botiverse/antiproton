@@ -41,7 +41,7 @@ const seats: Plugin = {
   async invoke() { return { ok: true }; },
   holds: {
     tools: { release: "letgo" },
-    async activity() { return { live: seat, quietUntil: null, billing: "billed while held" }; },
+    async activity() { return { live: seat, quietUntil: null, billing: "billed while held", complete: true }; },
     async release() { return true; },
   },
 } as Plugin;

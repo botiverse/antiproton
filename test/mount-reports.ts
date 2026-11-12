@@ -75,6 +75,22 @@ check("a count of unreadable entries reaches the page, and a mount whose count i
   must(Object.keys(bad ?? {}).join(",") === "ok", `a string count was accepted: ${JSON.stringify(bad)}`);
 });
 
+check("complete and its kinds reach the page; a complete that is not a boolean is not reported, a split that does not read is left out", () => {
+  const kinds = { unknown: false, machines: 1, other: 0 };
+  const r = asMountReports({ box: { activity: { live: null, unreadable: 1, complete: false, unreadableKinds: kinds }, usage: [] } });
+  must(r?.box?.activity.complete === false && JSON.stringify(r.box.activity.unreadableKinds) === JSON.stringify(kinds),
+    `a field was lost at the boundary: ${JSON.stringify(r)}`);
+  must(asMountReports({ box: { activity: { live: null }, usage: [] } })?.box?.activity.complete === undefined,
+    "an answer from older code was given a complete it never said");
+  const bad = asMountReports({ box: { activity: { live: null, complete: "yes" }, usage: [] }, ok: { activity: { live: null }, usage: [] } });
+  must(Object.keys(bad ?? {}).join(",") === "ok", `a string complete was accepted: ${JSON.stringify(bad)}`);
+  for (const k of [null, { unknown: "no", machines: 0, other: 0 }, { machines: 1 }]) {
+    const one = asMountReports({ box: { activity: { live: null, unreadable: 1, complete: false, unreadableKinds: k }, usage: [] } });
+    must(one?.box?.activity.complete === false && one.box.activity.unreadableKinds === undefined,
+      `a split that does not read (${JSON.stringify(k)}) cost the mount its answer, or was kept: ${JSON.stringify(one)}`);
+  }
+});
+
 check("worthReporting keeps a report that says something — and 'I could not tell' says something", () => {
   const live = { id: "b", startedAt: 1, lastUsedAt: 2 };
   must(worthReporting({ live, unreadable: 2 }, []) === true, "a live container is a report");

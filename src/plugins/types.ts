@@ -1371,9 +1371,50 @@ export interface MountActivity {
    * and repaired before the next leaves a hole in whatever was recorded
    * meanwhile, and this field will have stopped mentioning it. A window's
    * completeness has to be recorded by whoever records the window.
+   *
+   * Which way to decide anything by it: not this count. A caller that acts on
+   * "is this a lower bound" for a machine's time or cost asks `complete`, which
+   * leaves out the entries that cost no machine anything; this count stays as the
+   * console shows it.
    */
   unreadable?: number;
+  /**
+   * Whether this answer comes from the mount's own record read whole: every machine it holds is in it. False when
+   * the record, or its map of machines, did not read (`unreadableKinds.unknown`: which machines exist is not known)
+   * or a machine's own entry did not (`unreadableKinds.machines`); not made false by an unreadable entry that holds
+   * no machine (`unreadableKinds.other`: a session, saved environment, egress wiring), which costs no time.
+   *
+   * It is what a caller about to act on what the answer leaves out asks, and only `true` lets it: billing's prune
+   * removes a watermark only when every mount answered `complete: true` (#1189). Absent means an answer
+   * from code that predates this field, which says nothing either way, so it is never read as `true`; `false` is
+   * read as stated. Damage in the record is permanent until a person repairs it, so a `false` does not clear by
+   * waiting.
+   *
+   * Optional here because answers are also read back from JSON written by older code; a plugin answering
+   * `Holding.activity` must give it (`HeldActivity`).
+   */
+  complete?: boolean;
+  /**
+   * `unreadable` split by what each entry can hide, present exactly when `unreadable` is (billing's breakdown
+   * relies on that: a count without its split is counted as a split missing, #1189): `complete` is
+   * `!unknown && machines === 0`. For a report that says which kind of damage stopped a prune; nothing decides by
+   * it that cannot decide by `complete`.
+   */
+  unreadableKinds?: UnreadableKinds;
 }
+
+/** What `MountActivity.unreadable` counted, by what it can hide. */
+export interface UnreadableKinds {
+  /** The record, or its map of machines, did not read: which machines exist is not known. */
+  unknown: boolean;
+  /** Machines whose own entry did not read. */
+  machines: number;
+  /** Entries that did not read and hold no machine: sessions, saved environments, egress wiring, left-out lists. */
+  other: number;
+}
+
+/** What a plugin answers for `Holding.activity`: always saying whether it read its own record whole. */
+export type HeldActivity = MountActivity & { complete: boolean };
 
 /** One finished stretch of whatever a mount keeps alive. */
 export interface MountUsage {
@@ -1917,7 +1958,7 @@ export interface Holding {
    * calling the far end: it is asked when nobody is using the mount and by a
    * timer, so it must be answerable from what the runtime already has.
    */
-  activity(ctx: PluginContext): Promise<MountActivity>;
+  activity(ctx: PluginContext): Promise<HeldActivity>;
   /**
    * Every thing this mount is holding, each with its own activity, when it can hold more than one.
    *
@@ -1932,7 +1973,7 @@ export interface Holding {
    * Absent: the mount holds at most one thing, and `activity` is the whole answer. Same rules as
    * `activity`: no credential, no call to the far end. Entries with `live: null` are allowed and ignored.
    */
-  activities?(ctx: PluginContext): Promise<MountActivity[]>;
+  activities?(ctx: PluginContext): Promise<HeldActivity[]>;
   /**
    * What it has cost, as far as this mount can still say. A rolling window is a
    * legitimate answer: this is not a ledger, and anything that has to be

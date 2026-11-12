@@ -1,5 +1,5 @@
 import type { Json, MountRecord } from "../core/types.ts";
-import type { CredentialRefKind, DbOperations, HeldFiles, NotShown, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm, ToolSchema, Withdrawal } from "./types.ts";
+import type { CredentialRefKind, DbOperations, HeldActivity, HeldFiles, NotShown, Plugin, PluginContext, MountActivity, MountUsage, UnreadableKinds, Released, SandboxForm, ToolSchema, Withdrawal } from "./types.ts";
 import { Backgrounded, backgrounded, identityNote, KeyRange, LEASE_KEY, markIdentity, markReleased, releaseRetryMs } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
@@ -1416,25 +1416,50 @@ function isEnv(v: unknown): v is Env {
  * mount, which is how an alarm stops being read.
  */
 export function unreadableEntries(v: Json): number {
-  if (v === null || v === undefined) return 0;
-  if (typeof v !== "object") return 1;
+  const k = unreadableKindsOf(v);
+  return (k.unknown ? 1 : 0) + k.machines + k.other;
+}
+
+/**
+ * The same entries as `unreadableEntries`, by what they can hide (`MountActivity.unreadableKinds`). The total is the
+ * same count, split three ways, because only two of the three can hide a machine that is still running and billed:
+ * `unknown` — the record, or its map of machines, does not read, so which machines exist is not known; `machines` —
+ * a machine's own entry does not read; `other` — a session, saved environment, egress wiring or left-out entry does
+ * not read, which costs no machine its time. `complete` is false exactly when one of the first two is not zero.
+ */
+export function unreadableKindsOf(v: Json): UnreadableKinds {
+  const none: UnreadableKinds = { unknown: false, machines: 0, other: 0 };
+  if (v === null || v === undefined) return none;
+  if (typeof v !== "object") return { ...none, unknown: true };
   const o = v as Record<string, unknown>;
   const count = (list: unknown, readable: (x: unknown) => boolean) =>
     list === undefined ? 0 : Array.isArray(list) ? list.filter((x) => !readable(x)).length : 1;
   const shared = count(o.sessions, isSession) + count(o.envs, isEnv);
   if (o.machines === undefined) {
-    return (asBoxState(v) === null ? 1 : 0) + shared + count(o.wired, isWired) + count(o.leftOut, isLeftOut);
+    // The old shape: the record is the one machine's, so a record that does not read is a machine nobody can name.
+    return { unknown: asBoxState(v) === null, machines: 0, other: shared + count(o.wired, isWired) + count(o.leftOut, isLeftOut) };
   }
   // The new shape: the map itself, then each entry as a box record of its own.
   const listed = o.machines;
-  if (!listed || typeof listed !== "object" || Array.isArray(listed)) return 1 + shared;
-  let bad = 0;
+  if (!listed || typeof listed !== "object" || Array.isArray(listed)) return { unknown: true, machines: 0, other: shared };
+  let machines = 0, other = shared;
   for (const [name, entry] of Object.entries(listed as Record<string, unknown>)) {
     const e = entry as Record<string, unknown> | null;
-    if (!MACHINE_RE.test(name) || readBox(entry as Json) === null) { bad += 1; continue; }
-    bad += count(e?.wired, isWired) + count(e?.leftOut, isLeftOut);
+    if (!MACHINE_RE.test(name) || readBox(entry as Json) === null) { machines += 1; continue; }
+    other += count(e?.wired, isWired) + count(e?.leftOut, isLeftOut);
   }
-  return bad + shared;
+  return { unknown: false, machines, other };
+}
+
+/** What `activityOf` says about unreadable entries: the total, its kinds, and whether the record was read whole. */
+function unreadableFields(u: number | UnreadableKinds): Pick<HeldActivity, "complete" | "unreadable" | "unreadableKinds"> {
+  // A bare count says nothing of its kinds, so it is taken as the worst of them: whatever it is, it may hide a machine.
+  const kinds: UnreadableKinds = typeof u === "number" ? { unknown: u > 0, machines: 0, other: 0 } : u;
+  const total = typeof u === "number" ? u : (u.unknown ? 1 : 0) + u.machines + u.other;
+  return {
+    complete: !kinds.unknown && kinds.machines === 0,
+    ...(total ? { unreadable: total, unreadableKinds: kinds } : {}),
+  };
 }
 
 const SESSIONS_KEPT = 20;
@@ -1782,13 +1807,14 @@ async function dropSnapshots(ctx: PluginContext, provider: SandboxProvider, snap
  */
 export function activityOf(
   state: BoxState | null | undefined,
-  unreadable = 0,
+  unreadable: number | UnreadableKinds = 0,
   keepStoppedDays: number = DEFAULTS.keepStoppedDays,
   /** How the agent names this machine, when the mount has several or it is not the default one. */
   label: { name?: string; args?: Record<string, Json> } = {},
-): MountActivity {
+): HeldActivity {
   const billing = "billed for every second it exists, not per call";
-  if (!state?.boxId) return { live: null, billing, ...(unreadable ? { unreadable } : {}) };
+  const read = unreadableFields(unreadable);
+  if (!state?.boxId) return { live: null, billing, ...read };
   // An unused box is idle from when it started, not from zero: the same
   // rule the release record follows, so the two agree about its age.
   const used = state.lastUsedAt || state.createdAt;
@@ -1823,7 +1849,7 @@ export function activityOf(
         ...label,
       },
       quietUntil: state.quietUntil ?? null,
-      ...(unreadable ? { unreadable } : {}),
+      ...read,
       billing: pausedOf(state)
         ? "paused: no compute is billed; its memory and disk are kept, and billed as storage, until it is deleted"
         : "stopped: no compute is billed; only its disk is kept until it is deleted",
@@ -1842,7 +1868,7 @@ export function activityOf(
       ...label,
     },
     quietUntil: state.quietUntil ?? null,
-    ...(unreadable ? { unreadable } : {}),
+    ...read,
     billing,
   };
 }
@@ -1863,10 +1889,11 @@ function labelOf(machine: string, several: boolean): { name?: string; args?: Rec
  * activity when none has. What `holds.activities` answers.
  */
 export function activitiesOf(
-  mount: MountState | null, unreadable = 0, keepStoppedDays: number = DEFAULTS.keepStoppedDays,
-): MountActivity[] {
+  mount: MountState | null, unreadable: number | UnreadableKinds = 0, keepStoppedDays: number = DEFAULTS.keepStoppedDays,
+): HeldActivity[] {
   const names = boxedMachines(mount);
-  const aside = Object.values(mount?.stranded ?? {}).map(strandedActivity);
+  // Every entry is one read of the same record, so each says whether that read was whole.
+  const aside = Object.values(mount?.stranded ?? {}).map((b) => strandedActivity(b, unreadable));
   if (!names.length) return aside.length ? aside : [activityOf(null, unreadable, keepStoppedDays)];
   return [...names.map((n) => activityOf(viewOf(mount, n), unreadable, keepStoppedDays, labelOf(n, names.length > 1))), ...aside];
 }
@@ -1880,7 +1907,7 @@ export function activitiesOf(
  * in it that was not saved or kept is lost. Warning would mean a turn about a machine the agent cannot reach, and
  * keeping it would leave it billed for nobody; the console showed the deletion would happen when the key changed.
  */
-function strandedActivity(b: StrandedBox): MountActivity {
+function strandedActivity(b: StrandedBox, unreadable: number | UnreadableKinds = 0): HeldActivity {
   return {
     live: {
       id: b.boxId, startedAt: b.createdAt, lastUsedAt: b.strandedAt, ...createdUnder(b),
@@ -1888,6 +1915,7 @@ function strandedActivity(b: StrandedBox): MountActivity {
     },
     quietUntil: null,
     billing: "set aside: made with a credential that no longer works; still billed until it is deleted",
+    complete: unreadableFields(unreadable).complete,
   };
 }
 
@@ -1898,8 +1926,8 @@ function strandedActivity(b: StrandedBox): MountActivity {
  * a single answer must not hide.
  */
 export function summaryActivity(
-  mount: MountState | null, unreadable = 0, keepStoppedDays: number = DEFAULTS.keepStoppedDays,
-): MountActivity {
+  mount: MountState | null, unreadable: number | UnreadableKinds = 0, keepStoppedDays: number = DEFAULTS.keepStoppedDays,
+): HeldActivity {
   const names = boxedMachines(mount);
   const used = (n: string) => { const b = mount!.machines[n]!; return b.lastUsedAt || b.createdAt; };
   const off = (n: string) => parkedAt(mount!.machines[n]) === null ? 0 : 1;
@@ -3029,16 +3057,16 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     files: sandboxFiles,
     /** What this mount is keeping alive, read from its own state and nothing
      *  else: no credential, no call to run9. */
-    async activity(ctx: PluginContext): Promise<MountActivity> {
+    async activity(ctx: PluginContext): Promise<HeldActivity> {
       const raw = await ctx.db.get(BOX_STORE, BOX_KEY);
       const cfg = cfgOf(ctx);
-      return summaryActivity(asMountState(raw), unreadableEntries(raw), keepDaysOf(cfg));
+      return summaryActivity(asMountState(raw), unreadableKindsOf(raw), keepDaysOf(cfg));
     },
     /** Each machine on its own: its own schedule, postponement and cost (see `Holding.activities`). */
-    async activities(ctx: PluginContext): Promise<MountActivity[]> {
+    async activities(ctx: PluginContext): Promise<HeldActivity[]> {
       const raw = await ctx.db.get(BOX_STORE, BOX_KEY);
       const cfg = cfgOf(ctx);
-      return activitiesOf(asMountState(raw), unreadableEntries(raw), keepDaysOf(cfg));
+      return activitiesOf(asMountState(raw), unreadableKindsOf(raw), keepDaysOf(cfg));
     },
     /** The window this mount still holds. Bounded on purpose, which is why it is
      *  the console's history and not anybody's ledger. */
