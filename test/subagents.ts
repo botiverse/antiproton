@@ -36,6 +36,7 @@ import { SUBAGENT_MAX_TURNS, SUBAGENT_LIFETIME_MS, REPORT_MAX_ATTEMPTS, recordSu
 import { REPORT_BUDGET_CHARS, REPORT_MAX_CHARS, reportBodyChars, reportMessage, taskMessage } from "../src/runtime/subagents.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { BoundArtifacts } from "../cf/src/runtime.ts";
+import { newIsolatedSessionId, recordIsolated } from "../src/runtime/isolated-session.ts";
 
 /** An in-memory R2 bucket, as much of the binding as storing a report and reading it back use; `fail` refuses every put. */
 function memoryBucket() {
@@ -1372,6 +1373,28 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     const mine = exported!.tools.filter((t) => t.name === SUBAGENT_TOOL);
     must(mine.length === 1 && mine[0]!.source === "caller" && mine[0]!.description === "THE CALLER'S OWN", `not the caller's: ${show(mine)}`);
     must(logs.some((l) => l.evt === "subagent.tool_shadowed"), "the shadowing is not said");
+  });
+
+  await check(`${engine}: a short session (iso_) of an Agents API agent is not offered the caller's functions; the main session is`, async () => {
+    const w = await world(engine, { chatter: true });
+    const FN = "lookup_order";
+    await w.rt.store.updateAgentConfig("t", "a", { openai: { tools: [{ name: FN, description: "The caller's own.", parameters: { type: "object", properties: {} } }] } } as never);
+    // A short session as a mount's check opens one (`PluginNext.isolated`, `#runPluginHooks`), with no narrowing asked.
+    const iso = newIsolatedSessionId();
+    recordIsolated(w.raw.sql as never, iso, "chat", Date.now());
+    await w.rt.postMessage("t", "a", "check", "prompt", iso);
+    await w.rt.postMessage("t", "a", "hello", "prompt", "main");
+    await settle(w);
+    const isoReq = w.requests.find((r) => r.session === iso);
+    const mainReq = w.requests.find((r) => r.session === "main");
+    must(isoReq && mainReq, `no request from each session: ${show(w.requests.map((r) => r.session))}`);
+    // Only the caller's own session can answer a call to one: in a short session it would pause the turn for good.
+    must(!toolNames(isoReq.req).includes(FN), `the short session was offered the caller's ${FN}: ${show(toolNames(isoReq.req))}`);
+    // Control: the main session of the same agent is offered it, so the case above cannot pass for want of the function.
+    must(toolNames(mainReq.req).includes(FN), `the main session was not offered ${FN}: ${show(toolNames(mainReq.req))}`);
+    // The short session's own mount's tools are offered as before.
+    must(toolNames(isoReq.req).some((n) => /^chat[_.]+peek$/.test(n)), `the short session lost its mount's tools: ${show(toolNames(isoReq.req))}`);
+    must(toolNames(mainReq.req).some((n) => /^chat[_.]+peek$/.test(n)), `the main session has no chat tools: ${show(toolNames(mainReq.req))}`);
   });
 
   await check(`${engine}: a flush behind a follow-up gives each child step the parent call of its own turn`, async () => {

@@ -3952,12 +3952,15 @@ export class AgentRuntime {
     // A subagent's session (src/runtime/subagents.ts) is offered neither the caller's functions, which only the caller's
     // own session can answer, nor `send_to_agent`: delegation is one level deep.
     const child = isSubagentSession(session);
-    const callerDefs = !child && !memoryCall && Array.isArray(apiTools)
+    // A short session (`iso_`, `PluginNext.isolated`) is not offered the caller's functions either, for the same reason:
+    // its id is never given to the caller, so no caller can answer a call there, and the turn would pause for good.
+    const callerFree = child || isolated || memoryCall;
+    const callerDefs = !callerFree && Array.isArray(apiTools)
       ? apiTools.filter((t: any) => typeof t?.name === "string" && !taken.has(t.name)).map((t: any) => ({
           name: String(t.name), description: String(t.description ?? ""), parameters: t.parameters ?? { type: "object", properties: {} },
         }))
       : [];
-    const callerTools = !child && !memoryCall && Array.isArray(apiTools) && engine !== "pd"
+    const callerTools = !callerFree && Array.isArray(apiTools) && engine !== "pd"
       ? clientTools(callerDefs,
           { sql: this.#deps.ctx.storage.sql, session, lane: () => agentRef.current!.lane,
             branch: (tip) => agentRef.current!.storage.scanBranch({ start: tip, order: "oldestFirst" }, BACKGROUND_CONTEXT) as any })
