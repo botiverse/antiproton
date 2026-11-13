@@ -57,6 +57,44 @@ The operating-system analogy holds and is worth keeping in mind:
   So interruptions must be rare and complete — carrying enough context (like `siginfo`) to
   decide in one turn — and cancelling must release what was taken, not only drop a token.
 
+### Tools as generators: a decision the model owes
+
+Not every interruption is a fault. A tool may need the model to decide — overwrite or keep,
+join the existing channel or make a new one, yes or no — before it can go on. The old tool
+call is a function: called once, it returns or throws. A tool that can ask is a **generator**
+(tygg, 2026-10-01): it `yield`s a question, the model's answer is `next(answer)`, and it goes
+on until it `return`s; giving up is `return()`.
+
+```
+yield      → { state: "interrupted", reason: "needs_decision",
+               context: "<what the tool found>",
+               choices: [{ id, label }, …] | { kind: "yes_no" } | { kind: "text" },
+               resume: { token, expiresAt }, cancel: { token } }
+next(a)    → resume(token, answer)      // the model's tool, never callable from code
+return()   → cancel(token)              // releases what the tool had taken
+```
+
+A JS generator's execution cannot outlive a model turn (an object is evicted, a deploy
+replaces it, and a suspended frame cannot be stored), so a plugin writes the generator as
+**explicit step state**: when it yields it stores where it is and what it holds in its own
+database under the token, in the same transaction as the recorded tool result (#596); on
+`resume` it reads that state back and takes the next step. Proposed plugin contract
+(draft, for the plugins owner to settle):
+
+```ts
+// a tool's invoke may return, besides a result or a throw:
+{ interrupt: { reason: "needs_decision", context: string, choices: Choices,
+               state: Json /* what the next step needs; stored by the gateway, never shown */ } }
+// and the plugin implements:
+resume?(tool: string, state: Json, answer: Json, ctx: PluginContext): Promise<Json /* or another interrupt */>;
+cancel?(tool: string, state: Json, ctx: PluginContext): Promise<void>;
+```
+
+The gateway mints the token, stores `state` with the tool result, offers `resume`/`cancel` to
+the model, and expires the token. Inside run_js the program stops at such a call the way it
+stops at `pause()` (§4); the model answers with `resume`, then sends a new program for the
+rest.
+
 ## 3. Who does what
 
 - **The service** decides the condition: only it knows the newest message, who may do what,
