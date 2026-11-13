@@ -152,7 +152,7 @@ const OWN = ["receive_events", "enable_push", "disable_push", "push_status", "in
  * by a snapshot that lists them, never by the no-snapshot fallback (test/raft-assistant.ts and
  * test/raft-assistant-mode.ts hold them).
  */
-const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages", "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner", "assistant_forward_as_owner", "assistant_search_forward_targets", "assistant_reminder", "note_decision"];
+const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages", "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner", "assistant_forward_as_owner", "assistant_search_forward_targets", "assistant_reminder", "assistant_owner_artifact", "assistant_publish_artifact", "note_decision"];
 /** The image view: hand-written, and offered exactly where the download is (test/raft-attachments-view.ts holds it). */
 const VIEW = "attachments_view";
 /** The upload: hand-written, offered with storage to a credential holding `send` (test/raft-attachments-upload.ts holds it). */
@@ -2814,8 +2814,9 @@ await check("what a person wrote is never rewritten: message continuations, desc
     if (!text.includes(want)) throw new Error(`${where}: ${JSON.stringify(want)} did not come back as written: ${text}`);
   }
   // Controls: the hints around those words are the SDK's tool calls, and an admin write names its own tool (SDK 0.14.0).
+  // A window's edge is `Older: …` since SDK 0.35.0 (was `Older exist: …`).
   const page = String(((await raftPlugin.invoke("messages_read", { target: "#ops" }, lacking())) as any).text);
-  if (!/^Older exist: messages_read\(\{ target: "#ops", before: 41 \}\)$/m.test(page) || /no tool to open attachments/.test(page) ||
+  if (!/^Older: messages_read\(\{ target: "#ops", before: 41 \}\)$/m.test(page) || /no tool to open attachments/.test(page) ||
       !page.includes('[1 attachment: plan.pdf (id:att-9) — use attachments_download_url({ attachmentId: "att-9" }) to download]')) throw new Error(`page: ${page}`);
   const full = String(((await raftPlugin.invoke("server_info", { view: "full" }, lacking())) as any).text);
   if (!/^Server-profile changes use `server_update` and remain server-role gated\.$/m.test(full)) throw new Error(`overview: ${full}`);
@@ -4714,9 +4715,10 @@ await check("profile_update does not offer description: not in its schema or its
 /** A page with an attachment and older messages: the SDK points at attachments_download_url and at messages_read. */
 const pointing = () => history([historyMessage(41, "see", { attachments: [{ id: "att-1", filename: "plan.pdf" }] })], { has_older: true, target: "#ops" });
 const SDK_SUFFIX = '@tygg: see [1 attachment: plan.pdf (id:att-1) — use attachments_download_url({ attachmentId: "att-1" }) to download]';
-const SDK_OLDER = 'Older exist: messages_read({ target: "#ops", before: 41 })';
+// `Older: …` since SDK 0.35.0 (was `Older exist: …`), as `raft message read` says it.
+const SDK_OLDER = 'Older: messages_read({ target: "#ops", before: 41 })';
 const OUR_SUFFIX = "@tygg: see [1 attachment: plan.pdf — this mount has no tool to open attachments]";
-const OUR_OLDER = "Older exist: a Raft operation this mount does not offer";
+const OUR_OLDER = "Older: a Raft operation this mount does not offer";
 
 await check("a generated tool missing from ctx.offered is said in words, in a hint and in the attachment suffix; one in it is left as the SDK wrote it", async () => {
   const every = raftPlugin.tools.map((t) => t.name);

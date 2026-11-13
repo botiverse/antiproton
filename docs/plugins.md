@@ -1196,6 +1196,43 @@ not known (`source_known: false`) and every conversation read counts as foreign.
 apart (`inbox_reads`), never as foreign. Two reads at once may each write over the other's note, so the
 row can under-count. Never a message, the note, a destination's name, a link or Raft's text.
 
+An assistant works with Artifacts through two tools, offered in the chat only and listed exactly where
+`assistant_send_as_owner` is: `assistant_owner_artifact` reads one its owner can open, by id, `pt_` id or
+link (Raft's `GET /assistant/owner-artifact`, SDK 0.35.0 `routes.assistant.ownerArtifact`): its title,
+home, versions, files, one file (text inline, a binary file's size and type only) and the comments the owner
+can see, marking nothing read for them. It is an owner read (`isOwnerReadAddress`), so its result is never
+stored outside the conversation; a text file over 20,000 characters is cut, saying so. Older comments page
+with `commentsBefore` = the answer's `comments.olderCursor`; `artifact.position` is set only when one page
+holds every comment, else the first page's `comments.newestPosition` is the position to publish with, and
+the result says which as `seen` and `notes`. A Raft server before comment paging sends neither
+`olderCursor` nor `newestPosition`, which the SDK's contract requires: an answer missing only those is
+taken as sent (`withoutPaging`), and the result says there is no older page to ask for.
+`assistant_publish_artifact` publishes an Artifact into the assistant's own DM with its owner, as the
+assistant (`POST /assistant/owner-artifact`, `routes.assistant.publishArtifact`), or with `artifact` and
+`base` a new version of one it published there; files inline (`content`, or `content_base64` for bytes).
+No confirmation card: it acts as the assistant, as a message it sends there does. The result gives the
+Artifact's `url` and tells the model to send it to the owner. Code keeps: a call from a check, the brief,
+another session or a program is refused before anything is sent, as is one with no owner kept; the body is
+checked first (a new Artifact needs a title and a file; a version needs `base`; each file exactly one of
+`content` or `content_base64`); one request per call, never retried. A refusal is answered `not_published`
+with Raft's status, code and error and what to do next: `NOT_PUBLISHED_BY_ASSISTANT` (only its own
+Artifacts can take a version), `artifact_not_found` (no longer in the owner's DM: publish a new one, don't
+retry), `UNSEEN_CHANGES` (read it first, then resend with `seen`), `BASE_MOVED`, `RATE_LIMITED` (429: wait at
+least a minute and publish again once, then tell the owner) and `FILE_UPLOAD_QUOTA_EXCEEDED` (403, the
+server's monthly upload quota: tell the owner, don't retry). On a Raft server that cannot page comments yet
+(it sends `olderCursor` but no `newestPosition`; at most the newest 50 come back), `seen` is Raft's
+`artifact.position`, which Raft gives only when every comment is in the answer. When more comments exist, no
+`seen` is given and the model is not asked for an older page, so a new version is refused with
+`UNSEEN_CHANGES` until the server can page, rather than overwrite unread comments. A paging read the server
+did not page (no `newestPosition`, or the same `olderCursor` back) says so and never says to call again. A
+server that sends `newestPosition` and a fresh cursor but returns the same page passes both checks; the paging
+note asks the model to stop when a page repeats, which is an instruction, not something the tool enforces.
+No answer, or a 5xx, is
+`uncertain`: it may have been published, so never published again blindly. Each call writes a
+`raft.assistant_owner_artifact` or `raft.assistant_publish_artifact` log line and trace row (not
+forwarded) of ids, sizes, counts and Raft's status and code, never the Artifact as named, a title, a path,
+a file's content, a comment or the note.
+
 An assistant's one Raft app is the Reminder app (Raft offers an assistant no other, slock#10764), used
 through `assistant_reminder`, offered in the chat only (`src/plugins/raft-assistant-reminder.ts`) and
 built on the Raft SDK's `raft.integrations` (SDK 0.29). It takes an `action` and its `params`, nothing

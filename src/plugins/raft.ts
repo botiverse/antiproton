@@ -31,6 +31,7 @@ import {
   checkEnded, pushBriefImport, turnDelivered, type AssistantApi, type DeliveredReport, type RaftAnswer,
   NOTE_DECISION_TOOL, WakeReads, decisionEnded, noteDecision,
   FORWARD_AS_OWNER_TOOL, SEARCH_FORWARD_TARGETS_TOOL, forwardAsOwner, searchForwardTargets, noteReadInTurn, type ForwardAnswer, type ForwardBody, type TurnRead,
+  OWNER_ARTIFACT_TOOL, PUBLISH_ARTIFACT_TOOL, ownerArtifact, publishArtifact, type OwnerArtifactQuery, type PublishArtifactBody,
 } from "./raft-assistant.ts";
 import type { RaftCheck, RefusedCheck } from "./raft-assistant-check.ts";
 import { clearIntegrationSessions, INTEGRATION_SESSIONS_STORE, REMINDER_TOOL, reminderTool } from "./raft-assistant-reminder.ts";
@@ -2158,7 +2159,7 @@ type RouteAnswer =
   | { ok: false; status?: number; error:
       | { kind: "transport" }
       | { kind: "http"; status: number; errorCode?: string | null; response?: unknown }
-      | { kind: "validation"; reason: string; cause?: unknown } };
+      | { kind: "validation"; reason: string; cause?: unknown; response?: unknown } };
 
 /**
  * The most of the Server's `error` text an owner read's failure shows, in characters; past it the text is cut and ends
@@ -3640,6 +3641,10 @@ export function createRaftPlugin(deps: {
         if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
         return name === FORWARD_AS_OWNER_TOOL ? forwardAsOwner(args, ctx, { forward: forwardRaft }) : searchForwardTargets(args, ctx, { search: searchForwardRaft });
       }
+      if (name === OWNER_ARTIFACT_TOOL || name === PUBLISH_ARTIFACT_TOOL) {
+        if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
+        return name === OWNER_ARTIFACT_TOOL ? ownerArtifact(args, ctx, { read: ownerArtifactRaft }) : publishArtifact(args, ctx, { publish: publishArtifactRaft });
+      }
       if (name === "receive_events") {
         const limit = integer(a.limit, "limit", 1, EVENTS_LIMIT) ?? EVENTS_LIMIT;
         // The listing's snapshot is read off its response (`snapshotTap`); nothing else this client fetches matches.
@@ -4014,6 +4019,9 @@ function forwardAnswer(out: RouteAnswer, tool: string): ForwardAnswer {
   if (e.kind === "validation" && e.reason === "request_contract_mismatch") {
     throw ownerRefusal(`${tool}: the arguments were refused before anything was sent (${contractIssues(e.cause)})`);
   }
+  // Raft answered, in a shape the contract refused: said as such (status stays null, so a write still counts it as
+  // uncertain; only the read tells it apart).
+  if (e.kind === "validation" && e.reason === "response_contract_mismatch") return { ok: false, status: null, code: null, error: null, contract: true };
   return { ok: false, status: null, code: null, error: null };
 }
 
@@ -4035,6 +4043,56 @@ export async function searchForwardRaft(ctx: PluginContext, q: { q: string; limi
   try { out = await raftFor(ctx, { state: false }).routes.assistant.searchForwardTargets({ query }); }
   catch { return { ok: false, status: null, code: null, error: null }; }
   return forwardAnswer(out, SEARCH_FORWARD_TARGETS_TOOL);
+}
+
+/**
+ * The fields of the Artifact read's answer that a Raft server before comment paging does not send (SDK 0.35.0's
+ * contract requires them), each as `comments.<field>`.
+ */
+const PAGING_FIELDS = ["olderCursor", "newestPosition"];
+
+/**
+ * The Artifact read's answer with the comment paging a Raft server may not send yet let through: the SDK's contract
+ * refuses an answer without `comments.olderCursor` or `comments.newestPosition`, which every server before that release
+ * gives. When those absent fields are all the contract refused, the answer is taken as sent; `ownerArtifact` checks
+ * the rest of its shape itself and says that there is no older page to ask for. Anything else the contract refused
+ * stays refused. Today's production server sends olderCursor and lacks only newestPosition (Grace, b6ab423f).
+ * Any subset of the two may be missing (today only newestPosition is). It passes data, not abilities: the read
+ * must not then describe paging as available (ownerArtifact checks for newestPosition before offering older pages).
+ * It adds no value of its own: a present field (including a null `olderCursor`, "no older page") passes
+ * through untouched, so "this server cannot page" and "there is no older page" stay distinct for the caller.
+ * Remove once production runs Raft #14633 and the SDK no longer requires the two fields (Grace asked for 0.35.1).
+ */
+export function withoutPaging(out: RouteAnswer): RouteAnswer {
+  if (out.ok || out.error.kind !== "validation" || out.error.reason !== "response_contract_mismatch") return out;
+  const body = out.error.response, cause = out.error.cause;
+  const comments = body && typeof body === "object" && "comments" in body ? (body as { comments?: unknown }).comments : undefined;
+  const issues = cause && typeof cause === "object" && "issues" in cause && Array.isArray(cause.issues) ? cause.issues as unknown[] : [];
+  if (!comments || typeof comments !== "object" || Array.isArray(comments) || !issues.length) return out;
+  const absent = issues.every((i) => {
+    const path = i && typeof i === "object" && "path" in i && Array.isArray(i.path) ? i.path : [];
+    return path.length === 2 && path[0] === "comments" && PAGING_FIELDS.includes(String(path[1])) && !(String(path[1]) in comments);
+  });
+  return absent ? { ok: true, data: body } : out;
+}
+
+/**
+ * Raft's Artifact routes for a personal assistant (SDK 0.35.0 `routes.assistant.ownerArtifact` /
+ * `routes.assistant.publishArtifact`, `GET` / `POST /assistant/owner-artifact`), on the mount's own client with no
+ * saved state: the read marks nothing read for the owner. One request each, never retried here; a throw from the SDK
+ * is no answer, as the forward's is (`forwardAnswer`).
+ */
+export async function ownerArtifactRaft(ctx: PluginContext, query: OwnerArtifactQuery): Promise<ForwardAnswer> {
+  let out: RouteAnswer;
+  try { out = await raftFor(ctx, { state: false }).routes.assistant.ownerArtifact({ query }); }
+  catch { return { ok: false, status: null, code: null, error: null }; }
+  return forwardAnswer(withoutPaging(out), OWNER_ARTIFACT_TOOL);
+}
+export async function publishArtifactRaft(ctx: PluginContext, body: PublishArtifactBody): Promise<ForwardAnswer> {
+  let out: RouteAnswer;
+  try { out = await raftFor(ctx, { state: false }).routes.assistant.publishArtifact({ body }); }
+  catch { return { ok: false, status: null, code: null, error: null }; }
+  return forwardAnswer(out, PUBLISH_ARTIFACT_TOOL);
 }
 
 /**

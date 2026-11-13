@@ -111,7 +111,7 @@ export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "contain
   "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check", "raft.session_unsealable",
   "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner", "stamp.agent_login", "state.dropped",
   "raft.assistant_decision", "memory.shadow_due", "memory.shadow", "memory.observe", "memory.shadow_redact", "memory.shadow_clear",
-  "raft.assistant_owner_actions", "sandbox.box_owner", "raft.assistant_forward_as_owner"] as const;
+  "raft.assistant_owner_actions", "sandbox.box_owner", "raft.assistant_forward_as_owner", "raft.assistant_owner_artifact", "raft.assistant_publish_artifact"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
@@ -198,6 +198,16 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * and `sources`), the counts of messages, destinations, joins and each result, the sent forwards' `sent_message_ids`,
  * and each destination's status, code, channel and message ids (`destination_results`). Ids, codes and counts only:
  * never a message, the note, a destination as named, a link or Raft's text. Not forwarded.
+ * `raft.assistant_owner_artifact` is one call of a personal assistant's Artifact read (src/plugins/raft-assistant.ts
+ * `ownerArtifact`): status the `result` (`answered`, `refused`, `uncertain` or `malformed` for a read that reached Raft,
+ * `refused:<why>` for one refused before it), with whether a version, a path or a comments cursor was asked, Raft's
+ * `http_status` and `code`, and for an answer the Artifact's id, its version and latest version, the file's kind and
+ * size, whether it was cut, and counts of files, versions and comments. `raft.assistant_publish_artifact` is one call of
+ * its publish (`publishArtifact`): status the `result` (`published`, `unchanged`, `refused`, `uncertain`, `malformed`,
+ * `refused:<why>`), whether it was a new Artifact or a version, the counts of files, binary files and deletes, their
+ * bytes, the base, whether seen was given, Raft's status and code, and the id and version Raft answered. Ids, sizes,
+ * counts and codes only: never the Artifact as the model named it, a title, a path, a file's content, a comment or the
+ * note. Neither is forwarded.
  * `sandbox.box_owner` is a box a sandbox mount's record named, read for whose it is before anything was sent to it
  * (src/plugins/sandbox.ts `ownedProvider`): status `box_not_ours` (verdict `blocked`) when it was made for another
  * agent and the record let go of it, or `owner_unknown` (verdict `blocked`) when the provider lists it with no owner,
@@ -208,7 +218,8 @@ export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_
   "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check",
   "raft.session_unsealable", "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner",
   "stamp.agent_login", "state.dropped", "raft.assistant_decision", "memory.shadow_due", "memory.shadow_redact",
-  "raft.assistant_owner_actions", "sandbox.box_owner", "raft.assistant_forward_as_owner"] as const satisfies readonly TraceKind[];
+  "raft.assistant_owner_actions", "sandbox.box_owner", "raft.assistant_forward_as_owner", "raft.assistant_owner_artifact", "raft.assistant_publish_artifact",
+] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;
