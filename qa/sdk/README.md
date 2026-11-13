@@ -11,13 +11,18 @@ QA_ONLY=cancel qa/sdk/run.sh all   # only scenarios whose name contains "cancel"
 QA_REPEAT=5 QA_ONLY=cancel qa/sdk/run.sh model   # each 5 times: model behaviour is not the same every run
 ```
 
-- **Target:** the preview deployment (`https://preview.antiproton.ai/v1`), the only place `/v1` is deployed.
+- **Target:** the preview deployment (`https://preview.antiproton.ai/v1`) by default. `docs/agents-api.md`
+  says `/v1` is live on production too, so the same suite runs there with `QA_BASE`:
+  `QA_BASE=https://antiproton.ai qa/sdk/run.sh contract`. The operator token follows the target
+  (`PREVIEW_AUTOMATION_TOKEN`, `AUTOMATION_TOKEN`), and any other address is refused unless
+  `QA_BASE_ALLOW=1`. The model tier is not offered on production: it would put a model credential on
+  the deployment users reach, so a production Worker without one is a refusal, not a step.
 - **Client:** `new OpenAI()` with no arguments. The address and key come only from
   `OPENAI_BASE_URL` / `OPENAI_API_KEY`, which is itself the "change only the address" check.
 - **Key:** each run issues its own API key (owner `u-qa-sdk`) and deletes the agents and sessions it creates.
 - **Model tiers:** `run.sh` puts `DEEPSEEK_API_KEY` from `~/.secrets/antiproton.env` on the
-  `antiproton-preview` Worker for the run and deletes it on exit. The key is never printed or stored elsewhere.
-  Model scenarios spend real DeepSeek tokens.
+  `antiproton-preview` Worker for the run and deletes it on exit, and only when the Worker had none. The key
+  is never printed or stored elsewhere. Model scenarios spend real DeepSeek tokens.
 - **Record:** each run writes a JSON record and a self-contained HTML report to `qa/sdk/out/` (target, build,
   SDK version, each scenario's result, note or error, and time). It is not a published benchmark run, so it does
   not go in `report/runs/`. To combine several runs into one report:
