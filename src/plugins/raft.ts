@@ -4046,38 +4046,7 @@ export async function searchForwardRaft(ctx: PluginContext, q: { q: string; limi
 }
 
 /**
- * The fields of the Artifact read's answer that a Raft server before comment paging does not send (SDK 0.35.0's
- * contract requires them), each as `comments.<field>`.
- */
-const PAGING_FIELDS = ["olderCursor", "newestPosition"];
-
-/**
- * The Artifact read's answer with the comment paging a Raft server may not send yet let through: the SDK's contract
- * refuses an answer without `comments.olderCursor` or `comments.newestPosition`, which every server before that release
- * gives. When those absent fields are all the contract refused, the answer is taken as sent; `ownerArtifact` checks
- * the rest of its shape itself and says that there is no older page to ask for. Anything else the contract refused
- * stays refused. Today's production server sends olderCursor and lacks only newestPosition (Grace, b6ab423f).
- * Any subset of the two may be missing (today only newestPosition is). It passes data, not abilities: the read
- * must not then describe paging as available (ownerArtifact checks for newestPosition before offering older pages).
- * It adds no value of its own: a present field (including a null `olderCursor`, "no older page") passes
- * through untouched, so "this server cannot page" and "there is no older page" stay distinct for the caller.
- * Remove once production runs Raft #14633 and the SDK no longer requires the two fields (Grace asked for 0.35.1).
- */
-export function withoutPaging(out: RouteAnswer): RouteAnswer {
-  if (out.ok || out.error.kind !== "validation" || out.error.reason !== "response_contract_mismatch") return out;
-  const body = out.error.response, cause = out.error.cause;
-  const comments = body && typeof body === "object" && "comments" in body ? (body as { comments?: unknown }).comments : undefined;
-  const issues = cause && typeof cause === "object" && "issues" in cause && Array.isArray(cause.issues) ? cause.issues as unknown[] : [];
-  if (!comments || typeof comments !== "object" || Array.isArray(comments) || !issues.length) return out;
-  const absent = issues.every((i) => {
-    const path = i && typeof i === "object" && "path" in i && Array.isArray(i.path) ? i.path : [];
-    return path.length === 2 && path[0] === "comments" && PAGING_FIELDS.includes(String(path[1])) && !(String(path[1]) in comments);
-  });
-  return absent ? { ok: true, data: body } : out;
-}
-
-/**
- * Raft's Artifact routes for a personal assistant (SDK 0.35.0 `routes.assistant.ownerArtifact` /
+ * Raft's Artifact routes for a personal assistant (SDK 0.35.1 `routes.assistant.ownerArtifact` /
  * `routes.assistant.publishArtifact`, `GET` / `POST /assistant/owner-artifact`), on the mount's own client with no
  * saved state: the read marks nothing read for the owner. One request each, never retried here; a throw from the SDK
  * is no answer, as the forward's is (`forwardAnswer`).
@@ -4086,7 +4055,7 @@ export async function ownerArtifactRaft(ctx: PluginContext, query: OwnerArtifact
   let out: RouteAnswer;
   try { out = await raftFor(ctx, { state: false }).routes.assistant.ownerArtifact({ query }); }
   catch { return { ok: false, status: null, code: null, error: null }; }
-  return forwardAnswer(withoutPaging(out), OWNER_ARTIFACT_TOOL);
+  return forwardAnswer(out, OWNER_ARTIFACT_TOOL);
 }
 export async function publishArtifactRaft(ctx: PluginContext, body: PublishArtifactBody): Promise<ForwardAnswer> {
   let out: RouteAnswer;
