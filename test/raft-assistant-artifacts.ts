@@ -8,7 +8,7 @@
 // its contract, as test/raft-assistant-forward.ts does.
 //
 //   node test/raft-assistant-artifacts.ts
-import { raftPlugin, withoutPaging } from "../src/plugins/raft.ts";
+import { raftPlugin } from "../src/plugins/raft.ts";
 import {
   ARTIFACT_TEXT_MAX, CHAT_TOOLS, CHECK_TOOLS, OWNER_ARTIFACT_TOOL, PUBLISH_ARTIFACT_TOOL, PUBLISH_QUOTA_NOTE, PUBLISH_RATE_LIMITED_NOTE, PUBLISH_REFUSAL_NOTES, PUBLISH_UNCERTAIN_NOTE,
   PUBLISH_UNCERTAIN_VERSION_NOTE, assistantCheckPrompt, assistantPrompt, assistantTools, isOwnerReadAddress, ownerArtifactLabel,
@@ -246,18 +246,6 @@ await check("read: a Raft server without comment paging (no olderCursor, no newe
   a.r.readAnswer = { status: 200, body: bare };
   const out2 = await read(a, { artifact: ART_ID });
   must(out2.seen === null && out2.notes.some((n: string) => n.includes("no position")), show(out2));
-  // Control: the SDK's contract does refuse such an answer; only the two paging fields are let through, nothing else.
-  const refused = { ok: false as const, error: { kind: "validation" as const, reason: "response_contract_mismatch", response: { comments: { items: [] } },
-    cause: { issues: [{ path: ["comments", "newestPosition"] }, { path: ["comments", "olderCursor"] }] } } };
-  must(withoutPaging(refused).ok === true, "the paging fields alone are let through");
-  const other = { ...refused, error: { ...refused.error, cause: { issues: [{ path: ["comments", "newestPosition"] }, { path: ["artifact", "url"] }] } } };
-  must(withoutPaging(other).ok === false, "another field refused is let through");
-  const wrong = { ...refused, error: { ...refused.error, response: { comments: { items: [], newestPosition: "x" } }, cause: { issues: [{ path: ["comments", "newestPosition"] }] } } };
-  must(withoutPaging(wrong).ok === false, "a malformed (present) paging field is let through");
-  // An answer the contract accepted (the fields present, as after Raft #14633) passes through untouched: the adapter
-  // only acts on that one refusal, so once servers send the fields it is unreachable and can be deleted.
-  const accepted = { ok: true as const, data: { comments: { items: [], olderCursor: null, newestPosition: 5 } } };
-  must(withoutPaging(accepted as any) === accepted, "an accepted answer is changed");
 });
 
 await check("read: today's server (olderCursor sent, newestPosition not): seen is artifact.position, given only when every comment is in the answer", async () => {

@@ -1198,15 +1198,15 @@ row can under-count. Never a message, the note, a destination's name, a link or 
 
 An assistant works with Artifacts through two tools, offered in the chat only and listed exactly where
 `assistant_send_as_owner` is: `assistant_owner_artifact` reads one its owner can open, by id, `pt_` id or
-link (Raft's `GET /assistant/owner-artifact`, SDK 0.35.0 `routes.assistant.ownerArtifact`): its title,
+link (Raft's `GET /assistant/owner-artifact`, SDK 0.35.1 `routes.assistant.ownerArtifact`): its title,
 home, versions, files, one file (text inline, a binary file's size and type only) and the comments the owner
 can see, marking nothing read for them. It is an owner read (`isOwnerReadAddress`), so its result is never
 stored outside the conversation; a text file over 20,000 characters is cut, saying so. Older comments page
 with `commentsBefore` = the answer's `comments.olderCursor`; `artifact.position` is set only when one page
 holds every comment, else the first page's `comments.newestPosition` is the position to publish with, and
-the result says which as `seen` and `notes`. A Raft server before comment paging sends neither
-`olderCursor` nor `newestPosition`, which the SDK's contract requires: an answer missing only those is
-taken as sent (`withoutPaging`), and the result says there is no older page to ask for.
+the result says which as `seen` and `notes`. A Raft server before comment paging may send neither
+`olderCursor` nor `newestPosition` (both optional from SDK 0.35.1): the result then says there is no older
+page to ask for.
 `assistant_publish_artifact` publishes an Artifact into the assistant's own DM with its owner, as the
 assistant (`POST /assistant/owner-artifact`, `routes.assistant.publishArtifact`), or with `artifact` and
 `base` a new version of one it published there; files inline (`content`, or `content_base64` for bytes).
