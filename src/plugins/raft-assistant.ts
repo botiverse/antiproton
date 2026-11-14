@@ -2859,10 +2859,10 @@ function artifactReadFailure(out: { status: number | null; code: string | null; 
  * (`ownerArtifactLabel`), but for two things code adds: a text file over `ARTIFACT_TEXT_MAX` is cut, and `notes` says
  * how to page the comments and what to pass as `seen` when publishing a new version.
  *
- * Paging (SDK 0.35.0): `comments.olderCursor` given back as `commentsBefore` reads older comments; `artifact.position`
+ * Paging (SDK 0.35.1): `comments.olderCursor` given back as `commentsBefore` reads older comments; `artifact.position`
  * is set only when one page holds every comment, and every page carries `comments.newestPosition`, of which the first
  * page's is the one to publish with. A Raft server before that release sends neither `olderCursor` nor
- * `newestPosition` (`ownerArtifactRaft` lets such an answer through): then there is no older page to ask for, and the
+ * `newestPosition` (SDK 0.35.1 lets both be absent): then there is no older page to ask for, and the
  * read says so rather than inventing one.
  *
  * Its trace row (`raft.assistant_owner_artifact`) and log line carry ids, sizes, counts and Raft's status and code:
@@ -2957,7 +2957,7 @@ export async function ownerArtifact(args: unknown, ctx: PluginContext, deps: Pic
     // number only when every comment is in this answer. So position itself is the evidence; commentCount is the
     // card's count and need not match what the owner can see, so it is not compared. Premise gap, not covered by a
     // test (an honest fake server cannot produce it): if Raft ever sent a number with a capped answer, seen would
-    // over-claim. Revisit this with withoutPaging after Raft #14633.
+    // over-claim. Revisit this after Raft #14633.
     if (!paging) seen = position;
   }
   if (!paging && seen === null && position === null && !(typeof older === "string" && older))
