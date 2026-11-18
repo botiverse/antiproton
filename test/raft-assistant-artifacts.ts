@@ -10,7 +10,7 @@
 //   node test/raft-assistant-artifacts.ts
 import { raftPlugin } from "../src/plugins/raft.ts";
 import {
-  ARTIFACT_TEXT_MAX, CHAT_TOOLS, CHECK_TOOLS, OWNER_ARTIFACT_TOOL, PUBLISH_ARTIFACT_TOOL, PUBLISH_QUOTA_NOTE, PUBLISH_RATE_LIMITED_NOTE, PUBLISH_REFUSAL_NOTES, PUBLISH_UNCERTAIN_NOTE,
+  ARTIFACT_TEXT_MAX, CHAT_TOOLS, CHECK_TOOLS, OWNER_ARTIFACT_TOOL, PUBLISH_ARTIFACT_TOOL, PUBLISH_ARTIFACT_AS_OWNER_TOOL, PUBLISH_QUOTA_NOTE, PUBLISH_RATE_LIMITED_NOTE, PUBLISH_REFUSAL_NOTES, PUBLISH_UNCERTAIN_NOTE,
   PUBLISH_UNCERTAIN_VERSION_NOTE, assistantCheckPrompt, assistantPrompt, assistantTools, isOwnerReadAddress, ownerArtifactLabel,
 } from "../src/plugins/raft-assistant.ts";
 import { OWNER_ACTION_MARK } from "../src/plugins/raft-assistant-owner-actions.ts";
@@ -191,11 +191,12 @@ await check("the chat prompt names both tools only where offered; a check's prom
   const chat = assistantPrompt("raft");
   must(chat.includes("`raft__assistant_owner_artifact`") && chat.includes("`raft__assistant_publish_artifact`") && chat.includes("then send them its url"), chat);
   must(!/artifact/i.test(assistantCheckPrompt("raft")), "the check prompt mentions Artifacts");
-  const noPublish = assistantPrompt("raft", CHAT_TOOLS.filter((n) => n !== PUBLISH_ARTIFACT_TOOL));
+  // Without either publish (test/raft-assistant-artifact-as-owner.ts holds the one as the owner on its own).
+  const noPublish = assistantPrompt("raft", CHAT_TOOLS.filter((n) => n !== PUBLISH_ARTIFACT_TOOL && n !== PUBLISH_ARTIFACT_AS_OWNER_TOOL));
   must(noPublish.includes("`raft__assistant_owner_artifact`") && !noPublish.includes("publish"), noPublish);
   const noRead = assistantPrompt("raft", CHAT_TOOLS.filter((n) => n !== OWNER_ARTIFACT_TOOL));
   must(noRead.includes("`raft__assistant_publish_artifact`") && !noRead.includes("owner_artifact"), noRead);
-  must(!/Artifact/.test(assistantPrompt("raft", CHAT_TOOLS.filter((n) => n !== OWNER_ARTIFACT_TOOL && n !== PUBLISH_ARTIFACT_TOOL))), "neither offered");
+  must(!/Artifact/.test(assistantPrompt("raft", CHAT_TOOLS.filter((n) => n !== OWNER_ARTIFACT_TOOL && n !== PUBLISH_ARTIFACT_TOOL && n !== PUBLISH_ARTIFACT_AS_OWNER_TOOL))), "none offered");
 });
 
 // ---- the read ---------------------------------------------------------------------------------------------------------

@@ -32,6 +32,7 @@ import {
   NOTE_DECISION_TOOL, WakeReads, decisionEnded, noteDecision,
   FORWARD_AS_OWNER_TOOL, SEARCH_FORWARD_TARGETS_TOOL, forwardAsOwner, searchForwardTargets, noteReadInTurn, type ForwardAnswer, type ForwardBody, type TurnRead,
   OWNER_ARTIFACT_TOOL, PUBLISH_ARTIFACT_TOOL, ownerArtifact, publishArtifact, type OwnerArtifactQuery, type PublishArtifactBody,
+  PUBLISH_ARTIFACT_AS_OWNER_TOOL, publishArtifactAsOwner, type PublishArtifactAsOwnerBody,
 } from "./raft-assistant.ts";
 import type { RaftCheck, RefusedCheck } from "./raft-assistant-check.ts";
 import { clearIntegrationSessions, INTEGRATION_SESSIONS_STORE, REMINDER_TOOL, reminderTool } from "./raft-assistant-reminder.ts";
@@ -3645,6 +3646,10 @@ export function createRaftPlugin(deps: {
         if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
         return name === OWNER_ARTIFACT_TOOL ? ownerArtifact(args, ctx, { read: ownerArtifactRaft }) : publishArtifact(args, ctx, { publish: publishArtifactRaft });
       }
+      if (name === PUBLISH_ARTIFACT_AS_OWNER_TOOL) {
+        if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
+        return publishArtifactAsOwner(args, ctx, { publishAsOwner: publishArtifactAsOwnerRaft });
+      }
       if (name === "receive_events") {
         const limit = integer(a.limit, "limit", 1, EVENTS_LIMIT) ?? EVENTS_LIMIT;
         // The listing's snapshot is read off its response (`snapshotTap`); nothing else this client fetches matches.
@@ -4062,6 +4067,17 @@ export async function publishArtifactRaft(ctx: PluginContext, body: PublishArtif
   try { out = await raftFor(ctx, { state: false }).routes.assistant.publishArtifact({ body }); }
   catch { return { ok: false, status: null, code: null, error: null }; }
   return forwardAnswer(out, PUBLISH_ARTIFACT_TOOL);
+}
+/**
+ * Raft's publish as the owner (SDK 0.37.0 `routes.assistant.publishArtifactAsOwner`, `POST
+ * /assistant/owner-artifact/as-owner`), as the publish's: the mount's own client, no saved state, one request, a throw
+ * from the SDK no answer.
+ */
+export async function publishArtifactAsOwnerRaft(ctx: PluginContext, body: PublishArtifactAsOwnerBody): Promise<ForwardAnswer> {
+  let out: RouteAnswer;
+  try { out = await raftFor(ctx, { state: false }).routes.assistant.publishArtifactAsOwner({ body }); }
+  catch { return { ok: false, status: null, code: null, error: null }; }
+  return forwardAnswer(out, PUBLISH_ARTIFACT_AS_OWNER_TOOL);
 }
 
 /**

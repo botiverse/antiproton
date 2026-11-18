@@ -111,7 +111,8 @@ export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "contain
   "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check", "raft.session_unsealable",
   "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner", "stamp.agent_login", "state.dropped",
   "raft.assistant_decision", "memory.shadow_due", "memory.shadow", "memory.observe", "memory.shadow_redact", "memory.shadow_clear",
-  "raft.assistant_owner_actions", "sandbox.box_owner", "raft.assistant_forward_as_owner", "raft.assistant_owner_artifact", "raft.assistant_publish_artifact"] as const;
+  "raft.assistant_owner_actions", "sandbox.box_owner", "raft.assistant_forward_as_owner", "raft.assistant_owner_artifact", "raft.assistant_publish_artifact",
+  "raft.assistant_publish_artifact_as_owner"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
@@ -207,7 +208,10 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * `refused:<why>`), whether it was a new Artifact or a version, the counts of files, binary files and deletes, their
  * bytes, the base, whether seen was given, Raft's status and code, and the id and version Raft answered. Ids, sizes,
  * counts and codes only: never the Artifact as the model named it, a title, a path, a file's content, a comment or the
- * note. Neither is forwarded.
+ * note. Neither is forwarded. `raft.assistant_publish_artifact_as_owner` is one call of the publish as the owner
+ * (`publishArtifactAsOwner`): the publish's row, with the home's form (`home_kind`: `channel`, `dm`, `id`, `other`, or
+ * null for a version, never the home as named) and, when published, the id of the home Raft answered (`home_id`). Not
+ * forwarded.
  * `sandbox.box_owner` is a box a sandbox mount's record named, read for whose it is before anything was sent to it
  * (src/plugins/sandbox.ts `ownedProvider`): status `box_not_ours` (verdict `blocked`) when it was made for another
  * agent and the record let go of it, or `owner_unknown` (verdict `blocked`) when the provider lists it with no owner,
@@ -219,6 +223,7 @@ export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_
   "raft.session_unsealable", "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner",
   "stamp.agent_login", "state.dropped", "raft.assistant_decision", "memory.shadow_due", "memory.shadow_redact",
   "raft.assistant_owner_actions", "sandbox.box_owner", "raft.assistant_forward_as_owner", "raft.assistant_owner_artifact", "raft.assistant_publish_artifact",
+  "raft.assistant_publish_artifact_as_owner",
 ] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
