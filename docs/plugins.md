@@ -1254,7 +1254,10 @@ No answer, a 5xx or an unreadable answer is `uncertain`, never "publish again". 
 the same publish (same home, or artifact and base, and the same files' paths and content) after one in the same turn
 that went through or may have is answered `not_published` / `duplicate_in_turn` without a request
 (`published_as_owner_in_turn`); a refused one is not kept, so the `UNSEEN_CHANGES` resend goes, and outside a turn
-nothing is kept. Each call writes a
+nothing is kept. A publish that went through with a new version, or may have (uncertain, or an answer it can't
+read), marks the turn answered as the owner (`noteSentAsOwner`), as a send as the owner does: Raft's receipt is the
+turn's answer, so `replyFallback` does not also post the closing text. An `unchanged` answer (no new version, no
+receipt) and a refusal do not. Each call writes a
 `raft.assistant_publish_artifact_as_owner` log line and trace row (not forwarded): the publish's, plus the home's form
 (`home_kind`) and the home id Raft answered, never the home as named.
 

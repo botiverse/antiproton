@@ -11,9 +11,9 @@
 //   node test/raft-assistant-artifact-as-owner.ts
 import { raftPlugin } from "../src/plugins/raft.ts";
 import {
-  AS_OWNER_DUPLICATE_NOTE, AS_OWNER_REFUSAL_NOTES, AS_OWNER_UNAVAILABLE_NOTE, AS_OWNER_UNCERTAIN_NOTE, AS_OWNER_UNCERTAIN_VERSION_NOTE, AS_OWNER_VERSION_NOT_FOUND_NOTE,
+  AS_OWNER_DUPLICATE_NOTE, AS_OWNER_DUPLICATE_UNCHANGED_NOTE, AS_OWNER_REFUSAL_NOTES, AS_OWNER_UNAVAILABLE_NOTE, AS_OWNER_UNCERTAIN_NOTE, AS_OWNER_UNCERTAIN_VERSION_NOTE, AS_OWNER_VERSION_NOT_FOUND_NOTE,
   CHAT_TOOLS, CHECK_TOOLS, OWNER_ARTIFACT_TOOL, PUBLISH_ARTIFACT_AS_OWNER_TOOL, PUBLISH_ARTIFACT_TOOL, PUBLISH_QUOTA_NOTE, PUBLISH_RATE_LIMITED_NOTE,
-  PUBLISH_REFUSAL_NOTES, PUBLISH_REFUSED_NOTE, assistantCheckPrompt, assistantPrecedence, assistantPrompt, assistantTools, isOwnerReadAddress,
+  PUBLISH_REFUSAL_NOTES, PUBLISH_REFUSED_NOTE, assistantCheckPrompt, assistantPrecedence, assistantPrompt, assistantTools, isOwnerReadAddress, replyFallback,
 } from "../src/plugins/raft-assistant.ts";
 import { OWNER_ACTION_MARK } from "../src/plugins/raft-assistant-owner-actions.ts";
 import { PLUGIN_TRACE_KINDS } from "../src/trace/outbox.ts";
@@ -309,6 +309,56 @@ await check("not a duplicate: other files, another home, a refused first try, th
   await asOwner(c, NEW);
   await asOwner(c, NEW);
   must(c.r.publishes.length === 2, `no turn: ${c.r.publishes.length}`);
+});
+
+await check("a duplicate of an unchanged publish says no receipt was posted, not that one was", async () => {
+  const a = await assistant();
+  a.r.answers.push(published({ version: 3, unchanged: true }));
+  must((await asOwner(a, VERSION)).state === "unchanged", "control: unchanged");
+  const out = await asOwner(a, VERSION);
+  must(out.code === "duplicate_in_turn" && out.note === AS_OWNER_DUPLICATE_UNCHANGED_NOTE && a.r.publishes.length === 1, show(out));
+  must(/posted no receipt/.test(AS_OWNER_DUPLICATE_UNCHANGED_NOTE) && !/Raft posts your owner a receipt/.test(AS_OWNER_DUPLICATE_UNCHANGED_NOTE), AS_OWNER_DUPLICATE_UNCHANGED_NOTE);
+});
+
+// ---- the turn's answer: Raft's receipt answers it, so the closing text is not sent too (`replyFallback`) ---------------
+
+/** The turn's end after one publish answered `answer`: what `replyFallback` did, and whether it sent the closing text. */
+async function fallbackAfter(answer: Answer, args: unknown = NEW) {
+  const a = await assistant();
+  a.r.answers.push(answer);
+  const out = await asOwner(a, args);
+  const sends: Array<{ target: string; content: string }> = [];
+  const result = await replyFallback(a.ctx, { turnId: "turn-1", turnKey: null, finalText: "Done: I published it in #design for you.", outcome: "completed", rebuilding: false, isolated: false } as never,
+    async (_c, target, content) => { sends.push({ target, content }); return { sent: true } as never; });
+  return { out, result, sends, row: a.traced.find((t) => t.kind === "raft.assistant_publish_artifact_as_owner") };
+}
+
+await check("reply fallback: a publish as the owner that went through or may have answers the turn; unchanged or refused does not", async () => {
+  const cases: Array<[string, Answer, unknown, string, "skipped" | "sent"]> = [
+    ["published", published(), NEW, "published", "skipped"],
+    ["published version", published({ version: 4 }), VERSION, "published", "skipped"],
+    ["uncertain 503", { status: 503, error: "unavailable" }, NEW, "uncertain", "skipped"],
+    ["uncertain no answer", "drop", NEW, "uncertain", "skipped"],
+    // 201 with an empty url: the SDK's contract takes it, the tool's own check does not.
+    ["malformed", { status: 201, body: { artifact: { id: ART_ID, url: "", version: 1, unchanged: false }, home: { id: HOME_ID, ref: SECRET_HOME } } }, NEW, "uncertain", "skipped"],
+    ["unchanged", published({ version: 3, unchanged: true }), VERSION, "unchanged", "sent"],
+    ["refused", { status: 403, code: "assistant_send_as_owner_off", error: "off" }, NEW, "not_published", "sent"],
+  ];
+  // Every case is run and every wrong one named, so a reverse change shows exactly which cases it turns red.
+  const wrong: string[] = [];
+  for (const [tag, answer, args, state, want] of cases) {
+    const f = await fallbackAfter(answer, args);
+    must(f.out.state === state, `${tag}: control: ${show(f.out)}`);
+    if (tag === "malformed") must(f.row?.status === "malformed", `malformed: the tool's own check was not reached: ${show(f.row)}`);
+    if (f.result !== want || f.sends.length !== (want === "sent" ? 1 : 0)) wrong.push(`${tag}: fallback ${f.result}, sends ${f.sends.length}`);
+  }
+  must(wrong.length === 0, wrong.join("; "));
+  // The control: a turn with no publish at all is sent its closing text, so "skipped" above is the publish's doing.
+  const a = await assistant();
+  const sends: unknown[] = [];
+  const none = await replyFallback(a.ctx, { turnId: "turn-1", turnKey: null, finalText: "hi", outcome: "completed", rebuilding: false, isolated: false } as never,
+    async (_c, target, content) => { sends.push({ target, content }); return { sent: true } as never; });
+  must(none === "sent" && sends.length === 1, `control: ${none} ${show(sends)}`);
 });
 
 await check("no answer, a 5xx or an unreadable answer is uncertain and never says to publish a new Artifact again", async () => {

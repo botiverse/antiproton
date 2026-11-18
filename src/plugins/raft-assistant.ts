@@ -3193,6 +3193,10 @@ export const AS_OWNER_UNCERTAIN_VERSION_NOTE = `Raft's answer could not be read,
 export const PUBLISHED_AS_OWNER_IN_TURN_KEY = "published_as_owner_in_turn";
 export const AS_OWNER_DUPLICATE_NOTE = "Nothing was published: you already published this as your owner in this reply, and it went through or may have. " +
   `Do not call ${PUBLISH_ARTIFACT_AS_OWNER_TOOL} again for it, and do not confirm it: Raft posts your owner a receipt.`;
+/** The same, when the first answer was `unchanged`: no new version was made, so Raft posted no receipt. */
+export const AS_OWNER_DUPLICATE_UNCHANGED_NOTE = "Nothing was published: you already sent this publish as your owner in this reply, and Raft answered " +
+  `that nothing had changed, so no new version was made and Raft posted no receipt. Do not call ${PUBLISH_ARTIFACT_AS_OWNER_TOOL} again for it: ` +
+  "tell your owner it was already up to date.";
 
 /**
  * What one publish as the owner publishes, for `PUBLISHED_AS_OWNER_IN_TURN_KEY`: where (the home, or the Artifact and
@@ -3272,15 +3276,24 @@ export async function publishArtifactAsOwner(args: unknown, ctx: PluginContext, 
   const turn = ctx.caller.turnId ?? null;
   const publishKey = asOwnerPublishKey(body);
   const kept = turn !== null ? await ctx.db.get(ASSISTANT_STORE, PUBLISHED_AS_OWNER_IN_TURN_KEY) as { turn?: unknown; keys?: unknown } | undefined : undefined;
+  // Each kept as its key, with `:unchanged` after it when Raft answered that nothing changed (no receipt was posted).
   const thisTurn = turn !== null && kept?.turn === turn && Array.isArray(kept.keys) ? kept.keys.filter((k): k is string => typeof k === "string") : [];
-  if (thisTurn.includes(publishKey)) {
+  const before = thisTurn.find((k) => k === publishKey || k === `${publishKey}:unchanged`);
+  if (before !== undefined) {
     log("refused:duplicate_in_turn", "blocked", head);
-    return { state: "not_published", code: "duplicate_in_turn", note: AS_OWNER_DUPLICATE_NOTE };
+    return { state: "not_published", code: "duplicate_in_turn", note: before === publishKey ? AS_OWNER_DUPLICATE_NOTE : AS_OWNER_DUPLICATE_UNCHANGED_NOTE };
   }
-  // Published, or maybe published: kept before the result is read, so a second identical call in this turn is refused.
-  const notePublished = () => turn !== null
-    ? ctx.db.put(ASSISTANT_STORE, { turn, keys: [...thisTurn, publishKey].slice(-SENT_IN_TURN_MAX) } as unknown as Json, PUBLISHED_AS_OWNER_IN_TURN_KEY)
-    : Promise.resolve();
+  // Written once Raft's answer is back, for an answer that published or may have (never for a refusal), so a second
+  // identical call in this turn is refused. One that may have published, or did with a new version, also marks the
+  // turn answered as the owner (`noteSentAsOwner`): Raft's receipt is that turn's answer, so `replyFallback` sends no
+  // closing text after it. An `unchanged` answer posted no receipt, so it does not.
+  const notePublished = async (o: { unchanged?: boolean } = {}) => {
+    if (turn !== null) {
+      await ctx.db.put(ASSISTANT_STORE, { turn, keys: [...thisTurn, o.unchanged ? `${publishKey}:unchanged` : publishKey].slice(-SENT_IN_TURN_MAX) } as unknown as Json,
+        PUBLISHED_AS_OWNER_IN_TURN_KEY);
+    }
+    if (!o.unchanged) await noteSentAsOwner(ctx).catch(() => {});
+  };
   const out = await deps.publishAsOwner(ctx, body);
   if (!out.ok && (out.status === null || out.status >= 500)) await notePublished();
   if (!out.ok) {
@@ -3295,13 +3308,14 @@ export async function publishArtifactAsOwner(args: unknown, ctx: PluginContext, 
     };
   }
   const art = out.data.artifact, home = out.data.home;
-  await notePublished();
   if (!isObject(art) || typeof art.id !== "string" || typeof art.url !== "string" || !art.url) {
+    await notePublished();
     log("malformed", "failed", head);
     return { state: "uncertain", note: isVersion ? AS_OWNER_UNCERTAIN_VERSION_NOTE : AS_OWNER_UNCERTAIN_NOTE };
   }
   const version = whole(art.version, 1);
   const unchanged = art.unchanged === true;
+  await notePublished({ unchanged });
   const where = isObject(home) && typeof home.ref === "string" && home.ref.trim() ? home.ref.trim() : null;
   log(unchanged ? "unchanged" : "published", "ok", { ...head, artifact_id: traceId(art.id), home_id: isObject(home) ? traceId(home.id) : null, version, unchanged });
   const note = unchanged
