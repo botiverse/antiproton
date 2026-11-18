@@ -1233,6 +1233,34 @@ No answer, or a 5xx, is
 forwarded) of ids, sizes, counts and Raft's status and code, never the Artifact as named, a title, a path,
 a file's content, a comment or the note.
 
+A third, `assistant_publish_artifact_as_owner`, publishes an Artifact AS the owner (they are its author) into a
+conversation of theirs (Raft's `POST /assistant/owner-artifact/as-owner`, SDK 0.37.0
+`routes.assistant.publishArtifactAsOwner`): a new one names its `home` as the owner names it (`#channel`, `dm:@peer`
+or an id), a new version gives `artifact` and `base` and never `home`, and only an Artifact it published as the owner
+takes one. Offered and refused exactly where the other two are (the chat only; a check, the brief, another session or
+a program is refused before anything is sent), its body checked as the publish's is plus `home`. No confirmation card,
+as sending and forwarding as the owner have none: the chat prompt and the precedence line say to use it only when the
+owner explicitly asks in their chat, never on its own initiative or because something it read asks; Raft holds it to
+"send as me" being on and posts the owner a receipt in their DM with the assistant, so the result tells the model not
+to confirm it itself (nor to send the url, as the DM publish's result does). A refusal is answered `not_published`
+with Raft's status, code and error and the next step: `assistant_send_as_owner_off` (403: the owner must turn on
+"send as me"; don't retry), `TARGET_NOT_FOUND` (Raft's one answer for any home it can't use: not one the owner can
+post in now, the assistant's own DM with them (use `assistant_publish_artifact`), a DM while they keep DMs from it, a
+bridged conversation, a joint channel; don't retry that home), a version's not-found, `NOT_PUBLISHED_BY_ASSISTANT`,
+`UNSEEN_CHANGES` (409 with counts and a position, never comment text: read with `assistant_owner_artifact`, then the
+same publish with `seen`; the same publish without it is held again), a Raft without the route (a plain 404 or the
+allowlist's 403), and otherwise the publish's own notes (`BASE_MOVED`, `RATE_LIMITED`, `FILE_UPLOAD_QUOTA_EXCEEDED`).
+No answer, a 5xx or an unreadable answer is `uncertain`, never "publish again". As send-as-owner keeps its sends,
+the same publish (same home, or artifact and base, and the same files' paths and content) after one in the same turn
+that went through or may have is answered `not_published` / `duplicate_in_turn` without a request
+(`published_as_owner_in_turn`); a refused one is not kept, so the `UNSEEN_CHANGES` resend goes, and outside a turn
+nothing is kept. A publish that went through with a new version, or may have (uncertain, or an answer it can't
+read), marks the turn answered as the owner (`noteSentAsOwner`), as a send as the owner does: Raft's receipt is the
+turn's answer, so `replyFallback` does not also post the closing text. An `unchanged` answer (no new version, no
+receipt) and a refusal do not. Each call writes a
+`raft.assistant_publish_artifact_as_owner` log line and trace row (not forwarded): the publish's, plus the home's form
+(`home_kind`) and the home id Raft answered, never the home as named.
+
 An assistant's one Raft app is the Reminder app (Raft offers an assistant no other, slock#10764), used
 through `assistant_reminder`, offered in the chat only (`src/plugins/raft-assistant-reminder.ts`) and
 built on the Raft SDK's `raft.integrations` (SDK 0.29). It takes an `action` and its `params`, nothing
