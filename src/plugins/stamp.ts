@@ -1471,7 +1471,7 @@ export const stampPlugin: Plugin = {
     return route.kind === "refused" ? route.message : undefined;
   },
   // The one service this plugin may log in to through the agent's raft mount (`ctx.agentLogin`).
-  agentLogin: { services: [STAMP_SERVICE] },
+  agentLogin: { services: [STAMP_SERVICE], tool: LOGIN_TOOL },
   tools: [
     t(LOGIN_TOOL, "Log this mount in to Stamp with this agent's own Raft identity, so no person has to paste a session: Raft " +
       "signs the agent in to Stamp, Stamp issues a one-time grant, and the session it is exchanged for is kept by this " +

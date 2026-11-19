@@ -9,6 +9,7 @@
  * Each case names the acceptance item it is for: the ten recorded on #1092 for step 3 (`item N`), and the plan's
  * extras.
  */
+import { raftPlugin } from "../src/plugins/raft.ts";
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
@@ -80,7 +81,8 @@ const reset = () => { seen = []; refreshes = 0; refreshAccess = ACCESS_2; upstre
 
 // ---- a stamp mount behind a real gateway --------------------------------------------------------------------------
 
-const RAFT_STUB = { id: "raft", version: "1.0.0", tools: [], async invoke() { return {}; },
+// Who may read its credential is the real raft plugin's list (`Plugin.siblingReaders`), stamp among them.
+const RAFT_STUB = { id: "raft", version: "1.0.0", tools: [], async invoke() { return {}; }, siblingReaders: raftPlugin.siblingReaders,
   database: { version: 8, stores: { context: {} } } } as any;
 const caller = { tenantId: "t", agentId: "a", taskId: "k" };
 

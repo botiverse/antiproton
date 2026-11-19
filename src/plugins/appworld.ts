@@ -154,12 +154,16 @@ export function appworldPlugins(catalogue: Catalogue, cfg: AppWorldConfig): Plug
     }
 
     const needsAuth = (d: ApiDoc) => d.parameters.some((p) => p.name === "access_token");
-    /** Sibling-account tokens this call needs: param name -> app alias. */
-    const siblingTokens = (d: ApiDoc): Array<[string, string]> =>
-      d.parameters
-        .map((p) => [p.name, tokenParam(p.name)] as const)
-        .filter((x): x is readonly [string, string] => !!x[1])
-        .map(([n, a]) => [n, a] as [string, string]);
+    /**
+     * Sibling-account tokens this call takes: the parameter, the app whose mount holds the account, and whether the
+     * API's own spec marks the parameter optional (`required: false` in AppWorld's API docs). Whether a call may go
+     * ahead without the token is a property of that contract, never a choice the caller makes per call.
+     */
+    const siblingTokens = (d: ApiDoc): Array<{ param: string; otherApp: string; optional: boolean }> =>
+      d.parameters.flatMap((p) => {
+        const otherApp = tokenParam(p.name);
+        return otherApp ? [{ param: p.name, otherApp, optional: p.required !== true }] : [];
+      });
 
     async function session(ctx: PluginContext, force = false): Promise<string> {
       if (!force) {
@@ -178,6 +182,12 @@ export function appworldPlugins(catalogue: Catalogue, cfg: AppWorldConfig): Plug
     return {
       id: app,
       version: "1.0.0",
+      /**
+       * The family's other apps may read this mount's account (`Plugin.siblingReaders`): an action spanning two
+       * accounts takes the second app's token from that app's mount (`siblingTokens` below). Derived from the list
+       * this family is built from, so it is exactly the apps built beside this one. A security change to widen.
+       */
+      siblingReaders: apps.filter((other) => other !== app),
       /** The session token this mount logged in with. Nothing listed: the one key is a credential's shadow. */
       database: { version: 1, stores: { [SESSION_STORE]: {} } },
       /**
@@ -244,14 +254,22 @@ export function appworldPlugins(catalogue: Catalogue, cfg: AppWorldConfig): Plug
 
         // An action spanning two accounts gets the second token from the other
         // mount, not from the model.
-        for (const [param, otherApp] of siblingTokens(doc)) {
+        for (const { param, otherApp, optional } of siblingTokens(doc)) {
           const other = await ctx.sibling(otherApp);
           if (!other?.credential) {
-            // Optional, so it is left unset and the call goes ahead. Why is said in the trace, never in the result:
-            // the result is the API's own answer, which the evaluation reads.
-            ctx.trace?.({ kind: "appworld.sibling_unset", status: other ? "no_credential" : "not_callable", verdict: "failed",
-              attrs: { param, sibling: otherApp } });
-            continue;
+            const status = !other ? "not_callable" : other.withheld ? "withheld" : "no_credential";
+            ctx.trace?.({ kind: "appworld.sibling_unset", status, verdict: "failed", attrs: { param, sibling: otherApp } });
+            // A token the API's spec marks optional, whose mount is missing or has no account, is left unset and the
+            // call goes ahead, as the contract allows; the row says why, never the result, which is the API's own
+            // answer. One the gate withheld (the account is there, this app may not read it) is refused whatever the
+            // spec says, as is a required one: sent without it, the call would come back as the API's own answer.
+            if (status !== "withheld" && optional) continue;
+            const why = status === "withheld"
+              ? `it was refused by siblingReaders: ${otherApp} does not list ${app}, so the gateway did not hand it over`
+              : status === "not_callable"
+                ? `this agent has no callable mount named ${otherApp}`
+                : `the ${otherApp} mount has no account attached`;
+            throw new Error(`${app}.${tool} needs the ${otherApp} mount's account for ${param}, and ${why}. Nothing was sent.`);
           }
           const cached = (await other.db.get(SESSION_STORE, SESSION_KEY)) as Session | undefined;
           let t = cached?.token;
