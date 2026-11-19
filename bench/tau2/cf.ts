@@ -24,7 +24,7 @@ import { homedir } from "node:os";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { argDiff, actionMatch as grade, rewardOf, REWARD_RULE } from "./grade.ts";
-import { gold as goldOf, MAX_TURNS, OPENING, rowTaskId, SIM, SIM_LAST_MAX, simEnding, simRecord, simSystem } from "./episode.ts";
+import { gold as goldOf, MAX_TURNS, OPENING, rowTaskId, SIM, SIM_LAST_MAX, simEnding, simRecord, simSystem, dialogueOf } from "./episode.ts";
 import { beginRun, driverCommit, recordRun, teeRun, workerBuild, workerModel } from "../record.ts";
 import { stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
@@ -216,10 +216,16 @@ async function runTask(task: any) {
   const dbMatch = res.dbHash === hash;
   const actionMatch = grade(expected, writes);
 
+  const graded = rewardOf(task, { dbMatch, actionMatch });
+  // A failing row carries its conversation, since the object's transcript is gone once the run ends.
+  // At the turn limit the agent's last answer never reached the simulator, so it is added here.
+  const dialogue = graded.reward === 1 ? undefined
+    : dialogueOf(sim, ended === "max_turns" && turns > MAX_TURNS ? agentSaid : undefined);
+
   return {
     id: task.id, taskId, engine, object: `bench-${obj}`, ...(activity === undefined ? {} : { activity }),
-    ...rewardOf(task, { dbMatch, actionMatch }), dbMatch, actionMatch, ended, stall, stallWhy,
-    simLast: simLast.slice(0, SIM_LAST_MAX),
+    ...graded, dbMatch, actionMatch, ended, stall, stallWhy,
+    simLast: simLast.slice(0, SIM_LAST_MAX), ...(dialogue === undefined ? {} : { dialogue }),
     delivered: delivered.get(taskId) ?? { push: 0, poll: 0, pollAnswered: 0, pollFailed: 0, dropped: 0 },
     turns: turns - 1, simCalls, simMs, replyAts, toolExecMs: 0, // this runner's tools run in the object, not here
     usage: res.usage ?? {}, kinds: res.kinds ?? {}, byTool: res.byTool ?? {}, toolErrors: res.toolErrors ?? null,
