@@ -36,6 +36,31 @@ export const OPENING = "Hi! How can I help you today?";
  */
 export const SIM_LAST_MAX = 1000;
 
+/** How much of one dialogue line a failing row keeps (`dialogue`), for the same reason as SIM_LAST_MAX. */
+export const DIALOGUE_LINE_MAX = 4000;
+
+/**
+ * The conversation as the customer saw it, for a failing row: the agent's lines and the customer's, in order.
+ *
+ * The object's transcript is not readable once a run has ended (the bench object no longer has the task's
+ * agent bound), so a failure that `simLast` and the writes do not explain could otherwise only be argued
+ * about. The runner already holds every line in the simulator's message list, where the agent speaks as
+ * `user` and the customer as `assistant`; this turns it back round. `pending` is an agent line the
+ * simulator never received (the turn limit was reached after it). Tool calls are not here: the object
+ * makes them, and the row keeps the writes beside this.
+ */
+export function dialogueOf(
+  sim: ReadonlyArray<{ role: "system" | "user" | "assistant"; content: string }>, pending?: string,
+): Array<{ who: "agent" | "customer"; text: string }> {
+  const lines: Array<{ who: "agent" | "customer"; text: string }> = [];
+  for (const m of sim) {
+    if (m.role === "system") continue;
+    lines.push({ who: m.role === "user" ? "agent" : "customer", text: m.content.slice(0, DIALOGUE_LINE_MAX) });
+  }
+  if (pending !== undefined) lines.push({ who: "agent", text: pending.slice(0, DIALOGUE_LINE_MAX) });
+  return lines;
+}
+
 /**
  * A row's `taskId`: the τ² task's id and the time the row began, so it is unique per row (`id` is the task,
  * shared by its trials; bench/tau2/plan.ts). Both runners write it, so a consumer joins their rows on it; the
