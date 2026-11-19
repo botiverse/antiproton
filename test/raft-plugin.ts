@@ -222,6 +222,9 @@ const EXPECTED_GENERATED = [
   "messages.updateCard", "actions.withdraw", "artifacts.review", "artifacts.check",
   // SDK 0.34.0: resolve and reopen an artifact comment thread (the Server checks who may).
   "artifacts.resolve", "artifacts.reopen",
+  // SDK 0.38.0: set a channel member's role (owner/admin/member), beside addMember and removeMember; the Server
+  // checks whether the caller may.
+  "channels.setRole",
 ];
 
 await check("every manifest operation is a generated tool or in the exclusion table, never both, and every exclusion names a real operation", async () => {
