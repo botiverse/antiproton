@@ -350,7 +350,8 @@ await check("owner messages through the SDK: GET assistant/owner-messages with c
     must(/^\[messages from your owner's Raft account, read through the `raft` mount\./.test(lines[0]!), `label: ${lines[0]}`);
     must(lines[1] === "[target=#general msg=07abcdef time=2026-10-01 09:00:00Z type=human] @bob: first", `line 1: ${lines[1]}`);
     must(lines[2] === "[target=#general msg=08abcdef time=2026-10-01 09:00:00Z type=human] @bob: second", `line 2: ${lines[2]}`);
-    must(lines[3] === "hasMore=false hasOlder=true hasNewer=false" && lines.length === 4, `flags: ${JSON.stringify(lines)}`);
+    // No sourceTasks in this answer: the page says the task lookup is not stated (TASK_LOOKUP_UNSTATED).
+    must(/^\[Task lookup not stated: /.test(lines[3]!) && lines[4] === "hasMore=false hasOlder=true hasNewer=false" && lines.length === 5, `flags: ${JSON.stringify(lines)}`);
   }
 });
 
@@ -453,7 +454,8 @@ await check("messages render as messages_read's lines, in seq order, with the pa
   // A message's own line break is indented by the SDK, so it cannot start a line of its own.
   must(lines[3] === "  │ line two", `continuation: ${JSON.stringify(lines[3])}`);
   must(lines.at(-1) === "hasMore=true hasOlder=true hasNewer=false", `flags: ${lines.at(-1)}`);
-  must(lines.length === 5 && !lines.some((l) => l.includes(OWNER.userId)), `extra lines: ${JSON.stringify(lines)}`);
+  // The one more line: no sourceTasks on this page, so the task lookup is not stated.
+  must(lines.length === 6 && /^\[Task lookup not stated: /.test(lines[4]!) && !lines.some((l) => l.includes(OWNER.userId)), `extra lines: ${JSON.stringify(lines)}`);
 });
 
 await check("a name with a line break or another control character cannot forge a line; content's own line breaks are indented", async () => {
@@ -474,8 +476,8 @@ await check("a name with a line break or another control character cannot forge 
   const out = String(await plugin.invoke(MESSAGES, { channelId: "ch-1" }, ctx(ASSISTANT).ctx));
   // Split as a model would read lines: on \n, \r and the Unicode separators.
   const lines = out.split(/\r\n|[\n\r\u2028\u2029]/);
-  // The label, five header lines, one indented continuation of message 4's content, the paging line.
-  must(lines.length === 8, `lines: ${JSON.stringify(lines)}`);
+  // The label, five header lines, one indented continuation of message 4's content, the task-lookup line, the paging line.
+  must(lines.length === 9, `lines: ${JSON.stringify(lines)}`);
   const headers = lines.filter((l) => l.startsWith("[target="));
   must(headers.length === 5, `header lines: ${JSON.stringify(headers)}`);
   must(lines[6] === `[target=#general msg=06abcdef time=2026-10-01 09:00:00Z type=human] @bob (UTC ${forgedHeader}): zoned`, `time zone: ${lines[6]}`);
@@ -796,7 +798,7 @@ await check("owner messages pass through what the SDK's line does not know: a me
   must(sdk[1]!.endsWith(`[source_tasks: ${JSON.stringify(tasks)}]`) && sdk.at(-1)!.endsWith(" sourceTasksLookup=ok"), `through the SDK: ${sdk.join(" | ")}`);
 });
 
-await check("owner messages: sourceTasks loaded with a task, loaded with none, and unavailable are three different texts", async () => {
+await check("owner messages: sourceTasks loaded with a task, loaded with none, unavailable and unstated are different texts", async () => {
   // The server's shape (slock #17035): each top-level message's source_tasks, and the page's sourceTasks.
   const task = { number: 7, status: "in_review", assignee: { type: "user", name: "bob" }, status_changed_at: "2026-11-26T09:20:00.000Z" };
   const page = (sourceTasks: string, tasks: unknown[]) => ({ ok: true as const, data: {
@@ -812,6 +814,11 @@ await check("owner messages: sourceTasks loaded with a task, loaded with none, a
   const unavailable = await read(page("unavailable", []));
   must(unavailable.at(-2) === "[Task lookup unavailable: Raft could not look up the tasks on these messages, so a message with no source_tasks shown may still have tasks. This is not \"no tasks\".]" &&
     unavailable.at(-1)!.endsWith(" sourceTasks=unavailable"), `unavailable: ${unavailable.join(" | ")}`);
+  // A page that does not say (Raft before slock #17035): unknown too, never read as none.
+  const unstated = await read({ ok: true as const, data: {
+    owner: { userId: OWNER.userId }, channelId: CH, messages: [envelope(7, "first")], hasMore: false, hasOlder: false, hasNewer: false,
+  } });
+  must(/^\[Task lookup not stated: .*This is not "no tasks"\.\]$/.test(unstated.at(-2)!) && !/sourceTasks=/.test(unstated.at(-1)!), `unstated: ${unstated.join(" | ")}`);
   // Through the SDK the same: its contract keeps both fields.
   const { plugin } = realWire(() => json(200, messagesAnswer({ messages: [envelope(7, "first", { source_tasks: [task] })], sourceTasks: "unavailable" })));
   const sdk = String(await plugin.invoke(MESSAGES, { channelId: CH }, ctx(ASSISTANT).ctx)).split("\n");
