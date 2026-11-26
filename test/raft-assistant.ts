@@ -1,4 +1,5 @@
-// A personal assistant's two reads of its owner's Raft (`assistant_owner_inbox`, `assistant_owner_messages`): who is
+// A personal assistant's reads of its owner's Raft (`assistant_owner_inbox`, `assistant_owner_messages`,
+// `assistant_owner_activity`): who is
 // offered them, what a call refuses before it reaches the wire, how Raft's failures and answers reach the model.
 //
 // The real plugin and the real SDK (through a fake `fetch`, as test/raft-plugin.ts does): the credential context that
@@ -7,7 +8,9 @@
 // would refuse first.
 //
 //   node test/raft-assistant.ts
-import { GENERATED, RAFTBENCH_TOOL, appOf, UNTOLD_UNKNOWN, createRaftPlugin, isAssistantOf, OWNER_ERROR_TEXT_MAX, type AssistantWire, type OwnerAnswer, type OwnerInboxRequest, type OwnerMessagesRequest } from "../src/plugins/raft.ts";
+import { GENERATED, RAFTBENCH_TOOL, appOf, UNTOLD_UNKNOWN, createRaftPlugin, isAssistantOf, OWNER_ERROR_TEXT_MAX, OWNER_ACTIVITY_WINDOW_MS, type AssistantWire, type OwnerActivityRequest, type OwnerAnswer, type OwnerInboxRequest, type OwnerMessagesRequest } from "../src/plugins/raft.ts";
+import { CHAT_TOOLS, CHECK_TOOLS, assistantCheckPrompt, assistantPrompt, assistantTools, checkInstruction, briefInstruction, isOwnerReadAddress } from "../src/plugins/raft-assistant.ts";
+import { LOGICAL_TOOLS, checkTools, substituteTools } from "../src/plugins/raft-assistant-check.ts";
 import { toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
 import { admitTools } from "../src/runtime/mount-tools.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
@@ -15,8 +18,9 @@ import { SqliteStore } from "../src/store/sqlite.ts";
 
 const INBOX = "assistant_owner_inbox";
 const MESSAGES = "assistant_owner_messages";
+const ACTIVITY = "assistant_owner_activity";
 // With the assistant's own two tools (test/raft-assistant-mode.ts), offered exactly where the reads are.
-const ASSISTANT = [INBOX, MESSAGES, "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner", "assistant_forward_as_owner", "assistant_search_forward_targets", "assistant_reminder", "assistant_owner_artifact", "assistant_publish_artifact", "assistant_publish_artifact_as_owner", "note_decision"];
+const ASSISTANT = [INBOX, MESSAGES, ACTIVITY, "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner", "assistant_forward_as_owner", "assistant_search_forward_targets", "assistant_reminder", "assistant_owner_artifact", "assistant_publish_artifact", "assistant_publish_artifact_as_owner", "note_decision"];
 // A UUID, as Raft sends it (the SDK's contract takes any text since 0.13.1; 0.13.0 required a UUID).
 const OWNER = { userId: "7a0e1b2c-3d4e-4f50-8a61-72839405a6b7", name: "Ada" };
 const CH = "c0ffee00-0000-4000-8000-000000000001";
@@ -65,8 +69,8 @@ function ctx(offered?: readonly string[], credential: string | null = "sk_agent_
 }
 
 /** A wire that answers as told and records what it was asked; an inbox list is its answers in turn. */
-function fakeWire(o: { inbox?: OwnerAnswer | OwnerAnswer[]; messages?: OwnerAnswer } = {}) {
-  const asked = { inbox: [] as OwnerInboxRequest[], messages: [] as OwnerMessagesRequest[] };
+function fakeWire(o: { inbox?: OwnerAnswer | OwnerAnswer[]; messages?: OwnerAnswer; activity?: OwnerAnswer } = {}) {
+  const asked = { inbox: [] as OwnerInboxRequest[], messages: [] as OwnerMessagesRequest[], activity: [] as OwnerActivityRequest[] };
   const wire: AssistantWire = {
     async ownerInbox(_ctx, request) {
       asked.inbox.push(request);
@@ -74,6 +78,7 @@ function fakeWire(o: { inbox?: OwnerAnswer | OwnerAnswer[]; messages?: OwnerAnsw
       return answer ?? { ok: true, data: { items: [], hasMore: false, nextOffset: null } };
     },
     async ownerMessages(_ctx, request) { asked.messages.push(request); return o.messages ?? { ok: true, data: { messages: [], hasMore: false, hasOlder: false, hasNewer: false } }; },
+    async ownerActivity(_ctx, request) { asked.activity.push(request); return o.activity ?? { ok: true, data: { owner: { userId: OWNER.userId }, items: [], hasMore: false, nextSince: null } }; },
   };
   return { wire, asked };
 }
@@ -649,6 +654,168 @@ await check("arguments: at most one anchor, limits within Raft's bounds, a known
   await plugin.invoke(INBOX, {}, ctx(ASSISTANT).ctx);
   must(JSON.stringify(asked.messages) === JSON.stringify([{ channelId: "ch-1", limit: 100, around: "abc12345" }, { channelId: "ch-1", limit: 10 }]), `messages asked: ${JSON.stringify(asked.messages)}`);
   must(JSON.stringify(asked.inbox) === JSON.stringify([{ filter: "unread_mentions", limit: 50, offset: 40 }, { filter: "unread", limit: 20 }]), `inbox asked: ${JSON.stringify(asked.inbox)}`);
+});
+
+// ---- the owner's own activity (assistant_owner_activity) -----------------------------------------------------------------
+
+const SINCE = "2026-11-26T08:00:00.000Z";
+/** An activity answer as Raft sends it (SDK 0.41.0): one item of each kind, the read item with every field. */
+const READ_ITEM = { kind: "read", channelId: CH, at: "2026-11-26T09:30:00.000Z", readThroughSeq: 41, readThroughMessageId: MSG(2), markedUnread: false };
+const activityAnswer = (extra: Record<string, unknown> = {}) => ({
+  owner: { userId: OWNER.userId },
+  items: [
+    { kind: "message", channelId: CH, messageId: MSG(1), seq: 40, at: "2026-11-26T09:00:00.000Z" },
+    { kind: "reaction", channelId: CH, messageId: MSG(1), emoji: "👍", at: "2026-11-26T09:10:00.000Z" },
+    { kind: "task", channelId: CH, messageId: MSG(3), taskNumber: 7, event: "status_changed", status: "done", at: "2026-11-26T09:20:00.000Z" },
+    READ_ITEM,
+  ],
+  hasMore: true, nextSince: "2026-11-26T09:30:00.000Z", ...extra,
+});
+const UNREAD_ACTIVITY = /^Your owner's activity could not be read, so this says nothing about what they did: /;
+
+await check("owner activity: offered in the chat and in a check, an owner read (never stored), and {{tool:owner_activity}} names it", async () => {
+  must(CHAT_TOOLS.includes(ACTIVITY) && CHECK_TOOLS.includes(ACTIVITY), `chat ${CHAT_TOOLS.includes(ACTIVITY)} check ${CHECK_TOOLS.includes(ACTIVITY)}`);
+  const all = [...ASSISTANT, "messages_send"].map((n) => ({ address: `raft.${n}` }));
+  for (const session of ["chat", "check"] as const) {
+    must(assistantTools(all, "raft", session).some((t) => t.address === `raft.${ACTIVITY}`), `${session}: not offered`);
+  }
+  must(isOwnerReadAddress(`raft.${ACTIVITY}`) && isOwnerReadAddress(`raft.${MESSAGES}`), "not an owner read");
+  must(!isOwnerReadAddress(ACTIVITY) && !isOwnerReadAddress("raft.assistant_notify_owner"), "control: an address without a mount, or a write, counted");
+  must(LOGICAL_TOOLS.owner_activity === ACTIVITY, `logical name: ${LOGICAL_TOOLS.owner_activity}`);
+  const said = substituteTools("Read {{tool:owner_activity}} and {{tool:owner_messages}}.", "raft", CHECK_TOOLS);
+  must(said.text === "Read raft__assistant_owner_activity and raft__assistant_owner_messages." && said.unknown === 0 && said.unoffered === 0, JSON.stringify(said));
+  const without = substituteTools("Read {{tool:owner_activity}}.", "raft", CHECK_TOOLS.filter((n) => n !== ACTIVITY));
+  must(without.text === "Read ." && without.unknown === 0 && without.unoffered === 1, `unoffered: ${JSON.stringify(without)}`);
+  must(JSON.stringify(checkTools(["notify", "owner_activity"], CHECK_TOOLS)) === JSON.stringify({ tools: [ACTIVITY, "assistant_notify_owner"], dropped: 0 }), "Raft's allowed_tools cannot name it");
+});
+
+await check("owner activity in the prompts: facts to gather before telling or asking, said only with the tool; no wait time and no seen flag", async () => {
+  const gather = "Before you tell or ask your owner about something, gather the facts: with `raft__assistant_owner_activity`, where their read marker";
+  for (const [what, prompt, without] of [
+    ["chat", assistantPrompt("raft"), assistantPrompt("raft", CHAT_TOOLS.filter((n) => n !== ACTIVITY))],
+    ["check", assistantCheckPrompt("raft"), assistantCheckPrompt("raft", CHECK_TOOLS.filter((n) => n !== ACTIVITY))],
+    ["raft check", assistantCheckPrompt("raft", CHECK_TOOLS, { raftCheck: true }), assistantCheckPrompt("raft", CHECK_TOOLS.filter((n) => n !== ACTIVITY), { raftCheck: true })],
+  ] as const) {
+    must(prompt.includes(gather) && prompt.includes("with any tasks on a message and their status and when it changed. Then decide yourself."), `${what}: ${prompt}`);
+    must(prompt.includes("`raft__assistant_owner_activity` lists what they did themselves since a time"), `${what}: the reads sentence`);
+    must(!without.includes("assistant_owner_activity") && !without.includes("gather the facts"), `${what} without the tool: ${without}`);
+    must(!/\bseen\b|\d+ ?(?:minutes|hours)\b/i.test(prompt.split("\n\n").find((p) => p.startsWith("Before you tell"))!), `${what}: a rule crept in`);
+  }
+  const item = inboxItem({ channelId: CH });
+  must(checkInstruction("raft", [item as any]).includes("what your owner did themselves with `raft__assistant_owner_activity`"), "the doorbell's input");
+  must(briefInstruction("raft", { zone: "UTC", held: 0, waiting: [item as any], active: [] }).includes("what your owner did themselves with `raft__assistant_owner_activity`"), "the brief's input");
+});
+
+await check("owner activity through the SDK: GET assistant/owner-activity with since and limit; every item shown whole as JSON with its time, a read item included", async () => {
+  const { plugin, urls } = realWire(() => json(200, activityAnswer({ items: [...activityAnswer().items, { ...READ_ITEM, channelId: MSG(9), surprise: "kept" }] })));
+  const c = ctx(ASSISTANT);
+  const before = Date.now();
+  const out = String(await plugin.invoke(ACTIVITY, { since: "2026-11-26T08:00:00Z", limit: 30 }, c.ctx));
+  const after = Date.now();
+  must(urls.length === 1 && new URL(urls[0]!).pathname === "/internal/agent-api/assistant/owner-activity", `requests: ${JSON.stringify(urls)}`);
+  must(JSON.stringify(query(urls[0]!)) === JSON.stringify({ since: SINCE, limit: "30" }), `query: ${urls[0]}`);
+  const lines = out.split("\n");
+  must(/^\[your owner's own activity in Raft, read through the `raft` mount: what they did themselves/.test(lines[0]!), `label: ${lines[0]}`);
+  const head = /^now=(\S+) since=(\S+)$/.exec(lines[1]!);
+  must(head && Date.parse(head[1]!) >= before - 1 && Date.parse(head[1]!) <= after && head[2] === SINCE, `now and since: ${lines[1]}`);
+  const items = lines.slice(2, -1).map((l) => JSON.parse(l));
+  // Field for field as Raft sent them (the SDK's parse may put the keys in its schema's order).
+  const sorted = (o: Record<string, unknown>) => JSON.stringify(Object.fromEntries(Object.entries(o).sort(([x], [y]) => x.localeCompare(y))));
+  must(JSON.stringify(items.slice(0, 4).map(sorted)) === JSON.stringify(activityAnswer().items.map(sorted)), `items not as Raft sent them: ${JSON.stringify(items)}`);
+  must(items[3].kind === "read" && items[3].readThroughSeq === 41 && items[3].readThroughMessageId === MSG(2) && items[3].markedUnread === false && items[3].at === READ_ITEM.at, `read item: ${lines[5]}`);
+  // A field this build does not know is a fact too: passed through, not dropped.
+  must(items[4].surprise === "kept", `unknown field: ${lines[6]}`);
+  must(lines.at(-1) === "hasMore=true nextSince=2026-11-26T09:30:00.000Z", `paging: ${lines.at(-1)}`);
+  must(!out.includes(OWNER.userId) && c.touched.length === 0, "the owner's id was shown, or a record written");
+  // No since: Raft's own window, sent explicitly, so the answer can say from when; Raft's default limit, sent too.
+  const { plugin: p2, urls: u2 } = realWire(() => json(200, activityAnswer({ items: [], hasMore: false, nextSince: null })));
+  const t0 = Date.now();
+  const empty = String(await p2.invoke(ACTIVITY, {}, ctx(ASSISTANT).ctx));
+  const q = query(u2[0]!);
+  must(q.limit === "50" && Math.abs(Date.parse(q.since!) - (t0 - OWNER_ACTIVITY_WINDOW_MS)) < 5_000, `default query: ${u2[0]}`);
+  must(empty.split("\n")[2] === `No activity since ${q.since}: Raft answered, with no items.`, `empty: ${empty}`);
+});
+
+await check("owner activity: an empty answer and a failed read are said differently; a failure is never an empty list, and names its status", async () => {
+  const { plugin: ok } = pluginWith();
+  const empty = String(await ok.invoke(ACTIVITY, { since: SINCE }, ctx(ASSISTANT).ctx));
+  must(empty.includes(`No activity since ${SINCE}: Raft answered, with no items.`) && !/could not be read/.test(empty), `empty: ${empty}`);
+  for (const [what, answer, want] of [
+    ["403", { ok: false as const, status: 403, code: "assistant_not_enabled" }, "403 assistant_not_enabled"],
+    ["404 (a Server without the route)", { ok: false as const, status: 404, message: "Not found" }, "404: Not found"],
+    ["503", { ok: false as const, status: 503, code: "agent_api_assistant_owner_activity_failed", message: "Failed to list the owner's activity" }, "503 agent_api_assistant_owner_activity_failed: Failed to list the owner's activity"],
+  ] as const) {
+    const { plugin } = pluginWith({ activity: answer });
+    const e = await failure(() => plugin.invoke(ACTIVITY, { since: SINCE }, ctx(ASSISTANT).ctx));
+    must(UNREAD_ACTIVITY.test(e.message) && e.message.endsWith(want) && !/No activity/.test(e.message), `${what}: ${e.message}`);
+    must(e.transient === (answer.status >= 500), `${what}: transient ${e.transient}`);
+  }
+  // An answer not in shape, and no answer at all, are failures too, said the same way.
+  for (const [what, data] of [["no items", { hasMore: false, nextSince: null }], ["an item with no time", { items: [{ kind: "message", channelId: CH }], hasMore: false, nextSince: null }]] as const) {
+    const { plugin } = pluginWith({ activity: { ok: true, data } });
+    const e = await failure(() => plugin.invoke(ACTIVITY, {}, ctx(ASSISTANT).ctx));
+    must(UNREAD_ACTIVITY.test(e.message) && /not in the expected shape/.test(e.message), `${what}: ${e.message}`);
+  }
+  globalThis.fetch = (async () => { throw new TypeError("fetch failed"); }) as any;
+  const gone = await failure(() => createRaftPlugin().invoke(ACTIVITY, { since: SINCE }, ctx(ASSISTANT).ctx));
+  must(UNREAD_ACTIVITY.test(gone.message) && /no answer from Raft/.test(gone.message) && gone.transient === true, `no answer: ${gone.message}`);
+});
+
+await check("owner activity arguments: since an ISO time, limit within Raft's bounds, and not offered is refused; all before the wire", async () => {
+  const { plugin, asked } = pluginWith();
+  for (const [what, args, offered, why] of [
+    ["since not a time", { since: "yesterday" }, ASSISTANT, /since must be an ISO 8601 time/],
+    ["since not text", { since: 12 }, ASSISTANT, /since must be an ISO 8601 time/],
+    ["limit over 100", { limit: 101 }, ASSISTANT, /limit must be an integer from 1 to 100/],
+    ["not offered", {}, [INBOX, MESSAGES], /is not offered on this mount/],
+  ] as const) {
+    const e = await failure(() => plugin.invoke(ACTIVITY, args, ctx(offered).ctx)).catch((err) => { throw new Error(`${what}: ${err.message}`); });
+    must(why.test(e.message) && e.retryable === false, `${what}: ${e.message}`);
+  }
+  must(asked.activity.length === 0, `a refused call reached the wire: ${JSON.stringify(asked.activity)}`);
+  await plugin.invoke(ACTIVITY, { since: "2026-11-26T10:00:00+02:00", limit: 100 }, ctx(ASSISTANT).ctx);
+  must(JSON.stringify(asked.activity) === JSON.stringify([{ since: SINCE, limit: 100 }]), `control: asked ${JSON.stringify(asked.activity)}`);
+});
+
+await check("owner messages pass through what the SDK's line does not know: a message's source_tasks, and a flag at the top, as Raft sent them", async () => {
+  // The SDK's own fields (0.41.0 `source_tasks`), and one it does not read.
+  const tasks = [{ number: 7, status: "in_review", assignee_type: "user", assignee_id: "u-bob", assignee_name: "bob", status_changed_at: "2026-11-26T09:20:00.000Z" }];
+  const { plugin } = pluginWith({ messages: { ok: true, data: {
+    owner: { userId: OWNER.userId }, channelId: CH, messages: [envelope(7, "first", { source_tasks: tasks }), envelope(8, "second")],
+    hasMore: false, hasOlder: false, hasNewer: false, sourceTasksLookup: "unavailable", nested: { left: "out" },
+  } } });
+  const out = String(await plugin.invoke(MESSAGES, { channelId: CH }, ctx(ASSISTANT).ctx));
+  const lines = out.split("\n");
+  must(lines[1]!.endsWith(`first [tasks #general:#7 in_review @bob] [source_tasks: ${JSON.stringify(tasks)}]`), `the message's tasks: ${lines[1]}`);
+  must(!lines[2]!.includes("source_tasks"), `a message without tasks: ${lines[2]}`);
+  must(lines.at(-1) === "hasMore=false hasOlder=false hasNewer=false sourceTasksLookup=unavailable", `the page's flag: ${lines.at(-1)}`);
+  must(!out.includes("nested") && !out.includes(OWNER.userId), `an object at the top, or the owner, was shown: ${out}`);
+  // Through the SDK too: its contract keeps both (a passthrough schema), so they reach the line.
+  const { plugin: real } = realWire(() => json(200, messagesAnswer({ messages: [envelope(7, "first", { source_tasks: tasks })], sourceTasksLookup: "ok" })));
+  const sdk = String(await real.invoke(MESSAGES, { channelId: CH }, ctx(ASSISTANT).ctx)).split("\n");
+  must(sdk[1]!.endsWith(`[source_tasks: ${JSON.stringify(tasks)}]`) && sdk.at(-1)!.endsWith(" sourceTasksLookup=ok"), `through the SDK: ${sdk.join(" | ")}`);
+});
+
+await check("owner messages: sourceTasks loaded with a task, loaded with none, and unavailable are three different texts", async () => {
+  // The server's shape (slock #17035): each top-level message's source_tasks, and the page's sourceTasks.
+  const task = { number: 7, status: "in_review", assignee: { type: "user", name: "bob" }, status_changed_at: "2026-11-26T09:20:00.000Z" };
+  const page = (sourceTasks: string, tasks: unknown[]) => ({ ok: true as const, data: {
+    owner: { userId: OWNER.userId }, channelId: CH, messages: [envelope(7, "first", { source_tasks: tasks })],
+    hasMore: false, hasOlder: false, hasNewer: false, sourceTasks,
+  } });
+  const read = async (answer: OwnerAnswer) => String(await pluginWith({ messages: answer }).plugin.invoke(MESSAGES, { channelId: CH }, ctx(ASSISTANT).ctx)).split("\n");
+  const withTask = await read(page("loaded", [task]));
+  must(withTask[1]!.endsWith(`[source_tasks: ${JSON.stringify([task])}]`) && withTask.at(-1)!.endsWith(" sourceTasks=loaded") &&
+    !withTask.some((l) => /lookup unavailable/.test(l)), `loaded, one task: ${withTask.join(" | ")}`);
+  const none = await read(page("loaded", []));
+  must(none[1]!.endsWith("[source_tasks: []]") && none.at(-1)!.endsWith(" sourceTasks=loaded") && !none.some((l) => /lookup unavailable/.test(l)), `loaded, none: ${none.join(" | ")}`);
+  const unavailable = await read(page("unavailable", []));
+  must(unavailable.at(-2) === "[Task lookup unavailable: Raft could not look up the tasks on these messages, so a message with no source_tasks shown may still have tasks. This is not \"no tasks\".]" &&
+    unavailable.at(-1)!.endsWith(" sourceTasks=unavailable"), `unavailable: ${unavailable.join(" | ")}`);
+  // Through the SDK the same: its contract keeps both fields.
+  const { plugin } = realWire(() => json(200, messagesAnswer({ messages: [envelope(7, "first", { source_tasks: [task] })], sourceTasks: "unavailable" })));
+  const sdk = String(await plugin.invoke(MESSAGES, { channelId: CH }, ctx(ASSISTANT).ctx)).split("\n");
+  must(sdk[1]!.endsWith(`[source_tasks: ${JSON.stringify([task])}]`) && /Task lookup unavailable/.test(sdk.at(-2)!) && sdk.at(-1)!.endsWith(" sourceTasks=unavailable"), `through the SDK: ${sdk.join(" | ")}`);
 });
 
 // ---- whoami ------------------------------------------------------------------------------------------------------------

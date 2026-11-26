@@ -45,6 +45,7 @@ export const LOGICAL_TOOLS: Readonly<Record<string, string>> = {
   notify: "assistant_notify_owner",
   owner_inbox: "assistant_owner_inbox",
   owner_messages: "assistant_owner_messages",
+  owner_activity: "assistant_owner_activity",
 };
 
 /**
