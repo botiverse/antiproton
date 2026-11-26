@@ -624,7 +624,8 @@ await check("raft: a held send yields send/drop with the SDK's held text; resume
   const out = await f.send.execute("c1", { target: "#general", content: "done", idempotencyKey: "k1" });
   const y = body(out);
   must(y.state === "yielded" && y.question.startsWith("Held — 1 unread message in #general.") && JSON.stringify(y.answer) === '{"choices":["send","drop"]}', `held: ${JSON.stringify(y)}`);
-  must(y.question.includes("@tygg 10:00  wait, one more thing") && y.context?.reason === "unread_messages" && !out.content[0].text.includes('"content":"done"'), `the held text, and the state kept back: ${out.content[0].text}`);
+  // SDK 0.41.0 writes the held preview's time with its date and zone ("09-28 10:00Z"; 0.38.0 wrote "10:00").
+  must(y.question.includes("@tygg 09-28 10:00Z  wait, one more thing") && y.context?.reason === "unread_messages" && !out.content[0].text.includes('"content":"done"'), `the held text, and the state kept back: ${out.content[0].text}`);
   must(calls.length === 1, "one attempt so far");
   const sent = body(await f.resume.execute("r1", { token: y.token, answer: "send" }));
   const second = JSON.parse(String(calls[1]!.init.body));

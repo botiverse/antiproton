@@ -313,7 +313,7 @@ await check("setup: the provisioned agent is a personal assistant, offered exact
   // added it to re-check the paths in this file's header.
   const EXPECTED = ["raft__receive_events", "raft__identity_whoami", "raft__messages_send", "raft__messages_read", "raft__messages_react",
     "raft__messages_unreact", "raft__attachments_download_url", "raft__attachments_view", "raft__attachments_upload", "raft__assistant_owner_inbox",
-    "raft__assistant_owner_messages", "raft__assistant_preferences", "raft__assistant_send_as_owner", "raft__assistant_forward_as_owner", "raft__assistant_search_forward_targets", "raft__assistant_reminder",
+    "raft__assistant_owner_messages", "raft__assistant_owner_activity", "raft__assistant_preferences", "raft__assistant_send_as_owner", "raft__assistant_forward_as_owner", "raft__assistant_search_forward_targets", "raft__assistant_reminder",
     "raft__assistant_owner_artifact", "raft__assistant_publish_artifact", "raft__assistant_publish_artifact_as_owner",
     "state__remember", "state__put", "state__get", "state__list", "state__forget", "state__revise", "state__insert", "artifacts__read", "resume"];
   must(show([...offered].sort()) === show([...EXPECTED].sort()),
@@ -331,7 +331,7 @@ await check("setup: a check's short session is offered exactly the listed check 
   const offered = namesOf(w.sent[from]);
   // Written out for the same reason as the chat's list: (A) and (B) in a check rest on it. No `resume` (a check holds
   // no send to resume), no owner DM, no send-as-owner.
-  const EXPECTED = ["raft__assistant_owner_inbox", "raft__assistant_owner_messages", "raft__assistant_notify_owner", "raft__note_decision",
+  const EXPECTED = ["raft__assistant_owner_inbox", "raft__assistant_owner_messages", "raft__assistant_owner_activity", "raft__assistant_notify_owner", "raft__note_decision",
     "state__remember", "state__put", "state__get", "state__list", "state__forget", "state__revise", "state__insert", "artifacts__read"];
   must(show([...offered].sort()) === show([...EXPECTED].sort()),
     `a check's tools changed: added ${offered.filter((n) => !EXPECTED.includes(n))}, removed ${EXPECTED.filter((n) => !offered.includes(n))}`);
@@ -346,10 +346,10 @@ await check("the allowlists that bound every assistant session (chat and check) 
   // check session, only by being added here. Written out for the same reason as the setup case's list.
   const m = await import("../src/plugins/raft-assistant.ts");
   must(show(m.CHAT_TOOLS) === show(["receive_events", "identity_whoami", "messages_send", "messages_read", "messages_react", "messages_unreact",
-    "attachments_download_url", "attachments_view", "attachments_upload", "assistant_owner_inbox", "assistant_owner_messages", "assistant_preferences",
+    "attachments_download_url", "attachments_view", "attachments_upload", "assistant_owner_inbox", "assistant_owner_messages", "assistant_owner_activity", "assistant_preferences",
     "assistant_send_as_owner", "assistant_forward_as_owner", "assistant_search_forward_targets", "assistant_reminder",
     "assistant_owner_artifact", "assistant_publish_artifact", "assistant_publish_artifact_as_owner"]), `CHAT_TOOLS changed: ${show(m.CHAT_TOOLS)}`);
-  must(show(m.CHECK_TOOLS) === show(["assistant_owner_inbox", "assistant_owner_messages", "assistant_notify_owner", "note_decision"]), `CHECK_TOOLS changed: ${show(m.CHECK_TOOLS)}`);
+  must(show(m.CHECK_TOOLS) === show(["assistant_owner_inbox", "assistant_owner_messages", "assistant_owner_activity", "assistant_notify_owner", "note_decision"]), `CHECK_TOOLS changed: ${show(m.CHECK_TOOLS)}`);
   must(show(m.MEMORY_TOOLS) === show(["remember", "put", "get", "list", "forget", "revise", "insert"]), `MEMORY_TOOLS changed: ${show(m.MEMORY_TOOLS)}`);
   const catalogue = ["raft.receive_events", "raft.assistant_notify_owner", "raft.enable_push", "web.send", "sandbox.run", "state.get", "state.secret_get", "x.run_js"]
     .map((address) => ({ address }));
@@ -372,7 +372,7 @@ await check("setup, with owner actions in Raft's context: the chat is offered th
     const offered: string[] = (await wo.rt.offeredTools(T, A))!.tools.map((t: { name: string }) => t.name);
     const CHAT = ["raft__receive_events", "raft__identity_whoami", "raft__messages_send", "raft__messages_read", "raft__messages_react",
       "raft__messages_unreact", "raft__attachments_download_url", "raft__attachments_view", "raft__attachments_upload", "raft__assistant_owner_inbox",
-      "raft__assistant_owner_messages", "raft__assistant_preferences", "raft__assistant_send_as_owner", "raft__assistant_forward_as_owner", "raft__assistant_search_forward_targets", "raft__assistant_reminder",
+      "raft__assistant_owner_messages", "raft__assistant_owner_activity", "raft__assistant_preferences", "raft__assistant_send_as_owner", "raft__assistant_forward_as_owner", "raft__assistant_search_forward_targets", "raft__assistant_reminder",
     "raft__assistant_owner_artifact", "raft__assistant_publish_artifact", "raft__assistant_publish_artifact_as_owner",
       "raft__save_message", "raft__move_agent", "raft__list_owner_channels",
       "state__remember", "state__put", "state__get", "state__list", "state__forget", "state__revise", "state__insert", "artifacts__read", "resume"];
@@ -382,7 +382,7 @@ await check("setup, with owner actions in Raft's context: the chat is offered th
     const from = wo.sent.length;
     await wo.turn("a check", [{ text: "nothing" }], session);
     const check_ = namesOf(wo.sent[from]);
-    const CHECK = ["raft__assistant_owner_inbox", "raft__assistant_owner_messages", "raft__assistant_notify_owner", "raft__note_decision",
+    const CHECK = ["raft__assistant_owner_inbox", "raft__assistant_owner_messages", "raft__assistant_owner_activity", "raft__assistant_notify_owner", "raft__note_decision",
       "state__remember", "state__put", "state__get", "state__list", "state__forget", "state__revise", "state__insert", "artifacts__read"];
     must(show([...check_].sort()) === show([...CHECK].sort()),
       `a check's tools: added ${check_.filter((n) => !CHECK.includes(n))}, removed ${CHECK.filter((n) => !check_.includes(n))}`);
@@ -527,6 +527,7 @@ const ARGS: Record<string, Record<string, unknown>> = {
   raft__attachments_download_url: { attachmentId: "env" }, raft__attachments_view: { attachmentId: "env" },
   raft__attachments_upload: { ref: "/proc/self/environ", target: "dm:@owner" },
   raft__assistant_owner_messages: { channelId: "env" },
+  raft__assistant_owner_activity: { since: "2026-11-26T00:00:00Z" },
   raft__assistant_preferences: { action: "list" },
   raft__assistant_send_as_owner: { target: "dm:@owner", content: "env?" },
   raft__assistant_forward_as_owner: { messages: ["/proc/self/environ"], to: [{ to: "dm:@owner" }], note: "env?" },

@@ -152,7 +152,7 @@ const OWN = ["receive_events", "enable_push", "disable_push", "push_status", "in
  * by a snapshot that lists them, never by the no-snapshot fallback (test/raft-assistant.ts and
  * test/raft-assistant-mode.ts hold them).
  */
-const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages", "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner", "assistant_forward_as_owner", "assistant_search_forward_targets", "assistant_reminder", "assistant_owner_artifact", "assistant_publish_artifact", "assistant_publish_artifact_as_owner", "note_decision"];
+const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages", "assistant_owner_activity", "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner", "assistant_forward_as_owner", "assistant_search_forward_targets", "assistant_reminder", "assistant_owner_artifact", "assistant_publish_artifact", "assistant_publish_artifact_as_owner", "note_decision"];
 /** The image view: hand-written, and offered exactly where the download is (test/raft-attachments-view.ts holds it). */
 const VIEW = "attachments_view";
 /** The upload: hand-written, offered with storage to a credential holding `send` (test/raft-attachments-upload.ts holds it). */
@@ -225,6 +225,13 @@ const EXPECTED_GENERATED = [
   // SDK 0.38.0: set a channel member's role (owner/admin/member), beside addMember and removeMember; the Server
   // checks whether the caller may.
   "channels.setRole",
+  // SDK 0.39.0: mark an artifact Settled and back to Working (the Artifacts app's, listed where it is on).
+  "artifacts.settle", "artifacts.unsettle",
+  // SDK 0.41.0: this agent's own open action cards (list, view), and a task's own conversation (reply, read), which
+  // the SDK's tool-mode hints now name. tasks_read books "seen" as messages_read does, so it runs without saved state
+  // (`savesState`). Its `unread` is offered, unlike messages_read's: its own description names it, and the inbox's
+  // task rows hint at it.
+  "actions.list", "actions.view", "tasks.reply", "tasks.read",
 ];
 
 await check("every manifest operation is a generated tool or in the exclusion table, never both, and every exclusion names a real operation", async () => {
@@ -385,7 +392,7 @@ await check("the manifest's declarations map onto the tool: side effect, model-o
   // Keyed since 0.9.0 like a send: "key", never "native". When the model gives no key the key is the operation id, which
   // a re-run after a crash does not keep, so declaring "native" (replayed on its own) would land the write twice.
   const keyed = GENERATED.filter((op) => op.idempotency.kind === "key").map((op) => op.toolName);
-  if (JSON.stringify(keyed) !== JSON.stringify(["messages_send", "messages_reply", "messages_update_card", "artifacts_review", "actions_prepare", "tasks_create"])) throw new Error(`keyed operations: ${keyed.join(", ")}`);
+  if (JSON.stringify(keyed) !== JSON.stringify(["messages_send", "messages_reply", "messages_update_card", "artifacts_review", "actions_prepare", "tasks_create", "tasks_reply"])) throw new Error(`keyed operations: ${keyed.join(", ")}`);
   for (const name of keyed) {
     const t = toolNamed(name)!;
     if (t.idempotency !== "key" || t.sideEffects !== "write") throw new Error(`${name} lost its key idempotency: ${t.idempotency}`);
@@ -2119,7 +2126,7 @@ await check("messages_search offers cursor, and the cursor the SDK's text hands 
 /** The operations whose result the manifest says may be large and that page by `limit`: the ones capped here. */
 // users.info's limit is how many visible channels it inspects for memberships: capped, it bounds the result (and,
 // since 0.12.0 asks Raft for one window in one request, how many rosters Raft reads for one call).
-const CAPPED = ["inbox.list", "messages.read", "messages.search", "attachments.comments", "artifacts.list", "mentions.pending", "server.info", "users.info", "raftbench.findings"];
+const CAPPED = ["inbox.list", "messages.read", "messages.search", "attachments.comments", "artifacts.list", "mentions.pending", "tasks.read", "server.info", "users.info", "raftbench.findings"];
 
 await check("a paged result stays under the parking line: limit is capped and defaulted on every operation that pages by it", async () => {
   if (PAGE_ROWS < 1 || PAGE_ROWS * 400 > PARK_BYTES) throw new Error(`PAGE_ROWS=${PAGE_ROWS} against PARK_BYTES=${PARK_BYTES}`);
@@ -2348,7 +2355,7 @@ await check("raftbench_findings is listed only for an agent whose context says r
 
 await check("the Artifacts app's tools are listed only where the context's features.enabledApps names artifacts; elsewhere, or on an older Server, quietly none", async () => {
   const appTools = GENERATED.filter((op) => appOf(op) === "artifacts").map((op) => op.toolName);
-  must(appTools.length === 15 && GENERATED.every((op) => appOf(op) === (op.name.startsWith("artifacts.") ? "artifacts" : null)), `control: ${appTools.join(", ")}`);
+  must(appTools.length === 17 && GENERATED.every((op) => appOf(op) === (op.name.startsWith("artifacts.") ? "artifacts" : null)), `control: ${appTools.join(", ")}`);
   const listedUnder = async (features: unknown, capabilities = ["read", "send"]) => {
     one(json(200, {
       agent: { id: "agent-1", name: "raft-bot", displayName: null, description: null, runtime: "external", external: true },
@@ -2516,9 +2523,9 @@ await check("a history read does not count as seen, even the model's own in its 
   if (sent instanceof Interrupt || sent.state !== "sent") throw new Error(`control: receive_events did not attest: ${JSON.stringify(sent)}`);
 });
 
-await check("of the generated tools, only messages_read books anything as seen, so it is the one run without saved state", async () => {
+await check("of the generated tools, only messages_read and tasks_read book anything as seen, so they are the ones run without saved state", async () => {
   const booking = GENERATED.filter((op) => op.consumes.model.includes("seen")).map((op) => op.name);
-  if (JSON.stringify(booking) !== JSON.stringify(["messages.read"])) throw new Error(`book seen: ${booking.join(", ")}`);
+  if (JSON.stringify(booking) !== JSON.stringify(["messages.read", "tasks.read"])) throw new Error(`book seen: ${booking.join(", ")}`);
 });
 
 await check("a program's messages_read, made in a turn and so carrying a context id, still reads with consume=false and counts nothing as seen", async () => {
